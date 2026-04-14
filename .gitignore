@@ -32,3 +32,5 @@ results/
 Thumbs.db
 .json
 .claude
+.db
+PROVIDERS.md
