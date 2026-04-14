@@ -1,0 +1,2005 @@
+#!/usr/bin/env python3
+"""
+ip_intel.py — Domain / IP intelligence tool
+
+Usage:
+    uv run ip_intel.py <domain or IP>
+
+Sources (all free, no API keys required by default):
+    - dnspython   : DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME, PTR)
+    - python-whois: Domain and IP WHOIS
+    - ipwhois     : IP ASN / network info via RDAP
+    - crt.sh      : Subdomain discovery + full cert transparency data (SANs, issuers)
+    - hackertarget: Reverse IP lookup — skipped automatically for Cloudflare IPs
+    - CIRCL pDNS  : Passive / historical DNS records (pdns.circl.lu)
+    - Origin probe: Resolves crt.sh subdomains and flags any that bypass Cloudflare
+    - Censys      : Searches indexed TLS certs for IPs serving the domain's cert
+                    (optional — set CENSYS_API_KEY in .env)
+    - Shodan      : Searches indexed banners for ssl:"domain" hits
+                    (optional — set SHODAN_API_KEY in .env)
+    - Netlas      : Searches indexed TLS banners by cert CN — free tier available
+                    (optional — set NETLAS_API_KEY in .env)
+    - Origin scan : Two-phase TCP+TLS scan of targeted IP ranges (e.g. GCP) to
+                    find the cert CN directly. Opt-in via --scan flag.
+"""
+
+import asyncio
+import hashlib
+import json
+import os
+import shutil
+import ssl
+import socket
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from dotenv import load_dotenv
+load_dotenv()
+import ipaddress
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+import dns.asyncresolver
+import dns.resolver
+import dns.reversename
+import dns.zone
+import dns.query
+import dns.exception
+import httpx
+import requests
+import whois
+from ipwhois import IPWhois
+from ipwhois.exceptions import IPDefinedError
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from tqdm import tqdm
+
+
+RESULTS_DIR = Path(__file__).parent / "results"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    print(f"  [*] {msg}", flush=True)
+
+
+def clean_target(target: str) -> str:
+    """Strip protocol prefix and trailing slashes so bare hostnames/IPs remain."""
+    target = re.sub(r'^https?://', '', target)
+    return target.rstrip('/').strip()
+
+
+def is_ip(target: str) -> bool:
+    try:
+        ipaddress.ip_address(target)
+        return True
+    except ValueError:
+        return False
+
+
+# Cloudflare's published IP ranges (https://www.cloudflare.com/ips/)
+_CF_CIDRS = [ipaddress.ip_network(n) for n in [
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+    "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+]]
+
+
+def is_cloudflare_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in _CF_CIDRS)
+    except ValueError:
+        return False
+
+
+def resolve_ips(hostname: str) -> list[str]:
+    """Return A + AAAA records for hostname, empty list on failure."""
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 8
+    ips: list[str] = []
+    for rtype in ("A", "AAAA"):
+        try:
+            ips.extend(str(r) for r in resolver.resolve(hostname, rtype))
+        except Exception:
+            pass
+    return ips
+
+
+# ── DNS ───────────────────────────────────────────────────────────────────────
+
+def get_dns_records(domain: str) -> dict:
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 10
+
+    def _resolve(rtype: str) -> tuple[str, object]:
+        try:
+            answers = resolver.resolve(domain, rtype)
+            if rtype == "MX":
+                return rtype, [
+                    {"preference": r.preference, "exchange": str(r.exchange).rstrip(".")}
+                    for r in answers
+                ]
+            if rtype == "SOA":
+                r = answers[0]
+                return rtype, {
+                    "mname":   str(r.mname).rstrip("."),
+                    "rname":   str(r.rname).rstrip("."),
+                    "serial":  int(r.serial),
+                    "refresh": int(r.refresh),
+                    "retry":   int(r.retry),
+                    "expire":  int(r.expire),
+                    "minimum": int(r.minimum),
+                }
+            if rtype == "NS":
+                return rtype, sorted(str(r).rstrip(".") for r in answers)
+            if rtype == "TXT":
+                return rtype, [
+                    b"".join(r.strings).decode("utf-8", errors="replace")
+                    for r in answers
+                ]
+            return rtype, [str(r) for r in answers]
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            return rtype, []
+        except dns.exception.DNSException as exc:
+            return rtype, {"error": str(exc)}
+
+    rtypes = ("A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA")
+    with ThreadPoolExecutor(max_workers=len(rtypes)) as ex:
+        return dict(ex.map(_resolve, rtypes))
+
+
+def get_ptr(ip: str) -> str | None:
+    try:
+        rev = dns.reversename.from_address(ip)
+        answers = dns.resolver.resolve(rev, "PTR", lifetime=5)
+        return str(answers[0]).rstrip(".")
+    except Exception:
+        return None
+
+
+def attempt_zone_transfer(domain: str, nameservers: list[str]) -> list[str]:
+    found: list[str] = []
+    for ns in nameservers:
+        try:
+            zone = dns.zone.from_xfr(dns.query.xfr(ns, domain, timeout=5))
+            for name in zone.nodes:
+                label = str(name)
+                if label == "@":
+                    continue
+                full = f"{label}.{domain}"
+                if full not in found:
+                    found.append(full)
+        except Exception:
+            pass
+    return sorted(found)
+
+
+# ── Certificate Transparency via crt.sh ───────────────────────────────────────
+
+
+def _parse_crt_sh_entries(entries: list, domain: str) -> dict:
+    """Pure processing of a crt.sh JSON response list (no I/O)."""
+    result = {"subdomains": [], "total_certs": 0, "issuers": [], "cross_domain_sans": [], "certs": []}
+    result["total_certs"] = len(entries)
+    subdomains: set[str] = set()
+    issuers: set[str] = set()
+    cross_sans: set[str] = set()
+    seen_ids: set[int] = set()
+    certs: list[dict] = []
+
+    for entry in entries:
+        cert_id = entry.get("id")
+        if cert_id in seen_ids:
+            continue
+        seen_ids.add(cert_id)
+
+        issuer = entry.get("issuer_name", "")
+        cn_match = re.search(r"CN=([^,]+)", issuer)
+        issuer_cn = cn_match.group(1).strip() if cn_match else issuer
+        if issuer_cn:
+            issuers.add(issuer_cn)
+
+        sans_in_cert: list[str] = []
+        for name in entry.get("name_value", "").split("\n"):
+            name = name.strip().lstrip("*.").lower()
+            if not name:
+                continue
+            sans_in_cert.append(name)
+            if name.endswith(f".{domain}") or name == domain:
+                subdomains.add(name) if name != domain else None
+            else:
+                cross_sans.add(name)
+
+        certs.append({
+            "id":         cert_id,
+            "issuer":     issuer_cn,
+            "not_before": entry.get("not_before"),
+            "not_after":  entry.get("not_after"),
+            "logged_at":  entry.get("entry_timestamp"),
+            "sans":       sorted(set(sans_in_cert)),
+        })
+
+    result["subdomains"]        = sorted(subdomains)
+    result["issuers"]           = sorted(issuers)
+    result["cross_domain_sans"] = sorted(cross_sans)
+    result["certs"]             = sorted(certs, key=lambda c: c.get("not_before") or "", reverse=True)
+    return result
+
+
+_CRT_SH_EMPTY = {"subdomains": [], "total_certs": 0, "issuers": [], "cross_domain_sans": [], "certs": []}
+
+
+def crt_sh_data(domain: str) -> dict:
+    """
+    Query crt.sh for full certificate transparency data.
+
+    Returns subdomains, cert metadata, and cross-domain SANs — names that appear
+    in the same certificate as the target domain but belong to a different domain.
+    Cross-domain SANs are a strong signal for shared hosting / origin server
+    infrastructure that may not be visible via reverse-IP lookups.
+    """
+    try:
+        resp = requests.get(
+            "https://crt.sh/",
+            params={"q": domain, "output": "json"},
+            timeout=20,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            return dict(_CRT_SH_EMPTY)
+        return _parse_crt_sh_entries(resp.json(), domain)
+    except Exception:
+        return dict(_CRT_SH_EMPTY)
+
+
+# ── Historical / Passive DNS via CIRCL ────────────────────────────────────────
+
+def circl_passive_dns(domain: str) -> dict:
+    """
+    Query CIRCL Passive DNS (pdns.circl.lu) for historical DNS records.
+
+    Returns historical A/AAAA records with first-seen / last-seen timestamps.
+    IPs that pre-date the current Cloudflare records may be the true origin servers.
+    No API key required.
+    """
+    result: dict = {"records": [], "unique_historical_ips": []}
+    try:
+        resp = requests.get(
+            f"https://www.circl.lu/pdns/query/{domain}",
+            timeout=15,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            return result
+
+        records: list[dict] = []
+        seen_ips: set[str] = set()
+
+        # Response is newline-delimited JSON
+        for line in resp.text.strip().splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            rrtype = entry.get("rrtype", "")
+            rdata  = entry.get("rdata", "")
+
+            records.append({
+                "rrtype":     rrtype,
+                "rdata":      rdata,
+                "first_seen": entry.get("time_first_ms") or entry.get("time_first"),
+                "last_seen":  entry.get("time_last_ms")  or entry.get("time_last"),
+                "count":      entry.get("count"),
+            })
+
+            if rrtype in ("A", "AAAA") and rdata:
+                seen_ips.add(rdata)
+
+        result["records"]               = records
+        result["unique_historical_ips"] = sorted(seen_ips)
+
+    except Exception:
+        pass
+
+    return result
+
+
+# ── Subdomain origin probe ────────────────────────────────────────────────────
+
+def probe_subdomain_origins(subdomains: list[str]) -> list[dict]:
+    """
+    Resolve each subdomain discovered via crt.sh and flag any that resolve to
+    a non-Cloudflare IP. These are origin server leaks — the operator forgot to
+    proxy that subdomain through Cloudflare, exposing the real hosting IP.
+    """
+    leaks: list[dict] = []
+
+    def _check(sub: str) -> list[dict]:
+        return [{"subdomain": sub, "ip": ip} for ip in resolve_ips(sub) if not is_cloudflare_ip(ip)]
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(_check, sub): sub for sub in subdomains}
+        with tqdm(total=len(subdomains), desc="  Subdomain probe", unit="sub",
+                  dynamic_ncols=True) as bar:
+            for fut in as_completed(futures):
+                leaks.extend(fut.result())
+                bar.update(1)
+
+    return leaks
+
+
+# ── MX origin probe ──────────────────────────────────────────────────────────
+
+def probe_mx_origins(mx_records: list[dict]) -> list[dict]:
+    """
+    Resolve MX hostnames and flag any that resolve to a non-Cloudflare IP.
+    Mail servers are often co-hosted with the web server and not proxied,
+    leaking the real origin.
+    """
+    leaks: list[dict] = []
+
+    def _check(mx: dict) -> list[dict]:
+        host = mx.get("exchange", "")
+        if not host:
+            return []
+        return [
+            {"subdomain": host, "ip": ip, "source": "MX record"}
+            for ip in resolve_ips(host)
+            if not is_cloudflare_ip(ip)
+        ]
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for hits in ex.map(_check, mx_records):
+            leaks.extend(hits)
+
+    return leaks
+
+
+# ── Wordlist subdomain probe ──────────────────────────────────────────────────
+
+_SUBDOMAIN_WORDLIST = [
+    "direct", "origin", "mail", "smtp", "ftp", "cpanel", "webmail",
+    "staging", "dev", "test", "beta", "old", "admin", "ns1", "ns2",
+    "api", "static", "img",
+]
+
+
+def probe_wordlist_subdomains(domain: str) -> list[dict]:
+    """
+    Probe a fixed wordlist of common subdomains for non-Cloudflare IPs.
+    Catches origin leaks that crt.sh never logged a cert for.
+    """
+    candidates = [f"{prefix}.{domain}" for prefix in _SUBDOMAIN_WORDLIST]
+
+    def _check(fqdn: str) -> list[dict]:
+        return [
+            {"subdomain": fqdn, "ip": ip, "source": "wordlist probe"}
+            for ip in resolve_ips(fqdn)
+            if not is_cloudflare_ip(ip)
+        ]
+
+    leaks: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+        for hits in ex.map(_check, candidates):
+            leaks.extend(hits)
+
+    return leaks
+
+
+# ── SPF ip4 extraction ────────────────────────────────────────────────────────
+
+def extract_spf_origins(txt_records: list) -> list[dict]:
+    """
+    Parse SPF TXT records and extract ip4:/ip6: directives as origin candidates.
+    No extra network call — operates on already-fetched TXT records.
+    """
+    origins: list[dict] = []
+    if not isinstance(txt_records, list):
+        return origins
+    for txt in txt_records:
+        if not isinstance(txt, str) or "v=spf1" not in txt:
+            continue
+        for part in txt.split():
+            if part.startswith("ip4:") or part.startswith("ip6:"):
+                ip_or_cidr = part.split(":", 1)[1]
+                ip = ip_or_cidr.split("/")[0]
+                origins.append({"ip": ip, "cidr": ip_or_cidr, "source": "SPF record"})
+    return origins
+
+
+# ── HackerTarget host search ──────────────────────────────────────────────────
+
+def hackertarget_host_search(domain: str) -> list[dict]:
+    """
+    Query HackerTarget hostsearch for subdomains and their IPs.
+    Different from reverse-IP lookup — this goes domain → subdomains+IPs
+    and surfaces non-Cloudflare addresses directly.
+    """
+    try:
+        resp = requests.get(
+            "https://api.hackertarget.com/hostsearch/",
+            params={"q": domain},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return []
+        text = resp.text.strip()
+        if "error" in text.lower() or "API count" in text:
+            return []
+        results: list[dict] = []
+        for line in text.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) == 2:
+                subdomain, ip = parts[0].strip(), parts[1].strip()
+                if ip:
+                    results.append({
+                        "subdomain": subdomain,
+                        "ip":        ip,
+                        "cf":        is_cloudflare_ip(ip),
+                        "source":    "HackerTarget hostsearch",
+                    })
+        return results
+    except Exception:
+        return []
+
+
+# ── urlscan.io historical IPs ─────────────────────────────────────────────────
+
+def urlscan_historical_ips(domain: str) -> list[dict]:
+    """
+    Query urlscan.io for historical scan results and extract IPs seen serving
+    the domain. Pre-Cloudflare snapshots often reveal the real origin IP.
+    No API key required for basic search.
+    """
+    try:
+        resp = requests.get(
+            "https://urlscan.io/api/v1/search/",
+            params={"q": f"domain:{domain}", "size": "100"},
+            timeout=15,
+            headers={"User-Agent": "ip-intel/1.0 (OSINT research)"},
+        )
+        if resp.status_code != 200:
+            return []
+        seen: set[str] = set()
+        results: list[dict] = []
+        for hit in resp.json().get("results", []):
+            ip   = hit.get("page", {}).get("ip", "")
+            date = hit.get("task", {}).get("time", "")[:10]
+            if ip and ip not in seen:
+                seen.add(ip)
+                results.append({
+                    "ip":     ip,
+                    "date":   date,
+                    "url":    hit.get("page", {}).get("url", ""),
+                    "cf":     is_cloudflare_ip(ip),
+                    "source": "urlscan.io",
+                })
+        return results
+    except Exception:
+        return []
+
+
+# ── Censys cert search ────────────────────────────────────────────────────────
+
+def censys_cert_search(domain: str) -> dict:
+    """
+    Search Censys Platform for hosts currently serving a TLS cert whose CN
+    matches the target domain. Any result that isn't a Cloudflare IP is a
+    candidate origin server.
+
+    Requires a free Censys account — add to .env:
+        CENSYS_API_KEY=<personal-access-token>
+    """
+    api_key = os.environ.get("CENSYS_API_KEY")
+
+    if not api_key:
+        return {"skipped": True, "reason": "CENSYS_API_KEY not set in .env"}
+
+    from censys_platform import SDK
+
+    result: dict = {"hits": [], "origin_candidates": []}
+    try:
+        with SDK(personal_access_token=api_key) as sdk:
+            query = f'host.services.tls.leaf_certificate.subject.common_name = "{domain}"'
+            resp = sdk.global_data.search(search_query_input_body={
+                "query":     query,
+                "fields":    ["host.ip", "host.autonomous_system", "host.location", "host.services"],
+                "page_size": 100,
+            })
+
+        for record in (resp.search_response.results or []):
+            ip = getattr(record, "ip", None) or (
+                record.get("host", {}).get("ip") if isinstance(record, dict) else None
+            )
+            if not ip:
+                continue
+
+            asn_block  = getattr(record, "autonomous_system", None) or {}
+            loc_block  = getattr(record, "location", None) or {}
+            svc_block  = getattr(record, "services", None) or []
+
+            if isinstance(asn_block, dict):
+                asn      = asn_block.get("asn")
+                asn_name = asn_block.get("description")
+            else:
+                asn      = getattr(asn_block, "asn", None)
+                asn_name = getattr(asn_block, "description", None)
+
+            if isinstance(loc_block, dict):
+                country = loc_block.get("country_code")
+            else:
+                country = getattr(loc_block, "country_code", None)
+
+            services = []
+            for s in svc_block:
+                port  = s.get("port")  if isinstance(s, dict) else getattr(s, "port", None)
+                proto = s.get("transport_protocol", "") if isinstance(s, dict) else getattr(s, "transport_protocol", "")
+                if port:
+                    services.append(f"{port}/{str(proto).lower()}")
+
+            entry = {
+                "ip":         ip,
+                "cloudflare": is_cloudflare_ip(ip),
+                "asn":        asn,
+                "asn_name":   asn_name,
+                "country":    country,
+                "services":   services,
+            }
+            result["hits"].append(entry)
+            if not entry["cloudflare"]:
+                result["origin_candidates"].append(entry)
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
+# ── Shodan cert search ───────────────────────────────────────────────────────
+
+def shodan_cert_search(domain: str) -> dict:
+    """
+    Search Shodan for hosts whose TLS banner matches the target domain using
+    the ssl:"domain" filter. Returns all hits with ASN, org, country, and open
+    ports. Any non-Cloudflare result is a candidate origin server.
+
+    Requires a free Shodan account — add to .env:
+        SHODAN_API_KEY=<your-api-key>
+    """
+    api_key = os.environ.get("SHODAN_API_KEY")
+    if not api_key:
+        return {"skipped": True, "reason": "SHODAN_API_KEY not set in .env"}
+
+    import shodan
+
+    result: dict = {"hits": [], "origin_candidates": []}
+    try:
+        api = shodan.Shodan(api_key)
+        resp = api.search(f'ssl:"{domain}"', minify=False)
+
+        for match in resp.get("matches", []):
+            ip = match.get("ip_str")
+            if not ip:
+                continue
+
+            loc = match.get("location", {})
+            entry = {
+                "ip":         ip,
+                "cloudflare": is_cloudflare_ip(ip),
+                "asn":        match.get("asn"),
+                "org":        match.get("org"),
+                "country":    loc.get("country_code"),
+                "ports":      match.get("ports", []),
+                "hostnames":  match.get("hostnames", []),
+            }
+            result["hits"].append(entry)
+            if not entry["cloudflare"]:
+                result["origin_candidates"].append(entry)
+
+        result["total"] = resp.get("total", len(result["hits"]))
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
+# ── Netlas cert search ───────────────────────────────────────────────────────
+
+def netlas_cert_search(domain: str) -> dict:
+    """
+    Search Netlas for hosts whose TLS response includes a cert with the target
+    domain as the CN. Netlas has a free tier (~50 queries/day, no credit card).
+
+    Requires a free Netlas account — add to .env:
+        NETLAS_API_KEY=<your-api-key>
+    """
+    api_key = os.environ.get("NETLAS_API_KEY")
+    if not api_key:
+        return {"skipped": True, "reason": "NETLAS_API_KEY not set in .env"}
+
+    import netlas
+
+    result: dict = {"hits": [], "origin_candidates": []}
+    try:
+        conn  = netlas.Netlas(api_key=api_key)
+        query = f'certificate.subject.common_name:"{domain}"'
+        resp  = conn.query(query=query, datatype="response", page=0)
+
+        for item in (resp or {}).get("items", []):
+            data = item.get("data", {})
+            ip   = data.get("ip")
+            if not ip:
+                continue
+
+            entry = {
+                "ip":         ip,
+                "cloudflare": is_cloudflare_ip(ip),
+                "port":       data.get("port"),
+                "protocol":   data.get("protocol"),
+                "asn":        data.get("asn", {}).get("asn") if isinstance(data.get("asn"), dict) else data.get("asn"),
+                "org":        data.get("asn", {}).get("org")  if isinstance(data.get("asn"), dict) else None,
+                "country":    data.get("geo", {}).get("country") if isinstance(data.get("geo"), dict) else None,
+            }
+            result["hits"].append(entry)
+            if not entry["cloudflare"]:
+                result["origin_candidates"].append(entry)
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
+# ── Targeted origin scan ─────────────────────────────────────────────────────
+
+GCP_IP_RANGES_URL = "https://www.gstatic.com/ipranges/cloud.json"
+
+# Focused Eastern-European set — fast default for FIMI investigations.
+# GCP has no datacenters in Russia, Ukraine, Belarus, Romania, or Bulgaria;
+# these are the nearest regions for those markets.
+GCP_DEFAULT_REGIONS = [
+    "europe-north1",    # Finland      — closest GCP region to Russia
+    "europe-north2",    # Stockholm    — near Russia/Baltic states
+    "europe-central2",  # Warsaw       — nearest to Ukraine/Belarus
+    "europe-west3",     # Frankfurt    — most popular for Russian-language hosting
+    "europe-west10",    # Berlin       — additional Germany coverage
+    "europe-west4",     # Netherlands
+    "europe-west8",     # Milan        — nearest GCP region to Romania/Bulgaria
+]
+
+# Every GCP region on the European continent plus the nearest Middle-East
+# region for Turkey (me-west1 / Tel Aviv is the closest GCP PoP to Istanbul).
+# Pass None to fetch_gcp_ip_ranges() to scan every GCP region globally.
+GCP_EUROPE_ALL_REGIONS = [
+    "europe-north1",      # Helsinki, Finland   — closest to Russia
+    "europe-north2",      # Stockholm, Sweden   — near Russia / Baltic states
+    "europe-west1",       # St. Ghislain, Belgium
+    "europe-west2",       # London, UK
+    "europe-west3",       # Frankfurt, Germany
+    "europe-west4",       # Eemshaven, Netherlands
+    "europe-west6",       # Zurich, Switzerland
+    "europe-west8",       # Milan, Italy
+    "europe-west9",       # Paris, France
+    "europe-west10",      # Berlin, Germany
+    "europe-west12",      # Turin, Italy
+    "europe-central2",    # Warsaw, Poland       — nearest to Ukraine / Belarus
+    "europe-southwest1",  # Madrid, Spain
+    "me-west1",           # Tel Aviv, Israel     — nearest GCP PoP to Turkey
+]
+
+
+# Hosting providers commonly used for Russian/Eastern-European content.
+# ASN → (name, country/notes)
+PROVIDER_ASNS: dict[str, str] = {
+    # ── Western European VPS / dedicated ─────────────────────────────────────
+    "AS24940":  "Hetzner (DE) — cheap, popular, no-questions-asked",
+    "AS16276":  "OVH (FR) — large European cloud/VPS",
+    "AS21501":  "OVH SAS (FR)",
+    "AS35540":  "Aeza Group (NL/FI) — bulletproof-adjacent, popular for RU infra",
+    "AS9009":   "M247 (RO/UK) — transit/hosting used heavily by RU operators",
+    "AS60068":  "Datacamp / IPXO (UK) — IP leasing, used for RU infra",
+    "AS50673":  "Serverius (NL) — privacy-friendly Dutch DC",
+    "AS44901":  "Belcloud (BG) — Bulgarian hosting, near RU market",
+    "AS48721":  "FOP Kharytonov (UA) — Ukrainian infra",
+    "AS197695": "REG.RU (RU) — major Russian registrar/hoster",
+    # ── Russian hosting ───────────────────────────────────────────────────────
+    "AS49505":  "Selectel (RU) — large Russian cloud/colo",
+    "AS9123":   "TimeWeb (RU) — popular Russian web hosting",
+    "AS210644": "Aeza (RU) — bulletproof Russian VPS",
+    "AS198610": "Beget (RU) — popular Russian shared/VPS host",
+    "AS8334":   "Hosting Hut / Timeweb (RU)",
+    "AS57334":  "Serverspace (RU/BY)",
+    # ── Luxembourg / offshore ─────────────────────────────────────────────────
+    "AS53667":  "Frantech / BuyVM (LU) — privacy-focused, RU-adjacent use",
+    "AS51765":  "Frantech Solutions (LU)",
+}
+
+RIPE_STAT_URL          = "https://stat.ripe.net/data/announced-prefixes/data.json"
+RIPE_COUNTRY_URL       = "https://stat.ripe.net/data/country-resource-list/data.json"
+
+# All 27 EU member states (post-Brexit)
+EU_MEMBER_STATES = [
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+    "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+]
+
+
+def fetch_country_ip_ranges(country_code: str) -> list[str]:
+    """
+    Fetch all IPv4 prefixes allocated to a country via RIPE Stat (free, no key).
+    country_code is a 2-letter ISO code, e.g. "RU", "UA", "DE".
+    """
+    try:
+        resp = requests.get(
+            RIPE_COUNTRY_URL,
+            params={"resource": country_code.upper(), "v4_format": "prefix"},
+            timeout=30,
+            headers={"Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        resources = resp.json().get("data", {}).get("resources", {})
+        # Returns {"ipv4": ["1.2.3.0/24", ...], "ipv6": [...], "asn": [...]}
+        cidrs = [p for p in resources.get("ipv4", []) if "/" in p]
+        return cidrs
+    except Exception as exc:
+        log(f"RIPE Stat country lookup failed for {country_code}: {exc}")
+        return []
+
+
+def fetch_asn_ip_ranges(asns: list[str]) -> dict[str, list[str]]:
+    """
+    Fetch announced IPv4 prefixes for each ASN from RIPE Stat (free, no key).
+    Returns {asn: [cidr, ...]} for ASNs that returned results.
+    """
+    out: dict[str, list[str]] = {}
+    for asn in asns:
+        try:
+            resp = requests.get(
+                RIPE_STAT_URL,
+                params={"resource": asn},
+                timeout=15,
+                headers={"Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            prefixes = resp.json().get("data", {}).get("prefixes", [])
+            cidrs = [p["prefix"] for p in prefixes if ":" not in p.get("prefix", "")]  # IPv4 only
+            if cidrs:
+                out[asn] = cidrs
+        except Exception as exc:
+            log(f"RIPE Stat failed for {asn}: {exc}")
+    return out
+
+
+def fetch_gcp_ip_ranges(region_prefixes: list[str] | None = None) -> list[str]:
+    """Download GCP's published IPv4 ranges, filtered to the given region prefixes."""
+    try:
+        resp = requests.get(GCP_IP_RANGES_URL, timeout=15)
+        resp.raise_for_status()
+        cidrs = []
+        for entry in resp.json().get("prefixes", []):
+            cidr = entry.get("ipv4Prefix")
+            if not cidr:
+                continue
+            scope = entry.get("scope", "")
+            if region_prefixes is None or any(scope.startswith(r) for r in region_prefixes):
+                cidrs.append(cidr)
+        return cidrs
+    except Exception as exc:
+        log(f"Failed to fetch GCP IP ranges: {exc}")
+        return []
+
+
+def _parse_tls_cert(der: bytes, ip: str, port: int, domain: str) -> dict | None:
+    """Parse a DER cert and return a hit dict if CN or SAN matches domain."""
+    cert = x509.load_der_x509_certificate(der)
+
+    cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    cn = cn_attrs[0].value if cn_attrs else ""
+
+    sans: list[str] = []
+    try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        sans = san_ext.value.get_values_for_type(x509.DNSName)
+    except Exception:
+        pass
+
+    wildcard = "*." + ".".join(domain.split(".")[1:])
+    if domain not in ([cn] + sans) and wildcard not in ([cn] + sans):
+        return None
+
+    try:
+        not_before = cert.not_valid_before_utc.isoformat()
+        not_after  = cert.not_valid_after_utc.isoformat()
+    except AttributeError:
+        not_before = cert.not_valid_before.isoformat()
+        not_after  = cert.not_valid_after.isoformat()
+
+    issuer_cn = cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
+    return {
+        "ip":         ip,
+        "port":       port,
+        "cloudflare": is_cloudflare_ip(ip),
+        "cn":         cn,
+        "sans":       sans,
+        "issuer":     issuer_cn[0].value if issuer_cn else "",
+        "not_before": not_before,
+        "not_after":  not_after,
+    }
+
+
+async def _tcp_open_async(ip: str, port: int, timeout: float) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def _check_tls_async(ip: str, domain: str, port: int, timeout: float) -> dict | None:
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port, ssl=ctx, server_hostname=domain),
+            timeout=timeout,
+        )
+        ssl_obj = writer.get_extra_info("ssl_object")
+        der = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        if not der:
+            return None
+        return _parse_tls_cert(der, ip, port, domain)
+    except Exception:
+        return None
+
+
+async def _phase1_async(
+    ips: list[str], port: int, timeout: float, concurrency: int
+) -> list[str]:
+    """Async TCP connect scan. Returns IPs with port open."""
+    sem      = asyncio.Semaphore(concurrency)
+    open_ips: list[str] = []
+
+    async def check(ip: str) -> None:
+        async with sem:
+            if await _tcp_open_async(ip, port, timeout):
+                open_ips.append(ip)
+
+    # Process in chunks to avoid creating millions of task objects at once.
+    # The semaphore already caps concurrency; chunking caps peak memory.
+    chunk = 100_000
+    with tqdm(total=len(ips), desc="  Phase 1 TCP", unit="ip",
+              dynamic_ncols=True, miniters=1000) as bar:
+        for i in range(0, len(ips), chunk):
+            tasks = [asyncio.create_task(check(ip)) for ip in ips[i:i + chunk]]
+            for t in asyncio.as_completed(tasks):
+                await t
+                bar.update(1)
+                bar.set_postfix(open=len(open_ips), refresh=False)
+
+    return open_ips
+
+
+async def _phase2_async(
+    ips: list[str], domain: str, port: int, timeout: float, concurrency: int
+) -> list[dict]:
+    """Async TLS cert scan. Returns cert match dicts."""
+    sem  = asyncio.Semaphore(concurrency)
+    hits: list[dict] = []
+
+    async def check(ip: str) -> None:
+        async with sem:
+            result = await _check_tls_async(ip, domain, port, timeout)
+            if result:
+                hits.append(result)
+                tqdm.write(
+                    f"  [!] CERT MATCH: {result['ip']} — "
+                    f"CN={result['cn']} issuer={result['issuer']}"
+                )
+
+    with tqdm(total=len(ips), desc="  Phase 2 TLS", unit="ip",
+              dynamic_ncols=True, miniters=100) as bar:
+        tasks = [asyncio.create_task(check(ip)) for ip in ips]
+        for t in asyncio.as_completed(tasks):
+            await t
+            bar.update(1)
+            bar.set_postfix(hits=len(hits), refresh=False)
+
+    return hits
+
+
+def _cidrs_to_ips(cidrs: list[str]) -> list[str]:
+    """Expand a list of IPv4 CIDRs to individual host IP strings."""
+    ips: list[str] = []
+    for cidr in cidrs:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            if net.version == 4:
+                ips.extend(str(h) for h in net.hosts())
+        except ValueError:
+            continue
+    return ips
+
+
+def _count_ips(cidrs: list[str]) -> int:
+    """Count total hosts across CIDRs without allocating strings."""
+    total = 0
+    for cidr in cidrs:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            if net.version == 4:
+                total += net.num_addresses - 2  # exclude network/broadcast
+        except ValueError:
+            pass
+    return max(total, 0)
+
+
+def _run_two_phase_scan(
+    domain: str,
+    cidrs: list[str],
+    port: int,
+    concurrency: int,
+    tcp_timeout: float,
+    tls_timeout: float,
+    rate: int,
+) -> tuple[str, int, list[dict]]:
+    """
+    Run phase 1 (TCP open check) + phase 2 (TLS cert match) against cidrs.
+    Returns (phase1_method, open_port_count, hits).
+
+    Defers CIDR→IP expansion until after masscan is attempted — masscan takes
+    the CIDR file directly so expansion is only needed for the asyncio fallback.
+    """
+    masscan_result = _masscan_phase1(cidrs, port, rate=rate)
+    if masscan_result is not None:
+        open_ips = masscan_result
+        log(f"masscan complete: {len(open_ips):,} hosts have port {port} open")
+        phase1_method = "masscan"
+    else:
+        all_ips = _cidrs_to_ips(cidrs)
+        log(f"Phase 1: async TCP on {len(all_ips):,} IPs — {concurrency} concurrent, {tcp_timeout}s timeout")
+        open_ips = asyncio.run(_phase1_async(all_ips, port, tcp_timeout, concurrency))
+        log(f"Phase 1 complete: {len(open_ips):,} hosts have port {port} open")
+        phase1_method = "asyncio"
+
+    if not open_ips:
+        return phase1_method, 0, []
+
+    log(f"Phase 2: TLS cert check on {len(open_ips):,} responsive hosts")
+    hits = asyncio.run(_phase2_async(open_ips, domain, port, tls_timeout, concurrency))
+    return phase1_method, len(open_ips), hits
+
+
+def _masscan_phase1(cidrs: list[str], port: int, rate: int) -> list[str] | None:
+    """
+    Use masscan for phase 1 if available — orders of magnitude faster than
+    async TCP. Returns list of open IPs, or None if masscan is not installed.
+
+    Install:  sudo apt install masscan
+    Fix perms: sudo setcap cap_net_raw+ep $(which masscan)
+    """
+    if not shutil.which("masscan"):
+        return None
+
+    # Write CIDRs to a file to avoid shell arg-length limits with large region sets
+    with tempfile.NamedTemporaryFile(suffix=".ranges", delete=False, mode="w") as rf:
+        rf.write("\n".join(cidrs))
+        ranges_file = rf.name
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as of:
+        outfile = of.name
+
+    base_cmd = [
+        "-p", str(port),
+        "--includefile", ranges_file,
+        "--rate", str(rate),
+        "-oL", outfile,
+        "--wait", "3",
+    ]
+
+    # masscan needs raw socket access (raw packets).
+    # The cleanest fix is a one-time capability grant — no sudo required after that:
+    #   sudo setcap cap_net_raw+ep $(which masscan)
+    #
+    # Both stdout and stderr inherit the terminal so masscan's live status
+    # (rate, progress, ETA) prints directly with no buffering issues.
+    cmd = ["masscan"] + base_cmd
+    log(f"masscan -p{port} --includefile {ranges_file} --rate {rate} ...")
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        log("masscan exited with an error (see output above) — falling back to async TCP scan")
+        log("  If you saw a permission error, run once: sudo setcap cap_net_raw+ep $(which masscan)")
+        return None
+
+    open_ips: list[str] = []
+    try:
+        with open(outfile) as f:
+            for line in f:
+                if line.startswith("open"):
+                    parts = line.split()
+                    # format: open tcp 443 1.2.3.4 <timestamp>
+                    if len(parts) >= 4:
+                        open_ips.append(parts[3])
+    except Exception:
+        pass
+
+    return open_ips
+
+
+def targeted_origin_scan(
+    domain: str,
+    cert_issuers: list[str],
+    regions: list[str] | None = None,
+    force: bool = False,
+    port: int = 443,
+    concurrency: int = 5_000,
+    tcp_timeout: float = 0.2,
+    tls_timeout: float = 4.0,
+    *,
+    rate: int,
+) -> dict:
+    """
+    Two-phase scan to find the origin server behind Cloudflare.
+
+    Phase 1 — fast port check across target IP ranges.
+               Uses masscan if installed (sudo apt install masscan), otherwise
+               falls back to async TCP connects (5000 concurrent, 0.2s timeout).
+    Phase 2 — async TLS handshake on responsive hosts only, checking cert
+               CN and SANs for a match against domain.
+
+    regions=None  → scan every GCP region globally (--scan-all).
+    force=True    → skip the GTS-cert heuristic and scan regardless (--scan-europe).
+    """
+    result: dict = {
+        "strategy":        None,
+        "phase1_method":   None,
+        "regions":         [],
+        "cidrs_scanned":   0,
+        "hosts_attempted": 0,
+        "open_port_count": 0,
+        "hits":            [],
+    }
+
+    gts_family = {"GTS CA 1P5", "GTS CA 1C3", "GTS CA 1D4", "GTS Root R1"}
+    if regions is None:
+        # --scan-all: scan every GCP region, bypass heuristic
+        scan_regions = None
+    elif force:
+        # --scan-europe (or explicit region list): bypass heuristic
+        scan_regions = regions
+    elif not (set(cert_issuers) & gts_family):
+        result["strategy"] = "skipped"
+        result["reason"]   = "No GTS cert in history — no targeted range to scan. Re-run with --scan-europe or --scan-all to force a scan."
+        return result
+    else:
+        scan_regions = regions if regions else GCP_DEFAULT_REGIONS
+
+    result["strategy"] = "gcp"
+    result["regions"]  = scan_regions or ["(all GCP)"]
+
+    label = "ALL GCP regions" if scan_regions is None else f"{len(scan_regions)} regions"
+    log(f"Fetching GCP IP ranges for: {label}")
+    cidrs = fetch_gcp_ip_ranges(scan_regions)
+    if not cidrs:
+        result["strategy"] = "error"
+        result["reason"]   = "Failed to fetch GCP IP ranges"
+        return result
+
+    result["cidrs_scanned"]   = len(cidrs)
+    result["hosts_attempted"] = _count_ips(cidrs)
+
+    method, open_count, hits = _run_two_phase_scan(domain, cidrs, port, concurrency, tcp_timeout, tls_timeout, rate=rate)
+    result["phase1_method"]   = method
+    result["open_port_count"] = open_count
+    result["hits"]            = hits
+    return result
+
+
+# ── ASN provider scan ────────────────────────────────────────────────────────
+
+def targeted_asn_scan(
+    domain: str,
+    asns: list[str] | None = None,
+    port: int = 443,
+    concurrency: int = 5_000,
+    tcp_timeout: float = 0.2,
+    tls_timeout: float = 4.0,
+    *,
+    rate: int,
+) -> dict:
+    """
+    Two-phase scan across hosting provider IP ranges fetched live from RIPE Stat.
+
+    asns=None uses the built-in PROVIDER_ASNS list. Pass a custom list of ASN
+    strings (e.g. ["AS24940", "AS9009"]) to target specific providers.
+    """
+    scan_asns = asns if asns is not None else list(PROVIDER_ASNS.keys())
+
+    result: dict = {
+        "strategy":        "asn",
+        "phase1_method":   None,
+        "asns_scanned":    scan_asns,
+        "cidrs_scanned":   0,
+        "hosts_attempted": 0,
+        "open_port_count": 0,
+        "hits":            [],
+    }
+
+    log(f"Fetching IP ranges for {len(scan_asns)} ASNs via RIPE Stat...")
+    asn_ranges = fetch_asn_ip_ranges(scan_asns)
+    if not asn_ranges:
+        result["strategy"] = "error"
+        result["reason"]   = "No IP ranges returned from RIPE Stat"
+        return result
+
+    cidrs: list[str] = [cidr for ranges in asn_ranges.values() for cidr in ranges]
+    result["cidrs_scanned"]   = len(cidrs)
+    result["hosts_attempted"] = _count_ips(cidrs)
+
+    for asn, name in PROVIDER_ASNS.items():
+        if asn in asn_ranges:
+            log(f"  {asn:12s} {name}  ({len(asn_ranges[asn])} prefixes)")
+    log(f"Total IPs to scan: {result['hosts_attempted']:,}")
+
+    method, open_count, hits = _run_two_phase_scan(domain, cidrs, port, concurrency, tcp_timeout, tls_timeout, rate=rate)
+    result["phase1_method"]   = method
+    result["open_port_count"] = open_count
+    result["hits"]            = hits
+    return result
+
+
+# ── Country IP scan ───────────────────────────────────────────────────────────
+
+def targeted_country_scan(
+    domain: str,
+    country_codes: list[str],
+    port: int = 443,
+    concurrency: int = 5_000,
+    tcp_timeout: float = 0.2,
+    tls_timeout: float = 4.0,
+    *,
+    rate: int,
+) -> dict:
+    """
+    Two-phase scan across all IPv4 space allocated to one or more countries.
+    IP ranges are fetched live from RIPE Stat (free, no key required).
+
+    At 100k pps with masscan:
+      Russia (~40M IPs)  ≈ 7 min
+      Ukraine (~8M IPs)  ≈ 2 min
+    """
+    result: dict = {
+        "strategy":        "country",
+        "phase1_method":   None,
+        "countries":       country_codes,
+        "cidrs_scanned":   0,
+        "hosts_attempted": 0,
+        "open_port_count": 0,
+        "hits":            [],
+    }
+
+    all_cidrs: list[str] = []
+    for cc in country_codes:
+        log(f"Fetching IPv4 ranges for {cc.upper()} via RIPE Stat...")
+        cidrs = fetch_country_ip_ranges(cc)
+        log(f"  {cc.upper()}: {len(cidrs):,} prefixes  (~{_count_ips(cidrs):,} IPs)")
+        all_cidrs.extend(cidrs)
+
+    if not all_cidrs:
+        result["strategy"] = "error"
+        result["reason"]   = f"No IP ranges returned for: {country_codes}"
+        return result
+
+    result["cidrs_scanned"]   = len(all_cidrs)
+    result["hosts_attempted"] = _count_ips(all_cidrs)
+    log(f"Total: {result['cidrs_scanned']:,} prefixes, {result['hosts_attempted']:,} IPs")
+
+    method, open_count, hits = _run_two_phase_scan(domain, all_cidrs, port, concurrency, tcp_timeout, tls_timeout, rate=rate)
+    result["phase1_method"]   = method
+    result["open_port_count"] = open_count
+    result["hits"]            = hits
+    return result
+
+
+# ── Reverse IP via hackertarget ───────────────────────────────────────────────
+
+def hackertarget_reverse_ip(ip: str) -> list[str]:
+    try:
+        resp = requests.get(
+            "https://api.hackertarget.com/reverseiplookup/",
+            params={"q": ip},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return []
+        text = resp.text.strip()
+        if "error" in text.lower() or "API count" in text:
+            return []
+        return [line.strip() for line in text.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+# ── WHOIS ─────────────────────────────────────────────────────────────────────
+
+def get_domain_whois(domain: str) -> dict:
+    try:
+        w = whois.whois(domain)
+
+        def _fmt(v):
+            if v is None:
+                return None
+            if isinstance(v, list):
+                seen = []
+                for item in v:
+                    s = str(item)
+                    if s not in seen:
+                        seen.append(s)
+                return seen
+            return str(v)
+
+        return {
+            "registrar":     _fmt(w.registrar),
+            "creation_date": _fmt(w.creation_date),
+            "expiry_date":   _fmt(w.expiration_date),
+            "updated_date":  _fmt(w.updated_date),
+            "nameservers":   _fmt(w.name_servers),
+            "status":        _fmt(w.status),
+            "emails":        _fmt(w.emails),
+            "org":           _fmt(w.org),
+            "country":       _fmt(w.country),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def get_ip_whois(ip: str) -> dict:
+    try:
+        obj = IPWhois(ip)
+        result = obj.lookup_rdap(depth=1)
+        net = result.get("network", {})
+        return {
+            "asn":             result.get("asn"),
+            "asn_description": result.get("asn_description"),
+            "asn_country":     result.get("asn_country_code"),
+            "asn_cidr":        result.get("asn_cidr"),
+            "asn_registry":    result.get("asn_registry"),
+            "network_name":    net.get("name"),
+            "network_cidr":    net.get("cidr"),
+            "network_country": net.get("country"),
+        }
+    except IPDefinedError:
+        return {"error": "Private/reserved IP address — no public WHOIS"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ── Per-IP enrichment (used for IPs resolved from a domain) ───────────────────
+
+def enrich_ip(ip: str) -> dict:
+    cf = is_cloudflare_ip(ip)
+
+    ptr = get_ptr(ip)
+
+    if cf:
+        asn_info = {"asn_description": "Cloudflare, Inc.", "asn_country": "US", "note": "Cloudflare anycast — RDAP skipped"}
+        other_domains = []
+    else:
+        asn_info = get_ip_whois(ip)
+        other_domains = hackertarget_reverse_ip(ip)
+
+    return {
+        "ptr":                 ptr,
+        "cloudflare":          cf,
+        "asn_info":            asn_info,
+        "other_domains_on_ip": other_domains,
+    }
+
+
+# ── Page metadata / FIMI signals ─────────────────────────────────────────────
+
+_PAGE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+_SOCIAL_DEFS = [
+    ("telegram",       r'https?://t\.me/([A-Za-z0-9_]{3,60})'),
+    ("vkontakte",      r'https?://(?:www\.)?vk\.com/([^\s"\'<>/?]{2,80})'),
+    ("odnoklassniki",  r'https?://(?:www\.)?ok\.ru/(?:profile/|group/)?([^\s"\'<>/?]{2,80})'),
+    ("odnoklassniki",  r'https?://(?:www\.)?odnoklassniki\.ru/([^\s"\'<>/?]{2,80})'),
+    ("twitter_x",      r'https?://(?:www\.)?(?:twitter|x)\.com/(?!search|share|intent|home)([^\s"\'<>/?]{2,60})'),
+    ("tiktok",         r'https?://(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]{2,60})'),
+    ("instagram",      r'https?://(?:www\.)?instagram\.com/([^\s"\'<>/?]{2,60})'),
+    ("facebook",       r'https?://(?:www\.)?facebook\.com/(?!sharer|share|dialog|tr\b)([^\s"\'<>/?]{2,80})'),
+    ("youtube",        r'https?://(?:www\.)?youtube\.com/(?:channel/|@)([^\s"\'<>/?]{2,80})'),
+    ("linkedin",       r'https?://(?:www\.)?linkedin\.com/(?:company|in)/([^\s"\'<>/?]{2,80})'),
+    ("pinterest",      r'https?://(?:www\.)?pinterest\.(?:com|[a-z]{2})/([^\s"\'<>/?]{2,80})'),
+]
+_SOCIAL_NOISE = {"", "home", "login", "signup", "help", "support", "about", "contact"}
+
+
+def _process_page_html(html: str) -> dict:
+    """Pure extraction of FIMI signals from raw HTML — no I/O."""
+    out: dict = {
+        "google_analytics": [],
+        "gtm_ids":          [],
+        "facebook_pixel":   [],
+        "tiktok_pixel":     [],
+        "yandex_metrika":   [],
+        "html_lang":        None,
+        "cms_generator":    None,
+        "social_links":     {},
+        "social_handles":   {},
+    }
+    if not html:
+        return out
+
+    m = re.search(r'<html[^>]+\blang=["\']([^"\']{2,10})["\']', html, re.I)
+    if m:
+        out["html_lang"] = m.group(1).lower()
+
+    ga = re.findall(r'\b(UA-\d{4,12}-\d{1,3}|G-[A-Z0-9]{6,12}|AW-[0-9]{8,12})\b', html)
+    out["google_analytics"] = sorted(set(ga))
+
+    gtm = re.findall(r'\b(GTM-[A-Z0-9]{4,8})\b', html)
+    out["gtm_ids"] = sorted(set(gtm))
+
+    fb = re.findall(r'fbq\(["\']init["\'],\s*["\'](\d{10,20})["\']', html)
+    out["facebook_pixel"] = sorted(set(fb))
+
+    tt = re.findall(r'ttq\.load\(["\']([A-Z0-9]{15,25})["\']', html)
+    out["tiktok_pixel"] = sorted(set(tt))
+
+    ym  = re.findall(r'\bym\((\d{5,12})\s*,', html)
+    ym2 = re.findall(r'metrika\.yandex\.(?:com|ru)/watch/(\d{5,12})', html)
+    out["yandex_metrika"] = sorted(set(ym + ym2))
+
+    cm = re.search(
+        r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']'
+        r'|<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']generator["\']',
+        html, re.I,
+    )
+    if cm:
+        out["cms_generator"] = (cm.group(1) or cm.group(2) or "").strip()
+
+    social_links: dict[str, list[str]] = {}
+    social_handles: dict[str, list[str]] = {}
+    for key, pattern in _SOCIAL_DEFS:
+        for m2 in re.finditer(pattern, html, re.I):
+            full_url = m2.group(0).rstrip("/?")
+            handle   = m2.group(1).rstrip("/?")
+            if handle.lower() in _SOCIAL_NOISE:
+                continue
+            social_links.setdefault(key, [])
+            if full_url not in social_links[key]:
+                social_links[key].append(full_url)
+            social_handles.setdefault(key, [])
+            if handle not in social_handles[key]:
+                social_handles[key].append(handle)
+
+    out["social_links"]   = {k: sorted(set(v)) for k, v in social_links.items()}
+    out["social_handles"] = {k: sorted(set(v)) for k, v in social_handles.items()}
+    return out
+
+
+def fetch_page_metadata(domain: str, save_favicon_as: Path | None = None) -> dict:
+    """
+    Fetch the domain homepage and extract FIMI-relevant signals:
+    Google Analytics / GTM / Facebook Pixel / TikTok Pixel / Yandex.Metrika IDs,
+    HTML lang attribute, CMS generator, social links + handles, and favicon MD5.
+    """
+    result: dict = {
+        "google_analytics": [], "gtm_ids": [], "facebook_pixel": [], "tiktok_pixel": [],
+        "yandex_metrika": [], "html_lang": None, "cms_generator": None,
+        "social_links": {}, "social_handles": {}, "favicon_md5": None,
+        "favicon_saved": None, "error": None,
+    }
+    headers = {"User-Agent": _PAGE_UA, "Accept-Language": "en-US,en;q=0.9"}
+    html = ""
+    for scheme in ("https", "http"):
+        try:
+            r = requests.get(f"{scheme}://{domain}/", headers=headers, timeout=15, allow_redirects=True)
+            html = r.text
+            break
+        except Exception as exc:
+            result["error"] = str(exc)
+    if html:
+        result["error"] = None
+        result.update(_process_page_html(html))
+    try:
+        fav = requests.get(f"https://{domain}/favicon.ico", headers=headers, timeout=10, allow_redirects=True)
+        if fav.status_code == 200 and fav.content:
+            result["favicon_md5"] = hashlib.md5(fav.content).hexdigest()
+            if save_favicon_as:
+                save_favicon_as.write_bytes(fav.content)
+                result["favicon_saved"] = str(save_favicon_as)
+    except Exception:
+        pass
+    return result
+
+
+def get_dmarc_dkim(domain: str) -> dict:
+    """
+    Look up DMARC policy and DKIM public keys for common selectors.
+    Useful for attributing operators via mail infrastructure.
+    """
+    result: dict = {"dmarc": None, "dkim": {}}
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 8
+
+    # DMARC
+    try:
+        for rdata in resolver.resolve(f"_dmarc.{domain}", "TXT"):
+            txt = "".join(
+                s.decode() if isinstance(s, bytes) else s for s in rdata.strings
+            )
+            if "v=DMARC1" in txt:
+                result["dmarc"] = txt
+                break
+    except Exception:
+        pass
+
+    # DKIM — common selectors
+    for sel in ("google", "mail", "selector1", "selector2", "yandex", "default", "k1", "s1", "s2"):
+        try:
+            for rdata in resolver.resolve(f"{sel}._domainkey.{domain}", "TXT"):
+                txt = "".join(
+                    s.decode() if isinstance(s, bytes) else s for s in rdata.strings
+                )
+                if "p=" in txt or "v=DKIM1" in txt:
+                    result["dkim"][sel] = txt[:300]
+                    break
+        except Exception:
+            pass
+
+    return result
+
+
+# ── Main analysis functions ───────────────────────────────────────────────────
+
+# ── Async helpers ─────────────────────────────────────────────────────────────
+
+_HTTPX_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
+
+
+async def _aget_dns_records(domain: str) -> dict:
+    """True-async DNS resolution using dns.asyncresolver (no threads)."""
+    resolver = dns.asyncresolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 10
+
+    async def _resolve(rtype: str):
+        try:
+            answers = await resolver.resolve(domain, rtype)
+            if rtype == "MX":
+                return rtype, [{"preference": r.preference, "exchange": str(r.exchange).rstrip(".")} for r in answers]
+            if rtype == "SOA":
+                r = answers[0]
+                return rtype, {"mname": str(r.mname).rstrip("."), "rname": str(r.rname).rstrip("."), "serial": int(r.serial), "refresh": int(r.refresh), "retry": int(r.retry), "expire": int(r.expire), "minimum": int(r.minimum)}
+            if rtype == "NS":
+                return rtype, sorted(str(r).rstrip(".") for r in answers)
+            if rtype == "TXT":
+                return rtype, [b"".join(r.strings).decode("utf-8", errors="replace") for r in answers]
+            return rtype, [str(r) for r in answers]
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            return rtype, []
+        except dns.exception.DNSException as exc:
+            return rtype, {"error": str(exc)}
+
+    pairs = await asyncio.gather(*[_resolve(rt) for rt in ("A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA")])
+    return dict(pairs)
+
+
+async def _aget_dmarc_dkim(domain: str) -> dict:
+    """True-async DMARC + DKIM lookup — all selectors run concurrently."""
+    result: dict = {"dmarc": None, "dkim": {}}
+    resolver = dns.asyncresolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 8
+
+    try:
+        for rdata in await resolver.resolve(f"_dmarc.{domain}", "TXT"):
+            txt = "".join(s.decode() if isinstance(s, bytes) else s for s in rdata.strings)
+            if "v=DMARC1" in txt:
+                result["dmarc"] = txt
+                break
+    except Exception:
+        pass
+
+    async def _check_dkim(sel: str):
+        try:
+            for rdata in await resolver.resolve(f"{sel}._domainkey.{domain}", "TXT"):
+                txt = "".join(s.decode() if isinstance(s, bytes) else s for s in rdata.strings)
+                if "p=" in txt or "v=DKIM1" in txt:
+                    return sel, txt[:300]
+        except Exception:
+            pass
+        return sel, None
+
+    pairs = await asyncio.gather(*[_check_dkim(s) for s in ("google", "mail", "selector1", "selector2", "yandex", "default", "k1", "s1", "s2")])
+    result["dkim"] = {sel: val for sel, val in pairs if val}
+    return result
+
+
+async def _acrt_sh_data(domain: str, client: httpx.AsyncClient) -> dict:
+    try:
+        resp = await client.get("https://crt.sh/", params={"q": domain, "output": "json"}, headers={"Accept": "application/json"}, timeout=30.0)
+        if resp.status_code != 200:
+            return dict(_CRT_SH_EMPTY)
+        return _parse_crt_sh_entries(resp.json(), domain)
+    except Exception:
+        return dict(_CRT_SH_EMPTY)
+
+
+async def _acircl_passive_dns(domain: str, client: httpx.AsyncClient) -> dict:
+    result: dict = {"records": [], "unique_historical_ips": []}
+    try:
+        resp = await client.get(f"https://www.circl.lu/pdns/query/{domain}", headers={"Accept": "application/json"}, timeout=15.0)
+        if resp.status_code != 200:
+            return result
+        records: list[dict] = []
+        seen_ips: set[str] = set()
+        for line in resp.text.strip().splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rrtype = entry.get("rrtype", "")
+            rdata  = entry.get("rdata", "")
+            records.append({"rrtype": rrtype, "rdata": rdata, "first_seen": entry.get("time_first_ms") or entry.get("time_first"), "last_seen": entry.get("time_last_ms") or entry.get("time_last"), "count": entry.get("count")})
+            if rrtype in ("A", "AAAA") and rdata:
+                seen_ips.add(rdata)
+        result["records"]               = records
+        result["unique_historical_ips"] = sorted(seen_ips)
+    except Exception:
+        pass
+    return result
+
+
+async def _ahackertarget_host_search(domain: str, client: httpx.AsyncClient) -> list:
+    try:
+        resp = await client.get("https://api.hackertarget.com/hostsearch/", params={"q": domain}, timeout=15.0)
+        if resp.status_code != 200:
+            return []
+        text = resp.text.strip()
+        if "error" in text.lower() or "API count" in text:
+            return []
+        results: list[dict] = []
+        for line in text.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) == 2:
+                subdomain, ip = parts[0].strip(), parts[1].strip()
+                if ip:
+                    results.append({"subdomain": subdomain, "ip": ip, "cf": is_cloudflare_ip(ip), "source": "HackerTarget hostsearch"})
+        return results
+    except Exception:
+        return []
+
+
+async def _aurlscan_historical_ips(domain: str, client: httpx.AsyncClient) -> list:
+    try:
+        resp = await client.get("https://urlscan.io/api/v1/search/", params={"q": f"domain:{domain}", "size": "100"}, timeout=15.0)
+        if resp.status_code != 200:
+            return []
+        seen: set[str] = set()
+        results: list[dict] = []
+        for hit in resp.json().get("results", []):
+            ip   = hit.get("page", {}).get("ip", "")
+            date = hit.get("task", {}).get("time", "")[:10]
+            if ip and ip not in seen:
+                seen.add(ip)
+                results.append({"ip": ip, "date": date, "url": hit.get("page", {}).get("url", ""), "cf": is_cloudflare_ip(ip), "source": "urlscan.io"})
+        return results
+    except Exception:
+        return []
+
+
+async def _afetch_page_metadata(domain: str, client: httpx.AsyncClient, save_favicon_as: Path | None = None) -> dict:
+    result: dict = {
+        "google_analytics": [], "gtm_ids": [], "facebook_pixel": [], "tiktok_pixel": [],
+        "yandex_metrika": [], "html_lang": None, "cms_generator": None,
+        "social_links": {}, "social_handles": {}, "favicon_md5": None,
+        "favicon_saved": None, "error": None,
+    }
+    page_headers = {"User-Agent": _PAGE_UA, "Accept-Language": "en-US,en;q=0.9"}
+    html = ""
+    for scheme in ("https", "http"):
+        try:
+            r = await client.get(f"{scheme}://{domain}/", headers=page_headers, timeout=15.0)
+            html = r.text
+            result["error"] = None
+            break
+        except Exception as exc:
+            result["error"] = str(exc)
+    if html:
+        result["error"] = None
+        result.update(_process_page_html(html))
+    try:
+        fav = await client.get(f"https://{domain}/favicon.ico", timeout=10.0)
+        if fav.status_code == 200 and fav.content:
+            result["favicon_md5"] = hashlib.md5(fav.content).hexdigest()
+            if save_favicon_as:
+                save_favicon_as.write_bytes(fav.content)
+                result["favicon_saved"] = str(save_favicon_as)
+    except Exception:
+        pass
+    return result
+
+
+async def _analyze_domain_async(
+    domain: str,
+    scan: bool = False,
+    scan_europe: bool = False,
+    scan_all: bool = False,
+    scan_providers: bool = False,
+    scan_countries: list[str] | None = None,
+    scan_eu_countries: bool = False,
+    scan_full: bool = False,
+    concurrency: int = 5_000,
+    *,
+    rate: int,
+    on_partial=None,
+) -> dict:
+    result: dict = {
+        "input":             domain,
+        "type":              "domain",
+        "timestamp":         datetime.now(timezone.utc).isoformat(),
+        "whois":             {},
+        "dns":               {},
+        "zone_transfer":     [],
+        "subdomains":        [],
+        "cert_transparency": {},
+        "historical_dns":    {},
+        "page_metadata":     {},
+        "email_security":    {},
+        "spf_origins":       [],
+        "origin_candidates": {},
+        "ip_details":        {},
+    }
+
+    RESULTS_DIR.mkdir(exist_ok=True)
+    _safe     = re.sub(r"[^a-zA-Z0-9._-]", "_", domain)
+    _ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _fav_path = RESULTS_DIR / f"{_safe}_{_ts}_favicon.ico"
+
+    def _cb(key: str, value) -> None:
+        """Store value into result and fire the on_partial callback."""
+        if "." in key:
+            top, sub = key.split(".", 1)
+            result.setdefault(top, {})[sub] = value
+        else:
+            result[key] = value
+        if on_partial:
+            on_partial(key, value)
+
+    async def _task(key: str, coro):
+        v = await coro
+        _cb(key, v)
+        return v
+
+    async def _oc_task(key: str, coro):
+        v = await coro
+        _cb(f"origin_candidates.{key}", v)
+        return v
+
+    async def _empty_list():
+        return []
+
+    # ── Group 1: all concurrent via shared httpx client ───────────────────────
+    log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata (async)...")
+    async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True) as client:
+        (_, dns_r, ct_raw, _, _, _) = await asyncio.gather(
+            _task("whois",        asyncio.to_thread(get_domain_whois, domain)),
+            _task("dns",          _aget_dns_records(domain)),
+            _task("_ct_tmp",      _acrt_sh_data(domain, client)),
+            _task("historical_dns", _acircl_passive_dns(domain, client)),
+            _task("page_metadata",  _afetch_page_metadata(domain, client, _fav_path)),
+            _task("email_security", _aget_dmarc_dkim(domain)),
+        )
+
+        # Post-process CT — split subdomains out and notify each separately
+        del result["_ct_tmp"]
+        subdomains = ct_raw.pop("subdomains", [])
+        result["subdomains"]        = subdomains
+        result["cert_transparency"] = ct_raw
+        _cb("cert_transparency", ct_raw)
+        _cb("subdomains", subdomains)
+
+        spf = extract_spf_origins(dns_r.get("TXT", []))
+        _cb("spf_origins", spf)
+
+        ns = dns_r.get("NS", [])
+        if ns:
+            log(f"Zone transfer attempt on {len(ns)} nameserver(s)")
+            zt = await asyncio.to_thread(attempt_zone_transfer, domain, ns)
+            _cb("zone_transfer", zt)
+
+        # ── Group 2: origin discovery — all concurrent ────────────────────────
+        log("Subdomain probe / MX / wordlist / HackerTarget / urlscan / Censys / Shodan / Netlas (async)...")
+        mx_records = dns_r.get("MX") or []
+        await asyncio.gather(
+            _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, subdomains) if subdomains else _empty_list()),
+            _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
+            _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain)),
+            _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
+            _oc_task("urlscan",         _aurlscan_historical_ips(domain, client)),
+            _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
+            _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
+            _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
+        )
+
+    # ── Scan phases — sequential, long-running, each uses its own event loop ──
+    _do_gcp_europe   = scan_europe  or scan_full
+    _do_providers    = scan_providers or scan_full
+    _do_eu_countries = scan_eu_countries or scan_full
+    _country_list    = list({c.upper() for c in (scan_countries or [])})
+    if _do_eu_countries:
+        _country_list = sorted(set(_country_list) | set(EU_MEMBER_STATES))
+
+    issuers    = result["cert_transparency"].get("issuers", [])
+    gts_family = {"GTS CA 1P5", "GTS CA 1C3", "GTS CA 1D4", "GTS Root R1"}
+    has_gts    = bool(set(issuers) & gts_family)
+
+    if scan_all or _do_gcp_europe or scan or (scan_full and has_gts):
+        if scan_all:
+            regions, force, label = None, True, "all GCP regions globally"
+        elif _do_gcp_europe or scan_full:
+            regions, force, label = GCP_EUROPE_ALL_REGIONS, True, "all European GCP regions + Turkey"
+        else:
+            regions, force, label = GCP_DEFAULT_REGIONS, False, "Eastern European GCP regions"
+        log(f"Origin scan (GCP): {label}")
+        scan_r = await asyncio.to_thread(
+            targeted_origin_scan, domain, issuers, regions=regions, force=force, concurrency=concurrency, rate=rate,
+        )
+        _cb("origin_candidates.scan", scan_r)
+    else:
+        _cb("origin_candidates.scan", {"skipped": True, "reason": "Pass --scan, --scan-europe, --scan-full, or --scan-all to enable GCP scanning"})
+
+    if _do_providers:
+        log(f"Origin scan (providers): {len(PROVIDER_ASNS)} ASNs via RIPE Stat")
+        prov_r = await asyncio.to_thread(targeted_asn_scan, domain, concurrency=concurrency, rate=rate)
+        _cb("origin_candidates.provider_scan", prov_r)
+    else:
+        _cb("origin_candidates.provider_scan", {"skipped": True, "reason": "Pass --scan-providers or --scan-full to scan known RU/EU hosters"})
+
+    if _country_list:
+        log(f"Origin scan (country): {', '.join(_country_list)}")
+        ctry_r = await asyncio.to_thread(targeted_country_scan, domain, _country_list, concurrency=concurrency, rate=rate)
+        _cb("origin_candidates.country_scan", ctry_r)
+    else:
+        _cb("origin_candidates.country_scan", {"skipped": True, "reason": "Pass --scan-country CC or --scan-full (EU) to scan country IP space"})
+
+    # ── IP enrichment ──────────────────────────────────────────────────────────
+    # Collect every IP seen from any source: direct DNS + all origin discovery.
+    # ip_sources tracks which source(s) surfaced each IP so the report can show
+    # where it came from.
+    ip_sources: dict[str, list[str]] = {}
+
+    for k in ("A", "AAAA"):
+        for ip in (dns_r.get(k) or []):
+            if isinstance(ip, str):
+                ip_sources.setdefault(ip, []).append("dns")
+
+    oc_result = result.get("origin_candidates", {})
+
+    for entry in oc_result.get("hackertarget", []):
+        ip = entry.get("ip", "")
+        if ip and not entry.get("cf", False):
+            ip_sources.setdefault(ip, []).append("hackertarget")
+
+    for entry in oc_result.get("wordlist_leaks", []):
+        ip = entry.get("ip", "")
+        if ip:
+            ip_sources.setdefault(ip, []).append("wordlist_probe")
+
+    for entry in oc_result.get("mx_leaks", []):
+        ip = entry.get("ip", "")
+        if ip:
+            ip_sources.setdefault(ip, []).append("mx_record")
+
+    for entry in oc_result.get("subdomain_leaks", []):
+        ip = entry.get("ip", "")
+        if ip:
+            ip_sources.setdefault(ip, []).append("subdomain_probe")
+
+    for entry in oc_result.get("urlscan", []):
+        ip = entry.get("ip", "")
+        if ip and not entry.get("cf", False):
+            ip_sources.setdefault(ip, []).append("urlscan")
+
+    if ip_sources:
+        log(f"IP enrichment ({len(ip_sources)} unique IPs from DNS + all discovery sources)...")
+        all_ips = list(ip_sources.keys())
+        enriched = await asyncio.gather(*[asyncio.to_thread(enrich_ip, ip) for ip in all_ips])
+        ip_details: dict = {}
+        for ip, enrich_data in zip(all_ips, enriched):
+            entry = dict(enrich_data)
+            entry["sources"] = ip_sources[ip]
+            ip_details[ip] = entry
+        _cb("ip_details", ip_details)
+
+    return result
+
+
+def analyze_domain(
+    domain: str,
+    scan: bool = False,
+    scan_europe: bool = False,
+    scan_all: bool = False,
+    scan_providers: bool = False,
+    scan_countries: list[str] | None = None,
+    scan_eu_countries: bool = False,
+    scan_full: bool = False,
+    concurrency: int = 5_000,
+    *,
+    rate: int,
+    on_partial=None,
+) -> dict:
+    """Sync entry point — runs the async core in a new event loop."""
+    return asyncio.run(_analyze_domain_async(
+        domain,
+        scan=scan,
+        scan_europe=scan_europe,
+        scan_all=scan_all,
+        scan_providers=scan_providers,
+        scan_countries=scan_countries,
+        scan_eu_countries=scan_eu_countries,
+        scan_full=scan_full,
+        concurrency=concurrency,
+        rate=rate,
+        on_partial=on_partial,
+    ))
+
+
+def analyze_ip(ip: str) -> dict:
+    result: dict = {
+        "input":               ip,
+        "type":                "ip",
+        "timestamp":           datetime.now(timezone.utc).isoformat(),
+        "ptr":                 None,
+        "cloudflare":          False,
+        "asn_info":            {},
+        "other_domains_on_ip": [],
+    }
+
+    log(f"PTR record for {ip}")
+    result["ptr"] = get_ptr(ip)
+
+    log(f"ASN / network info for {ip}")
+    result["asn_info"] = get_ip_whois(ip)
+
+    result["cloudflare"] = is_cloudflare_ip(ip)
+    if result["cloudflare"]:
+        log(f"Skipping reverse IP lookup — Cloudflare anycast (results would be meaningless)")
+    else:
+        log(f"Reverse IP lookup (hackertarget)")
+        result["other_domains_on_ip"] = hackertarget_reverse_ip(ip)
+
+    return result
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="ip_intel",
+        description="Domain / IP intelligence tool",
+    )
+    parser.add_argument("target", help="Domain name or IP address to analyse")
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        help="Scan Eastern-European GCP regions for the origin cert (requires GTS cert in history)",
+    )
+    parser.add_argument(
+        "--scan-europe",
+        action="store_true",
+        help="Scan ALL European GCP regions + Turkey coverage (forces scan regardless of cert history)",
+    )
+    parser.add_argument(
+        "--scan-all",
+        action="store_true",
+        help="Scan every GCP region globally (very slow — several hours without masscan)",
+    )
+    parser.add_argument(
+        "--scan-providers",
+        action="store_true",
+        help="Scan Hetzner, OVH, M247, Aeza, Selectel, TimeWeb and other RU/EU hosters via RIPE Stat",
+    )
+    parser.add_argument(
+        "--scan-country",
+        metavar="CC",
+        nargs="+",
+        help="Scan all IPv4 space allocated to one or more countries (ISO codes, e.g. RU UA BY)",
+    )
+    parser.add_argument(
+        "--scan-eu-countries",
+        action="store_true",
+        help="Scan all IPv4 space for all 27 EU member states via RIPE Stat",
+    )
+    parser.add_argument(
+        "--scan-full",
+        action="store_true",
+        help="Run everything: EU countries + known providers + GCP Europe (+ GCP if GTS cert found)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=5_000,
+        metavar="N",
+        help="Max concurrent connections for async TCP/TLS phase (default: 5000, reduce if network struggles)",
+    )
+    parser.add_argument(
+        "--rate",
+        type=int,
+        default=100_000,
+        metavar="PPS",
+        help="masscan packets-per-second rate (default: 100000, e.g. --rate 1000 to be gentle)",
+    )
+    args = parser.parse_args()
+
+    target = clean_target(args.target)
+
+    out_dir = Path(__file__).parent / "results"
+    out_dir.mkdir(exist_ok=True)
+
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", target)
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file   = out_dir / f"{safe_name}_{timestamp}.json"
+
+    print(f"\n  ip-intel  |  target: {target}\n")
+
+    if is_ip(target):
+        data = analyze_ip(target)
+    else:
+        data = analyze_domain(
+            target,
+            scan=args.scan,
+            scan_europe=args.scan_europe,
+            scan_all=args.scan_all,
+            scan_providers=args.scan_providers,
+            scan_countries=args.scan_country,
+            scan_eu_countries=args.scan_eu_countries,
+            scan_full=args.scan_full,
+            concurrency=args.concurrency,
+            rate=args.rate,
+        )
+
+    with open(out_file, "w") as fh:
+        json.dump(data, fh, indent=2, default=str)
+
+    print(f"\n  [+] Saved → {out_file}\n")
+
+
+if __name__ == "__main__":
+    main()
