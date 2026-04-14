@@ -761,24 +761,36 @@ def fetch_asn_ip_ranges(asns: list[str]) -> dict[str, list[str]]:
     """
     Fetch announced IPv4 prefixes for each ASN from RIPE Stat (free, no key).
     Returns {asn: [cidr, ...]} for ASNs that returned results.
+    All ASNs are fetched in parallel via ThreadPoolExecutor.
     """
-    out: dict[str, list[str]] = {}
-    for asn in asns:
+    asn_to_cidrs: dict[str, list[str]] = {}
+
+    def _fetch_single_asn(asn: str) -> tuple[str, list[str]]:
         try:
-            resp = requests.get(
+            response = requests.get(
                 RIPE_STAT_URL,
                 params={"resource": asn},
                 timeout=15,
                 headers={"Accept": "application/json"},
             )
-            resp.raise_for_status()
-            prefixes = resp.json().get("data", {}).get("prefixes", [])
-            cidrs = [p["prefix"] for p in prefixes if ":" not in p.get("prefix", "")]  # IPv4 only
-            if cidrs:
-                out[asn] = cidrs
+            response.raise_for_status()
+            announced_prefixes = response.json().get("data", {}).get("prefixes", [])
+            ipv4_cidrs = [
+                prefix_entry["prefix"]
+                for prefix_entry in announced_prefixes
+                if ":" not in prefix_entry.get("prefix", "")  # IPv4 only
+            ]
+            return asn, ipv4_cidrs
         except Exception as exc:
             log(f"RIPE Stat failed for {asn}: {exc}")
-    return out
+            return asn, []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for asn, ipv4_cidrs in executor.map(_fetch_single_asn, asns):
+            if ipv4_cidrs:
+                asn_to_cidrs[asn] = ipv4_cidrs
+
+    return asn_to_cidrs
 
 
 def fetch_gcp_ip_ranges(region_prefixes: list[str] | None = None) -> list[str]:
@@ -836,6 +848,74 @@ def _parse_tls_cert(der: bytes, ip: str, port: int, domain: str) -> dict | None:
         "not_before": not_before,
         "not_after":  not_after,
     }
+
+
+def grab_tls_cert(
+    ip: str,
+    sni: str | None = None,
+    port: int = 443,
+    timeout: float = 5.0,
+) -> dict | None:
+    """
+    Grab a TLS certificate directly from ip:port without hostname verification.
+
+    sni is used as the TLS SNI / server_hostname hint.  When None the IP itself
+    is used as the hostname so at least SNI is attempted even without a domain.
+
+    Returns a dict with full cert metadata, or None if the connection fails
+    or the peer presents no certificate.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as raw_sock:
+            hostname = sni if sni else ip
+            with ctx.wrap_socket(raw_sock, server_hostname=hostname) as ssl_sock:
+                der = ssl_sock.getpeercert(binary_form=True)
+    except Exception:
+        return None
+
+    if not der:
+        return None
+
+    try:
+        cert = x509.load_der_x509_certificate(der)
+
+        cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        cn = cn_attrs[0].value if cn_attrs else ""
+
+        sans: list[str] = []
+        try:
+            san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            sans = san_ext.value.get_values_for_type(x509.DNSName)
+        except Exception:
+            pass
+
+        try:
+            not_before = cert.not_valid_before_utc.isoformat()
+            not_after  = cert.not_valid_after_utc.isoformat()
+        except AttributeError:
+            not_before = cert.not_valid_before.isoformat()
+            not_after  = cert.not_valid_after.isoformat()
+
+        issuer_cn_attrs = cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
+        issuer_o_attrs  = cert.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+
+        return {
+            "ip":         ip,
+            "port":       port,
+            "sni_used":   sni,
+            "cn":         cn,
+            "sans":       sans,
+            "issuer_cn":  issuer_cn_attrs[0].value if issuer_cn_attrs else "",
+            "issuer_org": issuer_o_attrs[0].value  if issuer_o_attrs  else "",
+            "not_before": not_before,
+            "not_after":  not_after,
+            "sha256":     hashlib.sha256(der).hexdigest(),
+        }
+    except Exception:
+        return None
 
 
 async def _tcp_open_async(ip: str, port: int, timeout: float) -> bool:
@@ -1717,10 +1797,10 @@ async def _analyze_domain_async(
     # ── Group 1: all concurrent via shared httpx client ───────────────────────
     log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata (async)...")
     async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True) as client:
-        (_, dns_r, ct_raw, _, _, _) = await asyncio.gather(
-            _task("whois",        asyncio.to_thread(get_domain_whois, domain)),
-            _task("dns",          _aget_dns_records(domain)),
-            _task("_ct_tmp",      _acrt_sh_data(domain, client)),
+        (_, dns_records, cert_transparency_raw, _, _, _) = await asyncio.gather(
+            _task("whois",          asyncio.to_thread(get_domain_whois, domain)),
+            _task("dns",            _aget_dns_records(domain)),
+            _task("_ct_tmp",        _acrt_sh_data(domain, client)),
             _task("historical_dns", _acircl_passive_dns(domain, client)),
             _task("page_metadata",  _afetch_page_metadata(domain, client, _fav_path)),
             _task("email_security", _aget_dmarc_dkim(domain)),
@@ -1728,26 +1808,27 @@ async def _analyze_domain_async(
 
         # Post-process CT — split subdomains out and notify each separately
         del result["_ct_tmp"]
-        subdomains = ct_raw.pop("subdomains", [])
-        result["subdomains"]        = subdomains
-        result["cert_transparency"] = ct_raw
-        _cb("cert_transparency", ct_raw)
-        _cb("subdomains", subdomains)
+        discovered_subdomains = cert_transparency_raw.pop("subdomains", [])
+        result["subdomains"]        = discovered_subdomains
+        result["cert_transparency"] = cert_transparency_raw
+        _cb("cert_transparency", cert_transparency_raw)
+        _cb("subdomains", discovered_subdomains)
 
-        spf = extract_spf_origins(dns_r.get("TXT", []))
-        _cb("spf_origins", spf)
+        spf_origin_ips = extract_spf_origins(dns_records.get("TXT", []))
+        _cb("spf_origins", spf_origin_ips)
 
-        ns = dns_r.get("NS", [])
-        if ns:
-            log(f"Zone transfer attempt on {len(ns)} nameserver(s)")
-            zt = await asyncio.to_thread(attempt_zone_transfer, domain, ns)
-            _cb("zone_transfer", zt)
+        nameservers  = dns_records.get("NS", [])
+        mx_records   = dns_records.get("MX") or []
 
-        # ── Group 2: origin discovery — all concurrent ────────────────────────
-        log("Subdomain probe / MX / wordlist / HackerTarget / urlscan / Censys / Shodan / Netlas (async)...")
-        mx_records = dns_r.get("MX") or []
+        # ── Group 2: origin discovery + zone transfer — all concurrent ────────
+        # Zone transfer is included here (not before) so its per-nameserver
+        # 5 s timeout does not delay the rest of origin discovery.
+        if nameservers:
+            log(f"Zone transfer attempt on {len(nameservers)} nameserver(s) (concurrent with origin discovery)")
+        log("Zone transfer / subdomain probe / MX / wordlist / HackerTarget / urlscan / Censys / Shodan / Netlas (async)...")
         await asyncio.gather(
-            _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, subdomains) if subdomains else _empty_list()),
+            _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
+            _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
             _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
             _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain)),
             _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
@@ -1758,43 +1839,43 @@ async def _analyze_domain_async(
         )
 
     # ── Scan phases — sequential, long-running, each uses its own event loop ──
-    _do_gcp_europe   = scan_europe  or scan_full
-    _do_providers    = scan_providers or scan_full
-    _do_eu_countries = scan_eu_countries or scan_full
-    _country_list    = list({c.upper() for c in (scan_countries or [])})
-    if _do_eu_countries:
-        _country_list = sorted(set(_country_list) | set(EU_MEMBER_STATES))
+    do_gcp_europe_scan   = scan_europe   or scan_full
+    do_provider_scan     = scan_providers or scan_full
+    do_eu_country_scan   = scan_eu_countries or scan_full
+    country_code_list    = list({country_code.upper() for country_code in (scan_countries or [])})
+    if do_eu_country_scan:
+        country_code_list = sorted(set(country_code_list) | set(EU_MEMBER_STATES))
 
-    issuers    = result["cert_transparency"].get("issuers", [])
-    gts_family = {"GTS CA 1P5", "GTS CA 1C3", "GTS CA 1D4", "GTS Root R1"}
-    has_gts    = bool(set(issuers) & gts_family)
+    cert_issuers     = result["cert_transparency"].get("issuers", [])
+    gts_issuer_names = {"GTS CA 1P5", "GTS CA 1C3", "GTS CA 1D4", "GTS Root R1"}
+    has_gts_cert     = bool(set(cert_issuers) & gts_issuer_names)
 
-    if scan_all or _do_gcp_europe or scan or (scan_full and has_gts):
+    if scan_all or do_gcp_europe_scan or scan or (scan_full and has_gts_cert):
         if scan_all:
-            regions, force, label = None, True, "all GCP regions globally"
-        elif _do_gcp_europe or scan_full:
-            regions, force, label = GCP_EUROPE_ALL_REGIONS, True, "all European GCP regions + Turkey"
+            gcp_regions, force_scan, scan_label = None, True, "all GCP regions globally"
+        elif do_gcp_europe_scan or scan_full:
+            gcp_regions, force_scan, scan_label = GCP_EUROPE_ALL_REGIONS, True, "all European GCP regions + Turkey"
         else:
-            regions, force, label = GCP_DEFAULT_REGIONS, False, "Eastern European GCP regions"
-        log(f"Origin scan (GCP): {label}")
-        scan_r = await asyncio.to_thread(
-            targeted_origin_scan, domain, issuers, regions=regions, force=force, concurrency=concurrency, rate=rate,
+            gcp_regions, force_scan, scan_label = GCP_DEFAULT_REGIONS, False, "Eastern European GCP regions"
+        log(f"Origin scan (GCP): {scan_label}")
+        gcp_scan_result = await asyncio.to_thread(
+            targeted_origin_scan, domain, cert_issuers, regions=gcp_regions, force=force_scan, concurrency=concurrency, rate=rate,
         )
-        _cb("origin_candidates.scan", scan_r)
+        _cb("origin_candidates.scan", gcp_scan_result)
     else:
         _cb("origin_candidates.scan", {"skipped": True, "reason": "Pass --scan, --scan-europe, --scan-full, or --scan-all to enable GCP scanning"})
 
-    if _do_providers:
+    if do_provider_scan:
         log(f"Origin scan (providers): {len(PROVIDER_ASNS)} ASNs via RIPE Stat")
-        prov_r = await asyncio.to_thread(targeted_asn_scan, domain, concurrency=concurrency, rate=rate)
-        _cb("origin_candidates.provider_scan", prov_r)
+        provider_scan_result = await asyncio.to_thread(targeted_asn_scan, domain, concurrency=concurrency, rate=rate)
+        _cb("origin_candidates.provider_scan", provider_scan_result)
     else:
         _cb("origin_candidates.provider_scan", {"skipped": True, "reason": "Pass --scan-providers or --scan-full to scan known RU/EU hosters"})
 
-    if _country_list:
-        log(f"Origin scan (country): {', '.join(_country_list)}")
-        ctry_r = await asyncio.to_thread(targeted_country_scan, domain, _country_list, concurrency=concurrency, rate=rate)
-        _cb("origin_candidates.country_scan", ctry_r)
+    if country_code_list:
+        log(f"Origin scan (country): {', '.join(country_code_list)}")
+        country_scan_result = await asyncio.to_thread(targeted_country_scan, domain, country_code_list, concurrency=concurrency, rate=rate)
+        _cb("origin_candidates.country_scan", country_scan_result)
     else:
         _cb("origin_candidates.country_scan", {"skipped": True, "reason": "Pass --scan-country CC or --scan-full (EU) to scan country IP space"})
 
@@ -1804,48 +1885,99 @@ async def _analyze_domain_async(
     # where it came from.
     ip_sources: dict[str, list[str]] = {}
 
-    for k in ("A", "AAAA"):
-        for ip in (dns_r.get(k) or []):
-            if isinstance(ip, str):
-                ip_sources.setdefault(ip, []).append("dns")
+    for record_type in ("A", "AAAA"):
+        for ip_address in (dns_records.get(record_type) or []):
+            if isinstance(ip_address, str):
+                ip_sources.setdefault(ip_address, []).append("dns")
 
-    oc_result = result.get("origin_candidates", {})
+    origin_candidates_result = result.get("origin_candidates", {})
 
-    for entry in oc_result.get("hackertarget", []):
-        ip = entry.get("ip", "")
-        if ip and not entry.get("cf", False):
-            ip_sources.setdefault(ip, []).append("hackertarget")
+    for candidate_entry in origin_candidates_result.get("hackertarget", []):
+        ip_address = candidate_entry.get("ip", "")
+        if ip_address and not candidate_entry.get("cf", False):
+            ip_sources.setdefault(ip_address, []).append("hackertarget")
 
-    for entry in oc_result.get("wordlist_leaks", []):
-        ip = entry.get("ip", "")
-        if ip:
-            ip_sources.setdefault(ip, []).append("wordlist_probe")
+    for candidate_entry in origin_candidates_result.get("wordlist_leaks", []):
+        ip_address = candidate_entry.get("ip", "")
+        if ip_address:
+            ip_sources.setdefault(ip_address, []).append("wordlist_probe")
 
-    for entry in oc_result.get("mx_leaks", []):
-        ip = entry.get("ip", "")
-        if ip:
-            ip_sources.setdefault(ip, []).append("mx_record")
+    for candidate_entry in origin_candidates_result.get("mx_leaks", []):
+        ip_address = candidate_entry.get("ip", "")
+        if ip_address:
+            ip_sources.setdefault(ip_address, []).append("mx_record")
 
-    for entry in oc_result.get("subdomain_leaks", []):
-        ip = entry.get("ip", "")
-        if ip:
-            ip_sources.setdefault(ip, []).append("subdomain_probe")
+    for candidate_entry in origin_candidates_result.get("subdomain_leaks", []):
+        ip_address = candidate_entry.get("ip", "")
+        if ip_address:
+            ip_sources.setdefault(ip_address, []).append("subdomain_probe")
 
-    for entry in oc_result.get("urlscan", []):
-        ip = entry.get("ip", "")
-        if ip and not entry.get("cf", False):
-            ip_sources.setdefault(ip, []).append("urlscan")
+    for candidate_entry in origin_candidates_result.get("urlscan", []):
+        ip_address = candidate_entry.get("ip", "")
+        if ip_address and not candidate_entry.get("cf", False):
+            ip_sources.setdefault(ip_address, []).append("urlscan")
+
+    for historical_record in result.get("historical_dns", {}).get("records", []):
+        if historical_record.get("rrtype") in ("A", "AAAA"):
+            ip_address = historical_record.get("rdata", "")
+            if ip_address and not is_cloudflare_ip(ip_address):
+                ip_sources.setdefault(ip_address, []).append("historical_dns")
+
+    for spf_entry in result.get("spf_origins", []):
+        ip_address = spf_entry.get("ip", "")
+        if ip_address and not is_cloudflare_ip(ip_address):
+            ip_sources.setdefault(ip_address, []).append("spf")
 
     if ip_sources:
         log(f"IP enrichment ({len(ip_sources)} unique IPs from DNS + all discovery sources)...")
-        all_ips = list(ip_sources.keys())
-        enriched = await asyncio.gather(*[asyncio.to_thread(enrich_ip, ip) for ip in all_ips])
+        all_discovered_ips = list(ip_sources.keys())
+        enrichment_results = await asyncio.gather(*[asyncio.to_thread(enrich_ip, ip_address) for ip_address in all_discovered_ips])
         ip_details: dict = {}
-        for ip, enrich_data in zip(all_ips, enriched):
-            entry = dict(enrich_data)
-            entry["sources"] = ip_sources[ip]
-            ip_details[ip] = entry
+        for ip_address, enrichment_data in zip(all_discovered_ips, enrichment_results):
+            enriched_entry = dict(enrichment_data)
+            enriched_entry["sources"] = ip_sources[ip_address]
+            ip_details[ip_address] = enriched_entry
         _cb("ip_details", ip_details)
+
+    # ── TLS probe — grab live certs from every non-CF IP found ────────────────
+    # ip_sources already contains every IP from every discovery source.
+    # Filter to non-Cloudflare IPs only; each is probed with the target domain
+    # as SNI so the server presents the cert it is actually serving.
+    tls_probe_targets: dict[str, str] = {
+        ip_address: domain
+        for ip_address in ip_sources
+        if not is_cloudflare_ip(ip_address)
+    }
+
+    result["non_cf_ips"] = list(tls_probe_targets.keys())
+
+    if tls_probe_targets:
+        log(f"TLS probe: grabbing certs from {len(tls_probe_targets)} non-Cloudflare IP(s)...")
+        raw_tls_certs = await asyncio.gather(*[
+            asyncio.to_thread(grab_tls_cert, ip_address, sni_domain)
+            for ip_address, sni_domain in tls_probe_targets.items()
+        ])
+        non_cloudflare_tls_certs = [cert for cert in raw_tls_certs if cert is not None]
+        log(f"TLS probe: {len(non_cloudflare_tls_certs)} cert(s) retrieved")
+    else:
+        non_cloudflare_tls_certs = []
+
+    result["non_cf_tls_certs"] = non_cloudflare_tls_certs
+    _cb("non_cf_tls_certs", non_cloudflare_tls_certs)
+
+    # Cloudflare-fronted flag
+    current_a_records = dns_records.get("A") or []
+    result["cloudflare_fronted"] = bool(current_a_records) and all(
+        is_cloudflare_ip(ip_address) for ip_address in current_a_records if isinstance(ip_address, str)
+    )
+
+    # ── Persist everything to SQLite ──────────────────────────────────────────
+    try:
+        from intel_db import save_search
+        save_search(result)
+        log("Search saved to ip_intel.db")
+    except Exception as _exc:
+        log(f"DB save failed: {_exc}")
 
     return result
 
@@ -1903,6 +2035,31 @@ def analyze_ip(ip: str) -> dict:
     else:
         log(f"Reverse IP lookup (hackertarget)")
         result["other_domains_on_ip"] = hackertarget_reverse_ip(ip)
+
+    # ── TLS probe — grab cert directly from this IP ───────────────────────────
+    result["tls_cert"] = None
+    result["non_cf_ips"] = []
+    result["non_cf_tls_certs"] = []
+    result["cloudflare_fronted"] = result["cloudflare"]
+
+    if not result["cloudflare"]:
+        log(f"Grabbing TLS cert from {ip}:443")
+        # Use PTR hostname as SNI if we have one, otherwise fall back to bare IP
+        sni = result.get("ptr") or ip
+        cert = grab_tls_cert(ip, sni=sni)
+        result["tls_cert"] = cert
+        result["non_cf_ips"] = [ip]
+        result["non_cf_tls_certs"] = [cert] if cert else []
+        if cert:
+            log(f"TLS cert: CN={cert.get('cn')}  issuer={cert.get('issuer_cn')}")
+
+    # ── Persist to SQLite ─────────────────────────────────────────────────────
+    try:
+        from intel_db import save_search
+        save_search(result)
+        log("Search saved to ip_intel.db")
+    except Exception as _exc:
+        log(f"DB save failed: {_exc}")
 
     return result
 

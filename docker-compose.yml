@@ -5,4 +5,6 @@ services:
       - "8501:8501"
     env_file:
       - .env
+    volumes:
+      - ./ip_intel.db:/app/ip_intel.db
     restart: unless-stopped

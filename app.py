@@ -13,6 +13,14 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent))
 import ip_intel  # noqa: E402  (local import after path fix)
+from intel_db import (  # noqa: E402
+    get_recent,
+    get_by_id,
+    cluster_by_ip,
+    cluster_by_tracking_id,
+    cluster_by_favicon,
+    cluster_by_tls_cert,
+)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -41,6 +49,7 @@ _DEFAULTS = {
     "log_messages":    [],
     "error":           None,
     "log_q":           queue.Queue(),
+    "last_db_id":      None,
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -322,6 +331,7 @@ PHASES = [
     "Netlas",
     "Origin scan",
     "IP enrichment",
+    "TLS probe",
 ]
 PHASE_KEYWORDS = {
     "WHOIS":           ["whois"],
@@ -339,6 +349,7 @@ PHASE_KEYWORDS = {
     "Netlas":          ["netlas"],
     "Origin scan":     ["origin scan", "masscan", "phase 1", "phase 2", "fetching gcp", "fetching ip ranges"],
     "IP enrichment":   ["ip enrichment", "ptr record", "asn"],
+    "TLS probe":       ["tls probe"],
 }
 
 if st.session_state.running or (st.session_state.log_messages and not st.session_state.results):
@@ -379,9 +390,29 @@ if st.session_state.error:
 
 
 # ── Results ───────────────────────────────────────────────────────────────────
+def _hosting_label(ip: str, ip_details: dict) -> str:
+    """Return a short hosting/ASN description for a non-CF IP, or empty string."""
+    info = ip_details.get(ip, {})
+    asn  = info.get("asn_info", {})
+    return asn.get("asn_description") or asn.get("network_name") or ""
+
+
+def _tls_line(ip: str, tls_by_ip: dict) -> str:
+    """Return an inline TLS cert summary for an IP, or empty string if none."""
+    cert = tls_by_ip.get(ip)
+    if not cert:
+        return ""
+    issuer = cert.get("issuer_cn") or cert.get("issuer_org") or "Unknown CA"
+    cn     = cert.get("cn") or "(no CN)"
+    expiry = (cert.get("not_after") or "")[:10]
+    return f"🔐 CN=<b>{cn}</b> issuer=<i>{issuer}</i> expires={expiry}"
+
+
 def render_results(d: dict):
-    target    = d.get("input", "")
-    is_domain = d.get("type") == "domain"
+    target     = d.get("input", "")
+    is_domain  = d.get("type") == "domain"
+    ip_details = d.get("ip_details", {})
+    tls_by_ip  = {c["ip"]: c for c in (d.get("non_cf_tls_certs") or []) if c.get("ip")}
 
     # ── Summary row ──────────────────────────────────────────────────────────
     st.header(f"Results: {target}")
@@ -444,7 +475,40 @@ def render_results(d: dict):
         else:
             for ip in a_records:
                 if not ip_intel.is_cloudflare_ip(ip):
-                    _hit_box(f"🟢 <b>Direct IP exposed:</b> {ip} — not behind Cloudflare", "hit")
+                    _host = _hosting_label(ip, ip_details)
+                    _host_str = f" — {_host}" if _host else " — not behind Cloudflare"
+                    _tls = _tls_line(ip, tls_by_ip)
+                    _tls_str = f"<br>{_tls}" if _tls else ""
+                    _hit_box(f"🟢 <b>Direct IP exposed:</b> {ip}{_host_str}{_tls_str}", "hit")
+
+        # ── Non-CF TLS certs (live-grabbed) ───────────────────────────────────
+        tls_list = d.get("non_cf_tls_certs") or (
+            [d["tls_cert"]] if d.get("tls_cert") else []
+        )
+        if tls_list:
+            st.markdown("#### Live TLS Certificates from Non-Cloudflare IPs")
+            _explainer(
+                "These certificates were grabbed directly from IPs that are <b>not</b> behind Cloudflare. "
+                "The CN/SANs confirm what domain(s) the server is actually serving. "
+                "The SHA-256 fingerprint can be searched across future scans to track infrastructure."
+            )
+            for cert in tls_list:
+                if not cert:
+                    continue
+                issuer = cert.get("issuer_cn") or cert.get("issuer_org") or "Unknown CA"
+                cn     = cert.get("cn") or "(no CN)"
+                sans   = cert.get("sans") or []
+                sha    = cert.get("sha256", "")
+                nb     = (cert.get("not_before") or "")[:10]
+                na     = (cert.get("not_after")  or "")[:10]
+                _hit_box(
+                    f"🔐 <b>{cert['ip']}:{cert.get('port',443)}</b> &nbsp; "
+                    f"CN=<b>{cn}</b><br>"
+                    f"SANs: <code>{', '.join(sans[:8])}</code><br>"
+                    f"Issuer: <i>{issuer}</i> &nbsp; valid {nb} → {na}<br>"
+                    f"SHA-256: <code>{sha}</code>",
+                    "hit",
+                )
 
         ns = dns.get("NS") or []
         if any("cloudflare" in n.lower() for n in ns):
@@ -668,7 +732,12 @@ def render_results(d: dict):
             st.markdown("#### Historical Non-Cloudflare IPs (CIRCL pDNS)")
             _explainer("These IPs predate Cloudflare and may be the real origin server.")
             for r in hist_ips:
-                _hit_box(f"🕰 <b>{r['rdata']}</b> — last seen: {r.get('last_seen', '?')}", "warn")
+                _ip   = r['rdata']
+                _host = _hosting_label(_ip, ip_details)
+                _host_str = f" — {_host}" if _host else ""
+                _tls = _tls_line(_ip, tls_by_ip)
+                _tls_str = f"<br>{_tls}" if _tls else ""
+                _hit_box(f"🕰 <b>{_ip}</b>{_host_str} — last seen: {r.get('last_seen', '?')}{_tls_str}", "warn")
 
     # ── Tab 1: WHOIS & DNS ────────────────────────────────────────────────────
     with tabs[1]:
@@ -789,8 +858,13 @@ def render_results(d: dict):
                 ip = r.get("rdata", "")
                 cf = ip_intel.is_cloudflare_ip(ip)
                 badge = "🟠 CF" if cf else "🟢 Non-CF"
+                _host = "" if cf else _hosting_label(ip, ip_details)
+                _host_str = f" — {_host}" if _host else ""
+                _tls = "" if cf else _tls_line(ip, tls_by_ip)
+                _tls_str = f"  {_tls}" if _tls else ""
                 st.markdown(
-                    f"`{ip}` {badge} — first: `{r.get('first_seen', '?')}` last: `{r.get('last_seen', '?')}`"
+                    f"`{ip}` {badge}{_host_str} — first: `{r.get('first_seen', '?')}` last: `{r.get('last_seen', '?')}`{_tls_str}",
+                    unsafe_allow_html=True,
                 )
         else:
             st.info("No historical A/AAAA records found in CIRCL pDNS. The domain may have been behind Cloudflare its entire life.")
@@ -812,7 +886,11 @@ def render_results(d: dict):
         _explainer("Subdomains from crt.sh that resolve to non-Cloudflare IPs. The operator forgot to proxy these through CF, exposing the real hosting IP.")
         if leaks:
             for l in leaks:
-                _hit_box(f"🔓 <b>{l['subdomain']}</b> → {l['ip']}", "hit")
+                _host = _hosting_label(l['ip'], ip_details)
+                _host_str = f" ({_host})" if _host else ""
+                _tls = _tls_line(l['ip'], tls_by_ip)
+                _tls_str = f"<br>{_tls}" if _tls else ""
+                _hit_box(f"🔓 <b>{l['subdomain']}</b> → {l['ip']}{_host_str}{_tls_str}", "hit")
         else:
             st.caption("No leaks found.")
 
@@ -822,7 +900,11 @@ def render_results(d: dict):
         _explainer("MX hostnames that resolve to non-Cloudflare IPs. Mail servers are often co-hosted with the web server but left unproxied.")
         if mx_leaks:
             for l in mx_leaks:
-                _hit_box(f"📧 <b>{l['subdomain']}</b> → {l['ip']}", "hit")
+                _host = _hosting_label(l['ip'], ip_details)
+                _host_str = f" ({_host})" if _host else ""
+                _tls = _tls_line(l['ip'], tls_by_ip)
+                _tls_str = f"<br>{_tls}" if _tls else ""
+                _hit_box(f"📧 <b>{l['subdomain']}</b> → {l['ip']}{_host_str}{_tls_str}", "hit")
         else:
             st.caption("No MX leaks found.")
 
@@ -832,7 +914,11 @@ def render_results(d: dict):
         _explainer("Probes common subdomains (direct, origin, mail, smtp, staging, dev…) not necessarily in CT logs. Catches origins that were never cert-logged.")
         if wlist_leaks:
             for l in wlist_leaks:
-                _hit_box(f"🔍 <b>{l['subdomain']}</b> → {l['ip']}", "hit")
+                _host = _hosting_label(l['ip'], ip_details)
+                _host_str = f" ({_host})" if _host else ""
+                _tls = _tls_line(l['ip'], tls_by_ip)
+                _tls_str = f"<br>{_tls}" if _tls else ""
+                _hit_box(f"🔍 <b>{l['subdomain']}</b> → {l['ip']}{_host_str}{_tls_str}", "hit")
         else:
             st.caption("No wordlist leaks found.")
 
@@ -842,7 +928,11 @@ def render_results(d: dict):
         _explainer("IP addresses explicitly listed in the SPF record. These are authorised mail senders and often reveal the real hosting IP or mail relay.")
         if spf_origins:
             for o in spf_origins:
-                _hit_box(f"📬 <b>{o['ip']}</b> (cidr: <code>{o['cidr']}</code>)", "warn")
+                _host = _hosting_label(o['ip'], ip_details)
+                _host_str = f" — {_host}" if _host else ""
+                _tls = _tls_line(o['ip'], tls_by_ip)
+                _tls_str = f"<br>{_tls}" if _tls else ""
+                _hit_box(f"📬 <b>{o['ip']}</b> (cidr: <code>{o['cidr']}</code>){_host_str}{_tls_str}", "warn")
         else:
             st.caption("No SPF ip4/ip6 directives found.")
 
@@ -855,7 +945,11 @@ def render_results(d: dict):
             for r in ht_results:
                 badge = "🟠" if r.get("cf") else "🟢"
                 level = "info" if r.get("cf") else "hit"
-                _hit_box(f"{badge} <b>{r['subdomain']}</b> → {r['ip']}", level)
+                _host = "" if r.get("cf") else _hosting_label(r['ip'], ip_details)
+                _host_str = f" ({_host})" if _host else ""
+                _tls = "" if r.get("cf") else _tls_line(r['ip'], tls_by_ip)
+                _tls_str = f"<br>{_tls}" if _tls else ""
+                _hit_box(f"{badge} <b>{r['subdomain']}</b> → {r['ip']}{_host_str}{_tls_str}", level)
         else:
             st.caption("No results (rate limit or no subdomains found).")
 
@@ -868,9 +962,13 @@ def render_results(d: dict):
             for r in us_results:
                 badge = "🟠" if r.get("cf") else "🟢"
                 level = "info" if r.get("cf") else "hit"
+                _host = "" if r.get("cf") else _hosting_label(r['ip'], ip_details)
+                _host_str = f" — {_host}" if _host else ""
+                _tls = "" if r.get("cf") else _tls_line(r['ip'], tls_by_ip)
+                _tls_str = f"<br>{_tls}" if _tls else ""
                 _hit_box(
-                    f"{badge} <b>{r['ip']}</b>  ({r.get('date', '?')})  "
-                    f"<small>{r.get('url', '')[:80]}</small>",
+                    f"{badge} <b>{r['ip']}</b>{_host_str}  ({r.get('date', '?')})  "
+                    f"<small>{r.get('url', '')[:80]}</small>{_tls_str}",
                     level,
                 )
         else:
@@ -953,6 +1051,8 @@ def render_results(d: dict):
         "mx_record":       "MX record",
         "subdomain_probe": "Subdomain probe",
         "urlscan":         "urlscan.io",
+        "historical_dns":  "Historical DNS (CIRCL)",
+        "spf":             "SPF record",
     }
 
     with tabs[5]:
@@ -965,7 +1065,6 @@ def render_results(d: dict):
             "For Cloudflare anycast IPs, reverse-IP and RDAP are skipped — "
             "millions of sites share the same IP so results would be meaningless."
         )
-        ip_details = d.get("ip_details", {})
         if not ip_details:
             if not is_domain:
                 # IP target — show top-level fields
@@ -975,6 +1074,21 @@ def render_results(d: dict):
                 asn = d.get("asn_info", {})
                 for k, v in asn.items():
                     if v: st.markdown(f"**{k}:** `{v}`")
+                # TLS cert grabbed directly
+                cert = d.get("tls_cert")
+                if cert:
+                    issuer = cert.get("issuer_cn") or cert.get("issuer_org") or "Unknown CA"
+                    _hit_box(
+                        f"🔐 <b>TLS cert on port {cert.get('port',443)}</b><br>"
+                        f"CN=<b>{cert.get('cn') or '(none)'}</b><br>"
+                        f"SANs: <code>{', '.join(cert.get('sans',[])[:8])}</code><br>"
+                        f"Issuer: <i>{issuer}</i> &nbsp; "
+                        f"valid {(cert.get('not_before') or '')[:10]} → {(cert.get('not_after') or '')[:10]}<br>"
+                        f"SHA-256: <code>{cert.get('sha256','')}</code>",
+                        "hit",
+                    )
+                elif not cf:
+                    st.caption("No TLS cert found on port 443.")
                 others = d.get("other_domains_on_ip", [])
                 if others:
                     st.markdown(f"**Co-hosted domains ({len(others)}):**")
@@ -1052,3 +1166,145 @@ elif not st.session_state.running:
 - 🚨 `mitmproxy` — someone is running a man-in-the-middle proxy for this domain.
 - ⚠️ `Caddy Local Authority` — an internal/self-signed Caddy cert. Usually a dev box or internal proxy.
 """)
+
+
+# ── Search History & Cross-Reference Clusters ─────────────────────────────────
+st.divider()
+st.header("📚 Search History & Infrastructure Clusters")
+_explainer(
+    "Every analysis is saved to <code>ip_intel.db</code>. "
+    "The cluster views show data points shared across multiple targets — "
+    "the strongest signal for FIMI infrastructure groupings."
+)
+
+_hist_tabs = st.tabs(["🕐 Recent Searches", "🌐 IP Clusters", "📊 Tracking ID Clusters", "🖼 Favicon Clusters", "🔐 TLS Cert Clusters"])
+
+with _hist_tabs[0]:
+    try:
+        recent = get_recent(limit=100)
+        if not recent:
+            st.info("No searches recorded yet. Run an analysis to start building the database.")
+        else:
+            st.markdown(f"**{len(recent)} searches in database**")
+            for row in recent:
+                cf_badge = "🟠 CF" if row.get("cloudflare_fronted") == 1 else ("🟢 Direct" if row.get("cloudflare_fronted") == 0 else "❓")
+                ts = str(row.get("timestamp", ""))[:16].replace("T", " ")
+                with st.expander(f"`{row['target']}` — {row['type'].upper()}  {cf_badge}  {ts}"):
+                    st.markdown(f"**Search ID:** {row['id']}")
+                    st.markdown(f"**Type:** {row['type']}")
+                    st.markdown(f"**Timestamp:** {ts}")
+                    st.markdown(f"**Cloudflare fronted:** {cf_badge}")
+                    # Show non-CF IPs and TLS certs for this search
+                    ips_rows = []
+                    tls_rows = []
+                    try:
+                        _detail = get_by_id(row["id"])
+                        if _detail:
+                            raw = __import__("json").loads(_detail.get("raw_json", "{}"))
+                            for ip in raw.get("non_cf_ips", []):
+                                ips_rows.append(ip)
+                            for cert in (raw.get("non_cf_tls_certs") or []):
+                                if cert:
+                                    tls_rows.append(cert)
+                            if raw.get("tls_cert"):
+                                tls_rows.append(raw["tls_cert"])
+                    except Exception:
+                        pass
+                    if ips_rows:
+                        st.markdown(f"**Non-CF IPs found:** `{'`, `'.join(ips_rows)}`")
+                    for cert in tls_rows:
+                        if cert:
+                            _hit_box(
+                                f"🔐 {cert.get('ip')}:{cert.get('port',443)}  "
+                                f"CN=<b>{cert.get('cn','?')}</b>  "
+                                f"issuer=<i>{cert.get('issuer_cn','?')}</i>  "
+                                f"<code>{cert.get('sha256','')[:16]}…</code>",
+                                "info",
+                            )
+    except Exception as exc:
+        st.warning(f"Could not load history: {exc}")
+
+with _hist_tabs[1]:
+    st.markdown("#### IPs observed across multiple targets")
+    _explainer("Non-Cloudflare IPs shared by more than one analysed target are strong indicators of shared hosting infrastructure.")
+    try:
+        clusters = cluster_by_ip()
+        if not clusters:
+            st.info("No shared IPs yet — analyse more targets to build clusters.")
+        else:
+            for row in clusters:
+                targets = str(row.get("targets", "")).split(",")
+                _hit_box(
+                    f"🌐 <b>{row['ip']}</b> — seen across <b>{row['target_count']}</b> targets: "
+                    f"<code>{', '.join(targets[:10])}</code>",
+                    "warn",
+                )
+    except Exception as exc:
+        st.warning(f"Could not load IP clusters: {exc}")
+
+with _hist_tabs[2]:
+    st.markdown("#### Tracking / analytics IDs shared across targets")
+    _explainer("The same GA, GTM, Facebook Pixel, TikTok Pixel, or Yandex Metrika ID on multiple domains is one of the strongest operator attribution signals available.")
+    try:
+        clusters = cluster_by_tracking_id()
+        if not clusters:
+            st.info("No shared tracking IDs yet.")
+        else:
+            _TRACK_ICONS = {
+                "ga":             "📊 Google Analytics",
+                "gtm":            "📦 Google Tag Manager",
+                "fb_pixel":       "📘 Facebook Pixel",
+                "tiktok_pixel":   "🎵 TikTok Pixel",
+                "yandex_metrika": "🇷🇺 Yandex Metrika",
+            }
+            for row in clusters:
+                targets = str(row.get("targets", "")).split(",")
+                label = _TRACK_ICONS.get(row.get("id_type", ""), row.get("id_type", ""))
+                level = "bad" if row.get("id_type") == "yandex_metrika" else "warn"
+                _hit_box(
+                    f"{label} <code>{row.get('id_value')}</code> — "
+                    f"<b>{row['target_count']}</b> targets: "
+                    f"<code>{', '.join(targets[:10])}</code>",
+                    level,
+                )
+    except Exception as exc:
+        st.warning(f"Could not load tracking clusters: {exc}")
+
+with _hist_tabs[3]:
+    st.markdown("#### Favicon MD5 hashes shared across targets")
+    _explainer("Identical favicons across domains = same operator or same CMS template. Strong fingerprint for infrastructure clusters.")
+    try:
+        clusters = cluster_by_favicon()
+        if not clusters:
+            st.info("No shared favicons yet.")
+        else:
+            for row in clusters:
+                targets = str(row.get("targets", "")).split(",")
+                _hit_box(
+                    f"🖼 MD5 <code>{row['md5']}</code> — "
+                    f"<b>{row['target_count']}</b> targets: "
+                    f"<code>{', '.join(targets[:10])}</code>",
+                    "warn",
+                )
+    except Exception as exc:
+        st.warning(f"Could not load favicon clusters: {exc}")
+
+with _hist_tabs[4]:
+    st.markdown("#### TLS fingerprints shared across targets")
+    _explainer("The same TLS certificate (by SHA-256) served by multiple targets means the same server is handling them — definitive infrastructure link.")
+    try:
+        clusters = cluster_by_tls_cert()
+        if not clusters:
+            st.info("No shared TLS fingerprints yet.")
+        else:
+            for row in clusters:
+                targets = str(row.get("targets", "")).split(",")
+                _hit_box(
+                    f"🔐 CN=<b>{row.get('cn','?')}</b>  issuer=<i>{row.get('issuer_cn','?')}</i><br>"
+                    f"SHA-256 <code>{row.get('sha256','')[:32]}…</code> — "
+                    f"<b>{row['target_count']}</b> targets: "
+                    f"<code>{', '.join(targets[:10])}</code>",
+                    "bad",
+                )
+    except Exception as exc:
+        st.warning(f"Could not load TLS clusters: {exc}")

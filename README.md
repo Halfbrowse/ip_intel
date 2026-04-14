@@ -1,20 +1,22 @@
 # IP Intel
 
-Domain and IP OSINT tool for infrastructure reconnaissance and FIMI (Foreign Information Manipulation and Interference) analysis. Given a domain or IP, it aggregates data from multiple free and optional paid sources to map hosting infrastructure, discover origin IPs hidden behind CDNs like Cloudflare, and surface risk indicators.
+Domain and IP OSINT tool for infrastructure reconnaissance and FIMI (Foreign Information Manipulation and Interference) analysis. Given a domain or IP, it queries multiple free and optional paid sources to map hosting infrastructure, discover origin IPs hidden behind Cloudflare, and surface attribution signals.
 
 ---
 
-## Tools
+## Files
 
 | File | Purpose |
 |---|---|
-| `ip_intel.py` | Core intelligence engine — DNS, WHOIS, crt.sh, passive DNS, Censys/Shodan/Netlas, origin IP scanning |
-| `app.py` | Streamlit web UI frontend for `ip_intel.py` |
-| `fimi_intel.py` | Standalone FIMI-focused scanner — lighter-weight, no API keys required, generates abuse report targets |
+| `ip_intel.py` | Core intelligence engine — all data collection, scanning, and analysis logic |
+| `app.py` | Streamlit web UI frontend |
+| `intel_db.py` | SQLite persistence layer — stores and cross-references every search |
+
+For a detailed breakdown of every data source, what it returns, and what it cannot tell you, see [`PROVIDERS.md`](PROVIDERS.md).
 
 ---
 
-## Workflow
+## Setup
 
 ### 1. Install dependencies
 
@@ -22,9 +24,13 @@ Domain and IP OSINT tool for infrastructure reconnaissance and FIMI (Foreign Inf
 uv sync
 ```
 
-### 2. Configure API keys (optional but recommended)
+### 2. Configure API keys (optional)
 
-Copy `.env.example` to `.env` and fill in keys for enhanced coverage:
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and fill in keys for enhanced coverage:
 
 ```
 CENSYS_API_KEY=<personal-access-token>
@@ -32,15 +38,9 @@ SHODAN_API_KEY=<your-api-key>
 NETLAS_API_KEY=<your-api-key>
 ```
 
-All three are optional. Without them the tool still runs all free-tier sources.
+All three are optional. Without them the tool runs all free-tier sources.
 
 ### 3. Run
-
-**CLI — full analysis:**
-
-```bash
-uv run ip_intel.py example.com
-```
 
 **Streamlit web UI:**
 
@@ -48,74 +48,112 @@ uv run ip_intel.py example.com
 uv run streamlit run app.py
 ```
 
-**FIMI-only scan (no API keys needed):**
+**CLI:**
 
 ```bash
-uv run fimi_intel.py example.com
-uv run fimi_intel.py example.com --output report.json
+uv run ip_intel.py example.com
+uv run ip_intel.py 1.2.3.4
 ```
 
 ---
 
-## Data Sources
+## How it works
+
+Every analysis runs in two concurrent groups followed by optional active scans:
+
+**Group 1** — all concurrent:
+WHOIS · DNS (A/AAAA/MX/NS/TXT/SOA/CNAME) · crt.sh · CIRCL Passive DNS · page metadata · DMARC/DKIM
+
+**Post-processing** (fast, no I/O):
+SPF `ip4:`/`ip6:` extraction · CT subdomain split
+
+**Group 2** — all concurrent:
+Zone transfer · subdomain origin probe · MX origin probe · wordlist probe · HackerTarget hostsearch · urlscan.io · Censys · Shodan · Netlas
+
+**Active scans** (opt-in, sequential):
+Each runs a two-phase sweep — Phase 1 port scan via `masscan` (or async TCP fallback), Phase 2 TLS cert match on responsive hosts.
+
+**IP enrichment + TLS probe** — all concurrent:
+Every non-Cloudflare IP gets PTR · ASN/RDAP · HackerTarget reverse-IP · live TLS cert grab.
+
+Results are persisted to `ip_intel.db` (SQLite).
+
+---
+
+## Data sources
 
 ### Always free (no key required)
 
 | Source | What it provides |
 |---|---|
-| `dnspython` | A, AAAA, MX, NS, TXT, SOA, CNAME, PTR records |
-| `python-whois` | Domain registration, registrar, nameservers, age |
-| `ipwhois` / RDAP | ASN, network org, country for an IP |
-| crt.sh | Certificate transparency — subdomains via SANs, linked domains, CA history |
-| HackerTarget | Reverse IP lookup — other domains on the same host |
-| CIRCL Passive DNS | Historical DNS records |
-| SPF record parsing | ip4: entries that leak origin IPs |
-| urlscan.io | Historical scan IPs and page metadata |
-| Wayback CDX | Snapshot history from Internet Archive |
-| Common Crawl | Index presence check |
-| Subdomain probing | ~20 common subdomains (mail, staging, api, …) resolved and checked against Cloudflare ranges |
+| DNS (`dnspython`) | A, AAAA, MX, NS, TXT, SOA, CNAME records; PTR lookups; zone transfer attempts |
+| WHOIS (`python-whois`) | Registrar, creation/expiry dates, registrant org/country/email |
+| IP WHOIS / RDAP (`ipwhois`) | ASN, network org, country for every discovered IP |
+| crt.sh | Certificate transparency — all subdomains via SANs, issuer history, cross-domain SANs |
+| CIRCL Passive DNS | Historical A/AAAA records with first-seen / last-seen timestamps |
+| HackerTarget | Subdomain + IP pairs (hostsearch); other domains on same server (reverse-IP) |
+| urlscan.io | Historical scan snapshots — IPs that served the domain in the past |
+| SPF parsing | `ip4:`/`ip6:` directives extracted as origin candidates (no extra DNS call) |
+| DMARC / DKIM | Email auth policy; DKIM selector names reveal mail provider (Yandex, Google, M365) |
+| Page metadata | GA/GTM IDs, Facebook/TikTok/Yandex Metrika pixels, social handles (Telegram, VK, OK, Twitter, TikTok, Instagram, Facebook, YouTube), CMS generator, favicon MD5 |
+| RIPE Stat | Full IPv4 allocations per ASN or country — feeds active scans |
+| GCP IP ranges | Live GCP CIDR list filtered by region |
 
 ### Optional (API key required)
 
 | Source | Env var | What it adds |
 |---|---|---|
-| Censys | `CENSYS_API_KEY` | Search indexed TLS certs for IPs currently serving the domain's certificate |
-| Shodan | `SHODAN_API_KEY` | Search indexed banners for `ssl:"domain"` hits |
-| Netlas | `NETLAS_API_KEY` | Search TLS banners by cert CN — free tier available |
+| Censys | `CENSYS_API_KEY` | IPs currently presenting the domain's TLS cert (indexed scan data) |
+| Shodan | `SHODAN_API_KEY` | Hosts matching `ssl:"domain"` in Shodan's banner database |
+| Netlas | `NETLAS_API_KEY` | IPs serving matching TLS cert CN — free tier ~50 queries/day |
 
-### Active scanning (opt-in in UI)
-
-The Streamlit UI exposes scan modes that do targeted TCP+TLS sweeps of IP ranges to find the cert CN directly:
+### Active scans (opt-in)
 
 | Mode | Scope |
 |---|---|
-| Eastern-EU GCP | GCP regions closest to Russia/Ukraine (requires a GTS CA cert in history) |
-| All-EU GCP + Turkey | All 14 European GCP regions + me-west1 |
-| Known RU/EU hosters | Hetzner, OVH, M247, Aeza, Selectel, TimeWeb, Beget, Serverius, Frantech, etc. via RIPE Stat |
-| All EU member states | IPv4 allocations for all 27 EU states via RIPE Stat |
-| Full scan | EU countries + known providers + GCP Europe combined |
+| Eastern-EU GCP | 7 GCP regions near Russia/Ukraine |
+| All-EU GCP + Turkey | 14 GCP regions (13 European + me-west1 / Tel Aviv) |
 | Global GCP | Every GCP region worldwide |
-| Custom countries | Any ISO-3166 country codes — fetches full national allocations from RIPE Stat |
+| Known RU/EU hosters | Hetzner, OVH, M247, Aeza, Selectel, TimeWeb, Beget, Serverius, Frantech, and more — IP ranges fetched live from RIPE Stat |
+| All EU member states | IPv4 allocations for all 27 EU states via RIPE Stat |
+| Custom countries | Any ISO-3166 country codes — full national IPv4 allocation |
+| Full scan | EU countries + known providers + EU GCP combined |
 
-Uses `masscan` if installed for speed, falls back to async TCP otherwise.
+Uses `masscan` if installed (`sudo apt install masscan`), falls back to async TCP otherwise.
 
 ---
 
 ## Output
 
-Results are saved to `results/<domain>_<date>.json`. The file contains structured output for every module: WHOIS, DNS, IP/ASN, certificate data, origin candidates with verification status, Wayback history, urlscan history, and a FIMI risk indicator summary.
+**SQLite database** — `ip_intel.db`
+
+Every search is persisted with normalised pivot tables so you can cross-reference across targets:
+
+| Table | Contents |
+|---|---|
+| `searches` | One row per scan with full raw JSON |
+| `ips` | Every IP seen, with source, ASN, country, PTR |
+| `tls_certs` | Live-grabbed TLS certs with SHA-256 fingerprint |
+| `ct_certs` | Certificate transparency records from crt.sh |
+| `subdomains` | Subdomains from crt.sh and zone transfers |
+| `dns_records` | Live DNS records |
+| `historical_dns` | CIRCL pDNS records |
+| `tracking_ids` | GA/GTM/FB pixel/TikTok/Yandex Metrika IDs |
+| `social_accounts` | Social handles and URLs found on the page |
+
+The Streamlit UI also exposes clustering views — find all scans sharing the same IP, TLS cert fingerprint, tracking ID, or favicon hash.
+
+**JSON results** — `results/<domain>_<timestamp>.json`
+
+Full structured output for every module, written alongside the database entry.
 
 ---
 
-## FIMI Risk Indicators
+## masscan setup (optional, recommended for large scans)
 
-`fimi_intel.py` and `ip_intel.py` both flag:
+```bash
+sudo apt install masscan
+sudo setcap cap_net_raw+ep $(which masscan)
+```
 
-- Domain registered less than 1 year ago
-- Hosting in elevated-risk jurisdictions (RU, CN, BY, IR, KP)
-- Exclusively Let's Encrypt certificates
-- Other domains sharing the same certificate (infrastructure overlap)
-- Confirmed live origin IPs (port 80/443 responds)
-- Absent from Common Crawl index (possible crawler blocking)
-
-The scan output also lists abuse report contacts for the detected hosting provider (AWS, Cloudflare, Hetzner, OVH, etc.) and links to ICANN, Google Safe Browsing, EUvsDisinfo, and EDMO.
+The `setcap` command grants raw socket access without requiring `sudo` on every run. Without it the tool falls back to async TCP, which is slower but works without any extra permissions.

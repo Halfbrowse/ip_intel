@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv pip install --system --no-cache -r pyproject.toml
 
 # Copy application code
-COPY app.py ip_intel.py ./
+COPY app.py ip_intel.py intel_db.py ./
 
 EXPOSE 8501
 
