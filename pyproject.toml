@@ -16,6 +16,9 @@ dependencies = [
     "cryptography>=42.0",
     "colorama>=0.4.6",
     "streamlit>=1.35",
+    "pyvis>=0.3",
+    "pycti>=6.0",
+    "libmagic>=1.0",
 ]
 
 [project.scripts]

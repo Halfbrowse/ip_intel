@@ -526,6 +526,23 @@ def get_recent(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_domains_with_source_errors(source: str | None = None) -> list[dict]:
+    """Searches where one or more external sources returned an error (e.g. 429 rate limit)."""
+    import json as _json
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, target, timestamp, json_extract(raw_json, '$.source_errors') AS errors "
+            "FROM searches WHERE json_extract(raw_json, '$.source_errors') IS NOT NULL",
+        ).fetchall()
+    results = []
+    for row in rows:
+        errors = _json.loads(row["errors"]) if row["errors"] else []
+        if source is None or source in errors:
+            results.append({"id": row["id"], "target": row["target"], "timestamp": row["timestamp"], "errors": errors})
+    return results
+
+
 def get_by_id(sid: int) -> dict | None:
     """Full row including raw_json."""
     init_db()
@@ -651,19 +668,119 @@ def find_by_cross_san(san: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ── Passive IP classification ─────────────────────────────────────────────────
+# Labels: "mail", "cdn_proxy", "shared_hosting", "direct"
+# Used to surface noise in the cluster UI without hard-filtering anything —
+# callers can decide what to show or hide.
+
+_MAIL_ASNS = {"15169", "16276", "8075", "3215", "394161"}  # Google, OVH, Microsoft, Orange, Google Workspace
+_CDN_PROXY_ASNS = {"13335", "19551", "54113", "20940", "60626", "394536", "22822", "16625"}  # CF, Incapsula, Fastly, Akamai, etc.
+_SHARED_HOSTING_ASNS = {"2635", "27647", "61493", "2025"}  # Automattic, Weebly, Squarespace, Tumblr
+
+_MAIL_PTR_PATTERNS = ("1e100.net", "google.com", "mail.ovh.", "smtp.", "mx.", "-mx-", "mail-", "mailout", "mxbiz")
+_CDN_PROXY_PTR_PATTERNS = ("incapsula.com", "cloudflare.com", "cloudflare.net", "fastly.net",
+                            "akamai.net", "akamaiedge.net", "akamaized.net", "edgecast.net",
+                            "sucuri.net", "imperva.com", "cdn.")
+_SHARED_HOSTING_PTR_PATTERNS = ("wildcard.", "weebly.com", "wordpress.com", "wix.com",
+                                 "squarespace.com", "cluster", "shared-", "hosting.")
+_EMAIL_SOURCES = {"mx_record", "spf"}
+
+
+def classify_ip(ip: str, ptr: str | None, asn: str | None, sources: str | None) -> str:
+    """
+    Passively classify an IP using PTR hostname, ASN, and discovery sources.
+    Returns one of: 'mail', 'cdn_proxy', 'shared_hosting', 'direct'.
+    """
+    ptr_l = (ptr or "").lower()
+    src_set = set((sources or "").split(","))
+
+    # Mail: came exclusively from MX/SPF lookups, or PTR/ASN screams mail
+    if src_set and src_set <= _EMAIL_SOURCES:
+        return "mail"
+    if asn in _MAIL_ASNS and src_set <= _EMAIL_SOURCES | {"dns"}:
+        return "mail"
+    if any(p in ptr_l for p in _MAIL_PTR_PATTERNS):
+        return "mail"
+
+    # CDN / reverse proxy
+    if asn in _CDN_PROXY_ASNS:
+        return "cdn_proxy"
+    if any(p in ptr_l for p in _CDN_PROXY_PTR_PATTERNS):
+        return "cdn_proxy"
+
+    # Shared hosting platforms
+    if asn in _SHARED_HOSTING_ASNS:
+        return "shared_hosting"
+    if any(p in ptr_l for p in _SHARED_HOSTING_PTR_PATTERNS):
+        return "shared_hosting"
+
+    return "direct"
+
+
+def _dedup_targets(targets_str: str) -> list[str]:
+    """
+    Normalize and deduplicate a comma-separated target list.
+    Strips www. prefix so 'www.example.com' and 'example.com' collapse into one.
+    Prefers the non-www form when both exist.
+    """
+    seen: dict[str, str] = {}  # norm -> display
+    for t in targets_str.split(","):
+        t = t.strip()
+        if not t:
+            continue
+        norm = t[4:] if t.lower().startswith("www.") else t
+        if norm not in seen or t == norm:   # prefer bare domain
+            seen[norm] = t
+    return list(seen.values())
+
+
+def _recount(raw_rows: list[dict]) -> list[dict]:
+    """
+    Post-process cluster query results: deduplicate targets (www. collapse),
+    recompute target_count, and drop any row that falls to < 2 unique targets.
+    """
+    out = []
+    for row in raw_rows:
+        deduped = _dedup_targets(str(row.get("targets", "")))
+        if len(deduped) < 2:
+            continue
+        d = dict(row)
+        d["targets"] = ",".join(deduped)
+        d["target_count"] = len(deduped)
+        out.append(d)
+    return out
+
+
 def cluster_by_ip() -> list[dict]:
-    """IPs seen across multiple targets — top candidates for shared infra."""
+    """
+    IPs seen across multiple targets, with passive classification.
+    Returns all shared IPs including mail/CDN/shared-hosting so the UI
+    can filter or highlight them rather than silently dropping them.
+    """
     init_db()
     with _conn() as c:
         rows = c.execute(
-            """SELECT i.ip, COUNT(DISTINCT s.target) AS target_count,
+            """SELECT i.ip, MAX(i.ptr) AS ptr, MAX(i.asn) AS asn, MAX(i.asn_desc) AS asn_desc,
+                      GROUP_CONCAT(DISTINCT i.source) AS sources,
+                      COUNT(DISTINCT s.target) AS target_count,
                       GROUP_CONCAT(DISTINCT s.target) AS targets
                FROM ips i JOIN searches s ON i.search_id = s.id
                WHERE i.cloudflare = 0 OR i.cloudflare IS NULL
                GROUP BY i.ip HAVING target_count > 1
-               ORDER BY target_count DESC LIMIT 50""",
+               ORDER BY target_count DESC""",
         ).fetchall()
-    return [dict(r) for r in rows]
+    raw = []
+    for row in rows:
+        d = dict(row)
+        d["label"] = classify_ip(d["ip"], d.get("ptr"), d.get("asn"), d.get("sources"))
+        raw.append(d)
+    # Dedup www./non-www targets, then re-apply label on surviving rows
+    results = []
+    for d in _recount(raw):
+        if "label" not in d:
+            d["label"] = classify_ip(d["ip"], d.get("ptr"), d.get("asn"), d.get("sources"))
+        results.append(d)
+    return results
 
 
 def cluster_by_tracking_id() -> list[dict]:
@@ -675,9 +792,9 @@ def cluster_by_tracking_id() -> list[dict]:
                       GROUP_CONCAT(DISTINCT s.target) AS targets
                FROM tracking_ids t JOIN searches s ON t.search_id = s.id
                GROUP BY t.id_type, t.id_value HAVING target_count > 1
-               ORDER BY target_count DESC LIMIT 50""",
+               ORDER BY target_count DESC""",
         ).fetchall()
-    return [dict(r) for r in rows]
+    return _recount([dict(r) for r in rows])
 
 
 def cluster_by_favicon() -> list[dict]:
@@ -689,9 +806,9 @@ def cluster_by_favicon() -> list[dict]:
                       GROUP_CONCAT(DISTINCT s.target) AS targets
                FROM favicons f JOIN searches s ON f.search_id = s.id
                GROUP BY f.md5 HAVING target_count > 1
-               ORDER BY target_count DESC LIMIT 50""",
+               ORDER BY target_count DESC""",
         ).fetchall()
-    return [dict(r) for r in rows]
+    return _recount([dict(r) for r in rows])
 
 
 def cluster_by_tls_cert() -> list[dict]:
@@ -703,6 +820,166 @@ def cluster_by_tls_cert() -> list[dict]:
                       GROUP_CONCAT(DISTINCT s.target) AS targets
                FROM tls_certs t JOIN searches s ON t.search_id = s.id
                GROUP BY t.sha256 HAVING target_count > 1
-               ORDER BY target_count DESC LIMIT 50""",
+               ORDER BY target_count DESC""",
         ).fetchall()
-    return [dict(r) for r in rows]
+    return _recount([dict(r) for r in rows])
+
+
+# ── Per-target connections breakdown ─────────────────────────────────────────
+
+# Generic registrar/abuse emails that aren't meaningful operator signals
+_GENERIC_EMAILS = {
+    "abuse@godaddy.com", "domain.operations@web.com",
+    "abuse@namecheap.com", "abuse@networksolutions.com",
+    "noreply@domains.google.com", "registrar@enom.com",
+    "abuse@tucows.com", "abuse@pairdomains.com",
+}
+
+
+def get_connections_for_target(target: str) -> dict | None:
+    """
+    Full cross-reference breakdown for a single target against every other
+    domain in the database.
+
+    Tries both the raw target and its www./non-www variant.
+    Returns None if the target is not in the database.
+    """
+    init_db()
+    norm = target.strip()
+    alt  = norm[4:] if norm.startswith("www.") else "www." + norm
+
+    with _conn() as c:
+        row = (
+            c.execute("SELECT * FROM searches WHERE target=?", (norm,)).fetchone()
+            or c.execute("SELECT * FROM searches WHERE target=?", (alt,)).fetchone()
+        )
+        if not row:
+            return None
+
+        sid = row["id"]
+
+        def _others_by(table: str, col: str, val: str) -> list[str]:
+            """All targets that share a single attribute value, deduped."""
+            rows = c.execute(
+                f"SELECT DISTINCT s.target FROM searches s "
+                f"JOIN {table} x ON s.id=x.search_id "
+                f"WHERE x.{col}=? AND s.id!=?",
+                (val, sid),
+            ).fetchall()
+            return _dedup_targets(",".join(r["target"] for r in rows))
+
+        # ── WHOIS summary ─────────────────────────────────────────────────────
+        w = c.execute(
+            "SELECT registrar, creation_date, expiry_date, org, country FROM whois_data WHERE search_id=?",
+            (sid,),
+        ).fetchone()
+
+        # ── Tracking IDs ──────────────────────────────────────────────────────
+        tracking = []
+        for t in c.execute("SELECT id_type, id_value FROM tracking_ids WHERE search_id=?", (sid,)).fetchall():
+            tracking.append({
+                "id_type":     t["id_type"],
+                "id_value":    t["id_value"],
+                "shared_with": _others_by("tracking_ids", "id_value", t["id_value"]),
+            })
+
+        # ── IPs (non-CF) ──────────────────────────────────────────────────────
+        ips = []
+        seen_ips: set[str] = set()
+        for ip_row in c.execute(
+            "SELECT ip, source, ptr, asn, asn_desc, country, cloudflare "
+            "FROM ips WHERE search_id=?", (sid,)
+        ).fetchall():
+            ip = ip_row["ip"]
+            if ip in seen_ips:
+                continue
+            seen_ips.add(ip)
+            others = c.execute(
+                "SELECT DISTINCT s.target, i.source FROM searches s "
+                "JOIN ips i ON s.id=i.search_id WHERE i.ip=? AND s.id!=?",
+                (ip, sid),
+            ).fetchall()
+            deduped = _dedup_targets(",".join(r["target"] for r in others))
+            ips.append({
+                "ip":          ip,
+                "source":      ip_row["source"],
+                "ptr":         ip_row["ptr"],
+                "asn_desc":    ip_row["asn_desc"],
+                "country":     ip_row["country"],
+                "cloudflare":  ip_row["cloudflare"],
+                "shared_with": deduped,
+            })
+
+        # ── TLS certs ─────────────────────────────────────────────────────────
+        tls = []
+        seen_fp: set[str] = set()
+        for cert in c.execute(
+            "SELECT sha256, cn, sans, issuer_cn, ip, not_before, not_after "
+            "FROM tls_certs WHERE search_id=?", (sid,)
+        ).fetchall():
+            fp = cert["sha256"]
+            if not fp or fp in seen_fp:
+                continue
+            seen_fp.add(fp)
+            tls.append({
+                "sha256":      fp,
+                "cn":          cert["cn"],
+                "sans":        cert["sans"],
+                "issuer_cn":   cert["issuer_cn"],
+                "ip":          cert["ip"],
+                "not_before":  cert["not_before"],
+                "not_after":   cert["not_after"],
+                "shared_with": _others_by("tls_certs", "sha256", fp),
+            })
+
+        # ── Favicons ──────────────────────────────────────────────────────────
+        favicons = []
+        for fav in c.execute("SELECT md5 FROM favicons WHERE search_id=?", (sid,)).fetchall():
+            favicons.append({
+                "md5":         fav["md5"],
+                "shared_with": _others_by("favicons", "md5", fav["md5"]),
+            })
+
+        # ── Registrant emails (skip generic ones) ─────────────────────────────
+        emails = []
+        for e in c.execute("SELECT email FROM registrant_emails WHERE search_id=?", (sid,)).fetchall():
+            em = e["email"]
+            if em in _GENERIC_EMAILS:
+                continue
+            emails.append({
+                "email":       em,
+                "shared_with": _others_by("registrant_emails", "email", em),
+            })
+
+        # ── Nameservers ───────────────────────────────────────────────────────
+        nameservers = []
+        for ns in c.execute("SELECT nameserver FROM nameservers WHERE search_id=?", (sid,)).fetchall():
+            nameservers.append({
+                "nameserver":  ns["nameserver"],
+                "shared_with": _others_by("nameservers", "nameserver", ns["nameserver"]),
+            })
+
+        # ── Social handles ────────────────────────────────────────────────────
+        social = [
+            dict(r) for r in c.execute(
+                "SELECT platform, handle, url FROM social_accounts WHERE search_id=?", (sid,)
+            ).fetchall()
+        ]
+
+        return {
+            "target":             row["target"],
+            "sid":                sid,
+            "type":               row["type"],
+            "timestamp":          row["timestamp"],
+            "cloudflare_fronted": row["cloudflare_fronted"],
+            "whois":              dict(w) if w else {},
+            "connections": {
+                "tracking_ids":      tracking,
+                "ips":               ips,
+                "tls_certs":         tls,
+                "favicons":          favicons,
+                "registrant_emails": emails,
+                "nameservers":       nameservers,
+            },
+            "social": social,
+        }

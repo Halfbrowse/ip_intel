@@ -1685,9 +1685,13 @@ async def _ahackertarget_host_search(domain: str, client: httpx.AsyncClient) -> 
         return []
 
 
+_RATE_LIMITED = "__rate_limited__"
+
 async def _aurlscan_historical_ips(domain: str, client: httpx.AsyncClient) -> list:
     try:
         resp = await client.get("https://urlscan.io/api/v1/search/", params={"q": f"domain:{domain}", "size": "100"}, timeout=15.0)
+        if resp.status_code == 429:
+            return [{"_error": _RATE_LIMITED, "source": "urlscan"}]
         if resp.status_code != 200:
             return []
         seen: set[str] = set()
@@ -1701,6 +1705,117 @@ async def _aurlscan_historical_ips(domain: str, client: httpx.AsyncClient) -> li
         return results
     except Exception:
         return []
+
+
+_URLSCAN_ANALYTICS_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # GA4 gtag loader URL:  /gtag/js?id=G-XXXXXX
+    ("ga",             re.compile(r'googletagmanager\.com/gtag/js\?id=(G-[A-Z0-9]{6,12})')),
+    # GA4 collect calls:    /g/collect?...&tid=G-XXXXXX
+    ("ga",             re.compile(r'google-analytics\.com/[^?]*collect\?[^"\']*?tid=(G-[A-Z0-9]{6,12})')),
+    # Universal Analytics:  /collect?...&tid=UA-XXXXX-X
+    ("ga",             re.compile(r'google-analytics\.com/[^?]*collect\?[^"\']*?tid=(UA-\d{4,12}-\d{1,3})')),
+    # GTM loader:           /gtm.js?id=GTM-XXXXX
+    ("gtm",            re.compile(r'googletagmanager\.com/gtm\.js\?id=(GTM-[A-Z0-9]{4,8})')),
+    # Facebook Pixel:       /tr/?id=XXXXXXXXXX  (id= may be the first param)
+    ("fb_pixel",       re.compile(r'facebook\.com/tr/?\?(?:[^"\']*?[?&])?id=(\d{10,20})')),
+    # Yandex Metrika:       mc.yandex.*/watch/XXXXXXXX
+    ("yandex_metrika", re.compile(r'mc\.yandex\.(?:ru|com)/watch/(\d{5,12})')),
+    # TikTok pixel events:  analytics.tiktok.com/...?sdkid=XXXXX
+    ("tiktok_pixel",   re.compile(r'analytics\.tiktok\.com[^"\']*?[?&](?:sdkid|pixel_id)=([A-Z0-9]{15,25})')),
+]
+
+# Keys that map urlscan analytics output -> page_metadata field names
+_URLSCAN_ANALYTICS_KEY_MAP = {
+    "ga":             "google_analytics",
+    "gtm":            "gtm_ids",
+    "fb_pixel":       "facebook_pixel",
+    "yandex_metrika": "yandex_metrika",
+    "tiktok_pixel":   "tiktok_pixel",
+}
+
+
+async def _aurlscan_fetch_analytics(domain: str, client: httpx.AsyncClient) -> dict:
+    """
+    Pull analytics / tracking IDs from the most recent urlscan.io result for
+    this domain by:
+      1. Searching for the latest scan UUID
+      2. Fetching the full result JSON and parsing every request URL
+      3. Fetching the rendered DOM HTML and running the same regex extraction
+
+    Returns a dict with the same keys as page_metadata tracking fields.
+    An empty dict is returned on any failure or rate-limit.
+    """
+    out: dict[str, list[str]] = {v: [] for v in _URLSCAN_ANALYTICS_KEY_MAP.values()}
+
+    try:
+        # Step 1 — find the most recent scan for this domain
+        search_resp = await client.get(
+            "https://urlscan.io/api/v1/search/",
+            params={"q": f"domain:{domain}", "size": "5"},
+            timeout=15.0,
+        )
+        if search_resp.status_code == 429:
+            return out
+        if search_resp.status_code != 200:
+            return out
+
+        results = search_resp.json().get("results", [])
+        if not results:
+            return out
+
+        # Take the most recent scan that has a result URL
+        uuid = None
+        for hit in results:
+            uid = hit.get("task", {}).get("uuid") or hit.get("_id")
+            if uid:
+                uuid = uid
+                break
+        if not uuid:
+            return out
+
+        found: dict[str, set[str]] = {v: set() for v in _URLSCAN_ANALYTICS_KEY_MAP.values()}
+
+        # Step 2 — fetch the full result JSON, parse request URLs
+        result_resp = await client.get(
+            f"https://urlscan.io/api/v1/result/{uuid}/",
+            timeout=20.0,
+        )
+        if result_resp.status_code == 200:
+            result_json = result_resp.json()
+            requests_list = result_json.get("data", {}).get("requests", [])
+            for req_entry in requests_list:
+                url = (
+                    req_entry.get("request", {}).get("url")
+                    or req_entry.get("requests", [{}])[0].get("request", {}).get("url", "")
+                    if isinstance(req_entry.get("requests"), list)
+                    else req_entry.get("request", {}).get("url", "")
+                )
+                if not url:
+                    continue
+                for id_type, pattern in _URLSCAN_ANALYTICS_PATTERNS:
+                    for m in pattern.finditer(url):
+                        field = _URLSCAN_ANALYTICS_KEY_MAP[id_type]
+                        found[field].add(m.group(1))
+
+        # Step 3 — fetch the rendered DOM, run the same HTML extraction
+        dom_resp = await client.get(
+            f"https://urlscan.io/dom/{uuid}/",
+            timeout=20.0,
+        )
+        if dom_resp.status_code == 200:
+            dom_result = _process_page_html(dom_resp.text)
+            for id_type, field in _URLSCAN_ANALYTICS_KEY_MAP.items():
+                html_key = field  # field names match page_metadata keys
+                for val in (dom_result.get(html_key) or []):
+                    found[field].add(val)
+
+        for field, values in found.items():
+            out[field] = sorted(values)
+
+    except Exception:
+        pass
+
+    return out
 
 
 async def _afetch_page_metadata(domain: str, client: httpx.AsyncClient, save_favicon_as: Path | None = None) -> dict:
@@ -1833,10 +1948,40 @@ async def _analyze_domain_async(
             _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain)),
             _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
             _oc_task("urlscan",         _aurlscan_historical_ips(domain, client)),
+            _task("urlscan_analytics",  _aurlscan_fetch_analytics(domain, client)),
             _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
             _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
             _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
         )
+
+    # ── Merge urlscan analytics IDs into page_metadata ───────────────────────
+    # urlscan renders pages in a real browser — it catches IDs that a plain
+    # HTTP fetch misses (lazy-loaded scripts, GTM-injected tags, etc.).
+    # We merge rather than replace so both sources contribute.
+    _us_analytics = result.get("urlscan_analytics") or {}
+    if _us_analytics:
+        _pm = result.setdefault("page_metadata", {})
+        for _field, _vals in _us_analytics.items():
+            existing = _pm.get(_field) or []
+            merged   = sorted(set(existing) | set(_vals))
+            if merged:
+                _pm[_field] = merged
+        _cb("page_metadata", _pm)
+    # Remove the staging key — not needed in the final result
+    result.pop("urlscan_analytics", None)
+
+    # ── Extract source errors (e.g. rate limits) from origin_candidates ───────
+    source_errors: list[str] = []
+    oc = result.get("origin_candidates", {})
+    for src, entries in list(oc.items()):
+        if isinstance(entries, list):
+            errors   = [e for e in entries if isinstance(e, dict) and "_error" in e]
+            clean    = [e for e in entries if not (isinstance(e, dict) and "_error" in e)]
+            if errors:
+                source_errors.extend(e["source"] for e in errors)
+                oc[src] = clean
+    if source_errors:
+        result["source_errors"] = source_errors
 
     # ── Scan phases — sequential, long-running, each uses its own event loop ──
     do_gcp_europe_scan   = scan_europe   or scan_full
