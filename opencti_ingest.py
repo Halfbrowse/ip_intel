@@ -2,7 +2,7 @@
 opencti_ingest.py — Pull Domain-Name observables from OpenCTI and run
 basic ip-intel analysis on each.
 
-Runs as a daemon thread at container startup. Configuration via env vars:
+Triggered manually from the UI or API. Configuration via env vars:
   OPENCTI_URL    — e.g. https://opencti.example.com
   OPENCTI_TOKEN  — API token with read access to observables
 """
@@ -35,20 +35,34 @@ _ingest_running = False
 
 # Live status dict — read by the UI without a lock (reads are GIL-safe for simple types)
 _status: dict = {
+    "kind":          "opencti_ingestion",
     "running":       False,
     "started_at":    None,
     "completed_at":  None,
+    "mode":          None,
     "total":         0,
     "done":          0,
     "skipped":       0,
     "current":       None,
     "last_error":    None,
+    "logs":          [],
 }
 
 
 def get_ingestion_status() -> dict:
     """Return a snapshot of the current ingestion status (safe to call from any thread)."""
-    return dict(_status)
+    snapshot = dict(_status)
+    snapshot["logs"] = list(_status.get("logs") or [])
+    return snapshot
+
+
+def _append_status_log(message: str) -> None:
+    entry = f"{time.strftime('%H:%M:%S')} {message}"
+    logs = list(_status.get("logs") or [])
+    logs.append(entry)
+    if len(logs) > 250:
+        logs = logs[-250:]
+    _status["logs"] = logs
 
 
 def _run_kwargs() -> dict:
@@ -62,8 +76,8 @@ def _run_kwargs() -> dict:
 def retry_source_errors(source: str | None = None) -> int:
     """
     Re-analyse all domains that previously had source errors (e.g. urlscan 429).
-    Since save_search does an upsert, re-running overwrites the old result with
-    fresh data. Returns the number of domains retried.
+    Re-running appends a fresh result so newer history and correlations become
+    available. Returns the number of domains retried.
     Safe to call from a background thread while ingestion is still running.
     """
     global _retry_running
@@ -113,9 +127,11 @@ def _get_domains() -> list[str]:
     url   = os.getenv("OPENCTI_URL", "").strip()
     token = os.getenv("OPENCTI_TOKEN", "").strip()
     if not url or not token:
+        _append_status_log("OpenCTI credentials are not configured in this environment.")
         log.info("OPENCTI_URL or OPENCTI_TOKEN not set — skipping ingestion")
         return []
 
+    _append_status_log("Connecting to OpenCTI and fetching Domain-Name observables.")
     log.info("Connecting to OpenCTI at %s", url)
     try:
         api = OpenCTIApiClient(url, token, log_level="error")
@@ -130,9 +146,11 @@ def _get_domains() -> list[str]:
             val = val.strip().lower()
             if val:
                 domains.append(val)
+        _append_status_log(f"Fetched {len(domains)} Domain-Name observables from OpenCTI.")
         log.info("Fetched %d Domain-Name observables from OpenCTI", len(domains))
         return domains
     except Exception as exc:
+        _append_status_log(f"OpenCTI connection error: {exc}")
         log.error("OpenCTI connection error: %s", exc)
         return []
 
@@ -151,17 +169,21 @@ def _run(force_reanalyse: bool = False) -> None:
         "running":      True,
         "started_at":   time.strftime("%Y-%m-%d %H:%M:%S"),
         "completed_at": None,
+        "mode":         "full_reanalyse" if force_reanalyse else "incremental",
         "total":        0,
         "done":         0,
         "skipped":      0,
         "current":      None,
         "last_error":   None,
+        "logs":         [],
     })
 
     try:
+        _append_status_log(f"OpenCTI ingestion started ({'re-run all' if force_reanalyse else 'incremental'} mode).")
         log.info("OpenCTI ingestion starting (force_reanalyse=%s)", force_reanalyse)
         domains = _get_domains()
         if not domains:
+            _append_status_log("OpenCTI ingestion found no domains to process.")
             log.info("OpenCTI ingestion: nothing to do")
             return
 
@@ -178,22 +200,26 @@ def _run(force_reanalyse: bool = False) -> None:
             new_domains   = [d for d in domains if d not in already_done]
             skipped_count = len(domains) - len(new_domains)
 
+        _append_status_log(f"Queued {len(new_domains)} domains and skipped {skipped_count} already present entries.")
         log.info("%d new domains to analyse, %d already in DB", len(new_domains), skipped_count)
         _status.update({"total": len(new_domains), "skipped": skipped_count})
 
         for i, domain in enumerate(new_domains, 1):
             _status["current"] = domain
             _status["done"]    = i - 1
+            _append_status_log(f"[{i}/{len(new_domains)}] Analysing {domain}")
             log.info("[%d/%d] Analysing %s", i, len(new_domains), domain)
             try:
                 ip_intel.analyze_domain(domain, **_run_kwargs())
             except Exception as exc:
+                _append_status_log(f"Error on {domain}: {exc}")
                 log.error("Error on %s — %s", domain, exc)
                 _status["last_error"] = f"{domain}: {exc}"
             time.sleep(1.5)
 
         _status["done"]    = len(new_domains)
         _status["current"] = None
+        _append_status_log("OpenCTI ingestion complete.")
         log.info("OpenCTI ingestion complete")
 
     finally:
@@ -205,7 +231,7 @@ def _run(force_reanalyse: bool = False) -> None:
 def start_background_ingestion() -> None:
     """
     Launch the ingestion worker as a daemon thread on first call.
-    Safe to call multiple times — only starts once per process automatically.
+    Safe to call multiple times — only starts once per process.
     Use restart_ingestion() to manually re-trigger.
     """
     global _started
@@ -223,7 +249,7 @@ def restart_ingestion(force_reanalyse: bool = False) -> bool:
     """
     Manually re-trigger ingestion in a background thread.
 
-    force_reanalyse=False  — skips domains already in the DB (default, same as auto-start)
+    force_reanalyse=False  — skips domains already in the DB
     force_reanalyse=True   — re-analyses every domain from OpenCTI regardless
 
     Returns False if ingestion is already running.
@@ -234,9 +260,8 @@ def restart_ingestion(force_reanalyse: bool = False) -> bool:
             log.info("restart_ingestion called but already running")
             return False
 
-    # Allow future calls to start_background_ingestion to be no-ops, but we
-    # are deliberately restarting so reset _started so callers don't need to
-    # track it themselves.
+    # Keep _started true so repeated manual restarts remain explicit and no
+    # caller can accidentally trigger a second implicit start path.
     with _start_lock:
         _started = True   # keep True so the auto-start guard stays inactive
 
