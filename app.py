@@ -32,13 +32,17 @@ from intel_db import (
     cluster_by_ip,
     cluster_by_tls_cert,
     cluster_by_tracking_id,
+    get_latest_search_id_for_target,
     get_by_id,
     get_connections_for_target,
     get_domains_with_source_errors,
     get_history_for_target,
     get_recent,
     init_db,
+    summarize_related_targets,
+    update_search_payload,
 )
+from mattermost_alerts import send_process_alert
 
 try:
     import opencti_ingest as opencti
@@ -67,6 +71,7 @@ PHASES = [
     "Origin scan",
     "IP enrichment",
     "TLS probe",
+    "Recursive pivots",
 ]
 
 PHASE_KEYWORDS = {
@@ -86,6 +91,7 @@ PHASE_KEYWORDS = {
     "Origin scan": ["origin scan", "masscan", "phase 1", "phase 2", "fetching gcp", "fetching ip ranges"],
     "IP enrichment": ["ip enrichment", "ptr record", "asn"],
     "TLS probe": ["tls probe"],
+    "Recursive pivots": ["pivot analysis"],
 }
 
 CERT_TYPE_DEFINITIONS = {
@@ -153,6 +159,7 @@ SCAN_OPTION_DEFINITIONS = {
     "scan_eu_countries": "Search IPv4 space allocated to all EU member states. Useful when hosting is likely somewhere in Europe but the provider is unclear.",
     "scan_full": "Run the broadest preset: EU countries, provider ranges, and European Google Cloud in one pass.",
     "scan_all": "Search all published Google Cloud regions globally. This is the slowest option and is best reserved for strong Google-hosting leads.",
+    "expand_related": "Automatically analyse the strongest related domains and IPs discovered during the run, using a conservative one-hop pivot so the stored network grows over time.",
 }
 
 SOURCE_LABELS = {
@@ -172,6 +179,11 @@ SOURCE_LABELS = {
     "spf": "SPF record",
 }
 
+PIVOT_EXPAND_DEFAULT = False
+PIVOT_EXPAND_LIMIT_DEFAULT = 12
+PIVOT_EXPAND_LIMIT_MIN = 1
+PIVOT_EXPAND_LIMIT_MAX = 50
+
 DB_ERROR_DETAIL = (
     "The SQLite database is corrupted or unreadable. Explorer data can appear empty "
     "until the database is repaired, restored from backup, or replaced."
@@ -180,6 +192,58 @@ DB_ERROR_DETAIL = (
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _count_origin_leads(result: dict[str, Any]) -> int:
+    origin = result.get("origin_candidates") or {}
+    total = 0
+    for key in ("scan", "provider_scan", "country_scan", "censys", "shodan", "netlas"):
+        total += len((origin.get(key) or {}).get("hits") or [])
+    for key in ("subdomain_leaks", "mx_leaks", "wordlist_leaks", "hackertarget", "urlscan"):
+        total += len(origin.get(key) or [])
+    return total
+
+
+def _notify_analysis_job_finished(snapshot: dict[str, Any]) -> None:
+    status = str(snapshot.get("status") or "unknown")
+    target = snapshot.get("target")
+    options = snapshot.get("options") or {}
+    result = snapshot.get("result") or {}
+    related_summary = result.get("related_targets_summary") or {}
+    recursive = result.get("recursive_expansion") or {}
+
+    recursive_detail = "disabled"
+    if options.get("expand_related"):
+        recursive_detail = f"enabled (limit {int(options.get('expand_limit') or PIVOT_EXPAND_LIMIT_DEFAULT)})"
+        if recursive:
+            recursive_detail = (
+                f"{recursive_detail}; "
+                f"{recursive.get('analysed_count', 0)} analysed, "
+                f"{recursive.get('linked_existing_count', 0)} already known, "
+                f"{recursive.get('skipped_count', 0)} skipped"
+            )
+
+    details = {
+        "Target": target,
+        "Job ID": snapshot.get("id"),
+        "Target type": result.get("type"),
+        "Search ID": result.get("search_id"),
+        "Cloudflare fronted": result.get("cloudflare_fronted", result.get("cloudflare")),
+        "Origin leads": _count_origin_leads(result) if result else None,
+        "Related targets": related_summary.get("total"),
+        "Recursive pivoting": recursive_detail,
+        "Source errors": result.get("source_errors"),
+        "Error": snapshot.get("error"),
+    }
+
+    send_process_alert(
+        title=f"IP Intel analysis {status}",
+        status=status,
+        summary=f"Target `{target}` finished with status `{status}`.",
+        details=details,
+        started_at=snapshot.get("started_at") or snapshot.get("created_at"),
+        finished_at=snapshot.get("updated_at"),
+    )
 
 
 def _raise_db_http_error(exc: sqlite3.DatabaseError) -> None:
@@ -299,6 +363,115 @@ def _annotate_result(payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _prepare_related_target_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    annotated = _annotate_result(payload)
+    annotated["related_targets_summary"] = annotated.get("related_targets_summary") or summarize_related_targets(annotated)
+    return annotated
+
+
+def _analyze_related_target(target: str) -> dict[str, Any]:
+    if ip_intel.is_ip(target):
+        return ip_intel.analyze_ip(target)
+    return ip_intel.analyze_domain(
+        target,
+        scan=False,
+        scan_europe=False,
+        scan_all=False,
+        scan_providers=False,
+        scan_countries=[],
+        scan_eu_countries=False,
+        scan_full=False,
+        concurrency=5_000,
+        rate=100_000,
+    )
+
+
+def _expand_related_targets(job_manager: "JobManager", job_id: str, payload: dict[str, Any], *, limit: int) -> dict[str, Any]:
+    summary = summarize_related_targets(payload)
+    candidates = [item for item in summary["items"] if item.get("auto_expand")]
+    selected = candidates[:limit]
+
+    expansion = {
+        "enabled": True,
+        "depth": 1,
+        "limit": limit,
+        "discovered_total": summary["total"],
+        "expandable_total": summary["expandable"],
+        "considered": len(selected),
+        "analysed": [],
+        "linked_existing": [],
+        "skipped": [],
+    }
+
+    for item in selected:
+        target = item["target"]
+        existing_search_id = get_latest_search_id_for_target(target)
+        if existing_search_id is not None:
+            expansion["linked_existing"].append(
+                {
+                    "target": target,
+                    "target_type": item["target_type"],
+                    "score": item["score"],
+                    "sources": item["sources"],
+                    "relations": item["relations"],
+                    "search_id": existing_search_id,
+                }
+            )
+            continue
+
+        if not job_manager.claim_related_target(target):
+            expansion["skipped"].append(
+                {
+                    "target": target,
+                    "target_type": item["target_type"],
+                    "score": item["score"],
+                    "sources": item["sources"],
+                    "relations": item["relations"],
+                    "reason": "Already being analysed by another running job",
+                }
+            )
+            continue
+
+        job_manager.append_log(
+            job_id,
+            f"Pivot analysis: {target} ({item['target_type']}) via {', '.join(item['sources'])}",
+        )
+
+        try:
+            child_result = _analyze_related_target(target)
+            expansion["analysed"].append(
+                {
+                    "target": target,
+                    "target_type": item["target_type"],
+                    "score": item["score"],
+                    "sources": item["sources"],
+                    "relations": item["relations"],
+                    "timestamp": child_result.get("timestamp"),
+                    "search_id": child_result.get("search_id"),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Pivot analysis failed for %s", target)
+            expansion["skipped"].append(
+                {
+                    "target": target,
+                    "target_type": item["target_type"],
+                    "score": item["score"],
+                    "sources": item["sources"],
+                    "relations": item["relations"],
+                    "reason": str(exc),
+                }
+            )
+            job_manager.append_log(job_id, f"Pivot analysis failed for {target}: {exc}")
+        finally:
+            job_manager.release_related_target(target)
+
+    expansion["analysed_count"] = len(expansion["analysed"])
+    expansion["linked_existing_count"] = len(expansion["linked_existing"])
+    expansion["skipped_count"] = len(expansion["skipped"])
+    return expansion
+
+
 def _build_progress(logs: list[str], status: str) -> dict[str, Any]:
     completed = []
     for phase in PHASES:
@@ -355,6 +528,7 @@ class JobState:
     options: dict[str, Any]
     created_at: str
     updated_at: str
+    started_at: str | None = None
     status: str = "queued"
     logs: list[str] = field(default_factory=list)
     partial_result: dict[str, Any] = field(default_factory=dict)
@@ -365,6 +539,7 @@ class JobState:
 class JobManager:
     def __init__(self, max_workers: int = 3) -> None:
         self._jobs: dict[str, JobState] = {}
+        self._active_related_targets: set[str] = set()
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ip-intel-job")
 
@@ -405,6 +580,19 @@ class JobManager:
 
         self._mutate(job_id, _update)
 
+    def claim_related_target(self, target: str) -> bool:
+        claim_key = target.strip().lower()
+        with self._lock:
+            if claim_key in self._active_related_targets:
+                return False
+            self._active_related_targets.add(claim_key)
+        return True
+
+    def release_related_target(self, target: str) -> None:
+        claim_key = target.strip().lower()
+        with self._lock:
+            self._active_related_targets.discard(claim_key)
+
     def update_partial(self, job_id: str, key: str, value: Any) -> None:
         def _update(job: JobState) -> None:
             target = job.partial_result
@@ -417,7 +605,12 @@ class JobManager:
         self._mutate(job_id, _update)
 
     def mark_running(self, job_id: str) -> None:
-        self._mutate(job_id, lambda job: setattr(job, "status", "running"))
+        def _update(job: JobState) -> None:
+            job.status = "running"
+            if not job.started_at:
+                job.started_at = _utc_now()
+
+        self._mutate(job_id, _update)
 
     def mark_complete(self, job_id: str, result: dict[str, Any]) -> None:
         def _update(job: JobState) -> None:
@@ -427,6 +620,7 @@ class JobManager:
             job.error = None
 
         self._mutate(job_id, _update)
+        _notify_analysis_job_finished(self.snapshot(job_id))
 
     def mark_failed(self, job_id: str, error: str) -> None:
         def _update(job: JobState) -> None:
@@ -434,6 +628,7 @@ class JobManager:
             job.error = error
 
         self._mutate(job_id, _update)
+        _notify_analysis_job_finished(self.snapshot(job_id))
 
     def snapshot(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -446,7 +641,9 @@ class JobManager:
                 "status": job.status,
                 "created_at": job.created_at,
                 "updated_at": job.updated_at,
+                "started_at": job.started_at,
                 "error": job.error,
+                "options": copy.deepcopy(job.options),
                 "logs": copy.deepcopy(job.logs),
                 "partial_result": copy.deepcopy(job.partial_result),
                 "result": copy.deepcopy(job.result),
@@ -464,9 +661,9 @@ class JobManager:
 
             try:
                 if ip_intel.is_ip(target):
-                    result = ip_intel.analyze_ip(target)
+                    result = _prepare_related_target_summary(ip_intel.analyze_ip(target))
                 else:
-                    result = ip_intel.analyze_domain(
+                    result = _prepare_related_target_summary(ip_intel.analyze_domain(
                         target,
                         scan=options["scan"],
                         scan_europe=options["scan_europe"],
@@ -478,7 +675,18 @@ class JobManager:
                         concurrency=options["concurrency"],
                         rate=options["rate"],
                         on_partial=lambda key, value: self.update_partial(job_id, key, value),
+                    ))
+                if result.get("search_id"):
+                    update_search_payload(int(result["search_id"]), result)
+                if options.get("expand_related"):
+                    result["recursive_expansion"] = _expand_related_targets(
+                        self,
+                        job_id,
+                        result,
+                        limit=int(options.get("expand_limit") or PIVOT_EXPAND_LIMIT_DEFAULT),
                     )
+                    if result.get("search_id"):
+                        update_search_payload(int(result["search_id"]), result)
                 self.mark_complete(job_id, result)
             finally:
                 ip_intel.reset_log_handler(log_token)
@@ -499,6 +707,8 @@ class AnalyzeRequest(BaseModel):
     scan_countries: list[str] = Field(default_factory=list)
     scan_eu_countries: bool = False
     scan_full: bool = False
+    expand_related: bool = PIVOT_EXPAND_DEFAULT
+    expand_limit: int = Field(default=PIVOT_EXPAND_LIMIT_DEFAULT, ge=PIVOT_EXPAND_LIMIT_MIN, le=PIVOT_EXPAND_LIMIT_MAX)
     concurrency: int = Field(default=5_000, ge=100, le=50_000)
     rate: int = Field(default=100_000, ge=100, le=500_000)
 
@@ -544,6 +754,12 @@ def meta() -> dict[str, Any]:
         "cert_types": CERT_TYPE_DEFINITIONS,
         "server_types": SERVER_TYPE_DEFINITIONS,
         "source_labels": SOURCE_LABELS,
+        "pivot_options": {
+            "expand_related_default": PIVOT_EXPAND_DEFAULT,
+            "expand_limit_default": PIVOT_EXPAND_LIMIT_DEFAULT,
+            "expand_limit_min": PIVOT_EXPAND_LIMIT_MIN,
+            "expand_limit_max": PIVOT_EXPAND_LIMIT_MAX,
+        },
     }
 
 
@@ -594,7 +810,7 @@ def history_detail(search_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Search not found.")
 
     raw = row.get("raw_json")
-    parsed = _annotate_result(json.loads(raw)) if raw else None
+    parsed = _prepare_related_target_summary(json.loads(raw)) if raw else None
     return {"search": {k: v for k, v in row.items() if k != "raw_json"}, "result": parsed}
 
 

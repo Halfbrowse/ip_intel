@@ -22,7 +22,7 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 | `ip_intel.py` | Core intelligence engine and scanning/origin-discovery pipeline |
 | `intel_db.py` | SQLite schema, persistence, history, clustering, and connection queries |
 | `opencti_ingest.py` | Manual OpenCTI ingestion worker and progress status feed |
-| `ip_intel.db` / `IP_INTEL_DB_PATH` | SQLite database with saved runs and derived observations |
+| `data/ip_intel.db` / `IP_INTEL_DB_PATH` | SQLite database with saved runs and derived observations |
 
 ## Storage Model
 
@@ -40,6 +40,8 @@ uv run uvicorn app:app --reload
 ```
 
 The API runs on `http://127.0.0.1:8000`.
+
+By default, local runs now use `data/ip_intel.db`. If you still have an older `ip_intel.db` in the repo root, that is a legacy location and is no longer the default.
 
 ### Frontend
 
@@ -79,7 +81,7 @@ The Docker setup:
 
 - builds the React frontend in a Node stage
 - runs the FastAPI backend with Uvicorn on port `9000`
-- stores SQLite under `./data/ip_intel.db` via `IP_INTEL_DB_PATH=/data/ip_intel.db`
+- stores SQLite under `./data/ip_intel.db`; the Compose override keeps the container path aligned as `/data/ip_intel.db`
 - mounts the whole `./data` directory so SQLite `-wal` and `-shm` sidecar files persist safely across rebuilds
 
 ## API Overview

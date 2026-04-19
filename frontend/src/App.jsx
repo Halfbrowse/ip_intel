@@ -84,6 +84,16 @@ const CONNECTION_SECTIONS = [
     key: "nameservers",
     title: "Nameservers",
     infoBody: "Nameservers are where the domain’s DNS is hosted. Shared nameservers can be useful background context, but they are not always a strong ownership signal."
+  },
+  {
+    key: "discovered_domains",
+    title: "Discovered domains",
+    infoBody: "These are related domains surfaced during collection, such as reverse-IP pivots, subdomains, SAN overlaps, aliases, and other infrastructure-adjacent leads."
+  },
+  {
+    key: "discovered_ips",
+    title: "Discovered IPs",
+    infoBody: "These are IPs surfaced during collection from DNS, historical DNS, provider hits, scans, and certificate observations. They become useful pivot points as the database grows."
   }
 ];
 
@@ -257,6 +267,25 @@ function formatNumber(value) {
     return "0";
   }
   return numberFormatter.format(value);
+}
+
+function clampNumber(value, minimum, maximum) {
+  let nextValue = value;
+  if (typeof minimum === "number") {
+    nextValue = Math.max(minimum, nextValue);
+  }
+  if (typeof maximum === "number") {
+    nextValue = Math.min(maximum, nextValue);
+  }
+  return nextValue;
+}
+
+function parseIntegerInput(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return clampNumber(parsed, minimum, maximum);
 }
 
 function downloadResult(result) {
@@ -480,6 +509,9 @@ function getConnectionItemTitle(sectionKey, item) {
   if (sectionKey === "nameservers") {
     return item.nameserver || "Nameserver";
   }
+  if (sectionKey === "discovered_domains" || sectionKey === "discovered_ips") {
+    return item.target || "Discovered target";
+  }
   return item.id_value || item.email || item.ip || item.nameserver || item.md5 || item.cn || "Link";
 }
 
@@ -567,6 +599,20 @@ function ConnectionItemDetails({ sectionKey, item, meta }) {
         {item.asn_desc || item.asn ? <p><strong>ASN:</strong> {item.asn_desc || `AS${item.asn}`}</p> : null}
         {item.org ? <p><strong>Org:</strong> {item.org}</p> : null}
         {item.country ? <p><strong>Country:</strong> {item.country}</p> : null}
+      </>
+    );
+  }
+
+  if (sectionKey === "discovered_domains" || sectionKey === "discovered_ips") {
+    return (
+      <>
+        <p><strong>Type:</strong> {item.target_type || "unknown"} | <strong>Score:</strong> {formatNumber(item.score || 0)}</p>
+        {item.relations && item.relations.length ? (
+          <p className="break-word"><strong>Relations:</strong> {item.relations.join(", ")}</p>
+        ) : null}
+        {item.sources && item.sources.length ? (
+          <p className="break-word"><strong>Sources:</strong> {item.sources.join(", ")}</p>
+        ) : null}
       </>
     );
   }
@@ -1256,11 +1302,43 @@ function JobProgress({ job }) {
   );
 }
 
-function OverviewTab({ result, meta }) {
+function RecursivePivotCards({ title, subtitle, items, onOpenSavedResult, actionLabel }) {
+  if (!items || !items.length) {
+    return null;
+  }
+
+  return (
+    <SectionCard title={title} subtitle={subtitle}>
+      <div className="card-grid">
+        {items.map((item) => (
+          <LeadCard
+            key={`${title}-${item.target_type || "target"}-${item.target}-${item.search_id || item.reason || "item"}`}
+            title={item.target}
+            footer={`${String(item.target_type || "target").toUpperCase()} | score ${formatNumber(item.score || 0)}`}
+          >
+            {item.search_id && onOpenSavedResult ? (
+              <button className="inline-action" onClick={() => onOpenSavedResult(item.search_id)} type="button">
+                {actionLabel}
+              </button>
+            ) : null}
+            {item.timestamp ? <p><strong>Saved:</strong> {formatDateTime(item.timestamp)}</p> : null}
+            <p className="break-word"><strong>Sources:</strong> {(item.sources || []).join(", ") || "unknown"}</p>
+            <p className="break-word"><strong>Relations:</strong> {(item.relations || []).join(", ") || "unknown"}</p>
+            {item.reason ? <p className="break-word"><strong>Reason:</strong> {item.reason}</p> : null}
+          </LeadCard>
+        ))}
+      </div>
+    </SectionCard>
+  );
+}
+
+function OverviewTab({ result, meta, onOpenSavedResult }) {
   const dns = result.dns || {};
   const page = result.page_metadata || {};
   const email = result.email_security || {};
   const currentCerts = result.non_cf_tls_certs || (result.tls_cert ? [result.tls_cert] : []);
+  const relatedTargets = result.related_targets_summary || {};
+  const recursiveExpansion = result.recursive_expansion || null;
   const trackingIds = [
     ...(page.google_analytics || []).map((value) => ({ label: "Google Analytics", value })),
     ...(page.gtm_ids || []).map((value) => ({ label: "Google Tag Manager", value })),
@@ -1315,6 +1393,61 @@ function OverviewTab({ result, meta }) {
           </Callout>
         )}
       </SectionCard>
+
+      {relatedTargets.total ? (
+        <SectionCard
+          title="Recursive pivot summary"
+          subtitle="What this run discovered beyond the original target, and how much of that was automatically expanded."
+          infoTitle="Recursive pivot summary"
+          infoBody="The backend extracts related domains and IPs from DNS, historical DNS, provider hits, scans, TLS, reverse-IP, and certificate evidence. The strongest new pivots can be analysed automatically so the stored network grows as you investigate."
+        >
+          <div className="metric-grid">
+            <Metric label="Related targets" value={formatNumber(relatedTargets.total || 0)} />
+            <Metric label="Domains" value={formatNumber(relatedTargets.domains || 0)} />
+            <Metric label="IPs" value={formatNumber(relatedTargets.ips || 0)} />
+            <Metric label="Expandable" value={formatNumber(relatedTargets.expandable || 0)} />
+          </div>
+          {recursiveExpansion ? (
+            <div className="metric-grid">
+              <Metric label="Auto-analysed" value={formatNumber(recursiveExpansion.analysed_count || 0)} detail="New pivots analysed during this run" />
+              <Metric label="Already known" value={formatNumber(recursiveExpansion.linked_existing_count || 0)} detail="Pivots already present in the database" />
+              <Metric label="Skipped" value={formatNumber(recursiveExpansion.skipped_count || 0)} detail={`Limit ${formatNumber(recursiveExpansion.limit || 0)} | depth ${recursiveExpansion.depth || 1}`} />
+            </div>
+          ) : null}
+          {relatedTargets.items && relatedTargets.items.length ? (
+            <div className="card-grid">
+              {relatedTargets.items.slice(0, 12).map((item) => (
+                <LeadCard key={`${item.target_type}-${item.target}`} title={item.target} footer={`${item.target_type.toUpperCase()} | score ${formatNumber(item.score || 0)}`}>
+                  <p className="break-word"><strong>Sources:</strong> {(item.sources || []).join(", ") || "unknown"}</p>
+                  <p className="break-word"><strong>Relations:</strong> {(item.relations || []).join(", ") || "unknown"}</p>
+                  <p><strong>Auto-expand:</strong> {item.auto_expand ? "Yes" : "No"}</p>
+                </LeadCard>
+              ))}
+            </div>
+          ) : null}
+          <RecursivePivotCards
+            title="Auto-analysed pivots"
+            subtitle="New related targets that were expanded during this run."
+            items={recursiveExpansion && recursiveExpansion.analysed ? recursiveExpansion.analysed : []}
+            onOpenSavedResult={onOpenSavedResult}
+            actionLabel="Open child result"
+          />
+          <RecursivePivotCards
+            title="Already-known pivots"
+            subtitle="Related targets that were already in the database, so the run linked to them instead of re-analysing them."
+            items={recursiveExpansion && recursiveExpansion.linked_existing ? recursiveExpansion.linked_existing : []}
+            onOpenSavedResult={onOpenSavedResult}
+            actionLabel="Open saved result"
+          />
+          <RecursivePivotCards
+            title="Skipped pivots"
+            subtitle="Targets that were discovered but not expanded during this run."
+            items={recursiveExpansion && recursiveExpansion.skipped ? recursiveExpansion.skipped : []}
+            onOpenSavedResult={onOpenSavedResult}
+            actionLabel="Open saved result"
+          />
+        </SectionCard>
+      ) : null}
 
       {currentCerts.length ? (
         <SectionCard
@@ -3717,7 +3850,7 @@ function SharedSignalPage({ eyebrow, title, subtitle, infoTitle, infoBody, items
   );
 }
 
-function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyze, onProvidersOnly, onOpenCtiAction, job }) {
+function InvestigatePage({ form, setForm, busy, scanHelp, pivotOptions, openctiState, onAnalyze, onProvidersOnly, onOpenCtiAction, job }) {
   const openctiJob = buildOpenctiJob(openctiState);
 
   return (
@@ -3734,6 +3867,7 @@ function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyz
           setForm={setForm}
           busy={busy}
           scanHelp={scanHelp}
+          pivotOptions={pivotOptions}
           openctiState={openctiState}
           onAnalyze={onAnalyze}
           onProvidersOnly={onProvidersOnly}
@@ -3749,6 +3883,7 @@ function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyz
             <div className="metric-grid">
               <Metric label="Fallbacks" value="Enabled" detail="Source errors do not stop the whole run" />
               <Metric label="OpenCTI" value={openctiState.running ? "Running" : "Manual"} detail="Only runs when you press the button" />
+              <Metric label="Pivoting" value={form.expand_related ? "Enabled" : "Off"} detail={form.expand_related ? `One hop, limit ${form.expand_limit}` : "Seed target only"} />
               <Metric label="Pipeline speed" value={form.concurrency} detail="Configured async concurrency" />
             </div>
           </SectionCard>
@@ -3765,7 +3900,7 @@ function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyz
   );
 }
 
-function ResultContentPage({ pageId, result, meta }) {
+function ResultContentPage({ pageId, result, meta, onOpenSavedResult }) {
   const pageMeta = RESULT_PAGES.find((page) => page.id === pageId) || RESULT_PAGES[0];
   const pageMetrics = (
     <>
@@ -3790,7 +3925,7 @@ function ResultContentPage({ pageId, result, meta }) {
       }
       metrics={pageMetrics}
     >
-      {pageId === "overview" ? <OverviewTab result={result} meta={meta} /> : null}
+      {pageId === "overview" ? <OverviewTab result={result} meta={meta} onOpenSavedResult={onOpenSavedResult} /> : null}
       {pageId === "dns" ? <DnsTab result={result} /> : null}
       {pageId === "certs" ? <CertificatesTab result={result} meta={meta} /> : null}
       {pageId === "origin" ? <OriginTab result={result} meta={meta} /> : null}
@@ -3799,7 +3934,10 @@ function ResultContentPage({ pageId, result, meta }) {
   );
 }
 
-function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, onProvidersOnly, onOpenCtiAction }) {
+function ControlPanel({ form, setForm, busy, scanHelp, pivotOptions, openctiState, onAnalyze, onProvidersOnly, onOpenCtiAction }) {
+  const pivotLimitMin = pivotOptions.expand_limit_min || 1;
+  const pivotLimitMax = pivotOptions.expand_limit_max || 50;
+
   const updateField = (key, value) => {
     setForm((current) => ({
       ...current,
@@ -3863,6 +4001,17 @@ function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, 
           />
         </div>
 
+        <div className="field-group">
+          <h3>Recursive pivoting</h3>
+          <label className="checkbox-row">
+            <input checked={form.expand_related} disabled={busy} onChange={() => toggle("expand_related")} type="checkbox" />
+            <span>
+              <strong>Auto-analyse related targets</strong>
+              <small>{scanHelp.expand_related || "Automatically analyse the strongest related domains and IPs discovered during the run."}</small>
+            </span>
+          </label>
+        </div>
+
         <div className="split-fields">
           <div className="field-row">
             <label htmlFor="concurrency">Async concurrency</label>
@@ -3875,6 +4024,22 @@ function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, 
               value={form.concurrency}
               onChange={(event) => updateField("concurrency", Number(event.target.value))}
               disabled={busy}
+            />
+          </div>
+          <div className="field-row">
+            <label htmlFor="expand_limit">Pivot limit</label>
+            <input
+              id="expand_limit"
+              min={pivotLimitMin}
+              max={pivotLimitMax}
+              step="1"
+              type="number"
+              value={form.expand_limit}
+              onChange={(event) => updateField(
+                "expand_limit",
+                parseIntegerInput(event.target.value, form.expand_limit, pivotLimitMin, pivotLimitMax)
+              )}
+              disabled={busy || !form.expand_related}
             />
           </div>
           <div className="field-row">
@@ -3945,7 +4110,8 @@ export default function App() {
   const [meta, setMeta] = useState({
     cert_types: {},
     server_types: {},
-    scan_options: {}
+    scan_options: {},
+    pivot_options: {}
   });
   const [job, setJob] = useState(null);
   const [recent, setRecent] = useState([]);
@@ -3971,6 +4137,8 @@ export default function App() {
     scan_providers: false,
     scan_eu_countries: false,
     scan_full: false,
+    expand_related: false,
+    expand_limit: 12,
     countriesText: "",
     concurrency: 5000,
     rate: 100000
@@ -4037,6 +4205,15 @@ export default function App() {
       try {
         const metaResponse = await apiFetch("/api/meta");
         setMeta(metaResponse);
+        setForm((current) => ({
+          ...current,
+          expand_related: typeof metaResponse.pivot_options?.expand_related_default === "boolean"
+            ? metaResponse.pivot_options.expand_related_default
+            : current.expand_related,
+          expand_limit: typeof metaResponse.pivot_options?.expand_limit_default === "number"
+            ? metaResponse.pivot_options.expand_limit_default
+            : current.expand_limit
+        }));
         await loadOpencti();
       } catch (error) {
         setErrorMessage(error.message);
@@ -4130,6 +4307,12 @@ export default function App() {
     setStatusMessage("");
 
     try {
+      const pivotOptions = meta.pivot_options || {};
+      const expandLimit = clampNumber(
+        Number.isFinite(form.expand_limit) ? form.expand_limit : (pivotOptions.expand_limit_default || 12),
+        pivotOptions.expand_limit_min || 1,
+        pivotOptions.expand_limit_max || 50
+      );
       const payload = {
         target: form.target,
         scan: form.scan,
@@ -4138,6 +4321,8 @@ export default function App() {
         scan_providers: form.scan_providers,
         scan_eu_countries: form.scan_eu_countries,
         scan_full: form.scan_full,
+        expand_related: form.expand_related,
+        expand_limit: expandLimit,
         scan_countries: form.countriesText.split(/\s+/).filter(Boolean),
         concurrency: form.concurrency,
         rate: form.rate,
@@ -4272,6 +4457,7 @@ export default function App() {
         setForm={setForm}
         busy={busy}
         scanHelp={meta.scan_options || {}}
+        pivotOptions={meta.pivot_options || {}}
         openctiState={openctiState}
         onAnalyze={() => submitAnalysis()}
         onProvidersOnly={() =>
@@ -4292,7 +4478,7 @@ export default function App() {
   }
 
   if (result && RESULT_PAGES.some((page) => page.id === activePage)) {
-    pageContent = <ResultContentPage pageId={activePage} result={result} meta={meta} />;
+    pageContent = <ResultContentPage pageId={activePage} result={result} meta={meta} onOpenSavedResult={openSavedResult} />;
   }
 
   if (activePage === "graph") {
