@@ -50,6 +50,7 @@ npm run dev
 ```
 
 The Vite dev server runs on `http://127.0.0.1:5173` and proxies `/api` to the FastAPI backend on `http://127.0.0.1:8000`.
+Use Node `20+` locally for the frontend toolchain.
 
 ### Production-style Local Run
 

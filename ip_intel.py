@@ -32,6 +32,7 @@ import ssl
 import socket
 import subprocess
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
@@ -58,12 +59,41 @@ from tqdm import tqdm
 
 
 RESULTS_DIR = Path(__file__).parent / "results"
+_LOG_CONTEXT = threading.local()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
-    print(f"  [*] {msg}", flush=True)
+    message = str(msg)
+    handler = getattr(_LOG_CONTEXT, "handler", None)
+    if handler is not None:
+        try:
+            handler(message)
+        except Exception:
+            pass
+    print(f"  [*] {message}", flush=True)
+
+
+def set_log_handler(handler) -> object:
+    """
+    Attach a log callback for the current worker thread.
+
+    Returns a token that can be passed back to reset_log_handler() to restore
+    the previous handler once the caller is done.
+    """
+    previous = getattr(_LOG_CONTEXT, "handler", None)
+    _LOG_CONTEXT.handler = handler
+    return previous
+
+
+def reset_log_handler(token: object) -> None:
+    """Restore the previous per-thread log callback returned by set_log_handler()."""
+    if token is None:
+        if hasattr(_LOG_CONTEXT, "handler"):
+            delattr(_LOG_CONTEXT, "handler")
+        return
+    _LOG_CONTEXT.handler = token
 
 
 def clean_target(target: str) -> str:

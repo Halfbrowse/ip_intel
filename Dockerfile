@@ -2,7 +2,7 @@ FROM node:20-slim AS frontend-build
 
 WORKDIR /frontend
 
-COPY frontend/package.json ./
+COPY frontend/package*.json ./
 COPY frontend/index.html frontend/vite.config.js ./
 COPY frontend/public ./public
 COPY frontend/src ./src
