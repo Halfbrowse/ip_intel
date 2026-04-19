@@ -2,7 +2,7 @@
 opencti_ingest.py — Pull Domain-Name observables from OpenCTI and run
 basic ip-intel analysis on each.
 
-Runs as a daemon thread at container startup. Configuration via env vars:
+This worker is triggered manually through the API/UI. Configuration via env vars:
   OPENCTI_URL    — e.g. https://opencti.example.com
   OPENCTI_TOKEN  — API token with read access to observables
 """
@@ -62,8 +62,8 @@ def _run_kwargs() -> dict:
 def retry_source_errors(source: str | None = None) -> int:
     """
     Re-analyse all domains that previously had source errors (e.g. urlscan 429).
-    Since save_search does an upsert, re-running overwrites the old result with
-    fresh data. Returns the number of domains retried.
+    The database is append-only, so each retry adds a fresh run instead of
+    overwriting the previous one. Returns the number of domains retried.
     Safe to call from a background thread while ingestion is still running.
     """
     global _retry_running
@@ -205,8 +205,8 @@ def _run(force_reanalyse: bool = False) -> None:
 def start_background_ingestion() -> None:
     """
     Launch the ingestion worker as a daemon thread on first call.
-    Safe to call multiple times — only starts once per process automatically.
-    Use restart_ingestion() to manually re-trigger.
+    Safe to call multiple times — only starts once per process.
+    Use restart_ingestion() for the manual UI/API trigger.
     """
     global _started
     with _start_lock:
@@ -223,7 +223,7 @@ def restart_ingestion(force_reanalyse: bool = False) -> bool:
     """
     Manually re-trigger ingestion in a background thread.
 
-    force_reanalyse=False  — skips domains already in the DB (default, same as auto-start)
+    force_reanalyse=False  — skips domains already in the DB
     force_reanalyse=True   — re-analyses every domain from OpenCTI regardless
 
     Returns False if ingestion is already running.

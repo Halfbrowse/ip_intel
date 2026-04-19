@@ -16,8 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-DEFAULT_DB_PATH = Path(__file__).parent / "ip_intel.db"
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DB_PATH = BASE_DIR / "data" / "ip_intel.db"
 DB_PATH = Path(os.getenv("IP_INTEL_DB_PATH", str(DEFAULT_DB_PATH))).expanduser()
+if not DB_PATH.is_absolute():
+    DB_PATH = (BASE_DIR / DB_PATH).resolve()
+else:
+    DB_PATH = DB_PATH.resolve()
 
 
 # ── Connection ────────────────────────────────────────────────────────────────

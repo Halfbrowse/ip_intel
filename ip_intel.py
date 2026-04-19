@@ -2118,9 +2118,9 @@ async def _analyze_domain_async(
 
     # ── Persist everything to SQLite ──────────────────────────────────────────
     try:
-        from intel_db import save_search
+        from intel_db import DB_PATH, save_search
         save_search(result)
-        log("Search saved to ip_intel.db")
+        log(f"Search saved to {DB_PATH}")
     except Exception as _exc:
         log(f"DB save failed: {_exc}")
 
@@ -2200,9 +2200,9 @@ def analyze_ip(ip: str) -> dict:
 
     # ── Persist to SQLite ─────────────────────────────────────────────────────
     try:
-        from intel_db import save_search
+        from intel_db import DB_PATH, save_search
         save_search(result)
-        log("Search saved to ip_intel.db")
+        log(f"Search saved to {DB_PATH}")
     except Exception as _exc:
         log(f"DB save failed: {_exc}")
 

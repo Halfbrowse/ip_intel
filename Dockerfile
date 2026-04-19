@@ -1,3 +1,16 @@
+FROM node:20-slim AS frontend-build
+
+WORKDIR /frontend
+
+COPY frontend/package.json ./
+COPY frontend/index.html frontend/vite.config.js ./
+COPY frontend/public ./public
+COPY frontend/src ./src
+
+RUN npm install
+RUN npm run build
+
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -22,10 +35,10 @@ RUN uv pip install --system --no-cache -r pyproject.toml
 
 # Copy application code
 COPY app.py ip_intel.py intel_db.py opencti_ingest.py ./
+COPY --from=frontend-build /frontend/dist ./frontend/dist
 
-EXPOSE 8501
+RUN mkdir -p /app/data
 
-CMD ["streamlit", "run", "app.py", \
-     "--server.address=0.0.0.0", \
-     "--server.port=8501", \
-     "--server.headless=true"]
+EXPOSE 8000
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
