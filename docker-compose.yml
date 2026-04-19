@@ -2,11 +2,9 @@ services:
   ip-intel:
     build: .
     ports:
-      - "9000:9000"
+      - "8501:8501"
     env_file:
       - .env
-    environment:
-      IP_INTEL_DB_PATH: /data/ip_intel.db
     volumes:
-      - ./data:/data
+      - ./ip_intel.db:/app/ip_intel.db
     restart: unless-stopped

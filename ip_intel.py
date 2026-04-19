@@ -33,9 +33,6 @@ import socket
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextvars import ContextVar
-from functools import lru_cache
-from typing import Callable
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -61,28 +58,12 @@ from tqdm import tqdm
 
 
 RESULTS_DIR = Path(__file__).parent / "results"
-_LOG_HANDLER: ContextVar[Callable[[str], None] | None] = ContextVar("ip_intel_log_handler", default=None)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
-    handler = _LOG_HANDLER.get()
-    if handler is not None:
-        try:
-            handler(msg)
-        except Exception:
-            pass
     print(f"  [*] {msg}", flush=True)
-
-
-def set_log_handler(handler):
-    """Install a per-analysis log callback and return the reset token."""
-    return _LOG_HANDLER.set(handler)
-
-
-def reset_log_handler(token) -> None:
-    _LOG_HANDLER.reset(token)
 
 
 def clean_target(target: str) -> str:
@@ -130,92 +111,6 @@ def resolve_ips(hostname: str) -> list[str]:
         except Exception:
             pass
     return ips
-
-
-_PROXY_SIGNATURES: list[tuple[str, float, tuple[str, ...]]] = [
-    ("cloudfront", 0.98, ("cloudfront", "x-amz-cf-pop", "x-amz-cf-id")),
-    ("fastly", 0.95, ("fastly", "x-served-by", "x-cache-hits", "x-timer")),
-    ("akamai", 0.95, ("akamai", "akamaighost", "x-akamai", "akamaized")),
-    ("imperva", 0.96, ("incapsula", "imperva", "x-cdn", "x-iinfo")),
-    ("sucuri", 0.96, ("sucuri", "x-sucuri-id", "x-sucuri-cache")),
-    ("azure_front_door", 0.95, ("azurefd", "x-azure-ref", "x-azure-fdid")),
-    ("google_frontend", 0.92, ("gfe", "google frontend", "via: 1.1 google")),
-    ("bunny", 0.93, ("bunnycdn", "bunny", "cdn pullzone")),
-    ("cloudflare", 0.99, ("cloudflare", "cf-ray", "cf-cache-status")),
-]
-
-
-def _socket_http_probe(ip: str, host: str | None, port: int, use_ssl: bool, timeout: float = 4.0) -> dict | None:
-    request_host = host or ip
-    try:
-        with socket.create_connection((ip, port), timeout=timeout) as raw_sock:
-            conn = raw_sock
-            if use_ssl:
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                conn = ctx.wrap_socket(raw_sock, server_hostname=request_host)
-
-            request = (
-                f"HEAD / HTTP/1.1\r\n"
-                f"Host: {request_host}\r\n"
-                f"User-Agent: ip-intel/1.0\r\n"
-                f"Accept: */*\r\n"
-                f"Connection: close\r\n\r\n"
-            ).encode("ascii", errors="ignore")
-            conn.sendall(request)
-
-            data = b""
-            while b"\r\n\r\n" not in data and len(data) < 16384:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-
-        header_blob = data.decode("iso-8859-1", errors="replace").split("\r\n\r\n", 1)[0]
-        lines = [line for line in header_blob.split("\r\n") if line]
-        if not lines:
-            return None
-
-        headers: dict[str, str] = {}
-        for line in lines[1:]:
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            headers[key.lower().strip()] = value.strip()
-
-        return {
-            "scheme": "https" if use_ssl else "http",
-            "port": port,
-            "status_line": lines[0],
-            "headers": headers,
-        }
-    except Exception:
-        return None
-
-
-def probe_http_headers(ip: str, host_hint: str | None = None, timeout: float = 4.0) -> dict | None:
-    for port, use_ssl in ((443, True), (80, False)):
-        result = _socket_http_probe(ip, host_hint, port, use_ssl, timeout=timeout)
-        if result:
-            return result
-    return None
-
-
-def detect_proxy_family(http_probe: dict | None) -> tuple[str | None, float]:
-    if not http_probe:
-        return None, 0.0
-
-    headers = http_probe.get("headers") or {}
-    text_parts = [str(http_probe.get("status_line") or "")]
-    for key, value in headers.items():
-        text_parts.append(f"{key}: {value}")
-    header_text = " | ".join(text_parts).lower()
-
-    for family, confidence, tokens in _PROXY_SIGNATURES:
-        if any(token in header_text for token in tokens):
-            return family, confidence
-    return None, 0.0
 
 
 # ── DNS ───────────────────────────────────────────────────────────────────────
@@ -596,35 +491,6 @@ def urlscan_historical_ips(domain: str) -> list[dict]:
 
 # ── Censys cert search ────────────────────────────────────────────────────────
 
-def _provider_result(
-    provider: str,
-    *,
-    mode: str,
-    status: str,
-    query_type: str | None,
-    skipped: bool = False,
-    reason: str | None = None,
-) -> dict:
-    result = {
-        "provider": provider,
-        "hits": [],
-        "origin_candidates": [],
-        "mode": mode,
-        "status": status,
-        "query_type": query_type,
-    }
-    if skipped:
-        result["skipped"] = True
-    if reason:
-        result["reason"] = reason
-    return result
-
-
-def _is_paid_only_provider_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return any(token in message for token in ("forbidden", "permission", "entitlement", "upgrade", "paid", "403"))
-
-
 def censys_cert_search(domain: str) -> dict:
     """
     Search Censys Platform for hosts currently serving a TLS cert whose CN
@@ -637,11 +503,11 @@ def censys_cert_search(domain: str) -> dict:
     api_key = os.environ.get("CENSYS_API_KEY")
 
     if not api_key:
-        return _provider_result("censys", mode="disabled", status="skipped", query_type=None, skipped=True, reason="CENSYS_API_KEY not set in .env")
+        return {"skipped": True, "reason": "CENSYS_API_KEY not set in .env"}
 
     from censys_platform import SDK
 
-    result = _provider_result("censys", mode="free_safe", status="supported", query_type="basic_host_search")
+    result: dict = {"hits": [], "origin_candidates": []}
     try:
         with SDK(personal_access_token=api_key) as sdk:
             query = f'host.services.tls.leaf_certificate.subject.common_name = "{domain}"'
@@ -692,10 +558,8 @@ def censys_cert_search(domain: str) -> dict:
             result["hits"].append(entry)
             if not entry["cloudflare"]:
                 result["origin_candidates"].append(entry)
-        result["total"] = len(result["hits"])
 
     except Exception as exc:
-        result["status"] = "paid_only" if _is_paid_only_provider_error(exc) else "error"
         result["error"] = str(exc)
 
     return result
@@ -714,29 +578,13 @@ def shodan_cert_search(domain: str) -> dict:
     """
     api_key = os.environ.get("SHODAN_API_KEY")
     if not api_key:
-        return _provider_result("shodan", mode="disabled", status="skipped", query_type=None, skipped=True, reason="SHODAN_API_KEY not set in .env")
+        return {"skipped": True, "reason": "SHODAN_API_KEY not set in .env"}
 
     import shodan
 
-    result = _provider_result("shodan", mode="free_safe", status="supported", query_type="member_search")
+    result: dict = {"hits": [], "origin_candidates": []}
     try:
         api = shodan.Shodan(api_key)
-        account_info = api.info()
-        result["account"] = {
-            "plan": account_info.get("plan"),
-            "unlocked": account_info.get("unlocked"),
-            "query_credits": account_info.get("query_credits"),
-        }
-
-        if not account_info.get("unlocked") or int(account_info.get("query_credits") or 0) <= 0:
-            result["status"] = "degraded"
-            result["query_type"] = "count_facets"
-            result["reason"] = "Shodan host/cert result queries require an unlocked account with query-credit access. Falling back to count/facets only."
-            count_resp = api.count(f'ssl:"{domain}"', facets="org,asn,port")
-            result["total"] = count_resp.get("total", 0)
-            result["summary_facets"] = count_resp.get("facets", {})
-            return result
-
         resp = api.search(f'ssl:"{domain}"', minify=False)
 
         for match in resp.get("matches", []):
@@ -761,7 +609,6 @@ def shodan_cert_search(domain: str) -> dict:
         result["total"] = resp.get("total", len(result["hits"]))
 
     except Exception as exc:
-        result["status"] = "error"
         result["error"] = str(exc)
 
     return result
@@ -779,11 +626,11 @@ def netlas_cert_search(domain: str) -> dict:
     """
     api_key = os.environ.get("NETLAS_API_KEY")
     if not api_key:
-        return _provider_result("netlas", mode="disabled", status="skipped", query_type=None, skipped=True, reason="NETLAS_API_KEY not set in .env")
+        return {"skipped": True, "reason": "NETLAS_API_KEY not set in .env"}
 
     import netlas
 
-    result = _provider_result("netlas", mode="free_safe", status="supported", query_type="certificate_cn_search")
+    result: dict = {"hits": [], "origin_candidates": []}
     try:
         conn  = netlas.Netlas(api_key=api_key)
         query = f'certificate.subject.common_name:"{domain}"'
@@ -807,9 +654,7 @@ def netlas_cert_search(domain: str) -> dict:
             result["hits"].append(entry)
             if not entry["cloudflare"]:
                 result["origin_candidates"].append(entry)
-        result["total"] = len(result["hits"])
     except Exception as exc:
-        result["status"] = "error"
         result["error"] = str(exc)
 
     return result
@@ -890,8 +735,7 @@ EU_MEMBER_STATES = [
 ]
 
 
-@lru_cache(maxsize=128)
-def _fetch_country_ip_ranges_cached(country_code: str) -> tuple[str, ...]:
+def fetch_country_ip_ranges(country_code: str) -> list[str]:
     """
     Fetch all IPv4 prefixes allocated to a country via RIPE Stat (free, no key).
     country_code is a 2-letter ISO code, e.g. "RU", "UA", "DE".
@@ -907,36 +751,10 @@ def _fetch_country_ip_ranges_cached(country_code: str) -> tuple[str, ...]:
         resources = resp.json().get("data", {}).get("resources", {})
         # Returns {"ipv4": ["1.2.3.0/24", ...], "ipv6": [...], "asn": [...]}
         cidrs = [p for p in resources.get("ipv4", []) if "/" in p]
-        return tuple(cidrs)
+        return cidrs
     except Exception as exc:
         log(f"RIPE Stat country lookup failed for {country_code}: {exc}")
-        return ()
-
-
-def fetch_country_ip_ranges(country_code: str) -> list[str]:
-    return list(_fetch_country_ip_ranges_cached(country_code.upper()))
-
-
-@lru_cache(maxsize=256)
-def _fetch_single_asn_ranges_cached(asn: str) -> tuple[str, tuple[str, ...]]:
-    try:
-        response = requests.get(
-            RIPE_STAT_URL,
-            params={"resource": asn},
-            timeout=15,
-            headers={"Accept": "application/json"},
-        )
-        response.raise_for_status()
-        announced_prefixes = response.json().get("data", {}).get("prefixes", [])
-        ipv4_cidrs = tuple(
-            prefix_entry["prefix"]
-            for prefix_entry in announced_prefixes
-            if ":" not in prefix_entry.get("prefix", "")
-        )
-        return asn, ipv4_cidrs
-    except Exception as exc:
-        log(f"RIPE Stat failed for {asn}: {exc}")
-        return asn, ()
+        return []
 
 
 def fetch_asn_ip_ranges(asns: list[str]) -> dict[str, list[str]]:
@@ -946,18 +764,36 @@ def fetch_asn_ip_ranges(asns: list[str]) -> dict[str, list[str]]:
     All ASNs are fetched in parallel via ThreadPoolExecutor.
     """
     asn_to_cidrs: dict[str, list[str]] = {}
-    normalized_asns = sorted({asn.upper() for asn in asns if asn})
 
-    with ThreadPoolExecutor(max_workers=min(10, max(len(normalized_asns), 1))) as executor:
-        for asn, ipv4_cidrs in executor.map(_fetch_single_asn_ranges_cached, normalized_asns):
+    def _fetch_single_asn(asn: str) -> tuple[str, list[str]]:
+        try:
+            response = requests.get(
+                RIPE_STAT_URL,
+                params={"resource": asn},
+                timeout=15,
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            announced_prefixes = response.json().get("data", {}).get("prefixes", [])
+            ipv4_cidrs = [
+                prefix_entry["prefix"]
+                for prefix_entry in announced_prefixes
+                if ":" not in prefix_entry.get("prefix", "")  # IPv4 only
+            ]
+            return asn, ipv4_cidrs
+        except Exception as exc:
+            log(f"RIPE Stat failed for {asn}: {exc}")
+            return asn, []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for asn, ipv4_cidrs in executor.map(_fetch_single_asn, asns):
             if ipv4_cidrs:
-                asn_to_cidrs[asn] = list(ipv4_cidrs)
+                asn_to_cidrs[asn] = ipv4_cidrs
 
     return asn_to_cidrs
 
 
-@lru_cache(maxsize=32)
-def _fetch_gcp_ip_ranges_cached(region_prefixes: tuple[str, ...] | None) -> tuple[str, ...]:
+def fetch_gcp_ip_ranges(region_prefixes: list[str] | None = None) -> list[str]:
     """Download GCP's published IPv4 ranges, filtered to the given region prefixes."""
     try:
         resp = requests.get(GCP_IP_RANGES_URL, timeout=15)
@@ -970,15 +806,10 @@ def _fetch_gcp_ip_ranges_cached(region_prefixes: tuple[str, ...] | None) -> tupl
             scope = entry.get("scope", "")
             if region_prefixes is None or any(scope.startswith(r) for r in region_prefixes):
                 cidrs.append(cidr)
-        return tuple(cidrs)
+        return cidrs
     except Exception as exc:
         log(f"Failed to fetch GCP IP ranges: {exc}")
-        return ()
-
-
-def fetch_gcp_ip_ranges(region_prefixes: list[str] | None = None) -> list[str]:
-    normalized_regions = None if region_prefixes is None else tuple(sorted(set(region_prefixes)))
-    return list(_fetch_gcp_ip_ranges_cached(normalized_regions))
+        return []
 
 
 def _parse_tls_cert(der: bytes, ip: str, port: int, domain: str) -> dict | None:
@@ -1016,7 +847,6 @@ def _parse_tls_cert(der: bytes, ip: str, port: int, domain: str) -> dict | None:
         "issuer":     issuer_cn[0].value if issuer_cn else "",
         "not_before": not_before,
         "not_after":  not_after,
-        "sha256":     hashlib.sha256(der).hexdigest(),
     }
 
 
@@ -1551,35 +1381,23 @@ def get_ip_whois(ip: str) -> dict:
 
 # ── Per-IP enrichment (used for IPs resolved from a domain) ───────────────────
 
-def enrich_ip(target: str | tuple[str, str | None]) -> dict:
-    if isinstance(target, tuple):
-        ip, host_hint = target
-    else:
-        ip, host_hint = target, None
-
+def enrich_ip(ip: str) -> dict:
     cf = is_cloudflare_ip(ip)
+
     ptr = get_ptr(ip)
-    probe_host = host_hint or ptr or ip
 
     if cf:
         asn_info = {"asn_description": "Cloudflare, Inc.", "asn_country": "US", "note": "Cloudflare anycast — RDAP skipped"}
         other_domains = []
-        http_probe = None
-        proxy_family, proxy_confidence = "cloudflare", 0.99
     else:
         asn_info = get_ip_whois(ip)
         other_domains = hackertarget_reverse_ip(ip)
-        http_probe = probe_http_headers(ip, probe_host)
-        proxy_family, proxy_confidence = detect_proxy_family(http_probe)
 
     return {
         "ptr":                 ptr,
         "cloudflare":          cf,
         "asn_info":            asn_info,
         "other_domains_on_ip": other_domains,
-        "proxy_family":        proxy_family,
-        "proxy_confidence":    proxy_confidence,
-        "http_probe":          http_probe,
     }
 
 
@@ -2032,52 +1850,6 @@ async def _afetch_page_metadata(domain: str, client: httpx.AsyncClient, save_fav
     return result
 
 
-def _default_historical_dns(error: str | None = None) -> dict:
-    return {"records": [], "error": error}
-
-
-def _default_page_metadata(error: str | None = None) -> dict:
-    return {
-        "google_analytics": [],
-        "gtm_ids": [],
-        "facebook_pixel": [],
-        "tiktok_pixel": [],
-        "yandex_metrika": [],
-        "html_lang": None,
-        "cms_generator": None,
-        "social_links": {},
-        "social_handles": {},
-        "favicon_md5": None,
-        "favicon_saved": None,
-        "error": error,
-    }
-
-
-def _default_email_security(error: str | None = None) -> dict:
-    return {"dmarc": None, "dkim": {}, "error": error}
-
-
-def _source_error_marker(source: str, exc: Exception) -> list[dict]:
-    return [{"_error": str(exc) or exc.__class__.__name__, "source": source}]
-
-
-def _parallel_map(func, items: list, max_workers: int) -> list:
-    if not items:
-        return []
-
-    results = [None] * len(items)
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as executor:
-        future_map = {executor.submit(func, item): index for index, item in enumerate(items)}
-        for future in as_completed(future_map):
-            results[future_map[future]] = future.result()
-    return results
-
-
-def _grab_tls_target(target: tuple[str, str]) -> dict | None:
-    ip_address, sni_domain = target
-    return grab_tls_cert(ip_address, sni_domain)
-
-
 async def _analyze_domain_async(
     domain: str,
     scan: bool = False,
@@ -2137,34 +1909,16 @@ async def _analyze_domain_async(
     async def _empty_list():
         return []
 
-    async def _safe_task(key: str, coro, fallback):
-        try:
-            value = await coro
-        except Exception as exc:
-            log(f"{key} failed: {exc}")
-            value = fallback(exc) if callable(fallback) else fallback
-        _cb(key, value)
-        return value
-
-    async def _safe_oc_task(key: str, coro, fallback):
-        try:
-            value = await coro
-        except Exception as exc:
-            log(f"{key} failed: {exc}")
-            value = fallback(exc) if callable(fallback) else fallback
-        _cb(f"origin_candidates.{key}", value)
-        return value
-
     # ── Group 1: all concurrent via shared httpx client ───────────────────────
     log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata (async)...")
     async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True) as client:
         (_, dns_records, cert_transparency_raw, _, _, _) = await asyncio.gather(
-            _safe_task("whois",          asyncio.to_thread(get_domain_whois, domain), lambda exc: {"error": str(exc)}),
-            _safe_task("dns",            _aget_dns_records(domain), lambda exc: {"error": str(exc)}),
-            _safe_task("_ct_tmp",        _acrt_sh_data(domain, client), lambda _exc: dict(_CRT_SH_EMPTY)),
-            _safe_task("historical_dns", _acircl_passive_dns(domain, client), lambda exc: _default_historical_dns(str(exc))),
-            _safe_task("page_metadata",  _afetch_page_metadata(domain, client, _fav_path), lambda exc: _default_page_metadata(str(exc))),
-            _safe_task("email_security", _aget_dmarc_dkim(domain), lambda exc: _default_email_security(str(exc))),
+            _task("whois",          asyncio.to_thread(get_domain_whois, domain)),
+            _task("dns",            _aget_dns_records(domain)),
+            _task("_ct_tmp",        _acrt_sh_data(domain, client)),
+            _task("historical_dns", _acircl_passive_dns(domain, client)),
+            _task("page_metadata",  _afetch_page_metadata(domain, client, _fav_path)),
+            _task("email_security", _aget_dmarc_dkim(domain)),
         )
 
         # Post-process CT — split subdomains out and notify each separately
@@ -2188,16 +1942,16 @@ async def _analyze_domain_async(
             log(f"Zone transfer attempt on {len(nameservers)} nameserver(s) (concurrent with origin discovery)")
         log("Zone transfer / subdomain probe / MX / wordlist / HackerTarget / urlscan / Censys / Shodan / Netlas (async)...")
         await asyncio.gather(
-            _safe_task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list(), []),
-            _safe_oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list(), lambda exc: _source_error_marker("subdomain_leaks", exc)),
-            _safe_oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records), lambda exc: _source_error_marker("mx_leaks", exc)),
-            _safe_oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain), lambda exc: _source_error_marker("wordlist_leaks", exc)),
-            _safe_oc_task("hackertarget",    _ahackertarget_host_search(domain, client), lambda exc: _source_error_marker("hackertarget", exc)),
-            _safe_oc_task("urlscan",         _aurlscan_historical_ips(domain, client), lambda exc: _source_error_marker("urlscan", exc)),
-            _safe_task("urlscan_analytics",  _aurlscan_fetch_analytics(domain, client), {}),
-            _safe_oc_task("censys",          asyncio.to_thread(censys_cert_search, domain), lambda exc: {"hits": [], "error": str(exc)}),
-            _safe_oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain), lambda exc: {"hits": [], "error": str(exc)}),
-            _safe_oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain), lambda exc: {"hits": [], "error": str(exc)}),
+            _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
+            _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
+            _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
+            _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain)),
+            _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
+            _oc_task("urlscan",         _aurlscan_historical_ips(domain, client)),
+            _task("urlscan_analytics",  _aurlscan_fetch_analytics(domain, client)),
+            _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
+            _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
+            _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
         )
 
     # ── Merge urlscan analytics IDs into page_metadata ───────────────────────
@@ -2226,10 +1980,8 @@ async def _analyze_domain_async(
             if errors:
                 source_errors.extend(e["source"] for e in errors)
                 oc[src] = clean
-        elif isinstance(entries, dict) and entries.get("error"):
-            source_errors.append(src)
     if source_errors:
-        result["source_errors"] = sorted(set(source_errors))
+        result["source_errors"] = source_errors
 
     # ── Scan phases — sequential, long-running, each uses its own event loop ──
     do_gcp_europe_scan   = scan_europe   or scan_full
@@ -2310,28 +2062,6 @@ async def _analyze_domain_async(
         if ip_address and not candidate_entry.get("cf", False):
             ip_sources.setdefault(ip_address, []).append("urlscan")
 
-    for provider_key in ("censys", "shodan", "netlas"):
-        provider_result = origin_candidates_result.get(provider_key, {})
-        if not isinstance(provider_result, dict):
-            continue
-        for candidate_entry in provider_result.get("hits", []):
-            ip_address = candidate_entry.get("ip", "")
-            if ip_address:
-                ip_sources.setdefault(ip_address, []).append(provider_key)
-
-    for scan_key, source_name in (
-        ("scan", "scan_gcp"),
-        ("provider_scan", "scan_provider"),
-        ("country_scan", "scan_country"),
-    ):
-        scan_result = origin_candidates_result.get(scan_key, {})
-        if not isinstance(scan_result, dict):
-            continue
-        for candidate_entry in scan_result.get("hits", []):
-            ip_address = candidate_entry.get("ip", "")
-            if ip_address:
-                ip_sources.setdefault(ip_address, []).append(source_name)
-
     for historical_record in result.get("historical_dns", {}).get("records", []):
         if historical_record.get("rrtype") in ("A", "AAAA"):
             ip_address = historical_record.get("rdata", "")
@@ -2343,18 +2073,10 @@ async def _analyze_domain_async(
         if ip_address and not is_cloudflare_ip(ip_address):
             ip_sources.setdefault(ip_address, []).append("spf")
 
-    for ip_address, sources in list(ip_sources.items()):
-        ip_sources[ip_address] = sorted(set(sources))
-
     if ip_sources:
         log(f"IP enrichment ({len(ip_sources)} unique IPs from DNS + all discovery sources)...")
         all_discovered_ips = list(ip_sources.keys())
-        enrichment_results = await asyncio.to_thread(
-            _parallel_map,
-            enrich_ip,
-            [(ip_address, domain) for ip_address in all_discovered_ips],
-            min(64, max(len(all_discovered_ips), 1)),
-        )
+        enrichment_results = await asyncio.gather(*[asyncio.to_thread(enrich_ip, ip_address) for ip_address in all_discovered_ips])
         ip_details: dict = {}
         for ip_address, enrichment_data in zip(all_discovered_ips, enrichment_results):
             enriched_entry = dict(enrichment_data)
@@ -2376,12 +2098,10 @@ async def _analyze_domain_async(
 
     if tls_probe_targets:
         log(f"TLS probe: grabbing certs from {len(tls_probe_targets)} non-Cloudflare IP(s)...")
-        raw_tls_certs = await asyncio.to_thread(
-            _parallel_map,
-            _grab_tls_target,
-            list(tls_probe_targets.items()),
-            min(48, max(len(tls_probe_targets), 1)),
-        )
+        raw_tls_certs = await asyncio.gather(*[
+            asyncio.to_thread(grab_tls_cert, ip_address, sni_domain)
+            for ip_address, sni_domain in tls_probe_targets.items()
+        ])
         non_cloudflare_tls_certs = [cert for cert in raw_tls_certs if cert is not None]
         log(f"TLS probe: {len(non_cloudflare_tls_certs)} cert(s) retrieved")
     else:
@@ -2398,9 +2118,9 @@ async def _analyze_domain_async(
 
     # ── Persist everything to SQLite ──────────────────────────────────────────
     try:
-        from intel_db import DB_PATH, save_search
+        from intel_db import save_search
         save_search(result)
-        log(f"Search saved to {DB_PATH}")
+        log("Search saved to ip_intel.db")
     except Exception as _exc:
         log(f"DB save failed: {_exc}")
 
@@ -2446,9 +2166,6 @@ def analyze_ip(ip: str) -> dict:
         "cloudflare":          False,
         "asn_info":            {},
         "other_domains_on_ip": [],
-        "proxy_family":        None,
-        "proxy_confidence":    0.0,
-        "http_probe":          None,
     }
 
     log(f"PTR record for {ip}")
@@ -2480,14 +2197,12 @@ def analyze_ip(ip: str) -> dict:
         result["non_cf_tls_certs"] = [cert] if cert else []
         if cert:
             log(f"TLS cert: CN={cert.get('cn')}  issuer={cert.get('issuer_cn')}")
-        result["http_probe"] = probe_http_headers(ip, sni)
-        result["proxy_family"], result["proxy_confidence"] = detect_proxy_family(result["http_probe"])
 
     # ── Persist to SQLite ─────────────────────────────────────────────────────
     try:
-        from intel_db import DB_PATH, save_search
+        from intel_db import save_search
         save_search(result)
-        log(f"Search saved to {DB_PATH}")
+        log("Search saved to ip_intel.db")
     except Exception as _exc:
         log(f"DB save failed: {_exc}")
 
