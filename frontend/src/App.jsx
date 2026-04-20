@@ -24,7 +24,7 @@ const EXPLORER_TABS = [
   { id: "asn", label: "Shared ASNs" },
   { id: "tracking", label: "Tracking IDs" },
   { id: "favicon", label: "Favicons" },
-  { id: "tls", label: "TLS fingerprints" },
+  { id: "tls", label: "Shared certificates" },
   { id: "connections", label: "Domain connections" }
 ];
 
@@ -36,7 +36,7 @@ const EXPLORER_PAGES = [
   { id: "asn", label: "ASNs", subtitle: "Domains clustering around the same autonomous system." },
   { id: "tracking", label: "Tracking IDs", subtitle: "Analytics and ad codes reused across domains." },
   { id: "favicon", label: "Favicons", subtitle: "Sites sharing the same browser-tab icon." },
-  { id: "tls", label: "TLS overlaps", subtitle: "Domains tied together by certificate identity." }
+  { id: "tls", label: "Shared certificates", subtitle: "Domains that reused the same HTTPS certificate." }
 ];
 
 const CONNECTION_SECTIONS = [
@@ -47,8 +47,8 @@ const CONNECTION_SECTIONS = [
   },
   {
     key: "tls_certs",
-    title: "TLS certificates",
-    infoBody: "These are HTTPS identity cards. Shared certificates are often one of the stronger technical links between domains."
+    title: "Shared certificates",
+    infoBody: "These cards show exact HTTPS certificates that multiple domains reused. Current certificate reuse is one of the stronger technical links in the app."
   },
   {
     key: "favicons",
@@ -72,8 +72,8 @@ const CONNECTION_SECTIONS = [
   },
   {
     key: "tls_history",
-    title: "TLS history",
-    infoBody: "This section shows whether certificate sharing is happening now or only appeared in the past, plus the time window where the overlap existed."
+    title: "Certificate reuse over time",
+    infoBody: "This section explains whether the certificate sharing is still live or only happened in the past, plus when that overlap was seen."
   },
   {
     key: "provider_hits",
@@ -100,7 +100,7 @@ const NETWORK_LINK_META = {
     label: "TLS cert",
     headline: "Shared TLS certificate",
     color: "#34b67f",
-    summary: "Both domains presented the same HTTPS certificate fingerprint.",
+    summary: "Both domains presented the same HTTPS certificate.",
     meaning: "In plain English: the same secure-web identity card showed up on both sites. When that overlap is current, it is one of the stronger technical links in the graph.",
     caution: "Managed hosts sometimes reuse certificates for multiple customers, so the issuer, the SAN list, and the surrounding infrastructure still matter."
   },
@@ -257,6 +257,66 @@ function formatNumber(value) {
     return "0";
   }
   return numberFormatter.format(value);
+}
+
+function formatFriendlyDateRange(start, end) {
+  if (start && end) {
+    return `${formatDateTime(start)} to ${formatDateTime(end)}`;
+  }
+  if (start) {
+    return `From ${formatDateTime(start)}`;
+  }
+  if (end) {
+    return `Until ${formatDateTime(end)}`;
+  }
+  return "Unknown";
+}
+
+function getTlsOverlapTitle(item) {
+  const commonName = String(item?.cn || "").trim();
+  if (commonName) {
+    return commonName;
+  }
+
+  const issuer = String(item?.issuer_cn || item?.issuer_org || "").trim();
+  if (issuer) {
+    return `Certificate from ${issuer}`;
+  }
+
+  const fingerprint = String(item?.sha256 || "").trim();
+  if (!fingerprint) {
+    return "Shared certificate";
+  }
+  return `Certificate ${fingerprint.length > 24 ? `${fingerprint.slice(0, 12)}...${fingerprint.slice(-8)}` : fingerprint}`;
+}
+
+function getTlsOverlapTargetCount(item) {
+  const directCount = Number(item?.target_count || 0);
+  if (Number.isFinite(directCount) && directCount > 0) {
+    return directCount;
+  }
+  return parseTargetList(item?.targets).length;
+}
+
+function getTlsOverlapStatusLabel(value) {
+  return normalizeEvidenceStatus(value) === "current" ? "Still shared now" : "Past sharing only";
+}
+
+function getTlsOverlapSummary(item) {
+  const status = normalizeEvidenceStatus(item?.relationship_status);
+  const domainCount = getTlsOverlapTargetCount(item);
+  const domainLabel = `${formatNumber(domainCount)} stored domain${domainCount === 1 ? "" : "s"}`;
+  const commonName = String(item?.cn || "").trim();
+
+  if (status === "current") {
+    return commonName
+      ? `The HTTPS certificate for ${commonName} is still shared across ${domainLabel}, which makes this one of the stronger technical overlaps in the app.`
+      : `This exact HTTPS certificate is still shared across ${domainLabel}, which makes it one of the stronger technical overlaps in the app.`;
+  }
+
+  return commonName
+    ? `The HTTPS certificate for ${commonName} linked ${domainLabel} in the past. That can reveal older hosting, migrations, or previous common control.`
+    : `This exact HTTPS certificate linked ${domainLabel} in the past. That can reveal older hosting, migrations, or previous common control.`;
 }
 
 function filterLowSignalClusterItems(items) {
@@ -885,7 +945,7 @@ function getConnectionItemTitle(sectionKey, item) {
     return item.id_value ? `${item.id_type}: ${item.id_value}` : "Tracking ID";
   }
   if (sectionKey === "tls_certs" || sectionKey === "tls_history") {
-    return item.cn || shortLabel(item.sha256 || "TLS certificate", 18);
+    return getTlsOverlapTitle(item);
   }
   if (sectionKey === "favicons") {
     return item.md5 || "Favicon";
@@ -956,11 +1016,17 @@ function ConnectionItemDetails({ sectionKey, item, meta }) {
   if (sectionKey === "tls_certs") {
     return (
       <>
-        {item.issuer_cn ? <p><strong>Issuer:</strong> {item.issuer_cn}</p> : null}
-        {item.ip ? <p><strong>Observed on:</strong> {item.ip}</p> : null}
-        {item.sha256 ? <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p> : null}
+        <p>{getTlsOverlapSummary(item)}</p>
+        {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+        {item.ip ? <p><strong>Seen on IP:</strong> {item.ip}</p> : null}
         {(item.not_before || item.not_after) ? (
-          <p><strong>Validity:</strong> {`${formatDate(item.not_before)} to ${formatDate(item.not_after)}`}</p>
+          <p><strong>Certificate valid:</strong> {`${formatDate(item.not_before)} to ${formatDate(item.not_after)}`}</p>
+        ) : null}
+        {item.sha256 ? (
+          <details className="fold-panel">
+            <summary>Raw certificate detail</summary>
+            <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
+          </details>
         ) : null}
       </>
     );
@@ -969,19 +1035,26 @@ function ConnectionItemDetails({ sectionKey, item, meta }) {
   if (sectionKey === "tls_history") {
     return (
       <>
-        {item.issuer_cn ? <p><strong>Issuer:</strong> {item.issuer_cn}</p> : null}
-        <p><strong>Status:</strong> {item.relationship_status === "current" ? "Shared now" : "Historical only"}</p>
+        <p>{getTlsOverlapSummary(item)}</p>
+        {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+        <p><strong>Status:</strong> {getTlsOverlapStatusLabel(item.relationship_status)}</p>
         {item.current_shared_with && item.current_shared_with.length ? (
-          <p className="break-word"><strong>Current overlap:</strong> {item.current_shared_with.join(", ")}</p>
+          <p className="break-word"><strong>Still shared with:</strong> {item.current_shared_with.join(", ")}</p>
         ) : null}
         {item.historical_shared_with && item.historical_shared_with.length ? (
-          <p className="break-word"><strong>Historical overlap:</strong> {item.historical_shared_with.join(", ")}</p>
+          <p className="break-word"><strong>Previously shared with:</strong> {item.historical_shared_with.join(", ")}</p>
         ) : null}
         {(item.first_observed || item.last_observed) ? (
-          <p><strong>Seen:</strong> {`${formatDateTime(item.first_observed)} to ${formatDateTime(item.last_observed)}`}</p>
+          <p><strong>Seen in our data:</strong> {formatFriendlyDateRange(item.first_observed, item.last_observed)}</p>
         ) : null}
         {(item.overlap_start || item.overlap_end) ? (
-          <p><strong>Overlap window:</strong> {`${formatDateTime(item.overlap_start)} to ${formatDateTime(item.overlap_end)}`}</p>
+          <p><strong>Shared during:</strong> {formatFriendlyDateRange(item.overlap_start, item.overlap_end)}</p>
+        ) : null}
+        {item.sha256 ? (
+          <details className="fold-panel">
+            <summary>Raw certificate detail</summary>
+            <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
+          </details>
         ) : null}
       </>
     );
@@ -1072,7 +1145,7 @@ function buildNetworkModel(clusters, options) {
         parseTargetList(row.targets),
         "tls",
         getTlsLinkScore(relationshipStatus),
-        `${row.cn || shortLabel(row.sha256, 16)} | ${row.issuer_cn || "Unknown issuer"} | ${relationshipStatus}`,
+        `${getTlsOverlapTitle(row)} | ${row.issuer_cn || "Unknown issuer"} | ${relationshipStatus}`,
         NETWORK_LINK_META.tls.color
       );
     });
@@ -1304,11 +1377,11 @@ function describeGraphDetail(detail) {
         ? `${subject}${issuer ? ` issued by ${issuer}` : ""}`
         : detail.descriptor,
       summary: subject
-        ? `Both domains ${status === "current" ? "currently present" : "were historically seen with"} the same HTTPS certificate identity: ${subject}.`
+        ? `Both domains ${status === "current" ? "still use" : "used in the past"} the same HTTPS certificate: ${subject}.`
         : meta.summary,
       meaning: status === "current"
-        ? "In plain English: the same certificate fingerprint is still live on both domains. That is one of the strongest technical links this graph can make from cert and IP data."
-        : "In plain English: the same certificate fingerprint was shared in the past. That still matters because it can reveal migrations, legacy hosting, or older common control that is no longer live.",
+        ? "In plain English: the same HTTPS certificate is still live on both domains. That is one of the strongest technical links this graph can make from cert and IP data."
+        : "In plain English: the same HTTPS certificate was shared in the past. That still matters because it can reveal migrations, legacy hosting, or older common control that is no longer live.",
       caution: status === "current"
         ? meta.caution
         : "Historical certificate overlap is valuable, but it can reflect an old migration or temporary shared platform instead of a current live relationship."
@@ -2987,7 +3060,7 @@ function NetworkGraphTab({ clusters, domainTargets, theme }) {
                         {detail.kind === "ip"
                           ? "These domains touched the same server address or hosting network."
                           : detail.kind === "tls"
-                            ? "These domains reused the same HTTPS certificate or certificate fingerprint."
+                            ? "These domains reused the same HTTPS certificate."
                             : detail.kind === "tracking"
                               ? "These domains shared the same analytics or advertising identifier."
                               : "These domains used the same browser-tab icon."}
@@ -3163,10 +3236,16 @@ function ExplorerPanel({
         <div className="stack">
           <div className="card-grid">
             {clusters.tls.map((item) => (
-              <LeadCard key={item.sha256} title={item.cn || item.sha256.slice(0, 16)} footer={`${item.target_count} linked targets`}>
-                <p><strong>Issuer:</strong> {item.issuer_cn || "Unknown"}</p>
-                <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
-                <p className="break-word">{item.targets}</p>
+              <LeadCard key={item.sha256} title={getTlsOverlapTitle(item)} footer={`${formatNumber(getTlsOverlapTargetCount(item))} linked domains | ${getTlsOverlapStatusLabel(item.relationship_status)}`}>
+                <p>{getTlsOverlapSummary(item)}</p>
+                <p className="break-word"><strong>Domains:</strong> {formatListPreview(parseTargetList(item.targets), 6) || "No linked domains recorded"}</p>
+                {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+                {item.sha256 ? (
+                  <details className="fold-panel">
+                    <summary>Raw certificate detail</summary>
+                    <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
+                  </details>
+                ) : null}
               </LeadCard>
             ))}
           </div>
@@ -5194,17 +5273,17 @@ export default function App() {
     pageContent = (
       <PageFrame
         eyebrow="Explorer"
-        title="TLS overlaps"
-        subtitle="Domains tied together by exact HTTPS certificate identity, with time-aware overlap status."
-        infoTitle="TLS overlaps"
-        infoBody="A TLS overlap means two domains presented the same certificate fingerprint. The scope switch lets you separate domains that share a certificate now from ones that only shared it in the past."
+        title="Shared certificates"
+        subtitle="Domains that reused the same HTTPS certificate, with the overlap explained in plain English."
+        infoTitle="Shared certificates"
+        infoBody="When domains present the same HTTPS certificate, they were configured together at some point. Current sharing is usually stronger than historical sharing."
       >
         <div className="field-row">
           <label htmlFor="tls-scope">Scope</label>
           <select id="tls-scope" value={tlsScope} onChange={(event) => setTlsScope(event.target.value)}>
-            <option value="current">Current overlaps</option>
-            <option value="historical">Historical only</option>
-            <option value="all">All history</option>
+            <option value="current">Still shared now</option>
+            <option value="historical">Past sharing only</option>
+            <option value="all">Now and past</option>
           </select>
         </div>
         {clusters.tls.length ? (
@@ -5212,20 +5291,31 @@ export default function App() {
             {clusters.tls.map((item) => (
               <LeadCard
                 key={item.sha256}
-                title={item.cn || item.sha256.slice(0, 16)}
-                footer={`${item.target_count} linked targets | ${item.relationship_status === "current" ? "shared now" : "historical only"}`}
+                title={getTlsOverlapTitle(item)}
+                footer={`${formatNumber(getTlsOverlapTargetCount(item))} linked domains | ${getTlsOverlapStatusLabel(item.relationship_status)}`}
               >
-                <p><strong>Issuer:</strong> {item.issuer_cn || "Unknown"}</p>
-                <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
-                <p><strong>Seen:</strong> {`${formatDateTime(item.first_observed)} to ${formatDateTime(item.last_observed)}`}</p>
-                <p><strong>Overlap window:</strong> {`${formatDateTime(item.overlap_start)} to ${formatDateTime(item.overlap_end)}`}</p>
-                <p><strong>Current targets:</strong> {formatNumber(item.current_target_count || 0)} | <strong>Historical targets:</strong> {formatNumber(item.historical_target_count || 0)}</p>
-                <p className="break-word">{item.targets}</p>
+                <p>{getTlsOverlapSummary(item)}</p>
+                <p className="break-word"><strong>Domains:</strong> {formatListPreview(parseTargetList(item.targets), 6) || "No linked domains recorded"}</p>
+                {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+                {(item.overlap_start || item.overlap_end) ? (
+                  <p><strong>Shared during:</strong> {formatFriendlyDateRange(item.overlap_start, item.overlap_end)}</p>
+                ) : null}
+                {(item.first_observed || item.last_observed) ? (
+                  <p><strong>Seen in our data:</strong> {formatFriendlyDateRange(item.first_observed, item.last_observed)}</p>
+                ) : null}
+                <details className="fold-panel">
+                  <summary>Raw certificate detail</summary>
+                  <div className="stack">
+                    {item.sha256 ? <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p> : null}
+                    <p><strong>Current linked domains:</strong> {formatNumber(item.current_target_count || 0)}</p>
+                    <p><strong>Historical linked domains:</strong> {formatNumber(item.historical_target_count || 0)}</p>
+                  </div>
+                </details>
               </LeadCard>
             ))}
           </div>
         ) : (
-          <Callout tone="info">No TLS overlaps are stored for this scope yet.</Callout>
+          <Callout tone="info">No shared certificates are stored for this scope yet.</Callout>
         )}
       </PageFrame>
     );
