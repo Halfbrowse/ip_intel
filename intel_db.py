@@ -520,6 +520,98 @@ def _is_noisy_pivot_domain(target: str) -> bool:
     return any(target == suffix or target.endswith(f".{suffix}") for suffix in _NOISY_PIVOT_SUFFIXES)
 
 
+def _normalize_text_list(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)):
+        raw_values = [values]
+    elif isinstance(values, list | tuple | set):
+        raw_values = list(values)
+    else:
+        raw_values = [values]
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    return cleaned
+
+
+def _merge_ip_detail_entry(
+    normalized: dict[str, dict[str, Any]],
+    ip_address: str,
+    payload: Any,
+) -> None:
+    ip_text = str(ip_address or "").strip()
+    if not ip_text:
+        return
+
+    raw = dict(payload) if isinstance(payload, Mapping) else {}
+    entry = normalized.setdefault(
+        ip_text,
+        {
+            "sources": [],
+            "other_domains_on_ip": [],
+            "asn_info": {},
+        },
+    )
+
+    sources = _normalize_text_list(raw.get("sources"))
+    if not sources:
+        sources = _normalize_text_list(raw.get("source"))
+    for source in sources:
+        if source not in entry["sources"]:
+            entry["sources"].append(source)
+
+    for domain in _normalize_text_list(raw.get("other_domains_on_ip")):
+        if domain not in entry["other_domains_on_ip"]:
+            entry["other_domains_on_ip"].append(domain)
+
+    if raw.get("ptr") and not entry.get("ptr"):
+        entry["ptr"] = raw.get("ptr")
+
+    for key in ("cloudflare", "proxy_family", "proxy_confidence"):
+        if key in raw and raw.get(key) is not None and entry.get(key) is None:
+            entry[key] = raw.get(key)
+
+    asn_info = entry.setdefault("asn_info", {})
+    nested_asn = raw.get("asn_info")
+    if isinstance(nested_asn, Mapping):
+        for key, value in nested_asn.items():
+            if value not in (None, "") and asn_info.get(key) in (None, ""):
+                asn_info[key] = value
+
+    for key, value in {
+        "asn": raw.get("asn"),
+        "asn_description": raw.get("asn_desc"),
+        "asn_registry": raw.get("asn_registry"),
+        "asn_country": raw.get("country"),
+        "network_name": raw.get("network_name"),
+        "network_cidr": raw.get("network_cidr"),
+    }.items():
+        if value not in (None, "") and asn_info.get(key) in (None, ""):
+            asn_info[key] = value
+
+
+def normalize_ip_details(value: Any) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    if isinstance(value, Mapping):
+        for ip_address, payload in value.items():
+            _merge_ip_detail_entry(normalized, str(ip_address or ""), payload)
+        return normalized
+
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            _merge_ip_detail_entry(normalized, str(item.get("ip") or ""), item)
+    return normalized
+
+
 def _iter_dns_host_values(values: Any, *, key: str | None = None) -> list[str]:
     if not values:
         return []
@@ -640,7 +732,7 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
             for san in hit.get("sans", []) or []:
                 add(san, "scan_certificate_san", "tls_san", hit)
 
-    ip_details = result.get("ip_details", {}) or {}
+    ip_details = normalize_ip_details(result.get("ip_details"))
     for ip, info in ip_details.items():
         add(ip, "observed_ip", "origin_hit", {"ip": ip, "sources": info.get("sources")})
         add(info.get("ptr"), "ptr", "ptr", {"ip": ip, "ptr": info.get("ptr")})
@@ -666,6 +758,78 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
         add(domain, "reverse_ip_domain", "reverse_ip")
 
     return items
+
+
+_HARD_CONNECTION_RELATIONS = {
+    "resolved_ip",
+    "historical_ip",
+    "origin_ip",
+    "provider_ip",
+    "scan_ip",
+    "tls_ip",
+    "cname",
+    "tls_cn",
+    "tls_san",
+    "scan_certificate_cn",
+    "scan_certificate_san",
+    "cross_domain_san",
+    "certificate_san",
+    "subdomain",
+    "zone_transfer",
+}
+
+_SUPPORTING_CONNECTION_RELATIONS = {
+    "spf_origin",
+    "mx_host",
+    "whois_nameserver",
+    "nameserver",
+    "provider_hostname",
+    "ptr",
+    "reverse_ip_domain",
+    "subdomain_leak",
+    "mx_leak",
+    "wordlist_leak",
+    "hackertarget_host",
+    "urlscan_url",
+}
+
+
+def _classify_connection_strength(relations: set[str]) -> tuple[str, list[str], list[str]]:
+    hard_relations = sorted(relation for relation in relations if relation in _HARD_CONNECTION_RELATIONS)
+    supporting_relations = sorted(relation for relation in relations if relation in _SUPPORTING_CONNECTION_RELATIONS)
+    if hard_relations:
+        return "hard", hard_relations, supporting_relations
+    if supporting_relations:
+        return "supporting", hard_relations, supporting_relations
+    return "weak", hard_relations, supporting_relations
+
+
+def _build_connection_rationale(target_type: str, hard_relations: list[str], supporting_relations: list[str]) -> str:
+    relation_set = set(hard_relations)
+    if target_type == "ip":
+        if "resolved_ip" in relation_set:
+            return "This IP is in the seed's live DNS, which is a direct infrastructure tie."
+        if "origin_ip" in relation_set:
+            return "This IP surfaced as a likely origin from nearby evidence rather than a generic shared-hosting guess."
+        if "provider_ip" in relation_set or "scan_ip" in relation_set:
+            return "This IP was rediscovered during provider or targeted scan work, which makes it a concrete infrastructure candidate."
+        if "historical_ip" in relation_set:
+            return "This IP was historically assigned to the seed, so it is a concrete past infrastructure link."
+        if "tls_ip" in relation_set:
+            return "This IP presented a live certificate during validation, which makes it a concrete HTTPS endpoint tie."
+    else:
+        if "subdomain" in relation_set or "zone_transfer" in relation_set:
+            return "This domain was discovered as part of the seed's own DNS namespace, which is a direct domain relationship."
+        if "cname" in relation_set:
+            return "This domain is directly referenced in the seed's live DNS via CNAME."
+        if {"tls_san", "certificate_san", "scan_certificate_san", "cross_domain_san"} & relation_set:
+            return "This domain shares certificate naming evidence with the seed, which is a strong technical overlap."
+        if "tls_cn" in relation_set or "scan_certificate_cn" in relation_set:
+            return "This domain appears as a certificate common name tied to the seed's infrastructure."
+
+    if supporting_relations:
+        return "This target is backed by multiple supporting signals around the seed, but it is not yet a hard link."
+    return "This target was discovered near the seed, but the evidence is still limited."
 
 
 def summarize_related_targets(result: dict[str, Any]) -> dict[str, Any]:
@@ -698,6 +862,8 @@ def summarize_related_targets(result: dict[str, Any]) -> dict[str, Any]:
             reverse_ip_only = entry["relations"] == {"reverse_ip_domain"}
             auto_expand = not reverse_ip_only and not _is_noisy_pivot_domain(entry["target"])
 
+        connection_strength, hard_relations, supporting_relations = _classify_connection_strength(entry["relations"])
+
         items.append(
             {
                 "target": entry["target"],
@@ -705,17 +871,63 @@ def summarize_related_targets(result: dict[str, Any]) -> dict[str, Any]:
                 "score": entry["score"],
                 "sources": sorted(entry["sources"]),
                 "relations": sorted(entry["relations"]),
+                "connection_strength": connection_strength,
+                "hard_relations": hard_relations,
+                "supporting_relations": supporting_relations,
+                "hard_evidence_count": len(hard_relations),
+                "evidence_rationale": _build_connection_rationale(entry["target_type"], hard_relations, supporting_relations),
                 "auto_expand": auto_expand,
             }
         )
 
-    items.sort(key=lambda item: (-item["score"], item["target_type"], item["target"]))
+    items.sort(
+        key=lambda item: (
+            item["connection_strength"] == "hard",
+            item["hard_evidence_count"],
+            item["score"],
+            item["target_type"] == "ip",
+            item["target"],
+        ),
+        reverse=True,
+    )
     return {
         "items": items,
         "total": len(items),
         "domains": sum(1 for item in items if item["target_type"] == "domain"),
         "ips": sum(1 for item in items if item["target_type"] == "ip"),
         "expandable": sum(1 for item in items if item["auto_expand"]),
+        "hard_total": sum(1 for item in items if item["connection_strength"] == "hard"),
+    }
+
+
+def summarize_hard_connections(
+    result: dict[str, Any],
+    *,
+    related_summary: dict[str, Any] | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    summary = related_summary or result.get("related_targets_summary") or summarize_related_targets(result)
+    all_items = [
+        item
+        for item in (summary.get("items") or [])
+        if item.get("connection_strength") == "hard"
+    ]
+    all_items.sort(
+        key=lambda item: (
+            item.get("hard_evidence_count", 0),
+            item.get("score", 0),
+            item.get("target_type") == "ip",
+            item.get("target", ""),
+        ),
+        reverse=True,
+    )
+    items = all_items[:limit]
+    return {
+        "items": items,
+        "total": len(all_items),
+        "shown": len(items),
+        "domains": sum(1 for item in all_items if item.get("target_type") == "domain"),
+        "ips": sum(1 for item in all_items if item.get("target_type") == "ip"),
     }
 
 
@@ -1236,6 +1448,18 @@ def get_recent(limit: int = 100) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_domain_targets() -> list[str]:
+    init_db()
+    with _conn() as c:
+        rows = [
+            row
+            for row in _latest_search_rows(c)
+            if row["type"] == "domain" and str(row["target"] or "").strip()
+        ]
+    rows.sort(key=lambda row: (row["timestamp"] or "", int(row["id"])), reverse=True)
+    return [str(row["target"]) for row in rows if row["target"]]
+
+
 def get_domains_with_source_errors(source: str | None = None) -> list[dict]:
     init_db()
     with _conn() as c:
@@ -1405,10 +1629,192 @@ def find_by_cross_san(san: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _targets_match_exact(left: str, right: str, target_type: str) -> bool:
+    if target_type == "domain":
+        return _normalize_target(left) == _normalize_target(right)
+    return str(left or "").strip() == str(right or "").strip()
+
+
+def find_searches_touching_target(
+    target: str,
+    *,
+    exclude_search_id: int | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    normalized_target, target_type = _normalize_candidate_target(target)
+    if not normalized_target or not target_type:
+        return []
+
+    init_db()
+    with _conn() as c:
+        search_rows = c.execute(
+            "SELECT id, target, type, timestamp, cloudflare_fronted FROM searches ORDER BY timestamp DESC, id DESC"
+        ).fetchall()
+        discovered_rows = c.execute(
+            """SELECT d.search_id, d.target AS discovered_target, d.target_type, d.relation, d.source, d.score,
+                      s.target, s.type, s.timestamp, s.cloudflare_fronted
+               FROM discovered_targets d
+               JOIN searches s ON s.id = d.search_id
+               ORDER BY s.timestamp DESC, s.id DESC""",
+        ).fetchall()
+
+    grouped: dict[int, dict[str, Any]] = {}
+
+    for row in search_rows:
+        sid = int(row["id"])
+        if exclude_search_id is not None and sid == int(exclude_search_id):
+            continue
+        if not _targets_match_exact(str(row["target"] or ""), normalized_target, target_type):
+            continue
+        grouped.setdefault(
+            sid,
+            {
+                "search_id": sid,
+                "target": row["target"],
+                "type": row["type"],
+                "timestamp": row["timestamp"],
+                "cloudflare_fronted": row["cloudflare_fronted"],
+                "matched_as_target": True,
+                "matched_relations": set(),
+                "matched_sources": set(),
+                "best_score": 0,
+            },
+        )["matched_as_target"] = True
+
+    for row in discovered_rows:
+        sid = int(row["search_id"])
+        if exclude_search_id is not None and sid == int(exclude_search_id):
+            continue
+        if not _targets_match_exact(str(row["discovered_target"] or ""), normalized_target, target_type):
+            continue
+        entry = grouped.setdefault(
+            sid,
+            {
+                "search_id": sid,
+                "target": row["target"],
+                "type": row["type"],
+                "timestamp": row["timestamp"],
+                "cloudflare_fronted": row["cloudflare_fronted"],
+                "matched_as_target": False,
+                "matched_relations": set(),
+                "matched_sources": set(),
+                "best_score": 0,
+            },
+        )
+        if row["relation"]:
+            entry["matched_relations"].add(row["relation"])
+        if row["source"]:
+            entry["matched_sources"].add(row["source"])
+        entry["best_score"] = max(entry["best_score"], int(row["score"] or 0))
+
+    items = []
+    for entry in grouped.values():
+        item = dict(entry)
+        item["matched_relations"] = sorted(entry["matched_relations"])
+        item["matched_sources"] = sorted(entry["matched_sources"])
+        items.append(item)
+
+    items.sort(
+        key=lambda item: (
+            item["matched_as_target"],
+            item["best_score"],
+            item["timestamp"] or "",
+            item["search_id"],
+        ),
+        reverse=True,
+    )
+    return items[:limit]
+
+
+def summarize_result_db_matches(
+    result: dict[str, Any],
+    *,
+    exclude_search_id: int | None = None,
+    limit_targets: int = 10,
+    limit_matches_per_target: int = 4,
+) -> dict[str, Any]:
+    related_summary = result.get("related_targets_summary") or summarize_related_targets(result)
+    related_items = list(related_summary.get("items") or [])
+    seed_target, seed_type = _normalize_candidate_target(result.get("input"))
+
+    if result.get("type") == "ip" and seed_target and seed_type == "ip":
+        related_items.insert(
+            0,
+            {
+                "target": seed_target,
+                "target_type": "ip",
+                "score": 99,
+                "sources": ["input"],
+                "relations": ["seed_ip"],
+                "auto_expand": True,
+            },
+        )
+
+    seen: set[tuple[str, str]] = set()
+    matched_items: list[dict[str, Any]] = []
+    for item in related_items:
+        target = str(item.get("target") or "").strip()
+        target_type = str(item.get("target_type") or "").strip()
+        if not target or not target_type:
+            continue
+
+        key = (target, target_type)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if target_type == "domain" and _is_noisy_pivot_domain(target):
+            continue
+        if seed_target and seed_type and target == seed_target and target_type == seed_type and result.get("type") == "domain":
+            continue
+
+        all_matches = find_searches_touching_target(
+            target,
+            exclude_search_id=exclude_search_id,
+            limit=50,
+        )
+        if not all_matches:
+            continue
+
+        matched_items.append(
+            {
+                "target": target,
+                "target_type": target_type,
+                "score": int(item.get("score") or 0),
+                "sources": list(item.get("sources") or []),
+                "relations": list(item.get("relations") or []),
+                "auto_expand": bool(item.get("auto_expand")),
+                "match_count": len(all_matches),
+                "direct_target_hits": sum(1 for match in all_matches if match.get("matched_as_target")),
+                "matches": all_matches[:limit_matches_per_target],
+            }
+        )
+
+    matched_items.sort(
+        key=lambda item: (
+            item["direct_target_hits"],
+            item["match_count"],
+            item["score"],
+            item["target_type"] == "ip",
+            item["target"],
+        ),
+        reverse=True,
+    )
+    matched_items = matched_items[:limit_targets]
+
+    return {
+        "items": matched_items,
+        "total": len(matched_items),
+        "matched_domains": sum(1 for item in matched_items if item["target_type"] == "domain"),
+        "matched_ips": sum(1 for item in matched_items if item["target_type"] == "ip"),
+        "direct_target_hits": sum(item["direct_target_hits"] for item in matched_items),
+    }
+
+
 # ── Classification ────────────────────────────────────────────────────────────
 
 _MAIL_ASNS = {"15169", "16276", "8075", "3215", "394161"}
-_CDN_PROXY_ASNS = {"13335", "19551", "54113", "20940", "60626", "394536", "22822", "16625", "16509", "8075", "15169", "20473"}
+_CDN_PROXY_ASNS = {"13335", "19551", "54113", "20940", "60626", "394536", "22822", "16625", "20473"}
 _SHARED_HOSTING_ASNS = {"2635", "27647", "61493", "2025"}
 
 _MAIL_PTR_PATTERNS = ("1e100.net", "google.com", "mail.ovh.", "smtp.", "mx.", "-mx-", "mail-", "mailout", "mxbiz")
@@ -1416,9 +1822,15 @@ _CDN_PROXY_PTR_PATTERNS = (
     "incapsula.com", "cloudflare.com", "cloudflare.net", "fastly.net",
     "akamai.net", "akamaiedge.net", "akamaized.net", "edgecast.net",
     "sucuri.net", "imperva.com", "cdn.", "cloudfront.net", "azurefd.net",
-    "googleusercontent.com", "googlehosted.com", "b-cdn.net",
+    "googleusercontent.com", "googlehosted.com", "b-cdn.net", "edgekey.net",
+    "edgesuite.net", "trafficmanager.net", "myshopify.com", "pantheonsite.io",
+    "webflow.io", "wixsite.com", "wpenginepowered.com",
 )
-_SHARED_HOSTING_PTR_PATTERNS = ("wildcard.", "weebly.com", "wordpress.com", "wix.com", "squarespace.com", "cluster", "shared-", "hosting.")
+_SHARED_HOSTING_PTR_PATTERNS = (
+    "wildcard.", "weebly.com", "wordpress.com", "wix.com", "squarespace.com",
+    "cluster", "shared-", "hosting.", "hostinger", "bluehost", "siteground",
+    "dreamhost", "namecheap", "godaddy", "ovh.net", "o2switch.net",
+)
 _EMAIL_SOURCES = {"mx_record", "spf"}
 
 

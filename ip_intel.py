@@ -129,6 +129,183 @@ def is_cloudflare_ip(ip: str) -> bool:
         return False
 
 
+def _normalize_asn(value: str | None) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    return text[2:] if text.startswith("AS") else text
+
+
+_PROXY_FAMILY_RULES = [
+    {
+        "family": "fastly",
+        "patterns": ("fastly", "fastlylb", "fastly.net"),
+        "asns": {"54113"},
+    },
+    {
+        "family": "akamai",
+        "patterns": ("akamai", "akamaiedge", "akamaized", "edgekey", "edgesuite"),
+        "asns": {"16625", "20940"},
+    },
+    {
+        "family": "imperva",
+        "patterns": ("imperva", "incapsula"),
+        "asns": {"19551"},
+    },
+    {
+        "family": "sucuri",
+        "patterns": ("sucuri",),
+        "asns": set(),
+    },
+    {
+        "family": "cloudfront",
+        "patterns": ("cloudfront", "awsglobalaccelerator"),
+        "asns": set(),
+    },
+    {
+        "family": "azure_front_door",
+        "patterns": ("azurefd", "azure front door", "trafficmanager"),
+        "asns": set(),
+    },
+    {
+        "family": "google_edge",
+        "patterns": ("googlehosted", "googleusercontent", "1e100.net", "google frontend"),
+        "asns": set(),
+    },
+    {
+        "family": "bunny",
+        "patterns": ("b-cdn.net", "bunnycdn", "bunny.net"),
+        "asns": {"60626"},
+    },
+    {
+        "family": "shopify",
+        "patterns": ("shopify", "myshopify.com"),
+        "asns": set(),
+    },
+    {
+        "family": "wordpress",
+        "patterns": ("wordpress.com", "automattic"),
+        "asns": set(),
+    },
+    {
+        "family": "wpengine",
+        "patterns": ("wpengine", "wpenginepowered"),
+        "asns": set(),
+    },
+    {
+        "family": "pantheon",
+        "patterns": ("pantheonsite.io", "pantheon"),
+        "asns": set(),
+    },
+    {
+        "family": "webflow",
+        "patterns": ("webflow.io", "webflow"),
+        "asns": set(),
+    },
+    {
+        "family": "wix",
+        "patterns": ("wix.com", "wixsite.com"),
+        "asns": set(),
+    },
+    {
+        "family": "squarespace",
+        "patterns": ("squarespace",),
+        "asns": set(),
+    },
+    {
+        "family": "weebly",
+        "patterns": ("weebly",),
+        "asns": set(),
+    },
+    {
+        "family": "hubspot",
+        "patterns": ("hubspot", "hubspotusercontent"),
+        "asns": set(),
+    },
+]
+
+
+def detect_proxy_details(
+    ip: str,
+    ptr: str | None,
+    asn_info: dict | None,
+    cert: dict | None = None,
+) -> dict[str, object]:
+    if is_cloudflare_ip(ip):
+        return {"proxy_family": "cloudflare", "proxy_confidence": 0.99}
+
+    asn_info = asn_info or {}
+    cert = cert or {}
+    norm_asn = _normalize_asn(asn_info.get("asn"))
+    text_fields = [
+        ptr,
+        asn_info.get("asn_description"),
+        asn_info.get("network_name"),
+        cert.get("cn"),
+        cert.get("issuer_cn"),
+        cert.get("issuer_org"),
+    ]
+    text_fields.extend((cert.get("sans") or [])[:12])
+    haystacks = [str(value).lower() for value in text_fields if value]
+    joined = " ".join(haystacks)
+    ptr_text = str(ptr or "").lower()
+    network_text = " ".join(
+        str(value).lower()
+        for value in (asn_info.get("asn_description"), asn_info.get("network_name"))
+        if value
+    )
+    cert_text = " ".join(
+        str(value).lower()
+        for value in [cert.get("cn"), cert.get("issuer_cn"), cert.get("issuer_org"), *(cert.get("sans") or [])[:12]]
+        if value
+    )
+
+    best_family = ""
+    best_score = 0.0
+    for rule in _PROXY_FAMILY_RULES:
+        score = 0.0
+        asn_hit = bool(norm_asn and norm_asn in rule["asns"])
+        ptr_hit = any(pattern in ptr_text for pattern in rule["patterns"])
+        cert_hit = any(pattern in cert_text for pattern in rule["patterns"])
+        network_hit = any(pattern in network_text for pattern in rule["patterns"])
+        generic_text_hit = any(pattern in joined for pattern in rule["patterns"])
+
+        if asn_hit:
+            score += 0.58
+        if ptr_hit:
+            score += 0.52
+        if cert_hit:
+            score += 0.22
+        if network_hit:
+            score += 0.16
+        if generic_text_hit and not (ptr_hit or cert_hit or network_hit):
+            score += 0.12
+        if score > best_score:
+            best_score = score
+            best_family = rule["family"]
+
+    if best_score >= 0.5:
+        return {
+            "proxy_family": best_family,
+            "proxy_confidence": round(min(best_score, 0.98), 2),
+        }
+
+    generic_edge_terms = (
+        " reverse proxy",
+        " load balancer",
+        " application gateway",
+        " front door",
+        " edge network",
+        " edge service",
+        " cdn",
+        " proxy edge",
+    )
+    if any(term in joined for term in generic_edge_terms):
+        return {"proxy_family": "managed_edge", "proxy_confidence": 0.51}
+
+    return {"proxy_family": None, "proxy_confidence": None}
+
+
 def resolve_ips(hostname: str) -> list[str]:
     """Return A + AAAA records for hostname, empty list on failure."""
     resolver = dns.resolver.Resolver()
@@ -1423,11 +1600,15 @@ def enrich_ip(ip: str) -> dict:
         asn_info = get_ip_whois(ip)
         other_domains = hackertarget_reverse_ip(ip)
 
+    proxy_details = detect_proxy_details(ip, ptr, asn_info)
+
     return {
         "ptr":                 ptr,
         "cloudflare":          cf,
         "asn_info":            asn_info,
         "other_domains_on_ip": other_domains,
+        "proxy_family":        proxy_details.get("proxy_family"),
+        "proxy_confidence":    proxy_details.get("proxy_confidence"),
     }
 
 
@@ -2103,6 +2284,30 @@ async def _analyze_domain_async(
         if ip_address and not is_cloudflare_ip(ip_address):
             ip_sources.setdefault(ip_address, []).append("spf")
 
+    provider_source_map = {
+        "censys": "censys",
+        "shodan": "shodan",
+        "netlas": "netlas",
+    }
+    for provider_key, source_name in provider_source_map.items():
+        provider_result = origin_candidates_result.get(provider_key, {})
+        for hit in provider_result.get("hits", []):
+            ip_address = hit.get("ip", "")
+            if ip_address:
+                ip_sources.setdefault(ip_address, []).append(source_name)
+
+    scan_source_map = {
+        "scan": "scan_gcp",
+        "provider_scan": "scan_provider",
+        "country_scan": "scan_country",
+    }
+    for scan_key, source_name in scan_source_map.items():
+        scan_result = origin_candidates_result.get(scan_key, {})
+        for hit in scan_result.get("hits", []):
+            ip_address = hit.get("ip", "")
+            if ip_address:
+                ip_sources.setdefault(ip_address, []).append(source_name)
+
     if ip_sources:
         log(f"IP enrichment ({len(ip_sources)} unique IPs from DNS + all discovery sources)...")
         all_discovered_ips = list(ip_sources.keys())
@@ -2138,6 +2343,18 @@ async def _analyze_domain_async(
         non_cloudflare_tls_certs = []
 
     result["non_cf_tls_certs"] = non_cloudflare_tls_certs
+    if result.get("ip_details"):
+        certs_by_ip = {cert.get("ip"): cert for cert in non_cloudflare_tls_certs if cert and cert.get("ip")}
+        for ip_address, details in result["ip_details"].items():
+            proxy_details = detect_proxy_details(
+                ip_address,
+                details.get("ptr"),
+                details.get("asn_info"),
+                certs_by_ip.get(ip_address),
+            )
+            details["proxy_family"] = proxy_details.get("proxy_family")
+            details["proxy_confidence"] = proxy_details.get("proxy_confidence")
+        _cb("ip_details", result["ip_details"])
     _cb("non_cf_tls_certs", non_cloudflare_tls_certs)
 
     # Cloudflare-fronted flag
@@ -2229,6 +2446,10 @@ def analyze_ip(ip: str) -> dict:
             log(f"TLS cert: CN={cert.get('cn')}  issuer={cert.get('issuer_cn')}")
 
     # ── Persist to SQLite ─────────────────────────────────────────────────────
+    proxy_details = detect_proxy_details(ip, result.get("ptr"), result.get("asn_info"), result.get("tls_cert"))
+    result["proxy_family"] = proxy_details.get("proxy_family")
+    result["proxy_confidence"] = proxy_details.get("proxy_confidence")
+
     try:
         from intel_db import DB_PATH, save_search
         save_search(result)

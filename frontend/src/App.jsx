@@ -368,13 +368,24 @@ function getRelatedTargetsSummary(result) {
     total: 0,
     domains: 0,
     ips: 0,
-    expandable: 0
+    expandable: 0,
+    hard_total: 0
+  };
+}
+
+function getHardConnections(result) {
+  return result.hard_connections || {
+    items: [],
+    total: 0,
+    shown: 0,
+    domains: 0,
+    ips: 0
   };
 }
 
 function getPivotCandidates(result, limit = 6) {
   return (getRelatedTargetsSummary(result).items || [])
-    .filter((item) => item.auto_expand)
+    .filter((item) => item.auto_expand && item.connection_strength !== "hard")
     .slice(0, limit);
 }
 
@@ -428,10 +439,64 @@ function buildExposureSummary(result) {
   };
 }
 
+function looksLikeIpTarget(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return false;
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) {
+    return text.split(".").every((part) => {
+      const numeric = Number(part);
+      return numeric >= 0 && numeric <= 255;
+    });
+  }
+  return text.includes(":");
+}
+
+function getCompletedAnalysisPhases(payload) {
+  const result = payload || {};
+  const origin = result.origin_candidates || {};
+  const relatedSummary = getRelatedTargetsSummary(result);
+  const providerChecksRan = ["censys", "shodan", "netlas"]
+    .some((key) => Object.prototype.hasOwnProperty.call(origin, key));
+  const targetedSweepsRan = ["scan", "provider_scan", "country_scan"]
+    .some((key) => {
+      const entry = origin[key];
+      return Boolean(entry) && !entry.skipped;
+    });
+  const ipEnrichmentRan = Boolean(
+    getIpEntries(result).length
+    || (result.type === "ip" && (result.ptr || (result.asn_info && Object.keys(result.asn_info).length)))
+  );
+  const tlsValidationRan = Object.prototype.hasOwnProperty.call(result, "non_cf_tls_certs")
+    || Object.prototype.hasOwnProperty.call(result, "tls_cert");
+
+  const completed = new Set();
+  if (result.type || result.timestamp || getCurrentIps(result).length) {
+    completed.add("Seed profile");
+  }
+  if (result.type || relatedSummary.total || collectOriginLeadCount(result) || (result.subdomains || []).length || (((result.historical_dns || {}).records) || []).length) {
+    completed.add("Expand from seed");
+  }
+  if (providerChecksRan) {
+    completed.add("Provider checks");
+  }
+  if (targetedSweepsRan) {
+    completed.add("Targeted sweeps");
+  }
+  if (ipEnrichmentRan) {
+    completed.add("ASN/IP enrichment");
+  }
+  if (tlsValidationRan) {
+    completed.add("TLS validation");
+  }
+  return completed;
+}
+
 function buildAnalysisStages(payload, job, targetHint = "") {
   const result = payload || {};
   const target = result.input || targetHint || job?.target || "";
-  const type = result.type || (job?.target && job.target === target ? (target.includes(".") ? "domain" : "") : "");
+  const type = result.type || (target ? (looksLikeIpTarget(target) ? "ip" : "domain") : "");
   const relatedSummary = getRelatedTargetsSummary(result);
   const currentIps = getCurrentIps(result);
   const providerHitCount = getProviderHitCount(result);
@@ -440,6 +505,7 @@ function buildAnalysisStages(payload, job, targetHint = "") {
   const liveTlsCount = getLiveTlsCount(result);
   const ipCount = getIpEntries(result).length;
   const cloudflareState = result.cloudflare_fronted ?? result.cloudflare;
+  const completedPhases = getCompletedAnalysisPhases(result);
   const progress = job?.progress || null;
   const completed = new Set(progress?.completed || []);
   const current = progress?.current || "";
@@ -504,7 +570,7 @@ function buildAnalysisStages(payload, job, targetHint = "") {
     if (hasMaterialData) {
       return stages.map((stage) => ({
         ...stage,
-        state: "complete"
+        state: completedPhases.has(stage.phase) ? "complete" : "pending"
       }));
     }
     return stages.map((stage, index) => ({
@@ -516,7 +582,7 @@ function buildAnalysisStages(payload, job, targetHint = "") {
   if (job.status === "completed") {
     return stages.map((stage) => ({
       ...stage,
-      state: "complete"
+      state: completedPhases.has(stage.phase) ? "complete" : "pending"
     }));
   }
 
@@ -603,6 +669,130 @@ function getDomainTargets(items) {
     targets.push(target);
   });
   return targets;
+}
+
+function SearchableDomainField({
+  id,
+  label,
+  value,
+  onChange,
+  options,
+  placeholder = "Search stored domains",
+  emptySelectionLabel = "",
+  helper = "",
+  className = "field-row"
+}) {
+  const [query, setQuery] = useState(value || "");
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setQuery(value || "");
+    }
+  }, [open, value]);
+
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  const visibleLimit = normalizedQuery ? 18 : 10;
+  const filteredOptions = [];
+  let matchCount = 0;
+
+  options.forEach((item) => {
+    if (normalizedQuery && !item.toLowerCase().includes(normalizedQuery)) {
+      return;
+    }
+    matchCount += 1;
+    if (filteredOptions.length < visibleLimit) {
+      filteredOptions.push(item);
+    }
+  });
+
+  const showResults = open && (Boolean(emptySelectionLabel) || Boolean(matchCount) || Boolean(normalizedQuery));
+  const metaText = normalizedQuery && query !== value
+    ? `${formatNumber(matchCount)} match${matchCount === 1 ? "" : "es"}${matchCount ? ". Press Enter to choose the first." : ""}`
+    : helper || `${formatNumber(options.length)} stored domain${options.length === 1 ? "" : "s"}`;
+
+  const handleSelect = (nextValue) => {
+    setQuery(nextValue);
+    onChange(nextValue);
+    setOpen(false);
+  };
+
+  return (
+    <div className={`${className} domain-search-field`}>
+      <label htmlFor={id}>{label}</label>
+      <div className="domain-search-shell">
+        <input
+          id={id}
+          type="text"
+          autoComplete="off"
+          value={query}
+          placeholder={placeholder}
+          aria-expanded={showResults}
+          onFocus={() => setOpen(true)}
+          onBlur={() => {
+            window.setTimeout(() => setOpen(false), 120);
+          }}
+          onChange={(event) => {
+            const nextQuery = event.target.value;
+            setQuery(nextQuery);
+            setOpen(true);
+            if (!nextQuery.trim()) {
+              onChange("");
+            }
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              if (!query.trim()) {
+                handleSelect("");
+                return;
+              }
+              if (filteredOptions.length) {
+                handleSelect(filteredOptions[0]);
+              }
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setQuery(value || "");
+              setOpen(false);
+            }
+          }}
+        />
+
+        {showResults ? (
+          <div className="domain-search-results" role="listbox" aria-label={`${label} results`}>
+            {emptySelectionLabel ? (
+              <button
+                className={!value ? "domain-search-option active" : "domain-search-option"}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => handleSelect("")}
+                type="button"
+              >
+                {emptySelectionLabel}
+              </button>
+            ) : null}
+
+            {filteredOptions.map((item) => (
+              <button
+                className={item === value ? "domain-search-option active" : "domain-search-option"}
+                key={item}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => handleSelect(item)}
+                type="button"
+              >
+                {item}
+              </button>
+            ))}
+
+            {!matchCount && normalizedQuery ? (
+              <div className="domain-search-empty">No stored domains match this search.</div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      <small className="domain-search-meta">{metaText}</small>
+    </div>
+  );
 }
 
 function parseTargetList(value) {
@@ -1348,6 +1538,141 @@ function AnalysisFlowPanel({ payload, job, targetHint = "", compact = false }) {
   );
 }
 
+function RecommendedScansPanel({ recommendations, onRunRecommendation, busy }) {
+  const items = recommendations && recommendations.items ? recommendations.items : [];
+  if (!items.length) {
+    return null;
+  }
+
+  return (
+    <SectionCard
+      title="Recommended next scans"
+      subtitle="The normal pass is done. These are the deeper scans the current evidence makes worth trying next."
+      infoTitle="Recommended next scans"
+      infoBody="These suggestions are generated from the finished seed analysis. They stay targeted so you can widen the search deliberately instead of running every heavy scan by default."
+    >
+      <div className="card-grid">
+        {items.map((item) => (
+          <LeadCard
+            key={item.id}
+            title={item.label}
+            footer={item.options && Array.isArray(item.options.scan_countries) && item.options.scan_countries.length
+              ? `Countries: ${item.options.scan_countries.join(", ")}`
+              : null}
+          >
+            <p>{item.reason}</p>
+            {onRunRecommendation ? (
+              <button className="inline-action" onClick={() => onRunRecommendation(item)} type="button" disabled={busy}>
+                {busy ? "Running..." : "Run this scan"}
+              </button>
+            ) : null}
+          </LeadCard>
+        ))}
+      </div>
+    </SectionCard>
+  );
+}
+
+function HardConnectionsPanel({ summary }) {
+  const items = summary && summary.items ? summary.items : [];
+  if (!items.length) {
+    return null;
+  }
+
+  return (
+    <SectionCard
+      title="Hard connections"
+      subtitle="These are the concrete IP or domain links the run can already defend with direct technical evidence."
+      infoTitle="Hard connections"
+      infoBody="Hard connections are the main point of the app: direct DNS links, certificate overlaps, discovered origin IPs, and other exact technical ties. They should be treated differently from softer pivots or broad similarity hints."
+    >
+      <div className="metric-grid">
+        <Metric label="Total hard links" value={formatNumber(summary.total || 0)} />
+        <Metric label="Domains" value={formatNumber(summary.domains || 0)} />
+        <Metric label="IPs" value={formatNumber(summary.ips || 0)} />
+        <Metric
+          label="Shown now"
+          value={formatNumber(summary.shown || items.length)}
+          detail={summary.total > items.length ? "Top-ranked evidence only" : "All hard links shown"}
+        />
+      </div>
+
+      <div className="card-grid">
+        {items.map((item) => (
+          <LeadCard
+            key={`${item.target_type}-${item.target}`}
+            title={item.target}
+            footer={`${item.target_type.toUpperCase()} | ${formatNumber(item.hard_evidence_count || 0)} hard evidence signal${(item.hard_evidence_count || 0) === 1 ? "" : "s"}`}
+          >
+            <p>{item.evidence_rationale || "Concrete technical overlap discovered around the seed."}</p>
+            <p><strong>Hard evidence:</strong> {formatRelationList(item.hard_relations && item.hard_relations.length ? item.hard_relations : item.relations, 4)}</p>
+            <p><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
+          </LeadCard>
+        ))}
+      </div>
+    </SectionCard>
+  );
+}
+
+function DatabaseMatchesPanel({ matches, onOpenSavedResult }) {
+  const items = matches && matches.items ? matches.items : [];
+  if (!items.length) {
+    return null;
+  }
+
+  return (
+    <SectionCard
+      title="Already in the database"
+      subtitle="These top exposed IPs or domains already touch searches we’ve stored before."
+      infoTitle="Already in the database"
+      infoBody="This section answers the question: did any of the pivots uncovered in this run already appear in our own history? The cards below are a ranked shortlist, not an exhaustive export. A direct target hit is stronger than a passive discovered-target hit."
+    >
+      <div className="metric-grid">
+        <Metric label="Top pivots shown" value={formatNumber(matches.total || 0)} />
+        <Metric label="Top domains shown" value={formatNumber(matches.matched_domains || 0)} />
+        <Metric label="Top IPs shown" value={formatNumber(matches.matched_ips || 0)} />
+        <Metric label="Direct hits shown" value={formatNumber(matches.direct_target_hits || 0)} />
+      </div>
+
+      <div className="card-grid">
+        {items.map((item) => (
+          <LeadCard
+            key={`${item.target_type}-${item.target}`}
+            title={item.target}
+            footer={item.match_count > item.matches.length
+              ? `Showing ${item.matches.length} of ${item.match_count} stored matches`
+              : `${item.match_count} stored match${item.match_count === 1 ? "" : "es"}`}
+          >
+            <p><strong>Pivot type:</strong> {item.target_type.toUpperCase()}</p>
+            <p><strong>Why it surfaced:</strong> {formatRelationList(item.relations)}</p>
+            <p><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
+            <div className="match-snippet-list">
+              {item.matches.map((match) => (
+                <div className="match-snippet" key={`${item.target}-${match.search_id}`}>
+                  <p><strong>{match.target}</strong> | {formatDateTime(match.timestamp)} | {cloudflareLabel(match.cloudflare_fronted)}</p>
+                  <p>
+                    {match.matched_as_target
+                      ? "Matched as a searched target."
+                      : `Matched via ${formatRelationList(match.matched_relations)}.`}
+                  </p>
+                  {!match.matched_as_target && match.matched_sources && match.matched_sources.length ? (
+                    <p><strong>Stored via:</strong> {formatListPreview(match.matched_sources, 4)}</p>
+                  ) : null}
+                  {onOpenSavedResult ? (
+                    <button className="inline-action" onClick={() => onOpenSavedResult(match.search_id)} type="button">
+                      Open match
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </LeadCard>
+        ))}
+      </div>
+    </SectionCard>
+  );
+}
+
 function TypePill({ kind, definitions }) {
   if (!kind) {
     return null;
@@ -1532,7 +1857,7 @@ function JobProgress({ job }) {
   );
 }
 
-function OverviewTab({ result, meta }) {
+function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, busy }) {
   const dns = result.dns || {};
   const page = result.page_metadata || {};
   const email = result.email_security || {};
@@ -1547,9 +1872,26 @@ function OverviewTab({ result, meta }) {
   const historicalIps = ((result.historical_dns || {}).records || []).filter((item) => ["A", "AAAA"].includes(item.rrtype));
   const interestingTxt = collectInterestingTxt(dns.TXT || []);
   const relatedSummary = getRelatedTargetsSummary(result);
+  const hardConnections = getHardConnections(result);
   const pivots = getPivotCandidates(result);
   const exposure = buildExposureSummary(result);
   const currentIps = getCurrentIps(result);
+  const hasPageContext = Boolean(
+    (page.social_handles && Object.keys(page.social_handles).length)
+    || (page.social_links && Object.keys(page.social_links).length)
+    || page.html_lang
+    || page.cms_generator
+    || page.favicon_md5
+  );
+  const hasEmailContext = Boolean(email.dmarc || (email.dkim && Object.keys(email.dkim).length));
+  const hasSupportingContext = Boolean(
+    currentCerts.length
+    || trackingIds.length
+    || interestingTxt.length
+    || hasPageContext
+    || historicalIps.length
+    || hasEmailContext
+  );
 
   return (
     <div className="stack">
@@ -1565,15 +1907,14 @@ function OverviewTab({ result, meta }) {
             <span className="eyebrow">At a glance</span>
             <h3>{result.input}</h3>
             <p>
-              Start from the supplied {result.type === "ip" ? "IP" : "domain"}, profile it directly,
-              then spread outward into provider, Google, Cloudflare, ASN, and TLS checks only where the nearby matches look worth chasing.
+              Seed first, then widen into provider, Google, Cloudflare, ASN, and TLS checks only where nearby matches look worth chasing.
             </p>
           </div>
           <div className="metric-grid overview-hero-metrics">
             <Metric label="Target type" value={(result.type || "").toUpperCase()} />
             <Metric label="Cloudflare" value={cloudflareLabel(result.cloudflare_fronted ?? result.cloudflare)} />
-            <Metric label="Origin leads" value={formatNumber(collectOriginLeadCount(result))} />
-            <Metric label="Expandable pivots" value={formatNumber(relatedSummary.expandable || 0)} detail={`${formatNumber(relatedSummary.total || 0)} total discovered`} />
+            <Metric label="Hard connections" value={formatNumber(hardConnections.total || 0)} detail={`${formatNumber(hardConnections.domains || 0)} domains • ${formatNumber(hardConnections.ips || 0)} IPs`} />
+            <Metric label="Broader pivots" value={formatNumber(Math.max((relatedSummary.expandable || 0) - (hardConnections.total || 0), 0))} detail={`${formatNumber(relatedSummary.total || 0)} total discovered`} />
           </div>
         </div>
         <Callout tone={exposure.tone}>
@@ -1583,18 +1924,22 @@ function OverviewTab({ result, meta }) {
 
       <SectionCard
         title="Analysis path"
-        subtitle="This is the order the app follows so you can tell what happened without reading the raw logs."
-        infoTitle="Analysis path"
-        infoBody="The workflow starts with the seed you supplied, then fans outward through related infrastructure and finally confirms likely matches with ASN and live TLS checks."
+        subtitle="Seed first, then outward only where the evidence supports it."
       >
         <AnalysisFlowPanel payload={result} compact />
       </SectionCard>
 
+      <HardConnectionsPanel summary={hardConnections} />
+
+      <RecommendedScansPanel
+        recommendations={result.scan_recommendations}
+        onRunRecommendation={onRunRecommendation}
+        busy={busy}
+      />
+
       <SectionCard
         title="Seed snapshot"
         subtitle="The direct facts pulled from the supplied target before the workflow fans outward."
-        infoTitle="Seed snapshot"
-        infoBody="This section keeps the seed evidence together so you can understand the basic shape of the target before you look at pivots or expanded infrastructure."
       >
         <KeyValueList
           items={[
@@ -1612,20 +1957,18 @@ function OverviewTab({ result, meta }) {
             <p className="break-word"><strong>Current IPs:</strong> {currentIps.length ? formatListPreview(currentIps, 6) : "No A/AAAA records were resolved"}</p>
             <p><strong>Direct-looking IPs:</strong> {formatNumber(getDirectIpCount(result))}</p>
           </LeadCard>
-          <LeadCard title="Next pivots">
+          <LeadCard title="Connection evidence">
+            <p><strong>Hard connections:</strong> {formatNumber(hardConnections.total || 0)}</p>
             <p><strong>Related domains:</strong> {formatNumber(relatedSummary.domains || 0)}</p>
             <p><strong>Related IPs:</strong> {formatNumber(relatedSummary.ips || 0)}</p>
-            <p><strong>Auto-expand candidates:</strong> {formatNumber(relatedSummary.expandable || 0)}</p>
           </LeadCard>
         </div>
       </SectionCard>
 
       {pivots.length ? (
         <SectionCard
-          title="Best expansion pivots"
-          subtitle="These are the strongest nearby domains or IPs the workflow uncovered around the seed."
-          infoTitle="Best expansion pivots"
-          infoBody="These cards show which discovered domains and IPs are worth following next, based on how many higher-signal sources pointed at them."
+          title="Broader pivots"
+          subtitle="Useful next leads, but weaker than the hard evidence links above."
         >
           <div className="card-grid">
             {pivots.map((item) => (
@@ -1638,122 +1981,131 @@ function OverviewTab({ result, meta }) {
         </SectionCard>
       ) : null}
 
-      {currentCerts.length ? (
-        <SectionCard
-          title="Live TLS certificates"
-          subtitle="Certificates pulled directly from discovered non-Cloudflare IPs."
-          infoTitle="Live TLS certificates"
-          infoBody="These are the HTTPS identity cards presented by servers we reached directly. Matching or unusual certificates can connect one domain to another behind the scenes."
-        >
-          <div className="card-grid">
-            {currentCerts.map((cert) => (
-              <LeadCard key={`${cert.ip}-${cert.sha256 || cert.cn}`} title={`${cert.ip}:${cert.port || 443}`} footer={`Valid ${formatDate(cert.not_before)} to ${formatDate(cert.not_after)}`}>
-                <p><strong>CN:</strong> {cert.cn || "None"}</p>
-                <p><strong>Issuer:</strong> {cert.issuer_cn || cert.issuer_org || "Unknown"}</p>
-                <TypePill kind={cert.cert_type} definitions={meta.cert_types || {}} />
-                <p className="muted break-word">{(cert.sans || []).slice(0, 8).join(", ") || "No SANs listed"}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
+      <DatabaseMatchesPanel matches={result.db_matches} onOpenSavedResult={onOpenSavedResult} />
 
-      {trackingIds.length ? (
-        <SectionCard
-          title="Tracking and attribution IDs"
-          subtitle="These IDs are useful pivot points when you want to find related domains."
-          infoTitle="Tracking and attribution IDs"
-          infoBody="These are analytics and advertising codes copied into a website. If the same code appears on several domains, the same team or contractor may be running them."
-        >
-          <div className="card-grid">
-            {trackingIds.map((item) => (
-              <LeadCard key={`${item.label}-${item.value}`} title={item.label}>
-                <p className="break-word">{item.value}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
+      {hasSupportingContext ? (
+        <details className="fold-panel">
+          <summary>Supporting context and technical detail</summary>
 
-      {interestingTxt.length ? (
-        <SectionCard title="Interesting TXT records" subtitle="Ownership and platform tokens translated into normal English.">
-          <div className="card-grid">
-            {interestingTxt.map((item) => (
-              <LeadCard key={`${item.label}-${item.value}`} title={item.label} footer={item.note}>
-                <p className="break-word">{item.value}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {(page.social_handles && Object.keys(page.social_handles).length) || (page.social_links && Object.keys(page.social_links).length) ? (
-        <SectionCard title="Social accounts and content signals" subtitle="Useful for operator mapping, especially when the site links out to stable public profiles.">
-          <div className="card-grid">
-            {Object.entries(page.social_handles || {}).map(([platform, handles]) => (
-              <LeadCard key={platform} title={platform.replace("_", " ")}>
-                <p className="break-word">{handles.join(", ")}</p>
-              </LeadCard>
-            ))}
-            {page.html_lang ? (
-              <LeadCard title="Page language">
-                <p>{page.html_lang}</p>
-              </LeadCard>
-            ) : null}
-            {page.cms_generator ? (
-              <LeadCard title="CMS generator">
-                <p>{page.cms_generator}</p>
-              </LeadCard>
-            ) : null}
-            {page.favicon_md5 ? (
-              <LeadCard title="Favicon hash">
-                <p className="break-word">{page.favicon_md5}</p>
-              </LeadCard>
-            ) : null}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {historicalIps.length ? (
-        <SectionCard
-          title="Historical IP history"
-          subtitle="Older A and AAAA records can expose previous hosting even when the current site is proxied."
-          infoTitle="Historical IP history"
-          infoBody="This shows where the domain pointed in the past. Old IPs can reveal origin servers that are no longer visible in the current DNS."
-        >
-          <div className="card-grid">
-            {historicalIps.map((item) => (
-              <LeadCard
-                key={`${item.rdata}-${item.last_seen}`}
-                title={item.rdata}
-                footer={`First seen ${item.first_seen || "unknown"} | Last seen ${item.last_seen || "unknown"}`}
+          <div className="stack">
+            {currentCerts.length ? (
+              <SectionCard
+                title="Live TLS certificates"
+                subtitle="Certificates pulled directly from discovered non-Cloudflare IPs."
               >
-                <p>Record type: {item.rrtype}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
+                <div className="card-grid">
+                  {currentCerts.map((cert) => (
+                    <LeadCard key={`${cert.ip}-${cert.sha256 || cert.cn}`} title={`${cert.ip}:${cert.port || 443}`} footer={`Valid ${formatDate(cert.not_before)} to ${formatDate(cert.not_after)}`}>
+                      <p><strong>CN:</strong> {cert.cn || "None"}</p>
+                      <p><strong>Issuer:</strong> {cert.issuer_cn || cert.issuer_org || "Unknown"}</p>
+                      <TypePill kind={cert.cert_type} definitions={meta.cert_types || {}} />
+                      <p className="muted break-word">{(cert.sans || []).slice(0, 8).join(", ") || "No SANs listed"}</p>
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
 
-      {email.dmarc || (email.dkim && Object.keys(email.dkim).length) ? (
-        <SectionCard title="Email security" subtitle="Mail infrastructure can reveal who actually runs the domain.">
-          <div className="card-grid">
-            {email.dmarc ? (
-              <LeadCard title="DMARC policy">
-                <p className="break-word">{email.dmarc}</p>
-              </LeadCard>
-            ) : (
-              <LeadCard title="DMARC policy">
-                <p>No DMARC record was found, which makes spoofing easier.</p>
-              </LeadCard>
-            )}
-            {Object.entries(email.dkim || {}).map(([selector, value]) => (
-              <LeadCard key={selector} title={`DKIM: ${selector}`}>
-                <p className="break-word">{value}</p>
-              </LeadCard>
-            ))}
+            {trackingIds.length ? (
+              <SectionCard
+                title="Tracking and attribution IDs"
+                subtitle="Useful pivot points when you want to find related domains."
+              >
+                <div className="card-grid">
+                  {trackingIds.map((item) => (
+                    <LeadCard key={`${item.label}-${item.value}`} title={item.label}>
+                      <p className="break-word">{item.value}</p>
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {interestingTxt.length ? (
+              <SectionCard title="Interesting TXT records" subtitle="Ownership and platform tokens translated into normal English.">
+                <div className="card-grid">
+                  {interestingTxt.map((item) => (
+                    <LeadCard key={`${item.label}-${item.value}`} title={item.label} footer={item.note}>
+                      <p className="break-word">{item.value}</p>
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {hasPageContext ? (
+              <SectionCard title="Social accounts and content signals" subtitle="Useful for operator mapping and template clues.">
+                <div className="card-grid">
+                  {Object.entries(page.social_handles || {}).map(([platform, handles]) => (
+                    <LeadCard key={platform} title={platform.replace("_", " ")}>
+                      <p className="break-word">{handles.join(", ")}</p>
+                    </LeadCard>
+                  ))}
+                  {Object.entries(page.social_links || {}).map(([platform, links]) => (
+                    <LeadCard key={`link-${platform}`} title={`${platform.replace("_", " ")} links`}>
+                      <p className="break-word">{links.join(", ")}</p>
+                    </LeadCard>
+                  ))}
+                  {page.html_lang ? (
+                    <LeadCard title="Page language">
+                      <p>{page.html_lang}</p>
+                    </LeadCard>
+                  ) : null}
+                  {page.cms_generator ? (
+                    <LeadCard title="CMS generator">
+                      <p>{page.cms_generator}</p>
+                    </LeadCard>
+                  ) : null}
+                  {page.favicon_md5 ? (
+                    <LeadCard title="Favicon hash">
+                      <p className="break-word">{page.favicon_md5}</p>
+                    </LeadCard>
+                  ) : null}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {historicalIps.length ? (
+              <SectionCard
+                title="Historical IP history"
+                subtitle="Older A and AAAA records can expose previous hosting even when the current site is proxied."
+              >
+                <div className="card-grid">
+                  {historicalIps.map((item) => (
+                    <LeadCard
+                      key={`${item.rdata}-${item.last_seen}`}
+                      title={item.rdata}
+                      footer={`First seen ${item.first_seen || "unknown"} | Last seen ${item.last_seen || "unknown"}`}
+                    >
+                      <p>Record type: {item.rrtype}</p>
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {hasEmailContext ? (
+              <SectionCard title="Email security" subtitle="Mail infrastructure can reveal who actually runs the domain.">
+                <div className="card-grid">
+                  {email.dmarc ? (
+                    <LeadCard title="DMARC policy">
+                      <p className="break-word">{email.dmarc}</p>
+                    </LeadCard>
+                  ) : (
+                    <LeadCard title="DMARC policy">
+                      <p>No DMARC record was found, which makes spoofing easier.</p>
+                    </LeadCard>
+                  )}
+                  {Object.entries(email.dkim || {}).map(([selector, value]) => (
+                    <LeadCard key={selector} title={`DKIM: ${selector}`}>
+                      <p className="break-word">{value}</p>
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
           </div>
-        </SectionCard>
+        </details>
       ) : null}
     </div>
   );
@@ -2177,7 +2529,7 @@ function IpDetailsTab({ result, meta }) {
   );
 }
 
-function ResultPanel({ result, meta }) {
+function ResultPanel({ result, meta, onRunRecommendation, onOpenSavedResult, busy }) {
   const [activeTab, setActiveTab] = useState("overview");
 
   useEffect(() => {
@@ -2202,7 +2554,15 @@ function ResultPanel({ result, meta }) {
         ))}
       </div>
 
-      {activeTab === "overview" ? <OverviewTab result={result} meta={meta} /> : null}
+      {activeTab === "overview" ? (
+        <OverviewTab
+          result={result}
+          meta={meta}
+          onRunRecommendation={onRunRecommendation}
+          onOpenSavedResult={onOpenSavedResult}
+          busy={busy}
+        />
+      ) : null}
       {activeTab === "dns" ? <DnsTab result={result} /> : null}
       {activeTab === "certs" ? <CertificatesTab result={result} meta={meta} /> : null}
       {activeTab === "origin" ? <OriginTab result={result} meta={meta} /> : null}
@@ -2211,9 +2571,9 @@ function ResultPanel({ result, meta }) {
   );
 }
 
-function NetworkGraphTab({ clusters, recent, theme }) {
+function NetworkGraphTab({ clusters, domainTargets, theme }) {
   const graphRef = useRef(null);
-  const focusOptions = getDomainTargets(recent);
+  const focusOptions = domainTargets || [];
   const visibleClusters = getVisibleClusters(clusters);
   const [controls, setControls] = useState({
     includeIp: true,
@@ -2431,25 +2791,17 @@ function NetworkGraphTab({ clusters, recent, theme }) {
                 <strong>{controls.maxLinks}</strong>
               </label>
 
-              <div className="control-inline control-inline-wide">
-                <label htmlFor="graph-focus">
-                  Focus on a domain
-                  <InfoPopover
-                    title="Focus on a domain"
-                    body="This shrinks the graph down to one domain and the domains most strongly connected to it, which is useful when the full network is too busy."
-                  />
-                </label>
-                <select
-                  id="graph-focus"
-                  value={controls.focus}
-                  onChange={(event) => updateControl("focus", event.target.value)}
-                >
-                  <option value="">All domains</option>
-                  {focusOptions.map((item) => (
-                    <option key={item} value={item}>{item}</option>
-                  ))}
-                </select>
-              </div>
+              <SearchableDomainField
+                className="control-inline control-inline-wide"
+                id="graph-focus"
+                label="Focus on a domain"
+                value={controls.focus}
+                onChange={(nextValue) => updateControl("focus", nextValue)}
+                options={focusOptions}
+                placeholder="Search stored domains"
+                emptySelectionLabel="All domains"
+                helper={`${formatNumber(focusOptions.length)} stored domains available`}
+              />
 
               <div className="button-row">
                 <button
@@ -2723,6 +3075,7 @@ function NetworkGraphTab({ clusters, recent, theme }) {
 function ExplorerPanel({
   meta,
   recent,
+  domainTargets,
   clusters,
   connections,
   theme,
@@ -2731,15 +3084,12 @@ function ExplorerPanel({
   onOpenSavedResult
 }) {
   const [activeTab, setActiveTab] = useState("network");
-  const domainTargets = getDomainTargets(recent);
   const visibleClusters = getVisibleClusters(clusters);
 
   return (
     <SectionCard
       title="Relationship explorer"
-      subtitle="Move from one domain to the next using stored overlaps, shared infrastructure, and historical results."
-      infoTitle="What this explorer does"
-      infoBody="This area helps you pivot from one domain to related ones. In plain English, it is the part of the app that answers 'what else looks connected to this site, and why?'"
+      subtitle="Pivot across stored domains using the strongest shared signals first."
     >
       <div className="tab-row">
         {EXPLORER_TABS.map((tab) => (
@@ -2749,9 +3099,6 @@ function ExplorerPanel({
 
       {activeTab === "recent" ? (
         <div className="stack">
-          <Callout tone="info">
-            These are saved investigations you can reopen. Think of this as your case history, not live traffic.
-          </Callout>
           <div className="card-grid">
             {recent.map((item) => (
               <LeadCard
@@ -2769,14 +3116,11 @@ function ExplorerPanel({
       ) : null}
 
       {activeTab === "network" ? (
-        <NetworkGraphTab clusters={clusters} recent={recent} theme={theme} />
+        <NetworkGraphTab clusters={clusters} domainTargets={domainTargets} theme={theme} />
       ) : null}
 
       {activeTab === "ip" ? (
         <div className="stack">
-          <Callout tone="info">
-            Shared IPs shown here have already had broad CDN, managed WordPress, mail, and shared-hosting noise filtered out, so this list should stay focused on the more interesting overlaps.
-          </Callout>
           <div className="card-grid">
             {visibleClusters.ip.map((item) => (
               <LeadCard key={item.ip} title={item.ip} footer={`${item.target_count} linked targets`}>
@@ -2793,9 +3137,6 @@ function ExplorerPanel({
 
       {activeTab === "tracking" ? (
         <div className="stack">
-          <Callout tone="info">
-            Tracking IDs are the analytics or ad codes copied into a site. Shared tracking IDs often mean the same people, agency, or toolkit were involved.
-          </Callout>
           <div className="card-grid">
             {clusters.tracking.map((item) => (
               <LeadCard key={`${item.id_type}-${item.id_value}`} title={`${item.id_type}: ${item.id_value}`} footer={`${item.target_count} linked targets`}>
@@ -2808,9 +3149,6 @@ function ExplorerPanel({
 
       {activeTab === "favicon" ? (
         <div className="stack">
-          <Callout tone="info">
-            Favicons are the small tab icons a website uses. Matching favicons are not proof by themselves, but they are a good clue that sites share a template or operator.
-          </Callout>
           <div className="card-grid">
             {clusters.favicon.map((item) => (
               <LeadCard key={item.md5} title={item.md5} footer={`${item.target_count} linked targets`}>
@@ -2823,9 +3161,6 @@ function ExplorerPanel({
 
       {activeTab === "tls" ? (
         <div className="stack">
-          <Callout tone="info">
-            TLS fingerprints come from HTTPS certificates. When several domains reuse the same certificate identity, that is often one of the strongest technical links in the app.
-          </Callout>
           <div className="card-grid">
             {clusters.tls.map((item) => (
               <LeadCard key={item.sha256} title={item.cn || item.sha256.slice(0, 16)} footer={`${item.target_count} linked targets`}>
@@ -2840,22 +3175,15 @@ function ExplorerPanel({
 
       {activeTab === "connections" ? (
         <div className="stack">
-          <Callout tone="info">
-            Domain connections show what a chosen domain shares with other stored domains. In plain English, this is the "why does the app think these sites belong in the same conversation?" view.
-          </Callout>
-          <div className="field-row">
-            <label htmlFor="connections-target">Choose a stored domain</label>
-            <select
-              id="connections-target"
-              value={selectedTarget}
-              onChange={(event) => setSelectedTarget(event.target.value)}
-            >
-              <option value="">Select a domain</option>
-              {domainTargets.map((item) => (
-                <option key={item} value={item}>{item}</option>
-              ))}
-            </select>
-          </div>
+          <SearchableDomainField
+            id="connections-target"
+            label="Find a stored domain"
+            value={selectedTarget}
+            onChange={setSelectedTarget}
+            options={domainTargets}
+            placeholder="Search stored domains"
+            helper={`${formatNumber(domainTargets.length)} stored domains available`}
+          />
 
           {connections ? (
             <div className="stack">
@@ -3646,7 +3974,7 @@ function GraphCanvasD3({ graph, selection, setSelection, theme, graphApiRef, hei
   );
 }
 
-function GraphPage({ clusters, recent, theme }) {
+function GraphPage({ clusters, domainTargets, theme }) {
   const graphApiRef = useRef({
     fit: () => {},
     reset: () => {}
@@ -3659,7 +3987,7 @@ function GraphPage({ clusters, recent, theme }) {
 
   const visibleClusters = getVisibleClusters(clusters);
   const graph = buildNetworkModel(visibleClusters, controls);
-  const focusOptions = getDomainTargets(recent);
+  const focusOptions = domainTargets || [];
   const activeNodeId = selection && selection.type === "node" ? selection.id : "";
   const activeEdgeKey = selection && selection.type === "edge" ? selection.key : "";
   const selectedNode = activeNodeId
@@ -3799,9 +4127,7 @@ function GraphPage({ clusters, recent, theme }) {
     <PageFrame
       eyebrow="Explorer"
       title="Relationship graph"
-      subtitle="Copied from the TikTok-tool graph layout and adapted to domain infrastructure links."
-      infoTitle="How to use this graph"
-      infoBody="Drag domains to spread the network out, click a line to inspect the connection, and use the controls above the graph to focus on the strongest relationships first."
+      subtitle="Filter stored domain links by strength, signal type, and focus domain."
       metrics={
         <>
           <Metric label="Domains in view" value={formatNumber(graph.nodes.length)} />
@@ -3818,10 +4144,7 @@ function GraphPage({ clusters, recent, theme }) {
               <div className="tt-graph-title-block">
                 <h3>Link graph for stored domains</h3>
                 <p className="tt-graph-subtitle">
-                  Inferred from shared TLS fingerprints, tracking IDs, favicons, direct IP overlaps, and shared provider networks.
-                </p>
-                <p className="tt-graph-tip">
-                  Drag nodes to spread the network out. Single-colour links show one matching indicator. Current TLS and direct-IP matches are weighted highest, while ASN, mail, shared-hosting, and CDN overlaps stay lower so the strongest evidence surfaces first.
+                  Shared TLS, tracking, favicon, direct-IP, and network evidence, ranked so the strongest technical links surface first.
                 </p>
               </div>
               <div className="tt-graph-badge-group">
@@ -3877,15 +4200,17 @@ function GraphPage({ clusters, recent, theme }) {
                 <strong>{controls.maxLinks}</strong>
               </label>
 
-              <label className="tt-graph-inline-select" htmlFor="graph-page-focus">
-                <span>Focus domain</span>
-                <select id="graph-page-focus" value={controls.focus} onChange={(event) => updateControl("focus", event.target.value)}>
-                  <option value="">All domains</option>
-                  {focusOptions.map((item) => (
-                    <option key={item} value={item}>{item}</option>
-                  ))}
-                </select>
-              </label>
+              <SearchableDomainField
+                className="tt-graph-inline-select domain-search-inline"
+                id="graph-page-focus"
+                label="Focus domain"
+                value={controls.focus}
+                onChange={(nextValue) => updateControl("focus", nextValue)}
+                options={focusOptions}
+                placeholder="Search stored domains"
+                emptySelectionLabel="All domains"
+                helper={`${formatNumber(focusOptions.length)} stored domains available`}
+              />
             </div>
 
             <div className="tt-graph-legend">
@@ -3959,30 +4284,22 @@ function GraphPage({ clusters, recent, theme }) {
   );
 }
 
-function ConnectionsPage({ connections, meta, selectedTarget, setSelectedTarget, recent, onOpenSavedResult }) {
-  const domainTargets = getDomainTargets(recent);
-
+function ConnectionsPage({ connections, meta, selectedTarget, setSelectedTarget, domainTargets, onOpenSavedResult }) {
   return (
     <PageFrame
       eyebrow="Explorer"
       title="Domain connections"
-      subtitle="Pick one stored domain and see, in plain English, why it overlaps with other domains already in the database."
-      infoTitle="What domain connections mean"
-      infoBody="This page answers the question 'why does the app think these domains belong in the same conversation?' by breaking the overlap into categories like certificates, TLS history, tracking IDs, IPs, ASNs, and favicons."
+      subtitle="Search a stored domain to inspect the strongest overlaps already in the database."
     >
-      <div className="field-row">
-        <label htmlFor="connections-page-target">Choose a stored domain</label>
-        <select
-          id="connections-page-target"
-          value={selectedTarget}
-          onChange={(event) => setSelectedTarget(event.target.value)}
-        >
-          <option value="">Select a domain</option>
-          {domainTargets.map((item) => (
-            <option key={item} value={item}>{item}</option>
-          ))}
-        </select>
-      </div>
+      <SearchableDomainField
+        id="connections-page-target"
+        label="Find a stored domain"
+        value={selectedTarget}
+        onChange={setSelectedTarget}
+        options={domainTargets}
+        placeholder="Search stored domains"
+        helper={`${formatNumber(domainTargets.length)} stored domains available`}
+      />
 
       {connections ? (
         <div className="stack">
@@ -4106,7 +4423,7 @@ function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyz
   );
 }
 
-function ResultContentPage({ pageId, result, meta }) {
+function ResultContentPage({ pageId, result, meta, onRunRecommendation, onOpenSavedResult, busy }) {
   const pageMeta = RESULT_PAGES.find((page) => page.id === pageId) || RESULT_PAGES[0];
   const pageMetrics = (
     <>
@@ -4131,7 +4448,15 @@ function ResultContentPage({ pageId, result, meta }) {
       }
       metrics={pageMetrics}
     >
-      {pageId === "overview" ? <OverviewTab result={result} meta={meta} /> : null}
+      {pageId === "overview" ? (
+        <OverviewTab
+          result={result}
+          meta={meta}
+          onRunRecommendation={onRunRecommendation}
+          onOpenSavedResult={onOpenSavedResult}
+          busy={busy}
+        />
+      ) : null}
       {pageId === "dns" ? <DnsTab result={result} /> : null}
       {pageId === "certs" ? <CertificatesTab result={result} meta={meta} /> : null}
       {pageId === "origin" ? <OriginTab result={result} meta={meta} /> : null}
@@ -4309,6 +4634,7 @@ export default function App() {
   });
   const [job, setJob] = useState(null);
   const [recent, setRecent] = useState([]);
+  const [domainTargets, setDomainTargets] = useState([]);
   const [clusters, setClusters] = useState({
     ip: [],
     asn: [],
@@ -4344,8 +4670,9 @@ export default function App() {
   }, [theme]);
 
   async function loadExplorerData() {
-    const [recentResponse, ipResponse, asnResponse, trackingResponse, faviconResponse, tlsResponse] = await Promise.allSettled([
+    const [recentResponse, domainsResponse, ipResponse, asnResponse, trackingResponse, faviconResponse, tlsResponse] = await Promise.allSettled([
       apiFetch("/api/history/recent?limit=100"),
+      apiFetch("/api/history/domains"),
       apiFetch("/api/clusters/ip"),
       apiFetch(`/api/clusters/asn?scope=${encodeURIComponent(asnScope)}`),
       apiFetch("/api/clusters/tracking"),
@@ -4354,6 +4681,7 @@ export default function App() {
     ]);
 
     setRecent(recentResponse.status === "fulfilled" ? recentResponse.value.items || [] : []);
+    setDomainTargets(domainsResponse.status === "fulfilled" ? domainsResponse.value.items || [] : []);
     setClusters({
       ip: ipResponse.status === "fulfilled" ? ipResponse.value.items || [] : [],
       asn: asnResponse.status === "fulfilled" ? asnResponse.value.items || [] : [],
@@ -4364,6 +4692,7 @@ export default function App() {
 
     const labeledResponses = [
       ["Recent searches", recentResponse],
+      ["Stored domains", domainsResponse],
       ["Shared IPs", ipResponse],
       ["Shared ASNs", asnResponse],
       ["Tracking IDs", trackingResponse],
@@ -4414,12 +4743,12 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedTarget) {
-      const firstDomain = getDomainTargets(recent)[0];
+      const firstDomain = (domainTargets.length ? domainTargets : getDomainTargets(recent))[0];
       if (firstDomain) {
         setSelectedTarget(firstDomain);
       }
     }
-  }, [recent, selectedTarget]);
+  }, [domainTargets, recent, selectedTarget]);
 
   useEffect(() => {
     if (!selectedTarget) {
@@ -4557,9 +4886,43 @@ export default function App() {
     }
   }
 
+  async function runRecommendedScan(recommendation) {
+    if (!result || !recommendation) {
+      return;
+    }
+
+    const options = recommendation.options || {};
+    const countries = Array.isArray(options.scan_countries) ? options.scan_countries : [];
+
+    setForm((current) => ({
+      ...current,
+      target: result.input,
+      scan: Boolean(options.scan),
+      scan_europe: Boolean(options.scan_europe),
+      scan_all: Boolean(options.scan_all),
+      scan_providers: Boolean(options.scan_providers),
+      scan_eu_countries: Boolean(options.scan_eu_countries),
+      scan_full: Boolean(options.scan_full),
+      countriesText: countries.join(" ")
+    }));
+
+    await submitAnalysis({
+      target: result.input,
+      scan: false,
+      scan_europe: false,
+      scan_all: false,
+      scan_providers: false,
+      scan_eu_countries: false,
+      scan_full: false,
+      scan_countries: countries,
+      ...options
+    });
+  }
+
   const result = job && job.result ? job.result : null;
   const busy = job && (job.status === "queued" || job.status === "running");
-  const storedDomains = getDomainTargets(recent).length;
+  const availableDomainTargets = domainTargets.length ? domainTargets : getDomainTargets(recent);
+  const storedDomains = availableDomainTargets.length;
   const visibleClusters = getVisibleClusters(clusters);
   const sharedSignalCount = visibleClusters.ip.length + visibleClusters.asn.length + clusters.tracking.length + clusters.favicon.length + clusters.tls.length;
   const openctiLabel = openctiState.available === false
@@ -4664,11 +5027,20 @@ export default function App() {
   }
 
   if (result && RESULT_PAGES.some((page) => page.id === activePage)) {
-    pageContent = <ResultContentPage pageId={activePage} result={result} meta={meta} />;
+    pageContent = (
+      <ResultContentPage
+        pageId={activePage}
+        result={result}
+        meta={meta}
+        onRunRecommendation={runRecommendedScan}
+        onOpenSavedResult={openSavedResult}
+        busy={busy}
+      />
+    );
   }
 
   if (activePage === "graph") {
-    pageContent = <GraphPage clusters={clusters} recent={recent} theme={theme} />;
+    pageContent = <GraphPage clusters={clusters} domainTargets={availableDomainTargets} theme={theme} />;
   }
 
   if (activePage === "connections") {
@@ -4678,7 +5050,7 @@ export default function App() {
         meta={meta}
         selectedTarget={selectedTarget}
         setSelectedTarget={setSelectedTarget}
-        recent={recent}
+        domainTargets={availableDomainTargets}
         onOpenSavedResult={openSavedResult}
       />
     );

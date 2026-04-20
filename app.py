@@ -34,10 +34,15 @@ from intel_db import (
     cluster_by_tracking_id,
     get_by_id,
     get_connections_for_target,
+    get_domain_targets,
     get_domains_with_source_errors,
     get_history_for_target,
     get_recent,
     init_db,
+    normalize_ip_details,
+    summarize_hard_connections,
+    summarize_result_db_matches,
+    summarize_related_targets,
 )
 
 try:
@@ -176,6 +181,12 @@ SOURCE_LABELS = {
     "spf": "SPF record",
 }
 
+EU_COUNTRY_CODES = {
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+    "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+}
+
 DB_ERROR_DETAIL = (
     "The SQLite database is corrupted or unreadable. Explorer data can appear empty "
     "until the database is repaired, restored from backup, or replaced."
@@ -239,7 +250,8 @@ def _attach_ip_context(item: dict[str, Any], ip_details: dict[str, Any]) -> dict
 
 def _annotate_result(payload: dict[str, Any]) -> dict[str, Any]:
     data = jsonable_encoder(payload)
-    ip_details = data.get("ip_details") or {}
+    ip_details = normalize_ip_details(data.get("ip_details"))
+    data["ip_details"] = ip_details
 
     for ip_address, info in ip_details.items():
         sources = sorted(set(info.get("sources") or []))
@@ -300,7 +312,227 @@ def _annotate_result(payload: dict[str, Any]) -> dict[str, Any]:
         data["server_type"] = server_type
         data["server_type_label"] = SERVER_TYPE_DEFINITIONS.get(server_type, SERVER_TYPE_DEFINITIONS["direct"])["label"]
 
+    related_summary = summarize_related_targets(data)
+    data["related_targets_summary"] = related_summary
+    data["hard_connections"] = summarize_hard_connections(
+        data,
+        related_summary=related_summary,
+    )
+    data["db_matches"] = summarize_result_db_matches(
+        data,
+        exclude_search_id=data.get("search_id"),
+    )
+    data["scan_recommendations"] = _build_scan_recommendations(data)
+
     return data
+
+
+def _origin_result_has_run(entry: Any) -> bool:
+    return isinstance(entry, dict) and not entry.get("skipped")
+
+
+def _collect_seed_country_codes(data: dict[str, Any]) -> list[str]:
+    countries: set[str] = set()
+
+    whois_country = str((data.get("whois") or {}).get("country") or "").strip().upper()
+    if len(whois_country) == 2:
+        countries.add(whois_country)
+
+    ip_details = data.get("ip_details") or {}
+    for info in ip_details.values():
+        asn_info = info.get("asn_info") or {}
+        for key in ("asn_country", "network_country"):
+            value = str(asn_info.get(key) or "").strip().upper()
+            if len(value) == 2:
+                countries.add(value)
+
+    origin = data.get("origin_candidates") or {}
+    for provider_key in ("censys", "shodan", "netlas"):
+        provider_result = origin.get(provider_key) or {}
+        for hit in provider_result.get("hits") or []:
+            value = str(hit.get("country") or "").strip().upper()
+            if len(value) == 2:
+                countries.add(value)
+
+    return sorted(countries)
+
+
+def _count_google_hints(data: dict[str, Any]) -> int:
+    hints = 0
+
+    issuer_details = ((data.get("cert_transparency") or {}).get("issuer_details")) or []
+    hints += sum(1 for item in issuer_details if item.get("cert_type") == "gcp_google")
+
+    live_certs = list(data.get("non_cf_tls_certs") or [])
+    if data.get("tls_cert"):
+        live_certs.append(data["tls_cert"])
+    hints += sum(1 for cert in live_certs if cert.get("cert_type") == "gcp_google")
+
+    text_values: list[str] = []
+    for info in (data.get("ip_details") or {}).values():
+        asn_info = info.get("asn_info") or {}
+        text_values.extend([
+            info.get("ptr"),
+            asn_info.get("asn_description"),
+            asn_info.get("network_name"),
+        ])
+
+    dns = data.get("dns") or {}
+    text_values.extend(dns.get("CNAME") or [])
+
+    combined = " ".join(str(value).lower() for value in text_values if value)
+    for pattern in ("googleusercontent", "googlehosted", "1e100.net", "google llc", "google cloud", "google"):
+        if pattern in combined:
+            hints += 1
+            break
+
+    return hints
+
+
+def _collect_origin_lead_count(data: dict[str, Any]) -> int:
+    origin = data.get("origin_candidates") or {}
+    scan_hits = sum(len((origin.get(key) or {}).get("hits") or []) for key in ("scan", "provider_scan", "country_scan"))
+    provider_hits = sum(len((origin.get(key) or {}).get("hits") or []) for key in ("censys", "shodan", "netlas"))
+    leak_hits = sum(len(origin.get(key) or []) for key in ("subdomain_leaks", "mx_leaks", "wordlist_leaks", "hackertarget", "urlscan"))
+    return scan_hits + provider_hits + leak_hits
+
+
+def _build_scan_recommendations(data: dict[str, Any]) -> dict[str, Any]:
+    if data.get("type") != "domain":
+        return {"items": [], "total": 0}
+
+    origin = data.get("origin_candidates") or {}
+    if any(_origin_result_has_run(origin.get(key)) for key in ("scan", "provider_scan", "country_scan")):
+        return {"items": [], "total": 0}
+
+    related_summary = data.get("related_targets_summary") or {}
+    current_ips = [ip for ip in (data.get("dns") or {}).get("A") or [] if isinstance(ip, str)]
+    google_hint_count = _count_google_hints(data)
+    lead_count = _collect_origin_lead_count(data)
+    country_codes = _collect_seed_country_codes(data)
+    has_historical_ips = any(
+        str(record.get("rrtype") or "").upper() in {"A", "AAAA"}
+        for record in ((data.get("historical_dns") or {}).get("records") or [])
+    )
+
+    items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    def add_recommendation(
+        rec_id: str,
+        label: str,
+        reason: str,
+        priority: int,
+        options: dict[str, Any],
+    ) -> None:
+        if rec_id in seen_ids:
+            return
+        seen_ids.add(rec_id)
+        items.append(
+            {
+                "id": rec_id,
+                "label": label,
+                "reason": reason,
+                "priority": priority,
+                "options": options,
+            }
+        )
+
+    if not _origin_result_has_run(origin.get("scan")) and google_hint_count > 0:
+        use_broader_google = google_hint_count > 1 or (data.get("cloudflare_fronted") and not current_ips)
+        add_recommendation(
+            "scan_europe" if use_broader_google else "scan",
+            "Google Cloud sweep" if not use_broader_google else "Broader European GCP sweep",
+            "Google-hosting clues already exist in the seed evidence, so a targeted GCP scan is the next most efficient fan-out.",
+            90 if use_broader_google else 80,
+            {
+                "scan": not use_broader_google,
+                "scan_europe": use_broader_google,
+                "scan_all": False,
+                "scan_providers": False,
+                "scan_eu_countries": False,
+                "scan_full": False,
+                "scan_countries": [],
+            },
+        )
+
+    provider_scan_needed = (
+        not _origin_result_has_run(origin.get("provider_scan"))
+        and (data.get("cloudflare_fronted") or lead_count == 0 or has_historical_ips or (related_summary.get("expandable") or 0) > 0)
+    )
+    if provider_scan_needed:
+        add_recommendation(
+            "scan_providers",
+            "Known hoster sweep",
+            "The normal pass found pivots but not a confirmed direct origin, so scanning the known provider ASNs is a sensible next step.",
+            70,
+            {
+                "scan": False,
+                "scan_europe": False,
+                "scan_all": False,
+                "scan_providers": True,
+                "scan_eu_countries": False,
+                "scan_full": False,
+                "scan_countries": [],
+            },
+        )
+
+    if not _origin_result_has_run(origin.get("country_scan")) and lead_count == 0:
+        targeted_countries = [code for code in country_codes if len(code) == 2][:3]
+        eu_countries = [code for code in country_codes if code in EU_COUNTRY_CODES]
+        prefer_eu_sweep = len(eu_countries) >= 3 and len(eu_countries) == len(country_codes)
+        if prefer_eu_sweep:
+            add_recommendation(
+                "scan_eu_countries",
+                "EU country sweep",
+                "The seed points toward Europe but not a single provider yet, so scanning EU country allocations is the next clean expansion.",
+                55,
+                {
+                    "scan": False,
+                    "scan_europe": False,
+                    "scan_all": False,
+                    "scan_providers": False,
+                    "scan_eu_countries": True,
+                    "scan_full": False,
+                    "scan_countries": [],
+                },
+            )
+        elif targeted_countries:
+            add_recommendation(
+                "scan_countries",
+                "Targeted country sweep",
+                f"The seed evidence leans toward {', '.join(targeted_countries)}, so scanning those country allocations is more precise than a broad sweep.",
+                60,
+                {
+                    "scan": False,
+                    "scan_europe": False,
+                    "scan_all": False,
+                    "scan_providers": False,
+                    "scan_eu_countries": False,
+                    "scan_full": False,
+                    "scan_countries": targeted_countries,
+                },
+            )
+
+    if not items and lead_count == 0 and not any(_origin_result_has_run(origin.get(key)) for key in ("scan", "provider_scan", "country_scan")):
+        add_recommendation(
+            "scan_full",
+            "Broad follow-up sweep",
+            "The normal pass stayed quiet, so the broad combined scan is the fallback when you want to fan out aggressively.",
+            20,
+            {
+                "scan": False,
+                "scan_europe": False,
+                "scan_all": False,
+                "scan_providers": False,
+                "scan_eu_countries": False,
+                "scan_full": True,
+                "scan_countries": [],
+            },
+        )
+
+    items.sort(key=lambda item: (-item["priority"], item["label"]))
+    return {"items": items, "total": len(items)}
 
 
 def _build_progress(logs: list[str], status: str) -> dict[str, Any]:
@@ -582,6 +814,14 @@ def job_status(job_id: str) -> dict[str, Any]:
 def recent_history(limit: int = 100) -> dict[str, Any]:
     try:
         return {"items": get_recent(limit=limit)}
+    except sqlite3.DatabaseError as exc:
+        _raise_db_http_error(exc)
+
+
+@app.get("/api/history/domains")
+def domain_history_targets() -> dict[str, Any]:
+    try:
+        return {"items": get_domain_targets()}
     except sqlite3.DatabaseError as exc:
         _raise_db_http_error(exc)
 
