@@ -217,6 +217,7 @@ def _classify_nameservers(nameservers: list[str]) -> dict[str, list[dict[str, st
 
 _PROXY_FAMILY_RULES = _load_proxy_rules()
 _SUBDOMAIN_WORDLIST = _load_lines(CONFIG_DIR / "subdomain_wordlist.txt")
+_WORDLIST_FOLLOWUP_LIMIT = 8
 _BORING_NS_PROVIDERS = set(_load_lines(CONFIG_DIR / "boring_ns_providers.txt"))
 
 
@@ -587,6 +588,50 @@ def probe_wordlist_subdomains(domain: str) -> list[dict]:
             leaks.extend(hits)
 
     return leaks
+
+
+def _select_wordlist_followup_targets(wordlist_hits: list[dict], *, limit: int = _WORDLIST_FOLLOWUP_LIMIT) -> list[dict]:
+    """
+    Pick a stable, de-duplicated set of wordlist hits for full subdomain follow-up scans.
+
+    We preserve first-seen order, merge duplicate IPs for the same subdomain, and cap
+    the total follow-up count so a noisy domain does not recursively explode the job.
+    """
+    grouped: dict[str, dict] = {}
+    ordered: list[dict] = []
+
+    for entry in wordlist_hits or []:
+        if not isinstance(entry, dict):
+            continue
+
+        subdomain = clean_target(str(entry.get("subdomain") or "")).lower()
+        if not subdomain or is_ip(subdomain):
+            continue
+
+        payload = grouped.get(subdomain)
+        if payload is None:
+            payload = {
+                "subdomain": subdomain,
+                "ips": [],
+                "hits": [],
+            }
+            grouped[subdomain] = payload
+            ordered.append(payload)
+
+        ip_address = str(entry.get("ip") or "").strip()
+        if ip_address and ip_address not in payload["ips"]:
+            payload["ips"].append(ip_address)
+
+        payload["hits"].append(dict(entry))
+
+    return [
+        {
+            "subdomain": item["subdomain"],
+            "ips": list(item["ips"]),
+            "hits": list(item["hits"]),
+        }
+        for item in ordered[:limit]
+    ]
 
 
 # ── SPF ip4 extraction ────────────────────────────────────────────────────────
@@ -1878,6 +1923,9 @@ async def _analyze_domain_async(
     *,
     rate: int,
     on_partial=None,
+    persist: bool = True,
+    enable_wordlist_probe: bool = True,
+    enable_wordlist_followups: bool = True,
 ) -> dict:
     result: dict = {
         "input":             domain,
@@ -1901,6 +1949,17 @@ async def _analyze_domain_async(
         "origin_candidates": {},
         "ip_details":        {},
         "ssh_host_keys":     [],
+        "subdomain_followups": [],
+        "subdomain_followup_summary": {
+            "enabled": enable_wordlist_followups,
+            "limit": _WORDLIST_FOLLOWUP_LIMIT,
+            "candidate_count": 0,
+            "selected_count": 0,
+            "truncated": 0,
+            "completed": 0,
+            "failed": 0,
+            "status": "pending" if enable_wordlist_followups else "disabled",
+        },
     }
 
     RESULTS_DIR.mkdir(exist_ok=True)
@@ -1980,7 +2039,7 @@ async def _analyze_domain_async(
             _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
             _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
             _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
-            _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain)),
+            _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain) if enable_wordlist_probe else _empty_list()),
             _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
             _oc_task("urlscan",         _aurlscan_historical_ips(domain, client)),
             _task("urlscan_analytics",  _aurlscan_fetch_analytics(domain, client)),
@@ -1988,6 +2047,25 @@ async def _analyze_domain_async(
             _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
             _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
         )
+
+    wordlist_hits = (result.get("origin_candidates", {}) or {}).get("wordlist_leaks", [])
+    all_wordlist_followup_targets = _select_wordlist_followup_targets(
+        wordlist_hits,
+        limit=max(len(wordlist_hits), _WORDLIST_FOLLOWUP_LIMIT),
+    )
+    wordlist_followup_targets = all_wordlist_followup_targets[:_WORDLIST_FOLLOWUP_LIMIT]
+    followup_summary = {
+        "enabled": enable_wordlist_followups,
+        "limit": _WORDLIST_FOLLOWUP_LIMIT,
+        "candidate_count": len(all_wordlist_followup_targets),
+        "selected_count": len(wordlist_followup_targets),
+        "truncated": 0,
+        "completed": 0,
+        "failed": 0,
+        "status": "pending" if wordlist_followup_targets and enable_wordlist_followups else ("disabled" if not enable_wordlist_followups else "none"),
+    }
+    followup_summary["truncated"] = max(0, followup_summary["candidate_count"] - followup_summary["selected_count"])
+    _cb("subdomain_followup_summary", followup_summary)
 
     # ── Merge urlscan analytics IDs into page_metadata ───────────────────────
     # urlscan renders pages in a real browser — it catches IDs that a plain
@@ -2189,6 +2267,71 @@ async def _analyze_domain_async(
         _cb("ip_details", result["ip_details"])
     _cb("non_cf_tls_certs", non_cloudflare_tls_certs)
 
+    if enable_wordlist_followups and wordlist_followup_targets:
+        log(
+            f"Subdomain follow-up scans: {len(wordlist_followup_targets)} "
+            f"wordlist hit(s) selected (cap {followup_summary['limit']}, "
+            f"{followup_summary['truncated']} skipped)"
+        )
+        followups: list[dict] = []
+        for target in wordlist_followup_targets:
+            subdomain = target["subdomain"]
+            log(f"Subdomain follow-up: scanning {subdomain}")
+            try:
+                nested_result = await _analyze_domain_async(
+                    subdomain,
+                    scan=scan,
+                    scan_europe=scan_europe,
+                    scan_all=scan_all,
+                    scan_providers=scan_providers,
+                    scan_countries=scan_countries,
+                    scan_eu_countries=scan_eu_countries,
+                    scan_full=scan_full,
+                    concurrency=concurrency,
+                    rate=rate,
+                    on_partial=None,
+                    persist=False,
+                    enable_wordlist_probe=False,
+                    enable_wordlist_followups=False,
+                )
+                followups.append(
+                    {
+                        "subdomain": subdomain,
+                        "source": "wordlist_probe",
+                        "ips": list(target.get("ips") or []),
+                        "hits": list(target.get("hits") or []),
+                        "status": "completed",
+                        "result": nested_result,
+                    }
+                )
+                followup_summary["completed"] += 1
+            except Exception as exc:
+                log(f"Subdomain follow-up failed for {subdomain}: {exc}")
+                followups.append(
+                    {
+                        "subdomain": subdomain,
+                        "source": "wordlist_probe",
+                        "ips": list(target.get("ips") or []),
+                        "hits": list(target.get("hits") or []),
+                        "status": "failed",
+                        "error": str(exc),
+                        "result": {
+                            "input": subdomain,
+                            "type": "domain",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "error": str(exc),
+                            "subdomain_followups": [],
+                        },
+                    }
+                )
+                followup_summary["failed"] += 1
+
+            _cb("subdomain_followups", followups)
+            _cb("subdomain_followup_summary", followup_summary)
+
+        followup_summary["status"] = "completed"
+        _cb("subdomain_followup_summary", followup_summary)
+
     # Cloudflare-fronted flag
     current_a_records = dns_records.get("A") or []
     result["cloudflare_fronted"] = bool(current_a_records) and all(
@@ -2196,12 +2339,13 @@ async def _analyze_domain_async(
     )
 
     # ── Persist everything to SQLite ──────────────────────────────────────────
-    try:
-        from intel_db import DB_PATH, save_search
-        save_search(result)
-        log(f"Search saved to {DB_PATH}")
-    except Exception as _exc:
-        log(f"DB save failed: {_exc}")
+    if persist:
+        try:
+            from intel_db import DB_PATH, save_search
+            save_search(result)
+            log(f"Search saved to {DB_PATH}")
+        except Exception as _exc:
+            log(f"DB save failed: {_exc}")
 
     return result
 

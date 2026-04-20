@@ -306,6 +306,19 @@ def _annotate_result(payload: dict[str, Any]) -> dict[str, Any]:
                 for hit in scan_result.get("hits") or []
             ]
 
+    annotated_followups = []
+    for followup in data.get("subdomain_followups") or []:
+        if not isinstance(followup, dict):
+            annotated_followups.append(followup)
+            continue
+        enriched_followup = dict(followup)
+        nested_result = followup.get("result")
+        if isinstance(nested_result, dict):
+            enriched_followup["result"] = _annotate_result(nested_result)
+        annotated_followups.append(enriched_followup)
+    if annotated_followups:
+        data["subdomain_followups"] = annotated_followups
+
     if data.get("type") == "ip":
         asn_info = data.get("asn_info") or {}
         data["asn_registry"] = asn_info.get("asn_registry")

@@ -2045,6 +2045,37 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(cert, Mapping):
             _append_cert_identifiers(items, seen, cert, source="tls_certs", observed_at=observed_at)
 
+    for followup in result.get("subdomain_followups") or []:
+        if not isinstance(followup, Mapping):
+            continue
+        subdomain = _normalize_identifier_host(followup.get("subdomain"))
+        if subdomain:
+            add(subdomain, id_type="subdomain_name", tier="tier_4", category="dns", source="subdomain_followups")
+
+        nested_result = followup.get("result")
+        if not isinstance(nested_result, Mapping):
+            continue
+
+        nested_source_prefix = f"subdomain_followups.{subdomain or _normalize_identifier_host(nested_result.get('input')) or 'unknown'}"
+        for nested_item in extract_search_identifiers(dict(nested_result)):
+            _append_identifier(
+                items,
+                seen,
+                id_type=nested_item["id_type"],
+                value=nested_item["id_value"],
+                tier=nested_item["tier"],
+                category=nested_item["category"],
+                source=f"{nested_source_prefix}.{nested_item['source']}",
+                observed_at=nested_item.get("observed_at") or observed_at,
+                first_seen=nested_item.get("first_seen"),
+                last_seen=nested_item.get("last_seen"),
+                raw={
+                    "subdomain": subdomain,
+                    "status": followup.get("status"),
+                    "identifier": nested_item.get("raw_json"),
+                },
+            )
+
     origin = result.get("origin_candidates") or {}
     for key in ("subdomain_leaks", "mx_leaks", "wordlist_leaks", "hackertarget", "urlscan"):
         for entry in origin.get(key) or []:
