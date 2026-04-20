@@ -1181,6 +1181,73 @@ function getRegistrar(result) {
   return value || "Unknown";
 }
 
+function collectTrackingSignals(page) {
+  const payload = page || {};
+  return [
+    ...(payload.google_analytics || []).map((value) => ({ label: "Google Analytics", value })),
+    ...(payload.gtm_ids || []).map((value) => ({ label: "Google Tag Manager", value })),
+    ...(payload.facebook_pixel || []).map((value) => ({ label: "Facebook Pixel", value })),
+    ...(payload.tiktok_pixel || []).map((value) => ({ label: "TikTok Pixel", value })),
+    ...(payload.yandex_metrika || []).map((value) => ({ label: "Yandex Metrika", value })),
+    ...(payload.adsense_publisher_ids || []).map((value) => ({ label: "AdSense publisher", value })),
+    ...(payload.fb_app_id || []).map((value) => ({ label: "Facebook app ID", value }))
+  ];
+}
+
+function extractDnsValues(values, key = null) {
+  if (!values) {
+    return [];
+  }
+  if (Array.isArray(values)) {
+    return values
+      .map((item) => {
+        if (item && typeof item === "object") {
+          if (key && item[key]) {
+            return String(item[key]);
+          }
+          return String(item.value || item.exchange || item.host || "");
+        }
+        return String(item || "");
+      })
+      .filter(Boolean);
+  }
+  if (typeof values === "object") {
+    if (key && values[key]) {
+      return [String(values[key])];
+    }
+    if (values.value || values.exchange || values.host) {
+      return [String(values.value || values.exchange || values.host)];
+    }
+    return [];
+  }
+  return [String(values)];
+}
+
+function summarizeWellKnownArtifacts(wellKnown) {
+  const payload = wellKnown || {};
+  const definitions = [
+    ["apple_app_site_association", "Apple app links"],
+    ["assetlinks", "Android asset links"],
+    ["security_txt", "security.txt"],
+    ["openid_configuration", "OpenID config"],
+    ["mta_sts_file", "MTA-STS"],
+    ["ads_txt", "ads.txt"],
+    ["humans_txt", "humans.txt"]
+  ];
+  return definitions
+    .filter(([key]) => {
+      const value = payload[key];
+      if (Array.isArray(value)) {
+        return value.length > 0;
+      }
+      if (value && typeof value === "object") {
+        return Object.keys(value).length > 0;
+      }
+      return Boolean(value);
+    })
+    .map(([, label]) => label);
+}
+
 function getDomainTargets(items) {
   const seen = new Set();
   const targets = [];
@@ -2416,13 +2483,7 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
   const page = result.page_metadata || {};
   const email = result.email_security || {};
   const currentCerts = result.non_cf_tls_certs || (result.tls_cert ? [result.tls_cert] : []);
-  const trackingIds = [
-    ...(page.google_analytics || []).map((value) => ({ label: "Google Analytics", value })),
-    ...(page.gtm_ids || []).map((value) => ({ label: "Google Tag Manager", value })),
-    ...(page.facebook_pixel || []).map((value) => ({ label: "Facebook Pixel", value })),
-    ...(page.tiktok_pixel || []).map((value) => ({ label: "TikTok Pixel", value })),
-    ...(page.yandex_metrika || []).map((value) => ({ label: "Yandex Metrika", value }))
-  ];
+  const trackingIds = collectTrackingSignals(page);
   const historicalIps = ((result.historical_dns || {}).records || []).filter((item) => ["A", "AAAA"].includes(item.rrtype));
   const interestingTxt = collectInterestingTxt(dns.TXT || []);
   const relatedSummary = getRelatedTargetsSummary(result);
@@ -2829,6 +2890,153 @@ function renderLeadCollection(title, subtitle, items, meta, fallback) {
   );
 }
 
+function SubdomainFollowupsSection({ result, meta }) {
+  const followups = result.subdomain_followups || [];
+  const summary = result.subdomain_followup_summary || {};
+
+  if (!followups.length && !summary.enabled) {
+    return null;
+  }
+
+  return (
+    <SectionCard
+      title="Subdomain follow-ups"
+      subtitle="Full nested scans run against selected wordlist hits so you can inspect each leaked host directly."
+      infoTitle="Subdomain follow-ups"
+      infoBody="These are the full secondary scans kicked off from wordlist leak hits. Each card gives you the leaked host, then the nested WHOIS, DNS, page, well-known, IP, and TLS details collected from that host."
+    >
+      <div className="metric-grid">
+        <Metric label="Candidates" value={formatNumber(summary.candidate_count || 0)} />
+        <Metric label="Scanned" value={formatNumber(summary.completed || followups.length)} detail={`${formatNumber(summary.failed || 0)} failed`} />
+        <Metric label="Cap" value={formatNumber(summary.limit || followups.length)} />
+        <Metric label="Skipped by cap" value={formatNumber(summary.truncated || 0)} detail={summary.status || "unknown"} />
+      </div>
+
+      {summary.truncated ? (
+        <Callout tone="info">
+          The backend capped follow-up scans at {formatNumber(summary.limit || 0)} subdomains for this run, so {formatNumber(summary.truncated || 0)} additional wordlist hits were not expanded.
+        </Callout>
+      ) : null}
+
+      {!followups.length ? (
+        <Callout tone="info">No nested follow-up scans were attached to this run yet.</Callout>
+      ) : (
+        <div className="card-grid">
+          {followups.map((followup, index) => {
+            const nested = followup.result || {};
+            const dns = nested.dns || {};
+            const whois = nested.whois || {};
+            const page = nested.page_metadata || {};
+            const email = nested.email_security || {};
+            const currentIps = getCurrentIps(nested);
+            const liveCerts = nested.non_cf_tls_certs || (nested.tls_cert ? [nested.tls_cert] : []);
+            const ipEntries = getIpEntries(nested);
+            const trackingIds = collectTrackingSignals(page);
+            const interestingTxt = collectInterestingTxt(dns.TXT || []);
+            const wellKnownArtifacts = summarizeWellKnownArtifacts(nested.well_known || {});
+            const mxHosts = extractDnsValues(dns.MX, "exchange");
+            const nameservers = extractDnsValues(dns.NS);
+            const dnsAliases = extractDnsValues(dns.CNAME);
+            const discoveredIpPreview = ipEntries.map(([ipAddress, info]) => {
+              const sourcePreview = formatListPreview((info && info.sources) || [], 2);
+              return sourcePreview ? `${ipAddress} (${sourcePreview})` : ipAddress;
+            });
+            const legalPageUrls = (nested.legal_pages || [])
+              .map((item) => item && item.url)
+              .filter(Boolean);
+
+            return (
+              <LeadCard
+                key={`${followup.subdomain || index}-${followup.status || "unknown"}`}
+                title={followup.subdomain || nested.input || `Follow-up ${index + 1}`}
+                footer={
+                  followup.status === "failed"
+                    ? "Nested scan failed"
+                    : `Scanned ${formatDateTime(nested.timestamp)}`
+                }
+              >
+                <p><strong>Status:</strong> {followup.status || "unknown"}</p>
+                {followup.error ? <p className="break-word"><strong>Error:</strong> {followup.error}</p> : null}
+                {(followup.ips || []).length ? (
+                  <p className="break-word"><strong>Leaked IPs:</strong> {formatListPreview(followup.ips, 4)}</p>
+                ) : null}
+                <p><strong>Registrar:</strong> {Array.isArray(whois.registrar) ? whois.registrar[0] : whois.registrar || "Unknown"}</p>
+                <p><strong>Org:</strong> {whois.org || "Unknown"}</p>
+                <p><strong>Country:</strong> {whois.country || "Unknown"}</p>
+                <p className="break-word"><strong>Current IPs:</strong> {currentIps.length ? formatListPreview(currentIps, 5) : "None resolved"}</p>
+                {trackingIds.length ? (
+                  <p className="break-word"><strong>Tracking IDs:</strong> {formatListPreview(trackingIds.map((item) => `${item.label}: ${item.value}`), 3)}</p>
+                ) : null}
+                {liveCerts.length ? (
+                  <p className="break-word"><strong>Live TLS:</strong> {formatListPreview(liveCerts.map((cert) => cert.cn || cert.ip || "Unknown"), 3)}</p>
+                ) : null}
+
+                <details className="fold-panel">
+                  <summary>Nested scan detail</summary>
+                  <div className="stack">
+                    <KeyValueList
+                      items={[
+                        { label: "Created", value: formatDate(whois.creation_date) },
+                        { label: "Updated", value: formatDate(whois.updated_date) },
+                        { label: "Expires", value: formatDate(whois.expiry_date) },
+                        { label: "Cloudflare", value: cloudflareLabel(nested.cloudflare_fronted) },
+                        { label: "Nested IPs", value: currentIps.length ? formatNumber(currentIps.length) : null },
+                        { label: "Live certs", value: liveCerts.length ? formatNumber(liveCerts.length) : null },
+                        { label: "Legal pages", value: nested.legal_pages && nested.legal_pages.length ? formatNumber(nested.legal_pages.length) : null }
+                      ]}
+                    />
+
+                    <p className="break-word"><strong>DNS A/AAAA:</strong> {currentIps.length ? formatListPreview(currentIps, 6) : "None"}</p>
+                    {dnsAliases.length ? <p className="break-word"><strong>CNAME:</strong> {formatListPreview(dnsAliases, 4)}</p> : null}
+                    {nameservers.length ? <p className="break-word"><strong>Nameservers:</strong> {formatListPreview(nameservers, 4)}</p> : null}
+                    {mxHosts.length ? <p className="break-word"><strong>MX:</strong> {formatListPreview(mxHosts, 4)}</p> : null}
+                    {interestingTxt.length ? (
+                      <p className="break-word"><strong>Interesting TXT:</strong> {formatListPreview(interestingTxt.map((item) => `${item.label}: ${item.value}`), 3)}</p>
+                    ) : null}
+                    {trackingIds.length ? (
+                      <p className="break-word"><strong>Page signals:</strong> {formatListPreview(trackingIds.map((item) => `${item.label}: ${item.value}`), 4)}</p>
+                    ) : null}
+                    {page.cms_generator || page.html_lang ? (
+                      <p className="break-word"><strong>Page context:</strong> {formatListPreview([page.cms_generator, page.html_lang].filter(Boolean), 3)}</p>
+                    ) : null}
+                    {wellKnownArtifacts.length ? (
+                      <p className="break-word"><strong>Well-known files:</strong> {formatListPreview(wellKnownArtifacts, 6)}</p>
+                    ) : null}
+                    {email.dmarc ? <p className="break-word"><strong>DMARC:</strong> {email.dmarc}</p> : null}
+                    {(email.spf_includes || []).length ? (
+                      <p className="break-word"><strong>SPF includes:</strong> {formatListPreview(email.spf_includes, 4)}</p>
+                    ) : null}
+                    {nested.microsoft_tenant && nested.microsoft_tenant.tenant_guid ? (
+                      <p className="break-word"><strong>Microsoft tenant:</strong> {nested.microsoft_tenant.tenant_guid}</p>
+                    ) : null}
+                    {legalPageUrls.length ? (
+                      <p className="break-word"><strong>Legal pages:</strong> {formatListPreview(legalPageUrls, 3)}</p>
+                    ) : null}
+                    {discoveredIpPreview.length ? (
+                      <p className="break-word"><strong>Discovered IP context:</strong> {formatListPreview(discoveredIpPreview, 4)}</p>
+                    ) : null}
+                    {liveCerts.length ? (
+                      <div className="pill-row">
+                        {liveCerts.slice(0, 4).map((cert, certIndex) => (
+                          <TypePill
+                            key={`${followup.subdomain || "followup"}-cert-${cert.ip || certIndex}`}
+                            kind={cert.cert_type}
+                            definitions={meta.cert_types || {}}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                </details>
+              </LeadCard>
+            );
+          })}
+        </div>
+      )}
+    </SectionCard>
+  );
+}
+
 function OriginTab({ result, meta }) {
   const origin = result.origin_candidates || {};
   const relatedSummary = getRelatedTargetsSummary(result);
@@ -2906,6 +3114,7 @@ function OriginTab({ result, meta }) {
         origin.wordlist_leaks || [],
         meta
       )}
+      <SubdomainFollowupsSection result={result} meta={meta} />
       {renderLeadCollection(
         "HackerTarget",
         "Historical hostsearch results surfaced for the target.",
