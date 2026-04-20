@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import json
 import os
+import ipaddress
+import re
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "ip_intel.db"
@@ -23,6 +26,8 @@ if not DB_PATH.is_absolute():
     DB_PATH = (BASE_DIR / DB_PATH).resolve()
 else:
     DB_PATH = DB_PATH.resolve()
+
+_RELATED_TARGET_BACKFILL_COMPLETE = False
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -272,6 +277,22 @@ CREATE TABLE IF NOT EXISTS page_metadata (
 CREATE INDEX IF NOT EXISTS idx_meta_search_id ON page_metadata(search_id);
 CREATE INDEX IF NOT EXISTS idx_meta_lang      ON page_metadata(html_lang);
 CREATE INDEX IF NOT EXISTS idx_meta_cms       ON page_metadata(cms_generator);
+
+CREATE TABLE IF NOT EXISTS discovered_targets (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_id       INTEGER NOT NULL REFERENCES searches(id),
+    target          TEXT    NOT NULL,
+    target_type     TEXT    NOT NULL,
+    relation        TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    score           INTEGER NOT NULL DEFAULT 0,
+    observed_at     TEXT,
+    raw_json        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_search_id      ON discovered_targets(search_id);
+CREATE INDEX IF NOT EXISTS idx_discovered_target         ON discovered_targets(target);
+CREATE INDEX IF NOT EXISTS idx_discovered_target_type    ON discovered_targets(target_type);
+CREATE INDEX IF NOT EXISTS idx_discovered_target_source  ON discovered_targets(target, source);
 """
 
 
@@ -279,8 +300,105 @@ _CHILD_TABLES = [
     "ips", "tls_certs", "ct_certs", "subdomains", "dns_records",
     "historical_dns", "tracking_ids", "social_accounts", "favicons",
     "whois_data", "registrant_emails", "nameservers", "spf_origins",
-    "cross_sans", "scan_hits", "provider_hits", "page_metadata",
+    "cross_sans", "scan_hits", "provider_hits", "page_metadata", "discovered_targets",
 ]
+
+_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+
+_PIVOT_SOURCE_SCORES = {
+    "dns_a": 10,
+    "dns_aaaa": 10,
+    "historical_dns": 8,
+    "origin_hit": 8,
+    "provider_hit": 8,
+    "scan_hit": 9,
+    "reverse_ip": 9,
+    "zone_transfer": 9,
+    "subdomain": 7,
+    "subdomain_leak": 8,
+    "mx_leak": 7,
+    "wordlist_leak": 7,
+    "cname": 6,
+    "mx": 5,
+    "nameserver": 3,
+    "whois_nameserver": 3,
+    "cross_san": 6,
+    "ct_san": 5,
+    "tls_cn": 8,
+    "tls_san": 7,
+    "ptr": 4,
+    "spf": 4,
+    "urlscan_url": 7,
+}
+
+_NOISY_PIVOT_SUFFIXES = {
+    "amazonaws.com",
+    "azurewebsites.net",
+    "bluehost.com",
+    "cloudflare.com",
+    "cloudflare.net",
+    "cloudfront.net",
+    "digitaloceanspaces.com",
+    "fastly.net",
+    "github.io",
+    "gitlab.io",
+    "google.com",
+    "googleapis.com",
+    "googlehosted.com",
+    "googleusercontent.com",
+    "mail.protection.outlook.com",
+    "o2switch.net",
+    "outlook.com",
+    "ovh.net",
+    "pantheonsite.io",
+    "shopify.com",
+    "squarespace.com",
+    "webflow.io",
+    "weebly.com",
+    "wix.com",
+    "wixsite.com",
+    "wordpress.com",
+    "wpengine.com",
+}
+
+_LOW_SIGNAL_HOSTING_PATTERNS = (
+    "amazonaws.com",
+    "automattic.com",
+    "azurefd.net",
+    "azurewebsites.net",
+    "bluehost.com",
+    "cloudflare.com",
+    "cloudflare.net",
+    "cloudfront.net",
+    "cloudways",
+    "digitaloceanspaces.com",
+    "dreamhost.com",
+    "fastly.net",
+    "github.io",
+    "gitlab.io",
+    "godaddy.com",
+    "googleapis.com",
+    "googlehosted.com",
+    "googleusercontent.com",
+    "hostgator.com",
+    "hostinger.com",
+    "kinsta",
+    "namecheap.com",
+    "o2switch.net",
+    "ovh.net",
+    "pantheonsite.io",
+    "pressable.com",
+    "shopify.com",
+    "siteground",
+    "squarespace.com",
+    "webflow.io",
+    "weebly.com",
+    "wix.com",
+    "wixsite.com",
+    "wordpress.com",
+    "wpengine.com",
+    "wpenginepowered.com",
+)
 
 
 def _table_columns(c: sqlite3.Connection, table: str) -> set[str]:
@@ -314,6 +432,8 @@ def _migrate_schema(c: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
+    global _RELATED_TARGET_BACKFILL_COMPLETE
+
     with _conn() as c:
         schema_statements = [stmt.strip() for stmt in _SCHEMA.strip().split(";") if stmt.strip()]
         table_statements = [stmt for stmt in schema_statements if not stmt.upper().startswith("CREATE INDEX")]
@@ -325,6 +445,9 @@ def init_db() -> None:
         _migrate_schema(c)
         for stmt in index_statements:
             c.execute(stmt)
+        if not _RELATED_TARGET_BACKFILL_COMPLETE:
+            _backfill_related_target_metadata(c)
+            _RELATED_TARGET_BACKFILL_COMPLETE = True
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -347,6 +470,316 @@ def _normalize_target(value: str) -> str:
     return target[4:] if target.startswith("www.") else target
 
 
+def _normalize_candidate_target(value: Any) -> tuple[str | None, str | None]:
+    text = str(value or "").strip()
+    if not text:
+        return None, None
+
+    if "://" in text:
+        text = urlsplit(text).hostname or ""
+    elif "/" in text and " " not in text:
+        text = urlsplit(f"//{text}").hostname or text
+
+    text = text.strip().strip("[]").rstrip(".").lower()
+    if text.startswith("*."):
+        text = text[2:]
+    if "@" in text and " " not in text:
+        maybe_host = text.rsplit("@", 1)[-1]
+        if "." in maybe_host:
+            text = maybe_host
+
+    try:
+        ip = ipaddress.ip_address(text)
+        return str(ip), "ip"
+    except ValueError:
+        pass
+
+    if not _HOSTNAME_RE.fullmatch(text):
+        return None, None
+    return text, "domain"
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_link_local
+    )
+
+
+def _is_noisy_pivot_domain(target: str) -> bool:
+    if not target or target.count(".") < 1:
+        return True
+    return any(target == suffix or target.endswith(f".{suffix}") for suffix in _NOISY_PIVOT_SUFFIXES)
+
+
+def _iter_dns_host_values(values: Any, *, key: str | None = None) -> list[str]:
+    if not values:
+        return []
+    if isinstance(values, list):
+        output: list[str] = []
+        for item in values:
+            if isinstance(item, dict):
+                lookup_keys = [key] if key else ["value", "exchange"]
+                for lookup_key in lookup_keys:
+                    candidate = item.get(lookup_key)
+                    if candidate:
+                        output.append(str(candidate))
+                        break
+            else:
+                output.append(str(item))
+        return output
+    if isinstance(values, dict):
+        lookup_keys = [key] if key else ["value", "exchange"]
+        for lookup_key in lookup_keys:
+            candidate = values.get(lookup_key)
+            if candidate:
+                return [str(candidate)]
+        return []
+    return [str(values)]
+
+
+def extract_related_targets(result: dict[str, Any], *, include_self: bool = False) -> list[dict[str, Any]]:
+    current_target, current_type = _normalize_candidate_target(result.get("input"))
+    seen: set[tuple[str, str, str, str]] = set()
+    items: list[dict[str, Any]] = []
+
+    def add(value: Any, relation: str, source: str, raw: Any = None) -> None:
+        target, target_type = _normalize_candidate_target(value)
+        if not target or not target_type:
+            return
+        if not include_self and current_target and current_type:
+            if target_type == "domain" and current_type == "domain" and _normalize_target(target) == _normalize_target(current_target):
+                return
+            if target_type == "ip" and current_type == "ip" and target == current_target:
+                return
+        key = (target, target_type, relation, source)
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(
+            {
+                "target": target,
+                "target_type": target_type,
+                "relation": relation,
+                "source": source,
+                "score": _PIVOT_SOURCE_SCORES.get(source, 1),
+                "raw_json": raw,
+            }
+        )
+
+    dns = result.get("dns", {})
+    for ip in _iter_dns_host_values(dns.get("A")):
+        add(ip, "resolved_ip", "dns_a")
+    for ip in _iter_dns_host_values(dns.get("AAAA")):
+        add(ip, "resolved_ip", "dns_aaaa")
+    for host in _iter_dns_host_values(dns.get("CNAME")):
+        add(host, "cname", "cname")
+    for host in _iter_dns_host_values(dns.get("MX"), key="exchange"):
+        add(host, "mx_host", "mx")
+    for host in _iter_dns_host_values(dns.get("NS")):
+        add(host, "nameserver", "nameserver")
+
+    for whois_ns in _parse_json_list((result.get("whois") or {}).get("nameservers")):
+        add(whois_ns, "whois_nameserver", "whois_nameserver")
+
+    for subdomain in result.get("subdomains", []) or []:
+        add(subdomain, "subdomain", "subdomain")
+    for subdomain in result.get("zone_transfer", []) or []:
+        add(subdomain, "zone_transfer", "zone_transfer")
+
+    historical = result.get("historical_dns", {}) or {}
+    for record in historical.get("records", []) or []:
+        if str(record.get("rrtype") or "").upper() in {"A", "AAAA"}:
+            add(record.get("rdata"), "historical_ip", "historical_dns", record)
+
+    for entry in result.get("spf_origins", []) or []:
+        add(entry.get("ip"), "spf_origin", "spf", entry)
+
+    cert_transparency = result.get("cert_transparency", {}) or {}
+    for san in cert_transparency.get("cross_domain_sans", []) or []:
+        add(san, "cross_domain_san", "cross_san")
+    for cert in cert_transparency.get("certs", []) or []:
+        for san in cert.get("sans", []) or []:
+            add(san, "certificate_san", "ct_san")
+
+    origin = result.get("origin_candidates", {}) or {}
+    for key, source_name, relation_name, subdomain_key in [
+        ("subdomain_leaks", "subdomain_leak", "subdomain_leak", "subdomain"),
+        ("mx_leaks", "mx_leak", "mx_leak", "subdomain"),
+        ("wordlist_leaks", "wordlist_leak", "wordlist_leak", "subdomain"),
+        ("hackertarget", "subdomain_leak", "hackertarget_host", "subdomain"),
+    ]:
+        for entry in origin.get(key, []) or []:
+            add(entry.get("ip"), "origin_ip", source_name, entry)
+            add(entry.get(subdomain_key), relation_name, source_name, entry)
+
+    for entry in origin.get("urlscan", []) or []:
+        add(entry.get("ip"), "origin_ip", "origin_hit", entry)
+        add(entry.get("url"), "urlscan_url", "urlscan_url", entry)
+
+    for provider_key in ("censys", "shodan", "netlas"):
+        provider_result = origin.get(provider_key) or {}
+        for hit in provider_result.get("hits", []) or []:
+            add(hit.get("ip"), "provider_ip", "provider_hit", hit)
+            for hostname in hit.get("hostnames", []) or []:
+                add(hostname, "provider_hostname", "provider_hit", hit)
+
+    for scan_key in ("scan", "provider_scan", "country_scan"):
+        scan_result = origin.get(scan_key) or {}
+        for hit in scan_result.get("hits", []) or []:
+            add(hit.get("ip"), "scan_ip", "scan_hit", hit)
+            add(hit.get("cn"), "scan_certificate_cn", "tls_cn", hit)
+            for san in hit.get("sans", []) or []:
+                add(san, "scan_certificate_san", "tls_san", hit)
+
+    ip_details = result.get("ip_details", {}) or {}
+    for ip, info in ip_details.items():
+        add(ip, "observed_ip", "origin_hit", {"ip": ip, "sources": info.get("sources")})
+        add(info.get("ptr"), "ptr", "ptr", {"ip": ip, "ptr": info.get("ptr")})
+        for domain in info.get("other_domains_on_ip", []) or []:
+            add(domain, "reverse_ip_domain", "reverse_ip", {"ip": ip, "domain": domain})
+
+    for cert in result.get("non_cf_tls_certs", []) or []:
+        add(cert.get("ip"), "tls_ip", "origin_hit", cert)
+        add(cert.get("cn"), "tls_cn", "tls_cn", cert)
+        for san in cert.get("sans", []) or []:
+            add(san, "tls_san", "tls_san", cert)
+
+    if result.get("tls_cert"):
+        cert = result.get("tls_cert") or {}
+        add(cert.get("ip"), "tls_ip", "origin_hit", cert)
+        add(cert.get("cn"), "tls_cn", "tls_cn", cert)
+        for san in cert.get("sans", []) or []:
+            add(san, "tls_san", "tls_san", cert)
+
+    if result.get("ptr"):
+        add(result.get("ptr"), "ptr", "ptr")
+    for domain in result.get("other_domains_on_ip", []) or []:
+        add(domain, "reverse_ip_domain", "reverse_ip")
+
+    return items
+
+
+def summarize_related_targets(result: dict[str, Any]) -> dict[str, Any]:
+    extracted = extract_related_targets(result)
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for item in extracted:
+        key = (item["target"], item["target_type"])
+        entry = grouped.setdefault(
+            key,
+            {
+                "target": item["target"],
+                "target_type": item["target_type"],
+                "score": 0,
+                "sources": set(),
+                "relations": set(),
+                "auto_expand": False,
+            },
+        )
+        entry["score"] += int(item.get("score") or 0)
+        entry["sources"].add(item["source"])
+        entry["relations"].add(item["relation"])
+
+    items = []
+    for entry in grouped.values():
+        auto_expand = False
+        if entry["target_type"] == "ip":
+            auto_expand = _is_public_ip(entry["target"])
+        elif entry["target_type"] == "domain":
+            reverse_ip_only = entry["relations"] == {"reverse_ip_domain"}
+            auto_expand = not reverse_ip_only and not _is_noisy_pivot_domain(entry["target"])
+
+        items.append(
+            {
+                "target": entry["target"],
+                "target_type": entry["target_type"],
+                "score": entry["score"],
+                "sources": sorted(entry["sources"]),
+                "relations": sorted(entry["relations"]),
+                "auto_expand": auto_expand,
+            }
+        )
+
+    items.sort(key=lambda item: (-item["score"], item["target_type"], item["target"]))
+    return {
+        "items": items,
+        "total": len(items),
+        "domains": sum(1 for item in items if item["target_type"] == "domain"),
+        "ips": sum(1 for item in items if item["target_type"] == "ip"),
+        "expandable": sum(1 for item in items if item["auto_expand"]),
+    }
+
+
+def _backfill_related_target_metadata(c: sqlite3.Connection) -> None:
+    rows = c.execute(
+        """
+        SELECT
+            s.id,
+            s.raw_json,
+            s.timestamp,
+            EXISTS(
+                SELECT 1
+                FROM discovered_targets d
+                WHERE d.search_id = s.id
+            ) AS has_discovered_targets
+        FROM searches s
+        WHERE json_extract(s.raw_json, '$.related_targets_summary.total') IS NULL
+        ORDER BY s.id ASC
+        """
+    ).fetchall()
+
+    for row in rows:
+        raw_json = row["raw_json"]
+        if not raw_json:
+            continue
+
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        summary = summarize_related_targets(payload)
+        stored_payload = dict(payload)
+        stored_payload["search_id"] = int(row["id"])
+        stored_payload["related_targets_summary"] = summary
+        c.execute(
+            "UPDATE searches SET raw_json = ? WHERE id = ?",
+            (json.dumps(stored_payload, default=str), int(row["id"])),
+        )
+
+        if row["has_discovered_targets"]:
+            continue
+
+        observed_at = str(payload.get("timestamp") or row["timestamp"] or datetime.now(timezone.utc).isoformat())
+        for item in extract_related_targets(payload):
+            c.execute(
+                """INSERT INTO discovered_targets
+                   (search_id, target, target_type, relation, source, score, observed_at, raw_json)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    int(row["id"]),
+                    item["target"],
+                    item["target_type"],
+                    item["relation"],
+                    item["source"],
+                    int(item.get("score") or 0),
+                    observed_at,
+                    _json(item.get("raw_json")),
+                ),
+            )
+
+
 def _dedup_targets(targets_str: str) -> list[str]:
     seen: dict[str, str] = {}
     for target in str(targets_str or "").split(","):
@@ -362,6 +795,13 @@ def _dedup_targets(targets_str: str) -> list[str]:
 def _safe_iso(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _text_contains_any(value: Any, patterns: tuple[str, ...]) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return any(pattern in text for pattern in patterns)
 
 
 def _latest_search_rows(c: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -486,6 +926,7 @@ def save_search(result: dict) -> int:
     timestamp = result.get("timestamp", datetime.now(timezone.utc).isoformat())
     cf = result.get("cloudflare_fronted")
     cf_val = 1 if cf else (0 if cf is not None else None)
+    related_summary = summarize_related_targets(result)
 
     payload = json.dumps(result, default=str)
 
@@ -753,6 +1194,33 @@ def save_search(result: dict) -> int:
             (sid, meta.get("html_lang"), meta.get("cms_generator"), favicon_md5, email_security.get("dmarc")),
         )
 
+        for item in extract_related_targets(result):
+            c.execute(
+                """INSERT INTO discovered_targets
+                   (search_id, target, target_type, relation, source, score, observed_at, raw_json)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    sid,
+                    item["target"],
+                    item["target_type"],
+                    item["relation"],
+                    item["source"],
+                    int(item.get("score") or 0),
+                    timestamp,
+                    _json(item.get("raw_json")),
+                ),
+            )
+
+        stored_result = dict(result)
+        stored_result["search_id"] = sid
+        stored_result["related_targets_summary"] = related_summary
+        c.execute(
+            "UPDATE searches SET raw_json = ? WHERE id = ?",
+            (json.dumps(stored_result, default=str), sid),
+        )
+
+    result["search_id"] = sid
+    result["related_targets_summary"] = related_summary
     return sid
 
 
@@ -790,6 +1258,26 @@ def get_by_id(sid: int) -> dict | None:
     with _conn() as c:
         row = c.execute("SELECT * FROM searches WHERE id = ?", (sid,)).fetchone()
     return dict(row) if row else None
+
+
+def get_latest_search_id_for_target(target: str) -> int | None:
+    init_db()
+    with _conn() as c:
+        row = _latest_row_for_target(c, target)
+    return int(row["id"]) if row else None
+
+
+def update_search_payload(search_id: int, payload: dict[str, Any]) -> None:
+    init_db()
+    with _conn() as c:
+        c.execute(
+            "UPDATE searches SET raw_json = ?, timestamp = ? WHERE id = ?",
+            (
+                json.dumps(payload, default=str),
+                str(payload.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+                search_id,
+            ),
+        )
 
 
 def get_history_for_target(target: str) -> list[dict]:
@@ -971,6 +1459,35 @@ def _is_noise_label(label: str | None) -> bool:
     return label in {"mail", "cdn_proxy", "shared_hosting"}
 
 
+def _build_ip_label_index(c: sqlite3.Connection) -> dict[tuple[int, str], str]:
+    rows = c.execute(
+        """SELECT search_id, ip, ptr, asn, source, proxy_family
+           FROM ips"""
+    ).fetchall()
+    labels: dict[tuple[int, str], str] = {}
+    for row in rows:
+        ip = str(row["ip"] or "").strip()
+        if not ip:
+            continue
+        key = (int(row["search_id"]), ip)
+        label = classify_ip(ip, row["ptr"], row["asn"], row["source"], row["proxy_family"])
+        if key not in labels or labels[key] != "direct":
+            labels[key] = label
+    return labels
+
+
+def _is_low_signal_tls_observation(row: Mapping[str, Any], ip_label_index: Mapping[tuple[int, str], str]) -> bool:
+    ip = str(row.get("ip") or "").strip()
+    search_id = row.get("search_id")
+    if ip and search_id is not None:
+        label = ip_label_index.get((int(search_id), ip))
+        if _is_noise_label(label):
+            return True
+
+    texts = [row.get("cn"), row.get("issuer")]
+    return any(_text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS) for value in texts)
+
+
 # ── Cluster helpers ───────────────────────────────────────────────────────────
 
 def _latest_ids(c: sqlite3.Connection) -> list[int]:
@@ -1017,6 +1534,8 @@ def cluster_by_ip() -> list[dict]:
         source_list = sorted({row["source"] for row in payload["rows"] if row["source"]})
         sample = payload["rows"][-1]
         label = classify_ip(ip, sample["ptr"], sample["asn"], ",".join(source_list), sample["proxy_family"])
+        if _is_noise_label(label):
+            continue
         items.append(
             {
                 "ip": ip,
@@ -1068,12 +1587,12 @@ def cluster_by_favicon() -> list[dict]:
 
 def _load_tls_observations(c: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = c.execute(
-        """SELECT s.id AS search_id, s.target, t.sha256, t.cn, t.issuer_cn AS issuer, t.not_before, t.not_after,
+        """SELECT s.id AS search_id, s.target, t.ip, t.sha256, t.cn, t.issuer_cn AS issuer, t.not_before, t.not_after,
                   t.observed_at, 'tls_probe' AS source
            FROM tls_certs t JOIN searches s ON s.id = t.search_id
            WHERE t.sha256 IS NOT NULL AND t.sha256 != ''
            UNION ALL
-           SELECT s.id AS search_id, s.target, h.sha256, h.cn, h.issuer AS issuer, h.not_before, h.not_after,
+           SELECT s.id AS search_id, s.target, h.ip, h.sha256, h.cn, h.issuer AS issuer, h.not_before, h.not_after,
                   h.observed_at, 'scan' AS source
            FROM scan_hits h JOIN searches s ON s.id = h.search_id
            WHERE h.sha256 IS NOT NULL AND h.sha256 != ''"""
@@ -1090,8 +1609,11 @@ def cluster_by_tls_cert(scope: str = "current") -> list[dict]:
     with _conn() as c:
         latest_map = _latest_search_id_map(c)
         latest_ids = set(latest_map.values())
+        ip_label_index = _build_ip_label_index(c)
         grouped: dict[str, dict[str, Any]] = {}
         for row in _load_tls_observations(c):
+            if _is_low_signal_tls_observation(row, ip_label_index):
+                continue
             fingerprint = row["sha256"]
             entry = grouped.setdefault(
                 fingerprint,
@@ -1208,6 +1730,8 @@ def cluster_by_asn(scope: str = "current") -> list[dict]:
 
     items = []
     for entry in grouped.values():
+        if _is_noise_label(entry["label"]):
+            continue
         current_targets = _dedup_targets(",".join(entry["targets_current"]))
         all_targets = _dedup_targets(",".join(entry["targets_all"]))
         if len(all_targets) < 2:
@@ -1295,6 +1819,8 @@ def get_connections_for_target(target: str) -> dict | None:
             seen_ips.add(ip)
             asn = _normalize_asn(row["asn"])
             label = classify_ip(ip, row["ptr"], asn, row["source"], row["proxy_family"])
+            if _is_noise_label(label):
+                continue
             network_shared_with = _others_by("ips", "network_cidr", row["network_cidr"]) if row["network_cidr"] else []
             ips.append(
                 {
@@ -1323,8 +1849,10 @@ def get_connections_for_target(target: str) -> dict | None:
             asn = _normalize_asn(row["asn"])
             if not asn or asn in seen_asns:
                 continue
-            seen_asns.add(asn)
             label = classify_ip("0.0.0.0", row["ptr"], asn, row["source"], row["proxy_family"])
+            if _is_noise_label(label):
+                continue
+            seen_asns.add(asn)
             shared_network = _others_by("ips", "network_cidr", row["network_cidr"]) if row["network_cidr"] else []
             asns.append(
                 {
@@ -1341,6 +1869,7 @@ def get_connections_for_target(target: str) -> dict | None:
 
         tls = []
         seen_tls: set[str] = set()
+        ip_label_index = _build_ip_label_index(c)
         for row in c.execute(
             """SELECT sha256, cn, sans, issuer_cn, ip, not_before, not_after
                FROM tls_certs WHERE search_id = ?""",
@@ -1348,6 +1877,14 @@ def get_connections_for_target(target: str) -> dict | None:
         ).fetchall():
             fingerprint = row["sha256"]
             if not fingerprint or fingerprint in seen_tls:
+                continue
+            tls_row = {
+                "search_id": current_sid,
+                "ip": row["ip"],
+                "cn": row["cn"],
+                "issuer": row["issuer_cn"],
+            }
+            if _is_low_signal_tls_observation(tls_row, ip_label_index):
                 continue
             seen_tls.add(fingerprint)
             tls.append(
@@ -1405,6 +1942,8 @@ def get_connections_for_target(target: str) -> dict | None:
         tls_observations = _load_tls_observations(c)
         grouped_tls: dict[str, dict[str, Any]] = defaultdict(lambda: {"target_rows": [], "other_rows": [], "cn": None, "issuer": None, "not_before": None, "not_after": None})
         for observation in tls_observations:
+            if _is_low_signal_tls_observation(observation, ip_label_index):
+                continue
             fingerprint = observation["sha256"]
             entry = grouped_tls[fingerprint]
             if observation.get("cn"):
@@ -1476,6 +2015,45 @@ def get_connections_for_target(target: str) -> dict | None:
         for row in c.execute("SELECT nameserver FROM nameservers WHERE search_id = ?", (current_sid,)).fetchall():
             nameservers.append({"nameserver": row["nameserver"], "shared_with": _others_by("nameservers", "nameserver", row["nameserver"])})
 
+        discovered_groups: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in c.execute(
+            """SELECT target, target_type, relation, source, score
+               FROM discovered_targets
+               WHERE search_id = ?
+               ORDER BY score DESC, target ASC""",
+            (current_sid,),
+        ).fetchall():
+            key = (row["target"], row["target_type"])
+            entry = discovered_groups.setdefault(
+                key,
+                {
+                    "target": row["target"],
+                    "target_type": row["target_type"],
+                    "score": 0,
+                    "sources": set(),
+                    "relations": set(),
+                },
+            )
+            entry["score"] += int(row["score"] or 0)
+            entry["sources"].add(row["source"])
+            entry["relations"].add(row["relation"])
+
+        discovered_domains = []
+        discovered_ips = []
+        for entry in sorted(discovered_groups.values(), key=lambda item: (-item["score"], item["target"])):
+            payload = {
+                "target": entry["target"],
+                "target_type": entry["target_type"],
+                "score": entry["score"],
+                "sources": sorted(entry["sources"]),
+                "relations": sorted(entry["relations"]),
+                "shared_with": _others_by("discovered_targets", "target", entry["target"]),
+            }
+            if entry["target_type"] == "domain":
+                discovered_domains.append(payload)
+            else:
+                discovered_ips.append(payload)
+
         social = [dict(row) for row in c.execute("SELECT platform, handle, url FROM social_accounts WHERE search_id = ?", (current_sid,)).fetchall()]
         history = [
             {
@@ -1507,6 +2085,8 @@ def get_connections_for_target(target: str) -> dict | None:
                 "favicons": favicons,
                 "registrant_emails": emails,
                 "nameservers": nameservers,
+                "discovered_domains": discovered_domains,
+                "discovered_ips": discovered_ips,
             },
             "social": social,
         }

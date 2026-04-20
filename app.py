@@ -46,8 +46,11 @@ except Exception:  # noqa: BLE001
     opencti = None
 
 try:
-    from mattermost_alerts import send_analysis_notification
+    from mattermost_alerts import mattermost_enabled, send_analysis_notification
 except Exception:  # noqa: BLE001
+    def mattermost_enabled() -> bool:
+        return False
+
     def send_analysis_notification(job: dict[str, Any]) -> bool:
         return False
 
@@ -533,6 +536,7 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    LOGGER.info("Mattermost alerts %s", "enabled" if mattermost_enabled() else "disabled")
 
 
 @app.get("/api/health")
@@ -552,6 +556,9 @@ def meta() -> dict[str, Any]:
         "cert_types": CERT_TYPE_DEFINITIONS,
         "server_types": SERVER_TYPE_DEFINITIONS,
         "source_labels": SOURCE_LABELS,
+        "notifications": {
+            "mattermost_enabled": mattermost_enabled(),
+        },
     }
 
 

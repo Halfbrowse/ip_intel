@@ -21,10 +21,55 @@ load_dotenv()
 LOGGER = logging.getLogger("ip_intel.mattermost")
 _WEBHOOK_TIMEOUT_SECONDS = 10
 _DETAIL_VALUE_LIMIT = 500
+_RESPONSE_BODY_LIMIT = 300
+_INTERESTING_FINDINGS_LIMIT = 6
+_LOW_SIGNAL_SERVER_TYPES = {"shared_hosting", "cdn_proxy", "mail"}
+_LOW_SIGNAL_HOSTING_PATTERNS = (
+    "amazonaws.com",
+    "automattic.com",
+    "azurefd.net",
+    "azurewebsites.net",
+    "bluehost.com",
+    "cloudflare.com",
+    "cloudflare.net",
+    "cloudfront.net",
+    "cloudways",
+    "digitaloceanspaces.com",
+    "dreamhost.com",
+    "fastly.net",
+    "github.io",
+    "gitlab.io",
+    "godaddy.com",
+    "googleapis.com",
+    "googlehosted.com",
+    "googleusercontent.com",
+    "hostgator.com",
+    "hostinger.com",
+    "kinsta",
+    "namecheap.com",
+    "o2switch.net",
+    "ovh.net",
+    "pantheonsite.io",
+    "pressable.com",
+    "shopify.com",
+    "siteground",
+    "squarespace.com",
+    "webflow.io",
+    "weebly.com",
+    "wix.com",
+    "wixsite.com",
+    "wordpress.com",
+    "wpengine.com",
+    "wpenginepowered.com",
+)
 
 
 def _webhook_url() -> str:
     return os.getenv("MATTERMOST_WEBHOOK_URL", "").strip()
+
+
+def mattermost_enabled() -> bool:
+    return bool(_webhook_url())
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -93,10 +138,228 @@ def _format_detail_value(value: Any) -> str | None:
     return f"`{text}`"
 
 
+def _safe_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def _collect_unique_texts(values: list[Any], *, limit: int = 3) -> list[str]:
+    seen: set[str] = set()
+    collected: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        collected.append(text)
+        if len(collected) >= limit:
+            break
+    return collected
+
+
+def _text_contains_any(value: Any, patterns: tuple[str, ...]) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return any(pattern in text for pattern in patterns)
+
+
+def _count_origin_hits(origin_candidates: Mapping[str, Any]) -> int:
+    total = 0
+    for key in ("scan", "provider_scan", "country_scan", "censys", "shodan", "netlas"):
+        total += len(_safe_list(_safe_dict(origin_candidates.get(key)).get("hits")))
+    for key in ("subdomain_leaks", "mx_leaks", "wordlist_leaks", "hackertarget", "urlscan"):
+        total += len(_safe_list(origin_candidates.get(key)))
+    return total
+
+
+def _meaningful_non_cf_ips(result: Mapping[str, Any], ip_details: Mapping[str, Any]) -> list[str]:
+    meaningful: list[str] = []
+    for ip in _safe_list(result.get("non_cf_ips")):
+        ip_text = str(ip or "").strip()
+        if not ip_text:
+            continue
+        details = _safe_dict(ip_details.get(ip_text))
+        server_type = str(details.get("server_type") or "")
+        if server_type == "direct":
+            meaningful.append(ip_text)
+            continue
+        if server_type in _LOW_SIGNAL_SERVER_TYPES:
+            continue
+        if any(
+            _text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS)
+            for value in (
+                details.get("ptr"),
+                details.get("network_name"),
+                _safe_dict(details.get("asn_info")).get("asn_description"),
+            )
+        ):
+            continue
+        meaningful.append(ip_text)
+    return _collect_unique_texts(meaningful, limit=20)
+
+
+def _is_low_signal_cert(cert: Mapping[str, Any], ip_details: Mapping[str, Any]) -> bool:
+    cert_ip = str(cert.get("ip") or "").strip()
+    details = _safe_dict(ip_details.get(cert_ip)) if cert_ip else {}
+    server_type = str(details.get("server_type") or "")
+    if server_type in _LOW_SIGNAL_SERVER_TYPES:
+        return True
+
+    cert_texts = [
+        cert.get("cn"),
+        cert.get("issuer"),
+        cert.get("issuer_cn"),
+        cert.get("issuer_org"),
+        details.get("ptr"),
+        details.get("network_name"),
+        _safe_dict(details.get("asn_info")).get("asn_description"),
+    ]
+    cert_texts.extend(_safe_list(cert.get("sans")))
+    return any(_text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS) for value in cert_texts)
+
+
+def _interesting_findings(result: Mapping[str, Any]) -> list[str]:
+    findings: list[str] = []
+    result_type = str(result.get("type") or "")
+    page_metadata = _safe_dict(result.get("page_metadata"))
+    cert_transparency = _safe_dict(result.get("cert_transparency"))
+    origin_candidates = _safe_dict(result.get("origin_candidates"))
+    ip_details = _safe_dict(result.get("ip_details"))
+    meaningful_non_cf_ips = _meaningful_non_cf_ips(result, ip_details)
+
+    if result_type == "domain" and result.get("cloudflare_fronted") and meaningful_non_cf_ips:
+        findings.append(
+            f"Cloudflare is in front, but {len(meaningful_non_cf_ips)} likely direct origin IP(s) were discovered."
+        )
+
+    non_cf_tls_certs = _safe_list(result.get("non_cf_tls_certs"))
+    meaningful_tls_certs = [
+        cert
+        for cert in non_cf_tls_certs
+        if isinstance(cert, Mapping) and not _is_low_signal_cert(cert, ip_details)
+    ]
+    if meaningful_tls_certs:
+        cert_names = _collect_unique_texts(
+            [cert.get("cn") for cert in meaningful_tls_certs],
+            limit=2,
+        )
+        findings.append(
+            "Live TLS certs recovered from non-Cloudflare infrastructure"
+            + (f": {', '.join(cert_names)}." if cert_names else ".")
+        )
+
+    cross_domain_sans = _safe_list(cert_transparency.get("cross_domain_sans"))
+    if cross_domain_sans:
+        examples = _collect_unique_texts(cross_domain_sans, limit=3)
+        findings.append(
+            f"Cross-domain SAN overlap found ({len(cross_domain_sans)} names)"
+            + (f": {', '.join(examples)}." if examples else ".")
+        )
+
+    ct_subdomains = _safe_list(result.get("subdomains")) + _safe_list(result.get("zone_transfer"))
+    if ct_subdomains:
+        findings.append(f"Subdomain discovery surfaced {len(ct_subdomains)} candidate hosts.")
+
+    source_errors = _collect_unique_texts(_safe_list(result.get("source_errors")), limit=4)
+    if source_errors:
+        findings.append(f"Some sources degraded or failed: {', '.join(source_errors)}.")
+
+    origin_hits = _count_origin_hits(origin_candidates)
+    if origin_hits:
+        findings.append(f"Origin discovery produced {origin_hits} lead(s) across passive, provider, and scan sources.")
+
+    tracking_count = sum(
+        len(_safe_list(page_metadata.get(key)))
+        for key in ("google_analytics", "gtm_ids", "facebook_pixel", "tiktok_pixel", "yandex_metrika")
+    )
+    if tracking_count:
+        findings.append(f"Tracking or analytics identifiers found: {tracking_count}.")
+
+    social_handle_count = sum(len(_safe_list(handles)) for handles in _safe_dict(page_metadata.get("social_handles")).values())
+    if social_handle_count:
+        findings.append(f"Social account handles extracted: {social_handle_count}.")
+
+    ip_count = len(ip_details)
+    if ip_count:
+        direct_like = sum(
+            1
+            for details in ip_details.values()
+            if isinstance(details, Mapping) and str(details.get("server_type") or "") == "direct"
+        )
+        findings.append(
+            f"IP enrichment covered {ip_count} IP(s)"
+            + (f", including {direct_like} likely direct-server lead(s)." if direct_like else ".")
+        )
+
+    reverse_ip_domains = _collect_unique_texts(
+        [
+            domain
+            for details in ip_details.values()
+            if isinstance(details, Mapping)
+            for domain in _safe_list(details.get("other_domains_on_ip"))
+        ],
+        limit=3,
+    )
+    if reverse_ip_domains:
+        findings.append(f"Reverse-IP overlap surfaced related domains such as {', '.join(reverse_ip_domains)}.")
+
+    related_summary = _safe_dict(result.get("related_targets_summary"))
+    if related_summary.get("total"):
+        findings.append(
+            f"Related-target extraction found {int(related_summary.get('total') or 0)} pivots"
+            f" ({int(related_summary.get('domains') or 0)} domains, {int(related_summary.get('ips') or 0)} IPs)."
+        )
+
+    recursive = _safe_dict(result.get("recursive_expansion"))
+    if recursive.get("analysed_count"):
+        findings.append(
+            f"Recursive expansion auto-analysed {int(recursive.get('analysed_count') or 0)} child target(s)."
+        )
+
+    if result_type == "ip":
+        other_domains = _safe_list(result.get("other_domains_on_ip"))
+        if other_domains:
+            examples = _collect_unique_texts(other_domains, limit=3)
+            findings.append(
+                f"Reverse-IP search found {len(other_domains)} other domain(s)"
+                + (f": {', '.join(examples)}." if examples else ".")
+            )
+        tls_cert = _safe_dict(result.get("tls_cert"))
+        server_type = str(result.get("server_type") or "")
+        if tls_cert.get("cn") and server_type not in _LOW_SIGNAL_SERVER_TYPES and not _is_low_signal_cert(tls_cert, ip_details):
+            findings.append(f"TLS certificate CN observed on the IP: {tls_cert.get('cn')}.")
+
+    deduped = _collect_unique_texts(findings, limit=_INTERESTING_FINDINGS_LIMIT)
+    return deduped
+
+
 def _deliver_message(webhook_url: str, payload: dict[str, Any]) -> None:
     try:
         response = requests.post(webhook_url, json=payload, timeout=_WEBHOOK_TIMEOUT_SECONDS)
         response.raise_for_status()
+        LOGGER.info("Mattermost alert delivered successfully")
+    except requests.HTTPError as exc:
+        response = exc.response
+        response_body = ""
+        if response is not None:
+            response_body = (response.text or "").strip()
+            if len(response_body) > _RESPONSE_BODY_LIMIT:
+                response_body = f"{response_body[:_RESPONSE_BODY_LIMIT - 3]}..."
+        LOGGER.exception(
+            "Mattermost alert delivery failed with HTTP %s%s",
+            response.status_code if response is not None else "unknown",
+            f": {response_body}" if response_body else "",
+        )
     except Exception:  # noqa: BLE001
         LOGGER.exception("Mattermost alert delivery failed")
 
@@ -112,6 +375,7 @@ def send_process_alert(
 ) -> bool:
     webhook_url = _webhook_url()
     if not webhook_url:
+        LOGGER.warning("Mattermost alert skipped because MATTERMOST_WEBHOOK_URL is not set")
         return False
 
     lines = [f"**{title}**", f"- Status: `{status}`"]
@@ -134,6 +398,7 @@ def send_process_alert(
         lines.append(f"- {label}: {formatted}")
 
     payload = {"text": "\n".join(lines)}
+    LOGGER.info("Queueing Mattermost alert for title=%r status=%r", title, status)
     thread = threading.Thread(
         target=_deliver_message,
         args=(webhook_url, payload),
@@ -162,6 +427,10 @@ def send_analysis_notification(job: Mapping[str, Any]) -> bool:
     completed_phases = progress.get("completed_count")
     if total_phases and completed_phases is not None:
         details["Phases"] = f"{completed_phases}/{total_phases}"
+
+    findings = _interesting_findings(result if result else partial)
+    if findings:
+        details["Interesting findings"] = findings
 
     if status == "failed":
         details["Error"] = job.get("error")

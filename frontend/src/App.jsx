@@ -63,12 +63,12 @@ const CONNECTION_SECTIONS = [
   {
     key: "ips",
     title: "IP addresses",
-    infoBody: "Shared IPs can mean the same server is involved, but this is weaker when the server belongs to a big shared host or CDN."
+    infoBody: "Shared IPs can mean the same server is involved. Large CDN, managed WordPress, mail, and shared-hosting overlaps are treated as background noise, so the IP links shown here aim to stay higher-signal."
   },
   {
     key: "asns",
     title: "ASNs and networks",
-    infoBody: "ASN overlap shows that domains lived inside the same provider network. This is useful context, but large CDN and shared-hosting ASNs should be treated as softer evidence."
+    infoBody: "ASN overlap shows that domains lived inside the same provider network. Broad CDN, managed WordPress, mail, and shared-hosting ASNs are filtered as low-signal noise, so the remaining overlaps are meant to be more actionable."
   },
   {
     key: "tls_history",
@@ -117,8 +117,8 @@ const NETWORK_LINK_META = {
     headline: "Shared server address",
     color: "#63a8ff",
     summary: "The domains resolved to the same IP address or hosting endpoint.",
-    meaning: "In plain English: the sites touched the same server address. That matters most when the IP looks dedicated, and less when it belongs to a big shared platform or CDN.",
-    caution: "Treat shared-hosting and CDN matches as softer evidence unless other signals line up too."
+    meaning: "In plain English: the sites touched the same server address. The graph already filters broad CDN, managed WordPress, mail, and shared-hosting overlaps, so what remains should skew toward more dedicated-looking infrastructure.",
+    caution: "A shared IP is still supportive evidence rather than proof, but the noisier platform overlaps are already suppressed here."
   },
   asn: {
     label: "ASN/network",
@@ -126,7 +126,7 @@ const NETWORK_LINK_META = {
     color: "#2fb6c4",
     summary: "The domains were observed inside the same autonomous system or network range.",
     meaning: "In plain English: the domains lived in the same provider network. That is useful context, especially on smaller or dedicated-looking networks, but it is usually weaker than an exact TLS or direct-IP match.",
-    caution: "Large ISPs, CDNs, and shared-hosting providers can place many unrelated domains in the same ASN, so treat this as weighted context rather than proof."
+    caution: "Broad CDN, managed WordPress, mail, and shared-hosting providers are filtered out of the overlap views, but ASN matches should still be treated as weighted context rather than proof."
   }
 };
 
@@ -257,6 +257,18 @@ function formatNumber(value) {
     return "0";
   }
   return numberFormatter.format(value);
+}
+
+function filterLowSignalClusterItems(items) {
+  return (items || []).filter((item) => !item?.is_noise);
+}
+
+function getVisibleClusters(clusters) {
+  return {
+    ...clusters,
+    ip: filterLowSignalClusterItems(clusters?.ip),
+    asn: filterLowSignalClusterItems(clusters?.asn)
+  };
 }
 
 function downloadResult(result) {
@@ -1873,6 +1885,7 @@ function ResultPanel({ result, meta }) {
 function NetworkGraphTab({ clusters, recent, theme }) {
   const graphRef = useRef(null);
   const focusOptions = getDomainTargets(recent);
+  const visibleClusters = getVisibleClusters(clusters);
   const [controls, setControls] = useState({
     includeIp: true,
     includeAsn: true,
@@ -1886,7 +1899,7 @@ function NetworkGraphTab({ clusters, recent, theme }) {
   const [selection, setSelection] = useState(null);
   const [hoveredId, setHoveredId] = useState("");
 
-  const graph = buildNetworkModel(clusters, controls);
+  const graph = buildNetworkModel(visibleClusters, controls);
   const updateControl = (key, value) => {
     setControls((current) => ({
       ...current,
@@ -1970,7 +1983,7 @@ function NetworkGraphTab({ clusters, recent, theme }) {
         <div>
           <h3>Interactive relationship map</h3>
           <p className="muted">
-            Each line connects domains that share something meaningful, like the same TLS fingerprint, tracking code, direct IP, or provider network. Current TLS and direct-IP matches are weighted highest, while ASN and CDN-style overlaps stay softer.
+            Each line connects domains that share something meaningful, like the same TLS fingerprint, tracking code, direct IP, or provider network. Broad CDN, managed WordPress, mail, and shared-hosting overlaps are filtered out before they reach this graph.
           </p>
         </div>
         <div className="graph-legend">
@@ -2032,7 +2045,7 @@ function NetworkGraphTab({ clusters, recent, theme }) {
                 <span>Shared IPs</span>
                 <InfoPopover
                   title="Shared IPs"
-                  body="A shared IP means two domains point to the same server address. This can be a strong lead when the IP looks dedicated, but a weaker lead when it belongs to a large shared host or CDN."
+                  body="A shared IP means two domains point to the same server address. Broad CDN, managed WordPress, mail, and shared-hosting overlaps are filtered from the graph, so the remaining IP links are meant to be higher-signal."
                 />
               </label>
               <label className="checkbox-chip">
@@ -2044,7 +2057,7 @@ function NetworkGraphTab({ clusters, recent, theme }) {
                 <span>ASNs</span>
                 <InfoPopover
                   title="ASNs and networks"
-                  body="ASN overlap means domains were seen in the same provider network. It is useful context, especially on smaller or dedicated-looking networks, but it is normally weaker than an exact TLS or direct-IP match."
+                  body="ASN overlap means domains were seen in the same provider network. Broad CDN, managed WordPress, mail, and shared-hosting networks are filtered as low-signal noise before they reach the graph."
                 />
               </label>
             </div>
@@ -2390,6 +2403,7 @@ function ExplorerPanel({
 }) {
   const [activeTab, setActiveTab] = useState("network");
   const domainTargets = getDomainTargets(recent);
+  const visibleClusters = getVisibleClusters(clusters);
 
   return (
     <SectionCard
@@ -2432,10 +2446,10 @@ function ExplorerPanel({
       {activeTab === "ip" ? (
         <div className="stack">
           <Callout tone="info">
-            A shared IP means more than one domain touched the same server address. That can suggest a real relationship, but it is weaker when the IP belongs to a big shared host or CDN.
+            Shared IPs shown here have already had broad CDN, managed WordPress, mail, and shared-hosting noise filtered out, so this list should stay focused on the more interesting overlaps.
           </Callout>
           <div className="card-grid">
-            {clusters.ip.map((item) => (
+            {visibleClusters.ip.map((item) => (
               <LeadCard key={item.ip} title={item.ip} footer={`${item.target_count} linked targets`}>
                 <div className="pill-row">
                   <TypePill kind={item.label} definitions={meta.server_types || {}} />
@@ -3314,7 +3328,8 @@ function GraphPage({ clusters, recent, theme }) {
   const [graphHeight, setGraphHeight] = useState(GRAPH_DEFAULT_HEIGHT);
   const [sidebarWidth, setSidebarWidth] = useState(GRAPH_DEFAULT_SIDEBAR_WIDTH);
 
-  const graph = buildNetworkModel(clusters, controls);
+  const visibleClusters = getVisibleClusters(clusters);
+  const graph = buildNetworkModel(visibleClusters, controls);
   const focusOptions = getDomainTargets(recent);
   const activeNodeId = selection && selection.type === "node" ? selection.id : "";
   const activeEdgeKey = selection && selection.type === "edge" ? selection.key : "";
@@ -4200,7 +4215,8 @@ export default function App() {
   const result = job && job.result ? job.result : null;
   const busy = job && (job.status === "queued" || job.status === "running");
   const storedDomains = getDomainTargets(recent).length;
-  const sharedSignalCount = clusters.ip.length + clusters.asn.length + clusters.tracking.length + clusters.favicon.length + clusters.tls.length;
+  const visibleClusters = getVisibleClusters(clusters);
+  const sharedSignalCount = visibleClusters.ip.length + visibleClusters.asn.length + clusters.tracking.length + clusters.favicon.length + clusters.tls.length;
   const openctiLabel = openctiState.available === false
     ? "Unavailable"
     : openctiState.running
@@ -4344,8 +4360,8 @@ export default function App() {
         title="Shared IPs"
         subtitle="Domains that touched the same server address or hosting network."
         infoTitle="Shared IPs"
-        infoBody="A shared IP can be a strong clue when the server looks dedicated, but it is weaker when the IP belongs to shared hosting, mail infrastructure, or a CDN."
-        items={clusters.ip}
+        infoBody="Broad CDN, managed WordPress, mail, and shared-hosting overlaps are filtered out here so the remaining shared IPs stay closer to dedicated-server leads."
+        items={visibleClusters.ip}
         emptyMessage="No shared IP clusters are stored yet."
         renderItem={(item) => (
           <LeadCard key={item.ip} title={item.ip} footer={`${item.target_count} linked targets`}>
@@ -4369,7 +4385,7 @@ export default function App() {
         title="Shared ASNs"
         subtitle="Domains clustering around the same provider network or autonomous system."
         infoTitle="How to read ASN overlap"
-        infoBody="ASN overlap is strongest when the ASN looks dedicated and weaker when it belongs to a CDN, mail service, or broad shared-hosting platform. Use the labels as a noise guide, not a final verdict."
+        infoBody="Broad CDN, managed WordPress, mail, and shared-hosting networks are filtered out here as low-signal noise. Treat the remaining ASN overlaps as supporting context, not final proof."
       >
         <div className="field-row">
           <label htmlFor="asn-scope">Scope</label>
@@ -4379,9 +4395,9 @@ export default function App() {
             <option value="all">All history</option>
           </select>
         </div>
-        {clusters.asn.length ? (
+        {visibleClusters.asn.length ? (
           <div className="card-grid">
-            {clusters.asn.map((item) => (
+            {visibleClusters.asn.map((item) => (
               <LeadCard
                 key={item.asn}
                 title={`AS${item.asn}`}
