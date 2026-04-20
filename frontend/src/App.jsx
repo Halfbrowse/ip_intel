@@ -1238,6 +1238,7 @@ function SearchableDomainField({
   const metaText = normalizedQuery && query !== value
     ? `${formatNumber(matchCount)} match${matchCount === 1 ? "" : "es"}${matchCount ? ". Press Enter to choose the first." : ""}`
     : helper || `${formatNumber(options.length)} stored domain${options.length === 1 ? "" : "s"}`;
+  const exactMatch = options.find((item) => item.toLowerCase() === normalizedQuery) || "";
 
   const handleSelect = (nextValue) => {
     setQuery(nextValue);
@@ -1258,7 +1259,15 @@ function SearchableDomainField({
           aria-expanded={showResults}
           onFocus={() => setOpen(true)}
           onBlur={() => {
-            window.setTimeout(() => setOpen(false), 120);
+            const querySnapshot = query;
+            const exactMatchSnapshot = options.find((item) => item.toLowerCase() === String(querySnapshot || "").trim().toLowerCase()) || "";
+            window.setTimeout(() => {
+              if (exactMatchSnapshot && exactMatchSnapshot !== value) {
+                handleSelect(exactMatchSnapshot);
+                return;
+              }
+              setOpen(false);
+            }, 120);
           }}
           onChange={(event) => {
             const nextQuery = event.target.value;
@@ -1273,6 +1282,10 @@ function SearchableDomainField({
               event.preventDefault();
               if (!query.trim()) {
                 handleSelect("");
+                return;
+              }
+              if (exactMatch) {
+                handleSelect(exactMatch);
                 return;
               }
               if (filteredOptions.length) {

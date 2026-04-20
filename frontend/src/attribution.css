@@ -10,16 +10,22 @@
 .attribution-graph-card,
 .attribution-graph-sidebar {
   position: relative;
-  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 28px;
   background: linear-gradient(180deg, color-mix(in srgb, var(--panel-strong) 92%, white 8%), var(--panel));
+}
+
+.attribution-hero,
+.attribution-graph-card,
+.attribution-graph-sidebar {
+  overflow: hidden;
 }
 
 .attribution-toolbar {
   display: grid;
   gap: 18px;
   padding: 22px;
+  overflow: visible;
 }
 
 .attribution-toolbar-top {
@@ -45,6 +51,15 @@
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.attribution-toolbar .domain-search-field {
+  position: relative;
+  z-index: 2;
+}
+
+.attribution-toolbar .domain-search-field:focus-within {
+  z-index: 30;
 }
 
 .attribution-slider {
