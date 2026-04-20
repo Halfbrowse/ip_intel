@@ -45,6 +45,12 @@ try:
 except Exception:  # noqa: BLE001
     opencti = None
 
+try:
+    from mattermost_alerts import send_analysis_notification
+except Exception:  # noqa: BLE001
+    def send_analysis_notification(job: dict[str, Any]) -> bool:
+        return False
+
 
 LOGGER = logging.getLogger("ip_intel.api")
 BASE_DIR = Path(__file__).resolve().parent
@@ -427,6 +433,7 @@ class JobManager:
             job.error = None
 
         self._mutate(job_id, _update)
+        send_analysis_notification(self.snapshot(job_id))
 
     def mark_failed(self, job_id: str, error: str) -> None:
         def _update(job: JobState) -> None:
@@ -434,6 +441,7 @@ class JobManager:
             job.error = error
 
         self._mutate(job_id, _update)
+        send_analysis_notification(self.snapshot(job_id))
 
     def snapshot(self, job_id: str) -> dict[str, Any]:
         with self._lock:

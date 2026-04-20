@@ -212,10 +212,12 @@ SHODAN_API_KEY=<your-api-key>
 NETLAS_API_KEY=<your-api-key>
 OPENCTI_URL=<https://opencti.example.com>
 OPENCTI_TOKEN=<opencti-api-token>
+MATTERMOST_WEBHOOK_URL=<incoming-webhook-url>
 ```
 
 Notes:
 
 - All provider keys are optional.
 - OpenCTI credentials are only needed if you want to use manual OpenCTI ingestion.
+- `MATTERMOST_WEBHOOK_URL` is optional. When set, the backend sends non-blocking Mattermost alerts for analysis completion/failure, OpenCTI ingestion completion/failure, and retry runs.
 - Missing provider keys degrade gracefully; the pipeline does not fail just because a provider is unavailable.

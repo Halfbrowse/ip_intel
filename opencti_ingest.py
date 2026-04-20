@@ -15,6 +15,7 @@ import time
 
 import ip_intel
 from intel_db import get_recent, get_domains_with_source_errors
+from mattermost_alerts import send_opencti_notification, send_retry_notification
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,10 +74,12 @@ def retry_source_errors(source: str | None = None) -> int:
             return 0
         _retry_running = True
 
+    last_error = None
     try:
         domains = get_domains_with_source_errors(source)
         if not domains:
             log.info("No domains with source errors to retry")
+            send_retry_notification("completed", {"source": source, "retried": 0})
             return 0
 
         label = source or "any"
@@ -88,10 +91,16 @@ def retry_source_errors(source: str | None = None) -> int:
                 ip_intel.analyze_domain(domain, **_run_kwargs())
             except Exception as exc:
                 log.error("Retry error on %s — %s", domain, exc)
+                last_error = f"{domain}: {exc}"
             time.sleep(2.0)
 
         log.info("Retry complete — %d domains reanalysed", len(domains))
+        send_retry_notification("completed", {"source": source, "retried": len(domains), "last_error": last_error})
         return len(domains)
+    except Exception as exc:
+        last_error = str(exc)
+        send_retry_notification("failed", {"source": source, "retried": 0, "last_error": last_error})
+        raise
     finally:
         with _retry_lock:
             _retry_running = False
@@ -140,6 +149,8 @@ def _get_domains() -> list[str]:
 def _run(force_reanalyse: bool = False) -> None:
     """Worker: fetch domains from OpenCTI and analyse each one (basic scan only)."""
     global _ingest_running
+    mode = "re-run-all" if force_reanalyse else "incremental"
+    fatal_error = None
 
     with _ingest_lock:
         if _ingest_running:
@@ -156,6 +167,7 @@ def _run(force_reanalyse: bool = False) -> None:
         "skipped":      0,
         "current":      None,
         "last_error":   None,
+        "mode":         mode,
     })
 
     try:
@@ -195,9 +207,26 @@ def _run(force_reanalyse: bool = False) -> None:
         _status["done"]    = len(new_domains)
         _status["current"] = None
         log.info("OpenCTI ingestion complete")
+    except Exception as exc:
+        fatal_error = str(exc)
+        _status["last_error"] = fatal_error
+        log.exception("OpenCTI ingestion failed")
 
     finally:
         _status.update({"running": False, "completed_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+        send_opencti_notification(
+            "failed" if fatal_error else ("completed_with_errors" if _status.get("last_error") else "completed"),
+            {
+                "mode": _status.get("mode"),
+                "done": _status.get("done", 0),
+                "total": _status.get("total", 0),
+                "skipped": _status.get("skipped", 0),
+                "started_at": _status.get("started_at"),
+                "completed_at": _status.get("completed_at"),
+                "last_error": _status.get("last_error"),
+                "note": "No domains to ingest." if _status.get("total", 0) == 0 and not fatal_error else None,
+            },
+        )
         with _ingest_lock:
             _ingest_running = False
 
