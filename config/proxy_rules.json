@@ -1,0 +1,257 @@
+{
+  "version": 1,
+  "minimum_score": 0.5,
+  "weights": {
+    "asn": 0.58,
+    "ptr": 0.52,
+    "cert": 0.22,
+    "network": 0.16,
+    "generic_text": 0.12
+  },
+  "generic_edge_terms": [
+    " reverse proxy",
+    " load balancer",
+    " application gateway",
+    " front door",
+    " edge network",
+    " edge service",
+    " cdn",
+    " proxy edge"
+  ],
+  "rules": [
+    {
+      "family": "cloudflare",
+      "patterns": [
+        "cloudflare",
+        "cloudflare.net",
+        "cloudflaressl",
+        "pages.dev",
+        "workers.dev"
+      ],
+      "asns": [
+        "13335"
+      ]
+    },
+    {
+      "family": "fastly",
+      "patterns": [
+        "fastly",
+        "fastlylb",
+        "fastly.net"
+      ],
+      "asns": [
+        "54113"
+      ]
+    },
+    {
+      "family": "akamai",
+      "patterns": [
+        "akamai",
+        "akamaiedge",
+        "akamaized",
+        "edgekey",
+        "edgesuite"
+      ],
+      "asns": [
+        "16625",
+        "20940"
+      ]
+    },
+    {
+      "family": "imperva",
+      "patterns": [
+        "imperva",
+        "incapsula"
+      ],
+      "asns": [
+        "19551"
+      ]
+    },
+    {
+      "family": "sucuri",
+      "patterns": [
+        "sucuri"
+      ],
+      "asns": []
+    },
+    {
+      "family": "cloudfront",
+      "patterns": [
+        "cloudfront",
+        "awsglobalaccelerator"
+      ],
+      "asns": []
+    },
+    {
+      "family": "azure_front_door",
+      "patterns": [
+        "azurefd",
+        "azure front door",
+        "trafficmanager"
+      ],
+      "asns": []
+    },
+    {
+      "family": "google_edge",
+      "patterns": [
+        "googlehosted",
+        "googleusercontent",
+        "1e100.net",
+        "google frontend"
+      ],
+      "asns": []
+    },
+    {
+      "family": "bunny",
+      "patterns": [
+        "b-cdn.net",
+        "bunnycdn",
+        "bunny.net"
+      ],
+      "asns": [
+        "60626"
+      ]
+    },
+    {
+      "family": "gcore",
+      "patterns": [
+        "gcore",
+        "edgecenter",
+        "gcdn"
+      ],
+      "asns": [
+        "199524"
+      ]
+    },
+    {
+      "family": "stackpath",
+      "patterns": [
+        "stackpath",
+        "netdna",
+        "highwinds"
+      ],
+      "asns": []
+    },
+    {
+      "family": "edgio",
+      "patterns": [
+        "edgio",
+        "limelight",
+        "llnwd"
+      ],
+      "asns": []
+    },
+    {
+      "family": "ddos_guard",
+      "patterns": [
+        "ddos-guard",
+        "ddosguard"
+      ],
+      "asns": []
+    },
+    {
+      "family": "shopify",
+      "patterns": [
+        "shopify",
+        "myshopify.com"
+      ],
+      "asns": []
+    },
+    {
+      "family": "wordpress",
+      "patterns": [
+        "wordpress.com",
+        "automattic"
+      ],
+      "asns": []
+    },
+    {
+      "family": "wpengine",
+      "patterns": [
+        "wpengine",
+        "wpenginepowered"
+      ],
+      "asns": []
+    },
+    {
+      "family": "pantheon",
+      "patterns": [
+        "pantheonsite.io",
+        "pantheon"
+      ],
+      "asns": []
+    },
+    {
+      "family": "webflow",
+      "patterns": [
+        "webflow.io",
+        "webflow"
+      ],
+      "asns": []
+    },
+    {
+      "family": "wix",
+      "patterns": [
+        "wix.com",
+        "wixsite.com"
+      ],
+      "asns": []
+    },
+    {
+      "family": "squarespace",
+      "patterns": [
+        "squarespace",
+        "squarespacedns"
+      ],
+      "asns": []
+    },
+    {
+      "family": "weebly",
+      "patterns": [
+        "weebly"
+      ],
+      "asns": []
+    },
+    {
+      "family": "hubspot",
+      "patterns": [
+        "hubspot",
+        "hubspotusercontent"
+      ],
+      "asns": []
+    },
+    {
+      "family": "vercel",
+      "patterns": [
+        "vercel",
+        "vercel-dns",
+        "now-dns"
+      ],
+      "asns": []
+    },
+    {
+      "family": "netlify",
+      "patterns": [
+        "netlify",
+        "netlifyglobalcdn"
+      ],
+      "asns": []
+    },
+    {
+      "family": "fly_io",
+      "patterns": [
+        "fly.io",
+        "fly.dev"
+      ],
+      "asns": []
+    },
+    {
+      "family": "render",
+      "patterns": [
+        "onrender.com",
+        "render.com"
+      ],
+      "asns": []
+    }
+  ]
+}

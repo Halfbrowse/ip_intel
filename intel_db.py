@@ -8,12 +8,13 @@ preserving enough history to answer "was this shared in the past?"
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import ipaddress
 import re
 import sqlite3
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -28,6 +29,7 @@ else:
     DB_PATH = DB_PATH.resolve()
 
 _RELATED_TARGET_BACKFILL_COMPLETE = False
+_IDENTIFIER_BACKFILL_COMPLETE = False
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -172,6 +174,22 @@ CREATE TABLE IF NOT EXISTS favicons (
 CREATE INDEX IF NOT EXISTS idx_fav_search_id ON favicons(search_id);
 CREATE INDEX IF NOT EXISTS idx_fav_md5       ON favicons(md5);
 
+CREATE TABLE IF NOT EXISTS identifiers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_id       INTEGER NOT NULL REFERENCES searches(id),
+    id_type         TEXT    NOT NULL,
+    id_value        TEXT    NOT NULL,
+    tier            TEXT    NOT NULL,
+    category        TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    observed_at     TEXT,
+    first_seen      TEXT,
+    last_seen       TEXT,
+    raw_json        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_identifiers_search_id     ON identifiers(search_id);
+CREATE INDEX IF NOT EXISTS idx_identifiers_type_value    ON identifiers(id_type, id_value);
+
 CREATE TABLE IF NOT EXISTS whois_data (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     search_id       INTEGER NOT NULL REFERENCES searches(id),
@@ -293,6 +311,7 @@ CREATE INDEX IF NOT EXISTS idx_discovered_search_id      ON discovered_targets(s
 CREATE INDEX IF NOT EXISTS idx_discovered_target         ON discovered_targets(target);
 CREATE INDEX IF NOT EXISTS idx_discovered_target_type    ON discovered_targets(target_type);
 CREATE INDEX IF NOT EXISTS idx_discovered_target_source  ON discovered_targets(target, source);
+
 """
 
 
@@ -400,6 +419,157 @@ _LOW_SIGNAL_HOSTING_PATTERNS = (
     "wpenginepowered.com",
 )
 
+_LOW_SIGNAL_TLS_IDENTITIES = {
+    "localhost",
+    "localhost.localdomain",
+    "localdomain",
+    "ip6-localhost",
+    "ip6-loopback",
+    "example.com",
+    "example.org",
+    "example.net",
+    "example.local",
+}
+
+_LOW_SIGNAL_TLS_PATTERNS = (
+    "acme staging",
+    "default certificate",
+    "dummy certificate",
+    "fake certificate",
+    "ingress controller fake certificate",
+    "kubernetes ingress controller fake certificate",
+    "mkcert development",
+    "snakeoil",
+)
+
+_IDENTIFIER_TIER_ORDER = {
+    "tier_1": 4,
+    "tier_2": 3,
+    "tier_3": 2,
+    "tier_4": 1,
+}
+
+_IDENTIFIER_TIER_LABELS = {
+    "tier_1": "strong",
+    "tier_2": "high",
+    "tier_3": "medium",
+    "tier_4": "supporting",
+}
+
+_IDENTIFIER_TIER_BASE_SCORES = {
+    "tier_1": 74,
+    "tier_2": 46,
+    "tier_3": 28,
+    "tier_4": 14,
+}
+
+_IDENTIFIER_CATEGORY_SCORE_MODIFIERS = {
+    "tls": 18,
+    "tls_ct": 14,
+    "ssh": 18,
+    "identity": 14,
+    "tracking": 12,
+    "content": 10,
+    "infrastructure": 8,
+    "legal": 8,
+    "policy": 6,
+    "email": 5,
+    "social": 4,
+    "nameserver": 3,
+    "dns": 2,
+    "generic": 0,
+}
+
+_IDENTIFIER_FREQUENCY_RULES = {
+    "tls": {"downweight_after": 10, "exclude_after": 60},
+    "tls_ct": {"downweight_after": 8, "exclude_after": 40},
+    "ssh": {"downweight_after": 4, "exclude_after": 20},
+    "identity": {"downweight_after": 5, "exclude_after": 25},
+    "tracking": {"downweight_after": 6, "exclude_after": 30},
+    "content": {"downweight_after": 4, "exclude_after": 20},
+    "infrastructure": {"downweight_after": 3, "exclude_after": 12},
+    "legal": {"downweight_after": 5, "exclude_after": 25},
+    "policy": {"downweight_after": 5, "exclude_after": 24},
+    "email": {"downweight_after": 5, "exclude_after": 24},
+    "social": {"downweight_after": 4, "exclude_after": 18},
+    "nameserver": {"downweight_after": 3, "exclude_after": 10},
+    "dns": {"downweight_after": 4, "exclude_after": 16},
+    "generic": {"downweight_after": 4, "exclude_after": 16},
+}
+
+_IDENTIFIER_HASH_TYPES = {
+    "favicon_md5",
+    "favicon_mmh3",
+    "homepage_html_hash",
+    "http_fingerprint",
+    "legal_text_hash",
+    "well_known_text_hash",
+    "tls_sha256",
+    "tls_spki_sha256",
+    "tls_transport_fingerprint",
+    "ssh_host_key_sha256",
+    "ssh_host_key_md5",
+    "android_cert_sha256",
+}
+
+_IDENTIFIER_EMAIL_TYPES = {
+    "registrant_email",
+    "contact_email",
+    "mail_client_email",
+    "dmarc_rua",
+    "dmarc_ruf",
+    "tls_rpt_rua",
+}
+
+_IDENTIFIER_URL_TYPES = {
+    "openid_issuer",
+    "openid_authorization_endpoint",
+    "openid_token_endpoint",
+    "openid_userinfo_endpoint",
+    "openid_jwks_uri",
+    "openid_registration_endpoint",
+    "rel_me_url",
+    "social_url",
+    "script_asset_url",
+    "source_map_url",
+    "mail_client_url",
+    "well_known_url",
+    "policy_url",
+    "bimi",
+    "mta_sts",
+    "tls_rpt",
+}
+
+_IDENTIFIER_HOST_TYPES = {
+    "resolved_ip",
+    "historical_ip",
+    "origin_ip",
+    "provider_ip",
+    "provider_hostname",
+    "scan_ip",
+    "dns_alias",
+    "mx_host",
+    "nameserver",
+    "nameserver_vanity",
+    "mail_client_domain",
+    "mail_client_server",
+    "script_asset_host",
+    "source_map_host",
+    "spf_include",
+    "dns_caa",
+    "subdomain_name",
+    "cross_san_domain",
+    "certificate_san",
+}
+
+_IDENTIFIER_HANDLE_TYPES = {
+    "social_handle",
+    "meta_social_handle",
+    "twitter_site",
+    "twitter_creator",
+    "author",
+}
+
 
 def _table_columns(c: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -408,6 +578,29 @@ def _table_columns(c: sqlite3.Connection, table: str) -> set[str]:
 def _add_column_if_missing(c: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     if column not in _table_columns(c, table):
         c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _recreate_identifiers_table(c: sqlite3.Connection) -> None:
+    c.execute("DROP TABLE IF EXISTS identifiers")
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identifiers (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_id       INTEGER NOT NULL REFERENCES searches(id),
+            id_type         TEXT    NOT NULL,
+            id_value        TEXT    NOT NULL,
+            tier            TEXT    NOT NULL,
+            category        TEXT    NOT NULL,
+            source          TEXT    NOT NULL,
+            observed_at     TEXT,
+            first_seen      TEXT,
+            last_seen       TEXT,
+            raw_json        TEXT
+        )
+        """
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_identifiers_search_id  ON identifiers(search_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_identifiers_type_value ON identifiers(id_type, id_value)")
 
 
 def _migrate_schema(c: sqlite3.Connection) -> None:
@@ -425,14 +618,35 @@ def _migrate_schema(c: sqlite3.Connection) -> None:
         _add_column_if_missing(c, "ips", column, definition)
 
     _add_column_if_missing(c, "tls_certs", "sha256", "TEXT")
+    _add_column_if_missing(c, "tls_certs", "spki_sha256", "TEXT")
     _add_column_if_missing(c, "tls_certs", "observed_at", "TEXT")
     _add_column_if_missing(c, "ct_certs", "observed_at", "TEXT")
     _add_column_if_missing(c, "scan_hits", "sha256", "TEXT")
+    _add_column_if_missing(c, "scan_hits", "spki_sha256", "TEXT")
     _add_column_if_missing(c, "scan_hits", "observed_at", "TEXT")
+
+    identifier_columns = _table_columns(c, "identifiers")
+    required_identifier_columns = {
+        "id",
+        "search_id",
+        "id_type",
+        "id_value",
+        "tier",
+        "category",
+        "source",
+        "observed_at",
+        "first_seen",
+        "last_seen",
+        "raw_json",
+    }
+    if identifier_columns and not required_identifier_columns.issubset(identifier_columns):
+        # Older local versions stored domain-scoped identifiers with a different shape.
+        # Rebuild the table and repopulate it from stored search payloads.
+        _recreate_identifiers_table(c)
 
 
 def init_db() -> None:
-    global _RELATED_TARGET_BACKFILL_COMPLETE
+    global _RELATED_TARGET_BACKFILL_COMPLETE, _IDENTIFIER_BACKFILL_COMPLETE
 
     with _conn() as c:
         schema_statements = [stmt.strip() for stmt in _SCHEMA.strip().split(";") if stmt.strip()]
@@ -445,6 +659,9 @@ def init_db() -> None:
         _migrate_schema(c)
         for stmt in index_statements:
             c.execute(stmt)
+        if not _IDENTIFIER_BACKFILL_COMPLETE:
+            _backfill_identifier_metadata(c)
+            _IDENTIFIER_BACKFILL_COMPLETE = True
         if not _RELATED_TARGET_BACKFILL_COMPLETE:
             _backfill_related_target_metadata(c)
             _RELATED_TARGET_BACKFILL_COMPLETE = True
@@ -1009,11 +1226,27 @@ def _safe_iso(value: Any) -> str | None:
     return text or None
 
 
+def _normalize_tls_identity(value: Any) -> str:
+    text = str(value or "").strip().lower().rstrip(".")
+    if text.startswith("*."):
+        text = text[2:]
+    return text[4:] if text.startswith("www.") else text
+
+
 def _text_contains_any(value: Any, patterns: tuple[str, ...]) -> bool:
     text = str(value or "").strip().lower()
     if not text:
         return False
     return any(pattern in text for pattern in patterns)
+
+
+def _is_low_signal_tls_identity(value: Any) -> bool:
+    text = _normalize_tls_identity(value)
+    if not text:
+        return False
+    if text in _LOW_SIGNAL_TLS_IDENTITIES:
+        return True
+    return _text_contains_any(text, _LOW_SIGNAL_TLS_PATTERNS)
 
 
 def _latest_search_rows(c: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -1125,6 +1358,779 @@ def _row_target_list(rows: list[sqlite3.Row], exclude_norm: str | None = None) -
     return _dedup_targets(",".join(targets))
 
 
+def _stable_text_hash(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list, tuple, set)):
+        text = json.dumps(value, sort_keys=True, default=str)
+    else:
+        text = str(value)
+    text = text.strip()
+    if not text:
+        return None
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _normalize_identifier_hash(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"^(sha256|spki|md5):", "", text)
+    text = re.sub(r"\s+", "", text)
+    if ":" in text and re.fullmatch(r"[0-9a-f:]+", text):
+        text = text.replace(":", "")
+    return text or None
+
+
+def _normalize_identifier_email(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if text.startswith("mailto:"):
+        text = text[7:]
+    if "?" in text:
+        text = text.split("?", 1)[0]
+    if not text or "@" not in text or " " in text:
+        return None
+    return text
+
+
+def _normalize_identifier_phone(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    keep_plus = text.startswith("+")
+    digits = re.sub(r"\D+", "", text)
+    if len(digits) < 7:
+        return None
+    return f"+{digits}" if keep_plus else digits
+
+
+def _normalize_identifier_guid(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", text)
+    if match:
+        return match.group(0)
+    return text if re.fullmatch(r"[0-9a-f]{32}", text) else None
+
+
+def _normalize_identifier_url(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    email = _normalize_identifier_email(text)
+    if email and text.lower().startswith("mailto:"):
+        return email
+
+    candidate = text if "://" in text else f"https://{text.lstrip('/')}"
+    parts = urlsplit(candidate)
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        return None
+    scheme = (parts.scheme or "https").lower()
+    port = f":{parts.port}" if parts.port and parts.port not in {80, 443} else ""
+    path = parts.path.rstrip("/")
+    normalized = f"{scheme}://{host}{port}{path}"
+    return normalized or None
+
+
+def _normalize_identifier_host(value: Any, *, allow_generic: bool = False) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    target, target_type = _normalize_candidate_target(text)
+    if target and target_type in {"domain", "ip"}:
+        return target
+
+    if "://" in text:
+        host = urlsplit(text).hostname
+        if host:
+            target, _ = _normalize_candidate_target(host)
+            if target:
+                return target
+
+    if allow_generic:
+        return re.sub(r"\s+", " ", text.strip().lower())
+    return None
+
+
+def _normalize_generic_identifier(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.strip("\"'`")
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text or None
+
+
+def _normalize_identifier_value(id_type: str, value: Any) -> str | None:
+    id_type = str(id_type or "").strip()
+    if not id_type:
+        return None
+    if id_type in _IDENTIFIER_HASH_TYPES:
+        return _normalize_identifier_hash(value)
+    if id_type in _IDENTIFIER_EMAIL_TYPES:
+        return _normalize_identifier_email(value)
+    if id_type in _IDENTIFIER_URL_TYPES:
+        return _normalize_identifier_url(value)
+    if id_type in _IDENTIFIER_HOST_TYPES:
+        return _normalize_identifier_host(value, allow_generic=id_type == "nameserver_vanity")
+    if id_type in _IDENTIFIER_HANDLE_TYPES:
+        text = _normalize_generic_identifier(value)
+        return text.lstrip("@") if text else None
+    if "guid" in id_type or id_type.endswith("_tenant"):
+        normalized = _normalize_identifier_guid(value)
+        return normalized or _normalize_generic_identifier(value)
+    if id_type.endswith("_phone"):
+        return _normalize_identifier_phone(value)
+    if id_type.endswith("_email"):
+        return _normalize_identifier_email(value)
+    if id_type.endswith("_url") or id_type.endswith("_endpoint") or id_type.endswith("_issuer"):
+        return _normalize_identifier_url(value)
+    return _normalize_generic_identifier(value)
+
+
+def _iter_flat_scalars(value: Any, *, max_depth: int = 4) -> list[str]:
+    if max_depth < 0 or value is None:
+        return []
+    if isinstance(value, Mapping):
+        values: list[str] = []
+        for nested in value.values():
+            values.extend(_iter_flat_scalars(nested, max_depth=max_depth - 1))
+        return values
+    if isinstance(value, list | tuple | set):
+        values = []
+        for nested in value:
+            values.extend(_iter_flat_scalars(nested, max_depth=max_depth - 1))
+        return values
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _collect_values_for_key_substrings(
+    value: Any,
+    substrings: tuple[str, ...],
+    *,
+    max_depth: int = 4,
+) -> list[str]:
+    if max_depth < 0 or value is None:
+        return []
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            key_text = str(key).strip().lower()
+            if any(sub in key_text for sub in substrings):
+                values.extend(_iter_flat_scalars(nested, max_depth=2))
+            values.extend(_collect_values_for_key_substrings(nested, substrings, max_depth=max_depth - 1))
+    elif isinstance(value, list | tuple | set):
+        for nested in value:
+            values.extend(_collect_values_for_key_substrings(nested, substrings, max_depth=max_depth - 1))
+    return values
+
+
+def _collect_url_like_values(value: Any) -> list[str]:
+    values = []
+    for item in _iter_flat_scalars(value):
+        if "://" in item or item.lower().startswith("mailto:"):
+            values.append(item)
+    return values
+
+
+def _extract_dns_txt_token_candidates(dns: Mapping[str, Any]) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    txt_records = _iter_dns_host_values(dns.get("TXT"))
+    patterns = [
+        ("google_site_verification", re.compile(r"google-site-verification=([A-Za-z0-9._-]+)", re.I)),
+        ("facebook_domain_verification", re.compile(r"facebook-domain-verification=([A-Za-z0-9._-]+)", re.I)),
+        ("microsoft", re.compile(r"\bms=([A-Za-z0-9._-]+)", re.I)),
+        ("stripe_verification", re.compile(r"stripe-verification=([A-Za-z0-9._-]+)", re.I)),
+        ("apple_domain_verification", re.compile(r"apple-domain-verification=([A-Za-z0-9._-]+)", re.I)),
+        ("zoom_verification", re.compile(r"zoom-domain-verification=([A-Za-z0-9._-]+)", re.I)),
+        ("atlassian_domain_verification", re.compile(r"atlassian-domain-verification=([A-Za-z0-9._-]+)", re.I)),
+    ]
+    for record in txt_records:
+        for provider, pattern in patterns:
+            for match in pattern.findall(record):
+                token = _normalize_generic_identifier(match)
+                if token:
+                    tokens.append((provider, token))
+    return tokens
+
+
+def _identifier_confidence_label(score: int) -> str:
+    if score >= 85:
+        return "high"
+    if score >= 60:
+        return "medium"
+    if score >= 30:
+        return "low"
+    return "very_low"
+
+
+def _identifier_score(tier: str, category: str, *, multiplier: float = 1.0, bonus: int = 0) -> dict[str, Any]:
+    base_score = _IDENTIFIER_TIER_BASE_SCORES.get(tier, 12) + _IDENTIFIER_CATEGORY_SCORE_MODIFIERS.get(category, 0) + bonus
+    base_score = max(1, min(100, base_score))
+    score = max(0, min(100, int(round(base_score * multiplier))))
+    return {
+        "base_score": base_score,
+        "score": score,
+        "confidence": _identifier_confidence_label(score),
+        "tier_label": _IDENTIFIER_TIER_LABELS.get(tier, tier),
+    }
+
+
+def _append_identifier(
+    items: list[dict[str, Any]],
+    seen: set[tuple[str, str, str]],
+    *,
+    id_type: str,
+    value: Any,
+    tier: str,
+    category: str,
+    source: str,
+    observed_at: str,
+    first_seen: Any = None,
+    last_seen: Any = None,
+    raw: Any = None,
+) -> None:
+    normalized = _normalize_identifier_value(id_type, value)
+    if not normalized:
+        return
+    key = (id_type, normalized, source)
+    if key in seen:
+        return
+    seen.add(key)
+    items.append(
+        {
+            "id_type": id_type,
+            "id_value": normalized,
+            "tier": tier,
+            "category": category,
+            "source": source,
+            "observed_at": observed_at,
+            "first_seen": _safe_iso(first_seen),
+            "last_seen": _safe_iso(last_seen),
+            "raw_json": raw,
+        }
+    )
+
+
+def _append_cert_identifiers(
+    items: list[dict[str, Any]],
+    seen: set[tuple[str, str, str]],
+    cert: Mapping[str, Any],
+    *,
+    source: str,
+    observed_at: str,
+) -> None:
+    not_before = cert.get("not_before")
+    not_after = cert.get("not_after")
+
+    _append_identifier(
+        items,
+        seen,
+        id_type="tls_spki_sha256",
+        value=cert.get("spki_sha256"),
+        tier="tier_1",
+        category="tls",
+        source=source,
+        observed_at=observed_at,
+        first_seen=not_before,
+        last_seen=not_after,
+        raw=cert,
+    )
+    _append_identifier(
+        items,
+        seen,
+        id_type="tls_sha256",
+        value=cert.get("sha256"),
+        tier="tier_1",
+        category="tls",
+        source=source,
+        observed_at=observed_at,
+        first_seen=not_before,
+        last_seen=not_after,
+        raw=cert,
+    )
+    _append_identifier(
+        items,
+        seen,
+        id_type="tls_transport_fingerprint",
+        value=cert.get("transport_fingerprint"),
+        tier="tier_2",
+        category="tls",
+        source=source,
+        observed_at=observed_at,
+        first_seen=not_before,
+        last_seen=not_after,
+        raw=cert,
+    )
+    sans = cert.get("sans") or []
+    if isinstance(sans, str):
+        parsed_sans = _parse_json_list(sans)
+        sans = parsed_sans if parsed_sans else [sans]
+    for san in sans:
+        _append_identifier(
+            items,
+            seen,
+            id_type="certificate_san",
+            value=san,
+            tier="tier_4",
+            category="tls",
+            source=f"{source}.sans",
+            observed_at=observed_at,
+            first_seen=not_before,
+            last_seen=not_after,
+            raw=cert,
+        )
+
+    issuer = cert.get("issuer") or cert.get("issuer_cn") or cert.get("issuer_org")
+    issuer_text = _normalize_generic_identifier(issuer)
+    if issuer_text and _safe_iso(not_before):
+        _append_identifier(
+            items,
+            seen,
+            id_type="cert_issuer_not_before",
+            value=f"{issuer_text}|{_safe_iso(not_before)}",
+            tier="tier_3",
+            category="tls_ct",
+            source=source,
+            observed_at=observed_at,
+            first_seen=not_before,
+            last_seen=not_after,
+            raw={"issuer": issuer, "not_before": not_before, "not_after": not_after},
+        )
+
+
+def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
+    observed_at = str(result.get("timestamp") or datetime.now(timezone.utc).isoformat())
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    ip_details = normalize_ip_details(result.get("ip_details"))
+
+    def add(
+        value: Any,
+        *,
+        id_type: str,
+        tier: str,
+        category: str,
+        source: str,
+        first_seen: Any = None,
+        last_seen: Any = None,
+        raw: Any = None,
+    ) -> None:
+        _append_identifier(
+            items,
+            seen,
+            id_type=id_type,
+            value=value,
+            tier=tier,
+            category=category,
+            source=source,
+            observed_at=observed_at,
+            first_seen=first_seen,
+            last_seen=last_seen,
+            raw=raw,
+        )
+
+    def meaningful_ip(ip: Any, *, fallback_sources: list[str] | None = None) -> bool:
+        ip_text = str(ip or "").strip()
+        if not ip_text or not _is_public_ip(ip_text):
+            return False
+
+        info = ip_details.get(ip_text) or {}
+        if info.get("cloudflare"):
+            return False
+
+        asn_info = info.get("asn_info") or {}
+        label = classify_ip(
+            ip_text,
+            info.get("ptr"),
+            asn_info.get("asn"),
+            ",".join(info.get("sources") or fallback_sources or []),
+            info.get("proxy_family"),
+        )
+        return not _is_noise_label(label)
+
+    dns = result.get("dns") or {}
+    for ip in _iter_dns_host_values(dns.get("A")):
+        if meaningful_ip(ip, fallback_sources=["dns"]):
+            add(ip, id_type="resolved_ip", tier="tier_2", category="infrastructure", source="dns.A")
+    for ip in _iter_dns_host_values(dns.get("AAAA")):
+        if meaningful_ip(ip, fallback_sources=["dns"]):
+            add(ip, id_type="resolved_ip", tier="tier_2", category="infrastructure", source="dns.AAAA")
+    for alias in _iter_dns_host_values(dns.get("CNAME")):
+        add(alias, id_type="dns_alias", tier="tier_4", category="dns", source="dns.CNAME")
+    for mx in _iter_dns_host_values(dns.get("MX"), key="exchange"):
+        add(mx, id_type="mx_host", tier="tier_4", category="email", source="dns.MX")
+
+    for ns in _iter_dns_host_values(dns.get("NS")):
+        add(ns, id_type="nameserver", tier="tier_4", category="nameserver", source="dns.NS")
+
+    caa_values = dns.get("CAA") or []
+    if isinstance(caa_values, list):
+        iterable_caa = caa_values
+    else:
+        iterable_caa = [caa_values]
+    for value in iterable_caa:
+        candidate = None
+        if isinstance(value, Mapping):
+            candidate = value.get("value") or value.get("issuer") or value.get("ca")
+        else:
+            text = str(value or "").strip()
+            match = re.search(r'"([^"]+\.[^"]+)"', text)
+            candidate = match.group(1) if match else text
+        add(candidate, id_type="dns_caa", tier="tier_4", category="dns", source="dns.CAA", raw=value)
+
+    for provider, token in _extract_dns_txt_token_candidates(dns):
+        add(f"{provider}|{token}", id_type="dns_txt_token", tier="tier_3", category="dns", source="dns.TXT")
+
+    for token_entry in result.get("dns_txt_tokens") or result.get("dns_txt_verification_tokens") or []:
+        if isinstance(token_entry, Mapping):
+            provider = _normalize_generic_identifier(token_entry.get("provider")) or "unknown"
+            token = _normalize_generic_identifier(token_entry.get("token") or token_entry.get("value"))
+            if token:
+                add(
+                    f"{provider}|{token}",
+                    id_type="dns_txt_token",
+                    tier="tier_3",
+                    category="dns",
+                    source="dns_txt_tokens",
+                    raw=token_entry,
+                )
+
+    historical = result.get("historical_dns") or {}
+    for record in historical.get("records") or []:
+        rrtype = str(record.get("rrtype") or "").upper()
+        if rrtype in {"A", "AAAA"} and meaningful_ip(record.get("rdata"), fallback_sources=["historical_dns"]):
+            add(
+                record.get("rdata"),
+                id_type="historical_ip",
+                tier="tier_4",
+                category="infrastructure",
+                source="historical_dns",
+                first_seen=record.get("first_seen"),
+                last_seen=record.get("last_seen"),
+                raw=record,
+            )
+
+    for subdomain in _normalize_text_list(result.get("subdomains") or []):
+        add(subdomain, id_type="subdomain_name", tier="tier_4", category="dns", source="subdomains")
+    for subdomain in _normalize_text_list(result.get("zone_transfer") or []):
+        add(subdomain, id_type="subdomain_name", tier="tier_4", category="dns", source="zone_transfer")
+
+    for entry in result.get("spf_origins") or []:
+        if meaningful_ip(entry.get("ip"), fallback_sources=["spf"]):
+            add(
+                entry.get("ip"),
+                id_type="origin_ip",
+                tier="tier_4",
+                category="email",
+                source="spf_origins",
+                raw=entry,
+            )
+
+    whois_row = result.get("whois") or {}
+    if isinstance(whois_row, Mapping) and not whois_row.get("error"):
+        for email in _normalize_text_list(whois_row.get("emails")):
+            add(email, id_type="registrant_email", tier="tier_3", category="identity", source="whois.emails")
+        for nameserver in _normalize_nameservers(whois_row.get("nameservers")):
+            add(nameserver, id_type="nameserver", tier="tier_4", category="nameserver", source="whois.nameservers")
+
+    nameserver_analysis = result.get("nameserver_analysis") or {}
+    for candidate in _iter_flat_scalars(nameserver_analysis.get("vanity_candidates")):
+        add(
+            candidate,
+            id_type="nameserver_vanity",
+            tier="tier_3",
+            category="nameserver",
+            source="nameserver_analysis.vanity_candidates",
+            raw=candidate,
+        )
+
+    page = result.get("page_metadata") or {}
+    for id_type, keys in [
+        ("ga_property", ("google_analytics", "ga_ids")),
+        ("gtm_container", ("gtm_ids", "google_tag_manager")),
+        ("fb_pixel", ("facebook_pixel",)),
+        ("tiktok_pixel", ("tiktok_pixel",)),
+        ("yandex_metrika", ("yandex_metrika",)),
+        ("adsense_publisher", ("adsense_publisher_ids",)),
+        ("fb_app_id", ("fb_app_id", "facebook_app_id")),
+    ]:
+        for key in keys:
+            for value in _normalize_text_list(page.get(key) or []):
+                add(value, id_type=id_type, tier="tier_2", category="tracking", source=f"page_metadata.{key}")
+
+    add(page.get("favicon_mmh3"), id_type="favicon_mmh3", tier="tier_2", category="content", source="page_metadata.favicon_mmh3")
+    add(page.get("favicon_md5"), id_type="favicon_md5", tier="tier_3", category="content", source="page_metadata.favicon_md5")
+    add(page.get("homepage_html_hash"), id_type="homepage_html_hash", tier="tier_2", category="content", source="page_metadata.homepage_html_hash")
+    if page.get("http_fingerprint"):
+        add(
+            _stable_text_hash(page.get("http_fingerprint")),
+            id_type="http_fingerprint",
+            tier="tier_2",
+            category="content",
+            source="page_metadata.http_fingerprint",
+            raw=page.get("http_fingerprint"),
+        )
+
+    for value in _normalize_text_list(page.get("rel_me") or []):
+        add(value, id_type="rel_me_url", tier="tier_3", category="social", source="page_metadata.rel_me")
+
+    for value in _normalize_text_list(page.get("authors") or []):
+        add(value, id_type="author", tier="tier_4", category="social", source="page_metadata.authors")
+
+    for value in _normalize_text_list(page.get("twitter_site") or []):
+        add(value, id_type="twitter_site", tier="tier_3", category="social", source="page_metadata.twitter_site")
+    for value in _normalize_text_list(page.get("twitter_creator") or []):
+        add(value, id_type="twitter_creator", tier="tier_3", category="social", source="page_metadata.twitter_creator")
+
+    handles = page.get("social_handles") or {}
+    for platform, platform_handles in handles.items():
+        for handle in _normalize_text_list(platform_handles or []):
+            add(
+                f"{_normalize_generic_identifier(platform) or platform}|{handle}",
+                id_type="social_handle",
+                tier="tier_3",
+                category="social",
+                source=f"page_metadata.social_handles.{platform}",
+            )
+
+    social_links = page.get("social_links") or {}
+    for platform, urls in social_links.items():
+        for url in _normalize_text_list(urls or []):
+            add(
+                url,
+                id_type="social_url",
+                tier="tier_4",
+                category="social",
+                source=f"page_metadata.social_links.{platform}",
+            )
+
+    meta_tags = page.get("meta_tags") or {}
+    for value in _collect_values_for_key_substrings(meta_tags, ("twitter:", "og:", "social", "author")):
+        if "://" in value:
+            add(value, id_type="social_url", tier="tier_4", category="social", source="page_metadata.meta_tags")
+        else:
+            add(value, id_type="meta_social_handle", tier="tier_4", category="social", source="page_metadata.meta_tags")
+
+    for url in _normalize_text_list(page.get("script_assets") or []):
+        add(url, id_type="script_asset_url", tier="tier_4", category="content", source="page_metadata.script_assets")
+        add(url, id_type="script_asset_host", tier="tier_4", category="content", source="page_metadata.script_assets")
+
+    for leak in page.get("source_map_leaks") or []:
+        leak_urls = []
+        if isinstance(leak, Mapping):
+            for key in ("url", "asset_url", "source_map_url", "map_url"):
+                if leak.get(key):
+                    leak_urls.append(leak.get(key))
+        else:
+            leak_urls.append(leak)
+        for url in leak_urls:
+            add(url, id_type="source_map_url", tier="tier_3", category="content", source="page_metadata.source_map_leaks", raw=leak)
+            add(url, id_type="source_map_host", tier="tier_4", category="content", source="page_metadata.source_map_leaks", raw=leak)
+
+    email_security = result.get("email_security") or {}
+    for include in _normalize_text_list(email_security.get("spf_includes") or []):
+        add(include, id_type="spf_include", tier="tier_4", category="email", source="email_security.spf_includes")
+
+    for key, id_type in [
+        ("dmarc_rua", "dmarc_rua"),
+        ("dmarc_ruf", "dmarc_ruf"),
+        ("tls_rpt_rua", "tls_rpt_rua"),
+    ]:
+        for value in _normalize_text_list(email_security.get(key)):
+            add(value, id_type=id_type, tier="tier_3", category="email", source=f"email_security.{key}")
+
+    for key, id_type in [
+        ("tls_rpt", "tls_rpt"),
+        ("bimi", "bimi"),
+        ("mta_sts", "mta_sts"),
+    ]:
+        if email_security.get(key):
+            add(email_security.get(key), id_type=id_type, tier="tier_3", category="policy", source=f"email_security.{key}")
+
+    microsoft_tenant = result.get("microsoft_tenant") or {}
+    add(
+        microsoft_tenant.get("tenant_guid") or microsoft_tenant.get("tenant_id"),
+        id_type="microsoft_tenant_guid",
+        tier="tier_1",
+        category="identity",
+        source="microsoft_tenant.tenant_guid",
+        raw=microsoft_tenant,
+    )
+    for key, id_type in [
+        ("issuer", "openid_issuer"),
+        ("authorization_endpoint", "openid_authorization_endpoint"),
+        ("token_endpoint", "openid_token_endpoint"),
+        ("userinfo_endpoint", "openid_userinfo_endpoint"),
+        ("jwks_uri", "openid_jwks_uri"),
+        ("registration_endpoint", "openid_registration_endpoint"),
+    ]:
+        if microsoft_tenant.get(key):
+            add(microsoft_tenant.get(key), id_type=id_type, tier="tier_2", category="identity", source=f"microsoft_tenant.{key}", raw=microsoft_tenant)
+
+    mail_client_config = result.get("mail_client_config") or result.get("mail_config") or {}
+    for key, payload in (mail_client_config.items() if isinstance(mail_client_config, Mapping) else []):
+        add((payload or {}).get("url"), id_type="mail_client_url", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
+        for domain in _normalize_text_list((payload or {}).get("domains") or []):
+            add(domain, id_type="mail_client_domain", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
+        for email in _normalize_text_list((payload or {}).get("emails") or []):
+            add(email, id_type="mail_client_email", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
+        for server in _normalize_text_list((payload or {}).get("servers") or []):
+            add(server, id_type="mail_client_server", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
+
+    well_known = result.get("well_known") or {}
+    apple = well_known.get("apple_app_site_association") or {}
+    for value in _collect_values_for_key_substrings(apple, ("appid", "app_id")):
+        add(value, id_type="apple_app_id", tier="tier_2", category="identity", source="well_known.apple_app_site_association", raw=apple)
+
+    assetlinks = well_known.get("assetlinks") or []
+    for value in _collect_values_for_key_substrings(assetlinks, ("package",)):
+        add(value, id_type="android_package", tier="tier_2", category="identity", source="well_known.assetlinks", raw=assetlinks)
+    for value in _collect_values_for_key_substrings(assetlinks, ("sha256", "fingerprint")):
+        add(value, id_type="android_cert_sha256", tier="tier_1", category="identity", source="well_known.assetlinks", raw=assetlinks)
+
+    security_txt = well_known.get("security_txt") or {}
+    for value in _collect_values_for_key_substrings(security_txt, ("contact", "mail", "email")):
+        add(value, id_type="contact_email", tier="tier_3", category="policy", source="well_known.security_txt", raw=security_txt)
+    for value in _collect_url_like_values(security_txt):
+        add(value, id_type="policy_url", tier="tier_4", category="policy", source="well_known.security_txt", raw=security_txt)
+
+    openid_configuration = well_known.get("openid_configuration") or {}
+    for key, id_type in [
+        ("issuer", "openid_issuer"),
+        ("authorization_endpoint", "openid_authorization_endpoint"),
+        ("token_endpoint", "openid_token_endpoint"),
+        ("userinfo_endpoint", "openid_userinfo_endpoint"),
+        ("jwks_uri", "openid_jwks_uri"),
+        ("registration_endpoint", "openid_registration_endpoint"),
+    ]:
+        if openid_configuration.get(key):
+            add(openid_configuration.get(key), id_type=id_type, tier="tier_2", category="identity", source=f"well_known.openid_configuration.{key}", raw=openid_configuration)
+
+    for key in ("mta_sts_file", "humans_txt", "ads_txt"):
+        payload = well_known.get(key)
+        if payload:
+            add(
+                _stable_text_hash(payload.get("raw") if isinstance(payload, Mapping) else payload),
+                id_type="well_known_text_hash",
+                tier="tier_4",
+                category="content",
+                source=f"well_known.{key}",
+                raw={"artifact": key},
+            )
+
+    legal_pages = result.get("legal_pages") or []
+    for page_entry in legal_pages:
+        if not isinstance(page_entry, Mapping):
+            continue
+        add(page_entry.get("text_hash"), id_type="legal_text_hash", tier="tier_2", category="legal", source="legal_pages.text_hash", raw={"url": page_entry.get("url")})
+        for value in _collect_values_for_key_substrings(page_entry, ("email", "mail")):
+            add(value, id_type="contact_email", tier="tier_3", category="legal", source="legal_pages.contact", raw=page_entry)
+        for value in _collect_values_for_key_substrings(page_entry, ("phone", "tel", "mobile")):
+            add(value, id_type="legal_phone", tier="tier_3", category="legal", source="legal_pages.phone", raw=page_entry)
+        for value in _collect_values_for_key_substrings(page_entry, ("address", "street", "city", "postal")):
+            add(value, id_type="legal_address", tier="tier_4", category="legal", source="legal_pages.address", raw=page_entry)
+        for value in _collect_values_for_key_substrings(page_entry, ("entity", "company", "organisation", "organization", "holder", "owner")):
+            add(value, id_type="legal_entity", tier="tier_4", category="legal", source="legal_pages.entity", raw=page_entry)
+        for value in _collect_values_for_key_substrings(page_entry, ("vat", "register", "registry", "registration", "company_number", "company-id", "reg")):
+            add(value, id_type="legal_registration", tier="tier_3", category="legal", source="legal_pages.registration", raw=page_entry)
+
+    for cert in result.get("non_cf_tls_certs") or ([] if not result.get("tls_cert") else [result.get("tls_cert")]):
+        if isinstance(cert, Mapping):
+            _append_cert_identifiers(items, seen, cert, source="tls_certs", observed_at=observed_at)
+
+    origin = result.get("origin_candidates") or {}
+    for key in ("subdomain_leaks", "mx_leaks", "wordlist_leaks", "hackertarget", "urlscan"):
+        for entry in origin.get(key) or []:
+            if meaningful_ip((entry or {}).get("ip"), fallback_sources=[key]):
+                add((entry or {}).get("ip"), id_type="origin_ip", tier="tier_4", category="infrastructure", source=f"origin_candidates.{key}", raw=entry)
+
+    for provider_key in ("censys", "shodan", "netlas"):
+        provider_result = origin.get(provider_key) or {}
+        for hit in provider_result.get("hits") or []:
+            if meaningful_ip(hit.get("ip"), fallback_sources=[provider_key]):
+                add(hit.get("ip"), id_type="provider_ip", tier="tier_3", category="infrastructure", source=f"origin_candidates.{provider_key}", raw=hit)
+            for hostname in hit.get("hostnames") or []:
+                add(hostname, id_type="provider_hostname", tier="tier_4", category="infrastructure", source=f"origin_candidates.{provider_key}.hostnames", raw=hit)
+            _append_cert_identifiers(items, seen, hit, source=f"origin_candidates.{provider_key}", observed_at=observed_at)
+
+    for scan_key in ("scan", "provider_scan", "country_scan"):
+        scan_result = origin.get(scan_key) or {}
+        if not isinstance(scan_result, Mapping) or scan_result.get("skipped"):
+            continue
+        for hit in scan_result.get("hits") or []:
+            if meaningful_ip(hit.get("ip"), fallback_sources=[scan_key]):
+                add(hit.get("ip"), id_type="scan_ip", tier="tier_3", category="infrastructure", source=f"origin_candidates.{scan_key}", raw=hit)
+            _append_cert_identifiers(items, seen, hit, source=f"origin_candidates.{scan_key}", observed_at=observed_at)
+
+    cert_transparency = result.get("cert_transparency") or {}
+    for san in _normalize_text_list(cert_transparency.get("cross_domain_sans") or []):
+        add(san, id_type="cross_san_domain", tier="tier_3", category="tls_ct", source="cert_transparency.cross_domain_sans")
+    for cert in cert_transparency.get("certs") or []:
+        if isinstance(cert, Mapping):
+            _append_cert_identifiers(items, seen, cert, source="cert_transparency", observed_at=observed_at)
+
+    for ssh_key in result.get("ssh_host_keys") or []:
+        if not isinstance(ssh_key, Mapping):
+            continue
+        add(ssh_key.get("sha256") or ssh_key.get("fingerprint_sha256"), id_type="ssh_host_key_sha256", tier="tier_1", category="ssh", source="ssh_host_keys", raw=ssh_key)
+        add(ssh_key.get("md5") or ssh_key.get("fingerprint_md5"), id_type="ssh_host_key_md5", tier="tier_2", category="ssh", source="ssh_host_keys", raw=ssh_key)
+
+    return items
+
+
+def _refresh_search_identifiers(c: sqlite3.Connection, search_id: int, payload: dict[str, Any]) -> None:
+    observed_at = str(payload.get("timestamp") or datetime.now(timezone.utc).isoformat())
+    c.execute("DELETE FROM identifiers WHERE search_id = ?", (search_id,))
+    for item in extract_search_identifiers(payload):
+        c.execute(
+            """INSERT INTO identifiers
+               (search_id, id_type, id_value, tier, category, source, observed_at, first_seen, last_seen, raw_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                search_id,
+                item["id_type"],
+                item["id_value"],
+                item["tier"],
+                item["category"],
+                item["source"],
+                item.get("observed_at") or observed_at,
+                item.get("first_seen"),
+                item.get("last_seen"),
+                _json(item.get("raw_json")),
+            ),
+        )
+
+
+def _backfill_identifier_metadata(c: sqlite3.Connection) -> None:
+    c.execute("DELETE FROM identifiers")
+    rows = c.execute(
+        """
+        SELECT s.id, s.raw_json
+        FROM searches s
+        ORDER BY s.id ASC
+        """
+    ).fetchall()
+
+    for row in rows:
+        raw_json = row["raw_json"]
+        if not raw_json:
+            continue
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        _refresh_search_identifiers(c, int(row["id"]), payload)
+
+
 # ── Save ──────────────────────────────────────────────────────────────────────
 
 def save_search(result: dict) -> int:
@@ -1215,8 +2221,8 @@ def save_search(result: dict) -> int:
                 continue
             c.execute(
                 """INSERT INTO tls_certs
-                   (search_id, ip, port, sni_used, cn, sans, issuer_cn, issuer_org, not_before, not_after, sha256, observed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (search_id, ip, port, sni_used, cn, sans, issuer_cn, issuer_org, not_before, not_after, sha256, spki_sha256, observed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     sid,
                     cert.get("ip"),
@@ -1229,6 +2235,7 @@ def save_search(result: dict) -> int:
                     cert.get("not_before"),
                     cert.get("not_after"),
                     cert.get("sha256"),
+                    cert.get("spki_sha256"),
                     timestamp,
                 ),
             )
@@ -1247,8 +2254,8 @@ def save_search(result: dict) -> int:
                     continue
                 c.execute(
                     """INSERT INTO scan_hits
-                       (search_id, scan_type, ip, port, cn, sans, issuer, not_before, not_after, sha256, cloudflare, observed_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (search_id, scan_type, ip, port, cn, sans, issuer, not_before, not_after, sha256, spki_sha256, cloudflare, observed_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         sid,
                         scan_label,
@@ -1260,6 +2267,7 @@ def save_search(result: dict) -> int:
                         hit.get("not_before"),
                         hit.get("not_after"),
                         hit.get("sha256"),
+                        hit.get("spki_sha256"),
                         1 if hit.get("cloudflare") else 0,
                         timestamp,
                     ),
@@ -1382,6 +2390,7 @@ def save_search(result: dict) -> int:
             ("fb_pixel", "facebook_pixel"),
             ("tiktok_pixel", "tiktok_pixel"),
             ("yandex_metrika", "yandex_metrika"),
+            ("adsense", "adsense_publisher_ids"),
         ]:
             for value in (meta.get(key) or []):
                 c.execute("INSERT INTO tracking_ids (search_id, id_type, id_value) VALUES (?,?,?)", (sid, id_type, str(value)))
@@ -1422,6 +2431,8 @@ def save_search(result: dict) -> int:
                     _json(item.get("raw_json")),
                 ),
             )
+
+        _refresh_search_identifiers(c, sid, result)
 
         stored_result = dict(result)
         stored_result["search_id"] = sid
@@ -1494,6 +2505,7 @@ def get_latest_search_id_for_target(target: str) -> int | None:
 def update_search_payload(search_id: int, payload: dict[str, Any]) -> None:
     init_db()
     with _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
         c.execute(
             "UPDATE searches SET raw_json = ?, timestamp = ? WHERE id = ?",
             (
@@ -1502,6 +2514,7 @@ def update_search_payload(search_id: int, payload: dict[str, Any]) -> None:
                 search_id,
             ),
         )
+        _refresh_search_identifiers(c, search_id, payload)
 
 
 def get_history_for_target(target: str) -> list[dict]:
@@ -1625,6 +2638,23 @@ def find_by_cross_san(san: str) -> list[dict]:
                WHERE cs.san = ?
                ORDER BY s.timestamp DESC, s.id DESC""",
             (san,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_by_identifier(id_type: str, id_value: str) -> list[dict]:
+    normalized_value = _normalize_identifier_value(id_type, id_value)
+    if not normalized_value:
+        return []
+
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT DISTINCT s.id, s.target, s.type, s.timestamp, i.tier, i.category
+               FROM searches s JOIN identifiers i ON s.id = i.search_id
+               WHERE i.id_type = ? AND i.id_value = ?
+               ORDER BY s.timestamp DESC, s.id DESC""",
+            (id_type, normalized_value),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -1811,6 +2841,572 @@ def summarize_result_db_matches(
     }
 
 
+def _latest_domain_rows(c: sqlite3.Connection) -> list[sqlite3.Row]:
+    return [
+        row
+        for row in _latest_search_rows(c)
+        if row["type"] == "domain" and str(row["target"] or "").strip()
+    ]
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    text = _safe_iso(value)
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _humanize_identifier_type(id_type: str) -> str:
+    return str(id_type or "").replace("_", " ").strip().title()
+
+
+def _identifier_rationale(category: str, tier: str, frequency_status: str, domain_count: int | None) -> str:
+    tier_label = _IDENTIFIER_TIER_LABELS.get(tier, tier).capitalize()
+    category_label = str(category or "generic").replace("_", " ")
+    if frequency_status == "excluded" and domain_count is not None:
+        return f"{tier_label} {category_label} evidence, but it is shared by {domain_count} stored domains so it was excluded."
+    if frequency_status == "downweighted" and domain_count is not None:
+        return f"{tier_label} {category_label} evidence that was downweighted because it appears on {domain_count} stored domains."
+    if domain_count is not None:
+        return f"{tier_label} {category_label} evidence shared by {domain_count} stored domains."
+    return f"{tier_label} {category_label} evidence derived from pairwise timing."
+
+
+def _load_latest_domain_identifier_state(c: sqlite3.Connection) -> dict[str, Any]:
+    latest_rows = _latest_domain_rows(c)
+    latest_ids = [int(row["id"]) for row in latest_rows]
+
+    domains: dict[str, dict[str, Any]] = {}
+    for row in latest_rows:
+        norm = _normalize_target(str(row["target"] or ""))
+        domains[norm] = {
+            "target": str(row["target"]),
+            "search_id": int(row["id"]),
+            "timestamp": row["timestamp"],
+            "identifiers": {},
+        }
+
+    if not latest_ids:
+        return {
+            "domains": domains,
+            "identifier_domains": {},
+            "identifier_meta": {},
+            "cert_issuance": {},
+            "frequency_cache": {},
+        }
+
+    identifier_rows = _query_rows_for_ids(
+        c,
+        """SELECT i.search_id, s.target, i.id_type, i.id_value, i.tier, i.category, i.source,
+                  i.observed_at, i.first_seen, i.last_seen, i.raw_json
+           FROM identifiers i
+           JOIN searches s ON s.id = i.search_id
+           WHERE i.search_id IN ({placeholders})""",
+        latest_ids,
+    )
+
+    identifier_domains: dict[tuple[str, str], set[str]] = defaultdict(set)
+    identifier_meta: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for row in identifier_rows:
+        norm_target = _normalize_target(str(row["target"] or ""))
+        domain_entry = domains.get(norm_target)
+        if not domain_entry:
+            continue
+
+        key = (str(row["id_type"]), str(row["id_value"]))
+        payload = domain_entry["identifiers"].setdefault(
+            key,
+            {
+                "id_type": str(row["id_type"]),
+                "id_value": str(row["id_value"]),
+                "tier": str(row["tier"]),
+                "category": str(row["category"]),
+                "sources": set(),
+                "first_seen": row["first_seen"],
+                "last_seen": row["last_seen"],
+                "observed_at": row["observed_at"],
+                "raw_examples": [],
+            },
+        )
+        if row["source"]:
+            payload["sources"].add(str(row["source"]))
+        if row["first_seen"] and (not payload["first_seen"] or str(row["first_seen"]) < str(payload["first_seen"])):
+            payload["first_seen"] = row["first_seen"]
+        if row["last_seen"] and (not payload["last_seen"] or str(row["last_seen"]) > str(payload["last_seen"])):
+            payload["last_seen"] = row["last_seen"]
+        if row["observed_at"] and (not payload["observed_at"] or str(row["observed_at"]) < str(payload["observed_at"])):
+            payload["observed_at"] = row["observed_at"]
+        if row["raw_json"] and len(payload["raw_examples"]) < 3:
+            try:
+                payload["raw_examples"].append(json.loads(row["raw_json"]))
+            except json.JSONDecodeError:
+                payload["raw_examples"].append(row["raw_json"])
+
+        identifier_domains[key].add(norm_target)
+        identifier_meta.setdefault(
+            key,
+            {
+                "id_type": str(row["id_type"]),
+                "id_value": str(row["id_value"]),
+                "tier": str(row["tier"]),
+                "category": str(row["category"]),
+            },
+        )
+
+    cert_issuance: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for query, issuer_col, source_label in [
+        (
+            """SELECT s.target, ct.issuer AS issuer, ct.not_before, ct.not_after
+               FROM ct_certs ct JOIN searches s ON s.id = ct.search_id
+               WHERE ct.search_id IN ({placeholders}) AND ct.not_before IS NOT NULL AND ct.not_before != ''""",
+            "issuer",
+            "ct_certs",
+        ),
+        (
+            """SELECT s.target, t.issuer_cn AS issuer, t.not_before, t.not_after
+               FROM tls_certs t JOIN searches s ON s.id = t.search_id
+               WHERE t.search_id IN ({placeholders}) AND t.not_before IS NOT NULL AND t.not_before != ''""",
+            "issuer",
+            "tls_certs",
+        ),
+        (
+            """SELECT s.target, h.issuer AS issuer, h.not_before, h.not_after
+               FROM scan_hits h JOIN searches s ON s.id = h.search_id
+               WHERE h.search_id IN ({placeholders}) AND h.not_before IS NOT NULL AND h.not_before != ''""",
+            "issuer",
+            "scan_hits",
+        ),
+    ]:
+        for row in _query_rows_for_ids(c, query, latest_ids):
+            norm_target = _normalize_target(str(row["target"] or ""))
+            issuer = _normalize_generic_identifier(row[issuer_col])
+            not_before = _safe_iso(row["not_before"])
+            if not issuer or not not_before:
+                continue
+            cert_issuance[norm_target].append(
+                {
+                    "issuer": issuer,
+                    "not_before": not_before,
+                    "not_after": _safe_iso(row["not_after"]),
+                    "source": source_label,
+                    "not_before_dt": _parse_dt(not_before),
+                }
+            )
+
+    for domain_entry in domains.values():
+        for payload in domain_entry["identifiers"].values():
+            payload["sources"] = sorted(payload["sources"])
+
+    return {
+        "domains": domains,
+        "identifier_domains": identifier_domains,
+        "identifier_meta": identifier_meta,
+        "cert_issuance": cert_issuance,
+        "frequency_cache": {},
+    }
+
+
+def _identifier_frequency_profile(state: Mapping[str, Any], key: tuple[str, str], category: str) -> dict[str, Any]:
+    cache_key = (key[0], key[1], category)
+    cached = state["frequency_cache"].get(cache_key)
+    if cached is not None:
+        return cached
+
+    domains = state["identifier_domains"].get(key, set())
+    domain_count = len(domains)
+    rules = _IDENTIFIER_FREQUENCY_RULES.get(category, _IDENTIFIER_FREQUENCY_RULES["generic"])
+    downweight_after = int(rules["downweight_after"])
+    exclude_after = int(rules["exclude_after"])
+
+    if domain_count > exclude_after:
+        status = "excluded"
+        multiplier = 0.0
+    elif domain_count > downweight_after:
+        status = "downweighted"
+        multiplier = max(0.2, downweight_after / max(domain_count, 1))
+    else:
+        status = "normal"
+        multiplier = 1.0
+
+    payload = {
+        "domain_count": domain_count,
+        "downweight_after": downweight_after,
+        "exclude_after": exclude_after,
+        "status": status,
+        "multiplier": multiplier,
+    }
+    state["frequency_cache"][cache_key] = payload
+    return payload
+
+
+def _build_identifier_evidence(
+    identifier_a: Mapping[str, Any],
+    identifier_b: Mapping[str, Any],
+    *,
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    key = (str(identifier_a["id_type"]), str(identifier_a["id_value"]))
+    frequency = _identifier_frequency_profile(state, key, str(identifier_a["category"]))
+    score_payload = _identifier_score(
+        str(identifier_a["tier"]),
+        str(identifier_a["category"]),
+        multiplier=float(frequency["multiplier"]),
+    )
+    return {
+        "id_type": identifier_a["id_type"],
+        "id_value": identifier_a["id_value"],
+        "label": _humanize_identifier_type(str(identifier_a["id_type"])),
+        "tier": identifier_a["tier"],
+        "category": identifier_a["category"],
+        "sources_a": list(identifier_a.get("sources") or []),
+        "sources_b": list(identifier_b.get("sources") or []),
+        "first_seen_a": identifier_a.get("first_seen") or identifier_a.get("observed_at"),
+        "first_seen_b": identifier_b.get("first_seen") or identifier_b.get("observed_at"),
+        "last_seen_a": identifier_a.get("last_seen"),
+        "last_seen_b": identifier_b.get("last_seen"),
+        "domain_frequency": frequency["domain_count"],
+        "frequency_status": frequency["status"],
+        "frequency_multiplier": frequency["multiplier"],
+        "base_score": score_payload["base_score"],
+        "score": score_payload["score"],
+        "confidence": score_payload["confidence"],
+        "tier_label": score_payload["tier_label"],
+        "rationale": _identifier_rationale(
+            str(identifier_a["category"]),
+            str(identifier_a["tier"]),
+            str(frequency["status"]),
+            int(frequency["domain_count"]),
+        ),
+    }
+
+
+def _build_ct_timing_evidence(norm_a: str, norm_b: str, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    left_rows = state["cert_issuance"].get(norm_a, [])
+    right_rows = state["cert_issuance"].get(norm_b, [])
+    if not left_rows or not right_rows:
+        return []
+
+    best_by_issuer: dict[tuple[str, str], dict[str, Any]] = {}
+    for left in left_rows:
+        left_dt = left.get("not_before_dt")
+        if left_dt is None:
+            continue
+        for right in right_rows:
+            right_dt = right.get("not_before_dt")
+            if right_dt is None:
+                continue
+            if left["issuer"] != right["issuer"]:
+                continue
+
+            delta_hours = abs((left_dt - right_dt).total_seconds()) / 3600
+            if delta_hours == 0:
+                continue
+            if delta_hours <= 24:
+                id_type = "ct_issuer_timing_24h"
+                tier = "tier_3"
+                bonus = 6
+            elif delta_hours <= 24 * 7:
+                id_type = "ct_issuer_timing_7d"
+                tier = "tier_4"
+                bonus = 2
+            else:
+                continue
+
+            score_payload = _identifier_score(tier, "tls_ct", bonus=bonus)
+            evidence = {
+                "id_type": id_type,
+                "id_value": left["issuer"],
+                "label": "CT Issuance Timing",
+                "tier": tier,
+                "category": "tls_ct",
+                "sources_a": [left["source"]],
+                "sources_b": [right["source"]],
+                "first_seen_a": left["not_before"],
+                "first_seen_b": right["not_before"],
+                "last_seen_a": left.get("not_after"),
+                "last_seen_b": right.get("not_after"),
+                "domain_frequency": None,
+                "frequency_status": "pairwise",
+                "frequency_multiplier": 1.0,
+                "base_score": score_payload["base_score"],
+                "score": score_payload["score"],
+                "confidence": score_payload["confidence"],
+                "tier_label": score_payload["tier_label"],
+                "delta_hours": round(delta_hours, 2),
+                "rationale": _identifier_rationale("tls_ct", tier, "pairwise", None),
+            }
+            key = (left["issuer"], id_type)
+            if key not in best_by_issuer or evidence["score"] > best_by_issuer[key]["score"] or evidence["delta_hours"] < best_by_issuer[key]["delta_hours"]:
+                best_by_issuer[key] = evidence
+
+    return sorted(best_by_issuer.values(), key=lambda item: (item["score"], -item["delta_hours"]), reverse=True)
+
+
+def _tier_sort_key(value: str) -> int:
+    return _IDENTIFIER_TIER_ORDER.get(str(value or ""), 0)
+
+
+def _compare_domains_from_state(
+    domain_a: str,
+    domain_b: str,
+    state: Mapping[str, Any],
+    *,
+    include_filtered: bool = False,
+) -> dict[str, Any] | None:
+    normalized_a, type_a = _normalize_candidate_target(domain_a)
+    normalized_b, type_b = _normalize_candidate_target(domain_b)
+    if type_a != "domain" or type_b != "domain" or not normalized_a or not normalized_b:
+        return None
+
+    norm_a = _normalize_target(normalized_a)
+    norm_b = _normalize_target(normalized_b)
+    node_a = state["domains"].get(norm_a)
+    node_b = state["domains"].get(norm_b)
+    if node_a is None or node_b is None:
+        return None
+
+    shared_keys = set(node_a["identifiers"]).intersection(node_b["identifiers"])
+    kept_evidence: list[dict[str, Any]] = []
+    filtered_out: list[dict[str, Any]] = []
+
+    for key in sorted(
+        shared_keys,
+        key=lambda item: (
+            _tier_sort_key(node_a["identifiers"][item]["tier"]),
+            node_a["identifiers"][item]["category"],
+            item[0],
+            item[1],
+        ),
+        reverse=True,
+    ):
+        evidence = _build_identifier_evidence(node_a["identifiers"][key], node_b["identifiers"][key], state=state)
+        if evidence["frequency_status"] == "excluded" and not include_filtered:
+            filtered_out.append(evidence)
+            continue
+        kept_evidence.append(evidence)
+
+    kept_evidence.extend(_build_ct_timing_evidence(norm_a, norm_b, state))
+    kept_evidence.sort(
+        key=lambda item: (
+            _tier_sort_key(str(item["tier"])),
+            int(item["score"]),
+            str(item["category"]),
+            str(item["id_type"]),
+            str(item["id_value"]),
+        ),
+        reverse=True,
+    )
+
+    tier_groups: dict[str, dict[str, Any]] = {}
+    for evidence in kept_evidence:
+        group = tier_groups.setdefault(
+            str(evidence["tier"]),
+            {
+                "tier": evidence["tier"],
+                "tier_label": _IDENTIFIER_TIER_LABELS.get(str(evidence["tier"]), str(evidence["tier"])),
+                "score": 0,
+                "confidence": "very_low",
+                "categories": set(),
+                "evidence": [],
+            },
+        )
+        group["score"] += int(evidence["score"])
+        group["categories"].add(str(evidence["category"]))
+        group["evidence"].append(evidence)
+
+    tiers = []
+    for tier, payload in sorted(tier_groups.items(), key=lambda item: _tier_sort_key(item[0]), reverse=True):
+        tier_score = min(100, int(payload["score"]))
+        tiers.append(
+            {
+                "tier": tier,
+                "tier_label": payload["tier_label"],
+                "score": tier_score,
+                "confidence": _identifier_confidence_label(tier_score),
+                "categories": sorted(payload["categories"]),
+                "evidence_count": len(payload["evidence"]),
+                "evidence": payload["evidence"],
+            }
+        )
+
+    distinct_categories = len({(item["tier"], item["category"]) for item in kept_evidence})
+    distinct_tiers = len({item["tier"] for item in kept_evidence})
+    score = min(
+        100,
+        sum(int(item["score"]) for item in kept_evidence)
+        + max(0, distinct_categories - 1) * 4
+        + max(0, distinct_tiers - 1) * 6,
+    )
+
+    return {
+        "domain_a": node_a["target"],
+        "domain_b": node_b["target"],
+        "search_id_a": node_a["search_id"],
+        "search_id_b": node_b["search_id"],
+        "timestamp_a": node_a["timestamp"],
+        "timestamp_b": node_b["timestamp"],
+        "score": score,
+        "confidence": _identifier_confidence_label(score),
+        "shared_identifier_count": len(kept_evidence),
+        "filtered_identifier_count": len(filtered_out),
+        "matched_categories": sorted({item["category"] for item in kept_evidence}),
+        "matched_tiers": [item["tier"] for item in tiers],
+        "tiers": tiers,
+        "filtered_out": filtered_out,
+    }
+
+
+def compare_domains(domain_a: str, domain_b: str) -> dict | None:
+    init_db()
+    with _conn() as c:
+        state = _load_latest_domain_identifier_state(c)
+    return _compare_domains_from_state(domain_a, domain_b, state)
+
+
+def traverse_identifier_cluster(
+    seed_domains: str | list[str],
+    *,
+    max_depth: int = 2,
+    min_edge_score: int = 20,
+    include_filtered: bool = False,
+) -> dict[str, Any]:
+    if isinstance(seed_domains, str):
+        requested_seeds = [seed_domains]
+    else:
+        requested_seeds = [str(item) for item in (seed_domains or []) if str(item or "").strip()]
+
+    init_db()
+    with _conn() as c:
+        state = _load_latest_domain_identifier_state(c)
+
+    found_seeds: list[str] = []
+    missing_seeds: list[str] = []
+    seed_norms: list[str] = []
+    seen_seed_norms: set[str] = set()
+    for seed in requested_seeds:
+        normalized, target_type = _normalize_candidate_target(seed)
+        norm = _normalize_target(normalized) if normalized and target_type == "domain" else None
+        if not norm or norm not in state["domains"]:
+            missing_seeds.append(seed)
+            continue
+        if norm in seen_seed_norms:
+            continue
+        seen_seed_norms.add(norm)
+        seed_norms.append(norm)
+        found_seeds.append(state["domains"][norm]["target"])
+
+    if not seed_norms:
+        return {
+            "seeds": [],
+            "missing": missing_seeds,
+            "component": {"domains": [], "identifiers": []},
+            "edges": [],
+        }
+
+    visited = set(seed_norms)
+    depth_map = {norm: 0 for norm in seed_norms}
+    queue: deque[tuple[str, int]] = deque((norm, 0) for norm in seed_norms)
+    component_identifier_keys: set[tuple[str, str]] = set()
+    candidate_pairs: set[tuple[str, str]] = set()
+
+    while queue:
+        current, depth = queue.popleft()
+        domain_entry = state["domains"][current]
+        for key, identifier in domain_entry["identifiers"].items():
+            frequency = _identifier_frequency_profile(state, key, str(identifier["category"]))
+            if frequency["status"] == "excluded" and not include_filtered:
+                continue
+
+            domains_for_identifier = state["identifier_domains"].get(key, set())
+            if len(domains_for_identifier) < 2:
+                continue
+
+            component_identifier_keys.add(key)
+            for neighbor in domains_for_identifier:
+                if neighbor == current:
+                    continue
+                candidate_pairs.add(tuple(sorted((current, neighbor))))
+                if depth < max_depth and neighbor not in visited:
+                    visited.add(neighbor)
+                    depth_map[neighbor] = depth + 1
+                    queue.append((neighbor, depth + 1))
+
+    edges = []
+    for left, right in sorted(candidate_pairs):
+        comparison = _compare_domains_from_state(left, right, state, include_filtered=include_filtered)
+        if not comparison or comparison["score"] < min_edge_score:
+            continue
+        comparison["hop_distance"] = min(depth_map.get(left, max_depth + 1), depth_map.get(right, max_depth + 1))
+        edges.append(comparison)
+        for tier_group in comparison["tiers"]:
+            for evidence in tier_group["evidence"]:
+                if evidence["domain_frequency"] is None:
+                    continue
+                component_identifier_keys.add((str(evidence["id_type"]), str(evidence["id_value"])))
+
+    edges.sort(
+        key=lambda item: (
+            int(item["score"]),
+            len(item["matched_categories"]),
+            item["shared_identifier_count"],
+            item["domain_a"],
+            item["domain_b"],
+        ),
+        reverse=True,
+    )
+
+    identifier_nodes = []
+    for key in sorted(
+        component_identifier_keys,
+        key=lambda item: (
+            _tier_sort_key(state["identifier_meta"].get(item, {}).get("tier", "")),
+            state["identifier_meta"].get(item, {}).get("category", ""),
+            item[0],
+            item[1],
+        ),
+        reverse=True,
+    ):
+        meta = state["identifier_meta"].get(key)
+        if not meta:
+            continue
+        frequency = _identifier_frequency_profile(state, key, str(meta["category"]))
+        component_domains = sorted(
+            state["domains"][norm]["target"]
+            for norm in state["identifier_domains"].get(key, set())
+            if norm in visited and norm in state["domains"]
+        )
+        identifier_nodes.append(
+            {
+                "id_type": meta["id_type"],
+                "id_value": meta["id_value"],
+                "tier": meta["tier"],
+                "tier_label": _IDENTIFIER_TIER_LABELS.get(str(meta["tier"]), str(meta["tier"])),
+                "category": meta["category"],
+                "domain_count": frequency["domain_count"],
+                "component_domain_count": len(component_domains),
+                "domains": component_domains,
+                "frequency_status": frequency["status"],
+            }
+        )
+
+    return {
+        "seeds": found_seeds,
+        "missing": missing_seeds,
+        "component": {
+            "domains": [state["domains"][norm]["target"] for norm in sorted(visited)],
+            "identifiers": identifier_nodes,
+        },
+        "edges": edges,
+    }
+
+
 # ── Classification ────────────────────────────────────────────────────────────
 
 _MAIL_ASNS = {"15169", "16276", "8075", "3215", "394161"}
@@ -1897,7 +3493,9 @@ def _is_low_signal_tls_observation(row: Mapping[str, Any], ip_label_index: Mappi
             return True
 
     texts = [row.get("cn"), row.get("issuer")]
-    return any(_text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS) for value in texts)
+    if any(_text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS) for value in texts):
+        return True
+    return any(_is_low_signal_tls_identity(value) for value in texts)
 
 
 # ── Cluster helpers ───────────────────────────────────────────────────────────
@@ -2427,6 +4025,52 @@ def get_connections_for_target(target: str) -> dict | None:
         for row in c.execute("SELECT nameserver FROM nameservers WHERE search_id = ?", (current_sid,)).fetchall():
             nameservers.append({"nameserver": row["nameserver"], "shared_with": _others_by("nameservers", "nameserver", row["nameserver"])})
 
+        identifiers = []
+        if current_row["type"] == "domain":
+            identifier_state = _load_latest_domain_identifier_state(c)
+            current_identifier_node = identifier_state["domains"].get(norm_target)
+            if current_identifier_node:
+                for key, payload in sorted(
+                    current_identifier_node["identifiers"].items(),
+                    key=lambda item: (
+                        _tier_sort_key(str(item[1]["tier"])),
+                        str(item[1]["category"]),
+                        str(item[1]["id_type"]),
+                        str(item[1]["id_value"]),
+                    ),
+                    reverse=True,
+                ):
+                    shared_domains = [
+                        identifier_state["domains"][domain_norm]["target"]
+                        for domain_norm in sorted(identifier_state["identifier_domains"].get(key, set()))
+                        if domain_norm != norm_target
+                    ]
+                    if not shared_domains:
+                        continue
+                    frequency = _identifier_frequency_profile(identifier_state, key, str(payload["category"]))
+                    score_payload = _identifier_score(
+                        str(payload["tier"]),
+                        str(payload["category"]),
+                        multiplier=float(frequency["multiplier"]),
+                    )
+                    identifiers.append(
+                        {
+                            "id_type": payload["id_type"],
+                            "id_value": payload["id_value"],
+                            "tier": payload["tier"],
+                            "tier_label": _IDENTIFIER_TIER_LABELS.get(str(payload["tier"]), str(payload["tier"])),
+                            "category": payload["category"],
+                            "sources": list(payload.get("sources") or []),
+                            "first_seen": payload.get("first_seen") or payload.get("observed_at"),
+                            "last_seen": payload.get("last_seen"),
+                            "shared_with": shared_domains,
+                            "domain_frequency": frequency["domain_count"],
+                            "frequency_status": frequency["status"],
+                            "score": score_payload["score"],
+                            "confidence": score_payload["confidence"],
+                        }
+                    )
+
         discovered_groups: dict[tuple[str, str], dict[str, Any]] = {}
         for row in c.execute(
             """SELECT target, target_type, relation, source, score
@@ -2497,6 +4141,7 @@ def get_connections_for_target(target: str) -> dict | None:
                 "favicons": favicons,
                 "registrant_emails": emails,
                 "nameservers": nameservers,
+                "identifiers": identifiers,
                 "discovered_domains": discovered_domains,
                 "discovered_ips": discovered_ips,
             },

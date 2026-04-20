@@ -20,6 +20,8 @@ dependencies = [
     "pycti>=6.0",
     "libmagic>=1.0",
     "tqdm>=4.66",
+    "mmh3>=5.1",
+    "paramiko>=3.5",
 ]
 
 [project.scripts]

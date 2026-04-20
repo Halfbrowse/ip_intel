@@ -1,0 +1,434 @@
+{
+  "version": 1,
+  "scope_mode": "regional_focus_plus_global_baseline",
+  "default_focus_set": "regional_priority",
+  "focus_sets": {
+    "regional_priority": {
+      "description": "Higher-signal European and Russian-adjacent hosting providers that are often useful in attribution-focused origin scans.",
+      "asns": [
+        "AS24940",
+        "AS16276",
+        "AS21501",
+        "AS35540",
+        "AS9009",
+        "AS60068",
+        "AS50673",
+        "AS44901",
+        "AS48721",
+        "AS197695",
+        "AS49505",
+        "AS9123",
+        "AS210644",
+        "AS198610",
+        "AS8334",
+        "AS57334",
+        "AS53667",
+        "AS51765",
+        "AS200019"
+      ]
+    },
+    "global_baseline": {
+      "description": "Broader global cloud, CDN, and VPS platforms that help separate likely origin infrastructure from common edge and commodity hosting noise.",
+      "asns": [
+        "AS14061",
+        "AS20473",
+        "AS63949",
+        "AS16509",
+        "AS14618",
+        "AS15169",
+        "AS8075",
+        "AS13335",
+        "AS54113",
+        "AS16625",
+        "AS20940",
+        "AS12876",
+        "AS51167",
+        "AS60781",
+        "AS8560",
+        "AS31898",
+        "AS47583",
+        "AS199524",
+        "AS60626"
+      ]
+    },
+    "edge_and_cdn_noise": {
+      "description": "Large edge platforms that may be useful to classify, but are often lower-signal for direct origin attribution.",
+      "asns": [
+        "AS13335",
+        "AS54113",
+        "AS16625",
+        "AS20940",
+        "AS199524",
+        "AS60626"
+      ]
+    }
+  },
+  "providers": {
+    "AS24940": {
+      "name": "Hetzner",
+      "category": "hosting",
+      "regions": [
+        "DE",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Common dedicated and cloud host in European origin infrastructure."
+    },
+    "AS16276": {
+      "name": "OVH",
+      "category": "hosting",
+      "regions": [
+        "FR",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Large European VPS and dedicated provider."
+    },
+    "AS21501": {
+      "name": "OVH SAS",
+      "category": "hosting",
+      "regions": [
+        "FR",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Companion OVH ASN that appears in some OVH-backed origin scans."
+    },
+    "AS35540": {
+      "name": "Aeza Group",
+      "category": "hosting",
+      "regions": [
+        "NL",
+        "FI",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Regional infrastructure with historical use in Russian-language ecosystems."
+    },
+    "AS9009": {
+      "name": "M247",
+      "category": "hosting",
+      "regions": [
+        "RO",
+        "UK",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Frequent transit and VPS provider in European scans."
+    },
+    "AS60068": {
+      "name": "Datacamp / IPXO",
+      "category": "hosting",
+      "regions": [
+        "UK",
+        "EU",
+        "GLOBAL"
+      ],
+      "focus": "regional_priority",
+      "notes": "Often used for leased address space and re-assigned infrastructure."
+    },
+    "AS50673": {
+      "name": "Serverius",
+      "category": "hosting",
+      "regions": [
+        "NL",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Dutch hosting and colocation provider."
+    },
+    "AS44901": {
+      "name": "Belcloud",
+      "category": "hosting",
+      "regions": [
+        "BG",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Bulgarian hosting footprint seen in regional investigations."
+    },
+    "AS48721": {
+      "name": "FOP Kharytonov",
+      "category": "hosting",
+      "regions": [
+        "UA",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Smaller Ukrainian infrastructure provider."
+    },
+    "AS197695": {
+      "name": "REG.RU",
+      "category": "hosting",
+      "regions": [
+        "RU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Major Russian registrar and hosting provider."
+    },
+    "AS49505": {
+      "name": "Selectel",
+      "category": "hosting",
+      "regions": [
+        "RU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Large Russian cloud and colocation provider."
+    },
+    "AS9123": {
+      "name": "TimeWeb",
+      "category": "hosting",
+      "regions": [
+        "RU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Popular Russian web-hosting platform."
+    },
+    "AS210644": {
+      "name": "Aeza",
+      "category": "hosting",
+      "regions": [
+        "RU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Russian VPS provider that can be relevant in higher-risk origin hunts."
+    },
+    "AS198610": {
+      "name": "Beget",
+      "category": "hosting",
+      "regions": [
+        "RU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Common Russian shared and VPS host."
+    },
+    "AS8334": {
+      "name": "Hosting Hut / Timeweb",
+      "category": "hosting",
+      "regions": [
+        "RU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Legacy Russian hosting footprint worth keeping in focused scans."
+    },
+    "AS57334": {
+      "name": "Serverspace",
+      "category": "hosting",
+      "regions": [
+        "RU",
+        "BY"
+      ],
+      "focus": "regional_priority",
+      "notes": "Regional cloud infrastructure provider."
+    },
+    "AS53667": {
+      "name": "Frantech / BuyVM",
+      "category": "hosting",
+      "regions": [
+        "LU",
+        "GLOBAL"
+      ],
+      "focus": "regional_priority",
+      "notes": "Privacy-oriented VPS host with recurring attribution relevance."
+    },
+    "AS51765": {
+      "name": "Frantech Solutions",
+      "category": "hosting",
+      "regions": [
+        "LU",
+        "GLOBAL"
+      ],
+      "focus": "regional_priority",
+      "notes": "Related Frantech network commonly paired with BuyVM infrastructure."
+    },
+    "AS200019": {
+      "name": "AlexHost",
+      "category": "hosting",
+      "regions": [
+        "MD",
+        "EU"
+      ],
+      "focus": "regional_priority",
+      "notes": "Moldova-based host often monitored in abuse and resilience contexts."
+    },
+    "AS14061": {
+      "name": "DigitalOcean",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Major developer cloud provider; common but useful baseline."
+    },
+    "AS20473": {
+      "name": "Choopa / Vultr",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Common VPS footprint in commodity hosting and fast-turn infrastructure."
+    },
+    "AS63949": {
+      "name": "Linode / Akamai Connected Cloud",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "General-purpose cloud platform that can appear as direct origin."
+    },
+    "AS16509": {
+      "name": "Amazon Web Services",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Large cloud provider; often needs classification rather than direct attribution."
+    },
+    "AS14618": {
+      "name": "Amazon AWS edge and service ranges",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Secondary Amazon ASN that appears in provider datasets and edge services."
+    },
+    "AS15169": {
+      "name": "Google",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Covers GCP and Google-managed service infrastructure."
+    },
+    "AS8075": {
+      "name": "Microsoft",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Azure and Microsoft-hosted services."
+    },
+    "AS13335": {
+      "name": "Cloudflare",
+      "category": "edge",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "edge_and_cdn_noise",
+      "notes": "Useful for platform classification, usually weaker as origin evidence."
+    },
+    "AS54113": {
+      "name": "Fastly",
+      "category": "edge",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "edge_and_cdn_noise",
+      "notes": "Common CDN and reverse-proxy platform."
+    },
+    "AS16625": {
+      "name": "Akamai",
+      "category": "edge",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "edge_and_cdn_noise",
+      "notes": "Large CDN and edge provider."
+    },
+    "AS20940": {
+      "name": "Akamai International",
+      "category": "edge",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "edge_and_cdn_noise",
+      "notes": "Companion Akamai ASN seen in edge-delivered infrastructure."
+    },
+    "AS12876": {
+      "name": "Scaleway / Online",
+      "category": "cloud",
+      "regions": [
+        "FR",
+        "EU"
+      ],
+      "focus": "global_baseline",
+      "notes": "European cloud provider with direct-origin potential."
+    },
+    "AS51167": {
+      "name": "Contabo",
+      "category": "hosting",
+      "regions": [
+        "DE",
+        "EU",
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Commodity VPS provider frequently reused across unrelated operators."
+    },
+    "AS60781": {
+      "name": "Leaseweb Netherlands",
+      "category": "hosting",
+      "regions": [
+        "NL",
+        "EU",
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "Large dedicated and cloud host with many leased blocks."
+    },
+    "AS8560": {
+      "name": "IONOS",
+      "category": "hosting",
+      "regions": [
+        "DE",
+        "EU"
+      ],
+      "focus": "global_baseline",
+      "notes": "Mass-market hosting that is still useful for origin classification."
+    },
+    "AS31898": {
+      "name": "Oracle Cloud",
+      "category": "cloud",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "OCI infrastructure seen in direct origin and API hosting."
+    },
+    "AS47583": {
+      "name": "Hostinger",
+      "category": "hosting",
+      "regions": [
+        "LT",
+        "EU",
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "High-volume hosting platform with global reach."
+    },
+    "AS199524": {
+      "name": "Gcore / EdgeCenter",
+      "category": "edge",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "edge_and_cdn_noise",
+      "notes": "CDN and edge network that can also front direct hosting."
+    },
+    "AS60626": {
+      "name": "Bunny CDN",
+      "category": "edge",
+      "regions": [
+        "GLOBAL"
+      ],
+      "focus": "edge_and_cdn_noise",
+      "notes": "Smaller CDN with distinct PTR and certificate patterns."
+    }
+  }
+}

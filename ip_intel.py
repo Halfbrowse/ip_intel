@@ -57,8 +57,28 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from tqdm import tqdm
 
+from signal_dns import (
+    acollect_spf_details,
+    aget_email_security_records,
+    aprobe_microsoft_tenant,
+    collect_spf_details,
+    extract_txt_tenancy_tokens,
+    get_email_security_records,
+    parse_caa_records,
+    probe_microsoft_tenant_sync,
+)
+from signal_transport import fetch_ssh_host_key, fetch_tls_certificate, parse_certificate_der
+from signal_web import (
+    extract_page_enrichment,
+    afetch_homepage_profile,
+    afetch_mail_client_config,
+    afetch_well_known_artifacts,
+    ascrape_legal_pages,
+)
+
 
 RESULTS_DIR = Path(__file__).parent / "results"
+CONFIG_DIR = Path(__file__).parent / "config"
 _LOG_CONTEXT = threading.local()
 
 
@@ -136,93 +156,68 @@ def _normalize_asn(value: str | None) -> str:
     return text[2:] if text.startswith("AS") else text
 
 
-_PROXY_FAMILY_RULES = [
-    {
-        "family": "fastly",
-        "patterns": ("fastly", "fastlylb", "fastly.net"),
-        "asns": {"54113"},
-    },
-    {
-        "family": "akamai",
-        "patterns": ("akamai", "akamaiedge", "akamaized", "edgekey", "edgesuite"),
-        "asns": {"16625", "20940"},
-    },
-    {
-        "family": "imperva",
-        "patterns": ("imperva", "incapsula"),
-        "asns": {"19551"},
-    },
-    {
-        "family": "sucuri",
-        "patterns": ("sucuri",),
-        "asns": set(),
-    },
-    {
-        "family": "cloudfront",
-        "patterns": ("cloudfront", "awsglobalaccelerator"),
-        "asns": set(),
-    },
-    {
-        "family": "azure_front_door",
-        "patterns": ("azurefd", "azure front door", "trafficmanager"),
-        "asns": set(),
-    },
-    {
-        "family": "google_edge",
-        "patterns": ("googlehosted", "googleusercontent", "1e100.net", "google frontend"),
-        "asns": set(),
-    },
-    {
-        "family": "bunny",
-        "patterns": ("b-cdn.net", "bunnycdn", "bunny.net"),
-        "asns": {"60626"},
-    },
-    {
-        "family": "shopify",
-        "patterns": ("shopify", "myshopify.com"),
-        "asns": set(),
-    },
-    {
-        "family": "wordpress",
-        "patterns": ("wordpress.com", "automattic"),
-        "asns": set(),
-    },
-    {
-        "family": "wpengine",
-        "patterns": ("wpengine", "wpenginepowered"),
-        "asns": set(),
-    },
-    {
-        "family": "pantheon",
-        "patterns": ("pantheonsite.io", "pantheon"),
-        "asns": set(),
-    },
-    {
-        "family": "webflow",
-        "patterns": ("webflow.io", "webflow"),
-        "asns": set(),
-    },
-    {
-        "family": "wix",
-        "patterns": ("wix.com", "wixsite.com"),
-        "asns": set(),
-    },
-    {
-        "family": "squarespace",
-        "patterns": ("squarespace",),
-        "asns": set(),
-    },
-    {
-        "family": "weebly",
-        "patterns": ("weebly",),
-        "asns": set(),
-    },
-    {
-        "family": "hubspot",
-        "patterns": ("hubspot", "hubspotusercontent"),
-        "asns": set(),
-    },
-]
+def _load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _load_lines(path: Path) -> list[str]:
+    try:
+        return [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    except Exception:
+        return []
+
+
+def _load_proxy_rules() -> list[dict[str, object]]:
+    raw = _load_json(CONFIG_DIR / "proxy_rules.json", [])
+    rules: list[dict[str, object]] = []
+    for entry in raw if isinstance(raw, list) else []:
+        rules.append(
+            {
+                "family": str(entry.get("family") or ""),
+                "patterns": tuple(str(item).lower() for item in entry.get("patterns") or []),
+                "asns": {_normalize_asn(item) for item in entry.get("asns") or [] if _normalize_asn(item)},
+            }
+        )
+    return rules
+
+
+def _load_provider_asns() -> dict[str, str]:
+    raw = _load_json(CONFIG_DIR / "provider_asns.json", {})
+    providers = raw.get("providers") if isinstance(raw, dict) else {}
+    return {f"AS{_normalize_asn(key)}": str(value) for key, value in (providers or {}).items() if _normalize_asn(key)}
+
+
+def _apex_domain(hostname: str | None) -> str | None:
+    labels = [label for label in str(hostname or "").strip(".").lower().split(".") if label]
+    if len(labels) < 2:
+        return None
+    return ".".join(labels[-2:])
+
+
+def _classify_nameservers(nameservers: list[str]) -> dict[str, list[dict[str, str]]]:
+    boring_tokens = {item.lower() for item in _BORING_NS_PROVIDERS}
+    boring: list[dict[str, str]] = []
+    vanity: list[dict[str, str]] = []
+    for nameserver in nameservers or []:
+        apex = _apex_domain(nameserver)
+        item = {"nameserver": nameserver, "apex": apex or ""}
+        if apex and any(token in apex for token in boring_tokens):
+            boring.append(item)
+        else:
+            vanity.append(item)
+    return {"boring": boring, "vanity_candidates": vanity}
+
+
+_PROXY_FAMILY_RULES = _load_proxy_rules()
+_SUBDOMAIN_WORDLIST = _load_lines(CONFIG_DIR / "subdomain_wordlist.txt")
+_BORING_NS_PROVIDERS = set(_load_lines(CONFIG_DIR / "boring_ns_providers.txt"))
 
 
 def detect_proxy_details(
@@ -359,7 +354,7 @@ def get_dns_records(domain: str) -> dict:
         except dns.exception.DNSException as exc:
             return rtype, {"error": str(exc)}
 
-    rtypes = ("A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA")
+    rtypes = ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")
     with ThreadPoolExecutor(max_workers=len(rtypes)) as ex:
         return dict(ex.map(_resolve, rtypes))
 
@@ -572,15 +567,6 @@ def probe_mx_origins(mx_records: list[dict]) -> list[dict]:
     return leaks
 
 
-# ── Wordlist subdomain probe ──────────────────────────────────────────────────
-
-_SUBDOMAIN_WORDLIST = [
-    "direct", "origin", "mail", "smtp", "ftp", "cpanel", "webmail",
-    "staging", "dev", "test", "beta", "old", "admin", "ns1", "ns2",
-    "api", "static", "img",
-]
-
-
 def probe_wordlist_subdomains(domain: str) -> list[dict]:
     """
     Probe a fixed wordlist of common subdomains for non-Cloudflare IPs.
@@ -610,18 +596,7 @@ def extract_spf_origins(txt_records: list) -> list[dict]:
     Parse SPF TXT records and extract ip4:/ip6: directives as origin candidates.
     No extra network call — operates on already-fetched TXT records.
     """
-    origins: list[dict] = []
-    if not isinstance(txt_records, list):
-        return origins
-    for txt in txt_records:
-        if not isinstance(txt, str) or "v=spf1" not in txt:
-            continue
-        for part in txt.split():
-            if part.startswith("ip4:") or part.startswith("ip6:"):
-                ip_or_cidr = part.split(":", 1)[1]
-                ip = ip_or_cidr.split("/")[0]
-                origins.append({"ip": ip, "cidr": ip_or_cidr, "source": "SPF record"})
-    return origins
+    return collect_spf_details("__seed__", txt_records).get("origins", [])
 
 
 # ── HackerTarget host search ──────────────────────────────────────────────────
@@ -905,31 +880,7 @@ GCP_EUROPE_ALL_REGIONS = [
 ]
 
 
-# Hosting providers commonly used for Russian/Eastern-European content.
-# ASN → (name, country/notes)
-PROVIDER_ASNS: dict[str, str] = {
-    # ── Western European VPS / dedicated ─────────────────────────────────────
-    "AS24940":  "Hetzner (DE) — cheap, popular, no-questions-asked",
-    "AS16276":  "OVH (FR) — large European cloud/VPS",
-    "AS21501":  "OVH SAS (FR)",
-    "AS35540":  "Aeza Group (NL/FI) — bulletproof-adjacent, popular for RU infra",
-    "AS9009":   "M247 (RO/UK) — transit/hosting used heavily by RU operators",
-    "AS60068":  "Datacamp / IPXO (UK) — IP leasing, used for RU infra",
-    "AS50673":  "Serverius (NL) — privacy-friendly Dutch DC",
-    "AS44901":  "Belcloud (BG) — Bulgarian hosting, near RU market",
-    "AS48721":  "FOP Kharytonov (UA) — Ukrainian infra",
-    "AS197695": "REG.RU (RU) — major Russian registrar/hoster",
-    # ── Russian hosting ───────────────────────────────────────────────────────
-    "AS49505":  "Selectel (RU) — large Russian cloud/colo",
-    "AS9123":   "TimeWeb (RU) — popular Russian web hosting",
-    "AS210644": "Aeza (RU) — bulletproof Russian VPS",
-    "AS198610": "Beget (RU) — popular Russian shared/VPS host",
-    "AS8334":   "Hosting Hut / Timeweb (RU)",
-    "AS57334":  "Serverspace (RU/BY)",
-    # ── Luxembourg / offshore ─────────────────────────────────────────────────
-    "AS53667":  "Frantech / BuyVM (LU) — privacy-focused, RU-adjacent use",
-    "AS51765":  "Frantech Solutions (LU)",
-}
+PROVIDER_ASNS: dict[str, str] = _load_provider_asns()
 
 RIPE_STAT_URL          = "https://stat.ripe.net/data/announced-prefixes/data.json"
 RIPE_COUNTRY_URL       = "https://stat.ripe.net/data/country-resource-list/data.json"
@@ -1021,39 +972,18 @@ def fetch_gcp_ip_ranges(region_prefixes: list[str] | None = None) -> list[str]:
 
 def _parse_tls_cert(der: bytes, ip: str, port: int, domain: str) -> dict | None:
     """Parse a DER cert and return a hit dict if CN or SAN matches domain."""
-    cert = x509.load_der_x509_certificate(der)
-
-    cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-    cn = cn_attrs[0].value if cn_attrs else ""
-
-    sans: list[str] = []
-    try:
-        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-        sans = san_ext.value.get_values_for_type(x509.DNSName)
-    except Exception:
-        pass
-
+    parsed = parse_certificate_der(der, ip=ip, port=port, sni_used=domain)
+    if not parsed:
+        return None
+    cn = parsed.get("cn") or ""
+    sans = parsed.get("sans") or []
     wildcard = "*." + ".".join(domain.split(".")[1:])
     if domain not in ([cn] + sans) and wildcard not in ([cn] + sans):
         return None
-
-    try:
-        not_before = cert.not_valid_before_utc.isoformat()
-        not_after  = cert.not_valid_after_utc.isoformat()
-    except AttributeError:
-        not_before = cert.not_valid_before.isoformat()
-        not_after  = cert.not_valid_after.isoformat()
-
-    issuer_cn = cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
     return {
-        "ip":         ip,
-        "port":       port,
+        **parsed,
         "cloudflare": is_cloudflare_ip(ip),
-        "cn":         cn,
-        "sans":       sans,
-        "issuer":     issuer_cn[0].value if issuer_cn else "",
-        "not_before": not_before,
-        "not_after":  not_after,
+        "issuer": parsed.get("issuer_cn") or "",
     }
 
 
@@ -1072,57 +1002,7 @@ def grab_tls_cert(
     Returns a dict with full cert metadata, or None if the connection fails
     or the peer presents no certificate.
     """
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        with socket.create_connection((ip, port), timeout=timeout) as raw_sock:
-            hostname = sni if sni else ip
-            with ctx.wrap_socket(raw_sock, server_hostname=hostname) as ssl_sock:
-                der = ssl_sock.getpeercert(binary_form=True)
-    except Exception:
-        return None
-
-    if not der:
-        return None
-
-    try:
-        cert = x509.load_der_x509_certificate(der)
-
-        cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-        cn = cn_attrs[0].value if cn_attrs else ""
-
-        sans: list[str] = []
-        try:
-            san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            sans = san_ext.value.get_values_for_type(x509.DNSName)
-        except Exception:
-            pass
-
-        try:
-            not_before = cert.not_valid_before_utc.isoformat()
-            not_after  = cert.not_valid_after_utc.isoformat()
-        except AttributeError:
-            not_before = cert.not_valid_before.isoformat()
-            not_after  = cert.not_valid_after.isoformat()
-
-        issuer_cn_attrs = cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
-        issuer_o_attrs  = cert.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
-
-        return {
-            "ip":         ip,
-            "port":       port,
-            "sni_used":   sni,
-            "cn":         cn,
-            "sans":       sans,
-            "issuer_cn":  issuer_cn_attrs[0].value if issuer_cn_attrs else "",
-            "issuer_org": issuer_o_attrs[0].value  if issuer_o_attrs  else "",
-            "not_before": not_before,
-            "not_after":  not_after,
-            "sha256":     hashlib.sha256(der).hexdigest(),
-        }
-    except Exception:
-        return None
+    return fetch_tls_certificate(ip, sni=sni, port=port, timeout=timeout)
 
 
 async def _tcp_open_async(ip: str, port: int, timeout: float) -> bool:
@@ -1649,6 +1529,16 @@ def _process_page_html(html: str) -> dict:
         "cms_generator":    None,
         "social_links":     {},
         "social_handles":   {},
+        "adsense_publisher_ids": [],
+        "fb_app_id":        [],
+        "twitter_site":     [],
+        "twitter_creator":  [],
+        "authors":          [],
+        "rel_me":           [],
+        "homepage_html_hash": None,
+        "meta_tags":        {},
+        "script_assets":    [],
+        "bundler_hints":    [],
     }
     if not html:
         return out
@@ -1698,6 +1588,7 @@ def _process_page_html(html: str) -> dict:
 
     out["social_links"]   = {k: sorted(set(v)) for k, v in social_links.items()}
     out["social_handles"] = {k: sorted(set(v)) for k, v in social_handles.items()}
+    out.update(extract_page_enrichment(html))
     return out
 
 
@@ -1707,34 +1598,11 @@ def fetch_page_metadata(domain: str, save_favicon_as: Path | None = None) -> dic
     Google Analytics / GTM / Facebook Pixel / TikTok Pixel / Yandex.Metrika IDs,
     HTML lang attribute, CMS generator, social links + handles, and favicon MD5.
     """
-    result: dict = {
-        "google_analytics": [], "gtm_ids": [], "facebook_pixel": [], "tiktok_pixel": [],
-        "yandex_metrika": [], "html_lang": None, "cms_generator": None,
-        "social_links": {}, "social_handles": {}, "favicon_md5": None,
-        "favicon_saved": None, "error": None,
-    }
-    headers = {"User-Agent": _PAGE_UA, "Accept-Language": "en-US,en;q=0.9"}
-    html = ""
-    for scheme in ("https", "http"):
-        try:
-            r = requests.get(f"{scheme}://{domain}/", headers=headers, timeout=15, allow_redirects=True)
-            html = r.text
-            break
-        except Exception as exc:
-            result["error"] = str(exc)
-    if html:
-        result["error"] = None
-        result.update(_process_page_html(html))
-    try:
-        fav = requests.get(f"https://{domain}/favicon.ico", headers=headers, timeout=10, allow_redirects=True)
-        if fav.status_code == 200 and fav.content:
-            result["favicon_md5"] = hashlib.md5(fav.content).hexdigest()
-            if save_favicon_as:
-                save_favicon_as.write_bytes(fav.content)
-                result["favicon_saved"] = str(save_favicon_as)
-    except Exception:
-        pass
-    return result
+    async def _run() -> dict:
+        async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True) as client:
+            return await _afetch_page_metadata(domain, client, save_favicon_as)
+
+    return asyncio.run(_run())
 
 
 def get_dmarc_dkim(domain: str) -> dict:
@@ -1742,37 +1610,7 @@ def get_dmarc_dkim(domain: str) -> dict:
     Look up DMARC policy and DKIM public keys for common selectors.
     Useful for attributing operators via mail infrastructure.
     """
-    result: dict = {"dmarc": None, "dkim": {}}
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = 5
-    resolver.lifetime = 8
-
-    # DMARC
-    try:
-        for rdata in resolver.resolve(f"_dmarc.{domain}", "TXT"):
-            txt = "".join(
-                s.decode() if isinstance(s, bytes) else s for s in rdata.strings
-            )
-            if "v=DMARC1" in txt:
-                result["dmarc"] = txt
-                break
-    except Exception:
-        pass
-
-    # DKIM — common selectors
-    for sel in ("google", "mail", "selector1", "selector2", "yandex", "default", "k1", "s1", "s2"):
-        try:
-            for rdata in resolver.resolve(f"{sel}._domainkey.{domain}", "TXT"):
-                txt = "".join(
-                    s.decode() if isinstance(s, bytes) else s for s in rdata.strings
-                )
-                if "p=" in txt or "v=DKIM1" in txt:
-                    result["dkim"][sel] = txt[:300]
-                    break
-        except Exception:
-            pass
-
-    return result
+    return get_email_security_records(domain)
 
 
 # ── Main analysis functions ───────────────────────────────────────────────────
@@ -1806,39 +1644,12 @@ async def _aget_dns_records(domain: str) -> dict:
         except dns.exception.DNSException as exc:
             return rtype, {"error": str(exc)}
 
-    pairs = await asyncio.gather(*[_resolve(rt) for rt in ("A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA")])
+    pairs = await asyncio.gather(*[_resolve(rt) for rt in ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")])
     return dict(pairs)
 
 
 async def _aget_dmarc_dkim(domain: str) -> dict:
-    """True-async DMARC + DKIM lookup — all selectors run concurrently."""
-    result: dict = {"dmarc": None, "dkim": {}}
-    resolver = dns.asyncresolver.Resolver()
-    resolver.timeout = 5
-    resolver.lifetime = 8
-
-    try:
-        for rdata in await resolver.resolve(f"_dmarc.{domain}", "TXT"):
-            txt = "".join(s.decode() if isinstance(s, bytes) else s for s in rdata.strings)
-            if "v=DMARC1" in txt:
-                result["dmarc"] = txt
-                break
-    except Exception:
-        pass
-
-    async def _check_dkim(sel: str):
-        try:
-            for rdata in await resolver.resolve(f"{sel}._domainkey.{domain}", "TXT"):
-                txt = "".join(s.decode() if isinstance(s, bytes) else s for s in rdata.strings)
-                if "p=" in txt or "v=DKIM1" in txt:
-                    return sel, txt[:300]
-        except Exception:
-            pass
-        return sel, None
-
-    pairs = await asyncio.gather(*[_check_dkim(s) for s in ("google", "mail", "selector1", "selector2", "yandex", "default", "k1", "s1", "s2")])
-    result["dkim"] = {sel: val for sel, val in pairs if val}
-    return result
+    return await aget_email_security_records(domain)
 
 
 async def _acrt_sh_data(domain: str, client: httpx.AsyncClient) -> dict:
@@ -2034,30 +1845,23 @@ async def _afetch_page_metadata(domain: str, client: httpx.AsyncClient, save_fav
         "google_analytics": [], "gtm_ids": [], "facebook_pixel": [], "tiktok_pixel": [],
         "yandex_metrika": [], "html_lang": None, "cms_generator": None,
         "social_links": {}, "social_handles": {}, "favicon_md5": None,
-        "favicon_saved": None, "error": None,
+        "favicon_mmh3": None, "favicon_saved": None, "error": None,
+        "adsense_publisher_ids": [], "fb_app_id": [], "twitter_site": [],
+        "twitter_creator": [], "authors": [], "rel_me": [],
+        "homepage_html_hash": None, "meta_tags": {}, "script_assets": [],
+        "bundler_hints": [], "http_fingerprint": {}, "source_map_leaks": [],
+        "final_url": None,
     }
-    page_headers = {"User-Agent": _PAGE_UA, "Accept-Language": "en-US,en;q=0.9"}
-    html = ""
-    for scheme in ("https", "http"):
-        try:
-            r = await client.get(f"{scheme}://{domain}/", headers=page_headers, timeout=15.0)
-            html = r.text
-            result["error"] = None
-            break
-        except Exception as exc:
-            result["error"] = str(exc)
+    profile = await afetch_homepage_profile(
+        domain,
+        client,
+        save_favicon_as=save_favicon_as,
+        user_agent=_PAGE_UA,
+    )
+    html = profile.pop("html", "")
     if html:
-        result["error"] = None
         result.update(_process_page_html(html))
-    try:
-        fav = await client.get(f"https://{domain}/favicon.ico", timeout=10.0)
-        if fav.status_code == 200 and fav.content:
-            result["favicon_md5"] = hashlib.md5(fav.content).hexdigest()
-            if save_favicon_as:
-                save_favicon_as.write_bytes(fav.content)
-                result["favicon_saved"] = str(save_favicon_as)
-    except Exception:
-        pass
+    result.update(profile)
     return result
 
 
@@ -2081,6 +1885,7 @@ async def _analyze_domain_async(
         "timestamp":         datetime.now(timezone.utc).isoformat(),
         "whois":             {},
         "dns":               {},
+        "dns_txt_tokens":    [],
         "zone_transfer":     [],
         "subdomains":        [],
         "cert_transparency": {},
@@ -2088,8 +1893,14 @@ async def _analyze_domain_async(
         "page_metadata":     {},
         "email_security":    {},
         "spf_origins":       [],
+        "nameserver_analysis": {},
+        "well_known":        {},
+        "legal_pages":       [],
+        "mail_client_config": {},
+        "microsoft_tenant":  {},
         "origin_candidates": {},
         "ip_details":        {},
+        "ssh_host_keys":     [],
     }
 
     RESULTS_DIR.mkdir(exist_ok=True)
@@ -2121,16 +1932,20 @@ async def _analyze_domain_async(
         return []
 
     # ── Group 1: all concurrent via shared httpx client ───────────────────────
-    log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata (async)...")
+    log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata / well-known / legal / tenant probe (async)...")
     async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True) as client:
-        (_, dns_records, cert_transparency_raw, _, _, _) = await asyncio.gather(
+        (_, dns_records, cert_transparency_raw, _, _, _, _, _, _) = await asyncio.gather(
             _task("whois",          asyncio.to_thread(get_domain_whois, domain)),
             _task("dns",            _aget_dns_records(domain)),
             _task("_ct_tmp",        _acrt_sh_data(domain, client)),
             _task("historical_dns", _acircl_passive_dns(domain, client)),
             _task("page_metadata",  _afetch_page_metadata(domain, client, _fav_path)),
             _task("email_security", _aget_dmarc_dkim(domain)),
+            _task("well_known",     afetch_well_known_artifacts(domain, client)),
+            _task("legal_pages",    ascrape_legal_pages(domain, client)),
+            _task("mail_client_config", afetch_mail_client_config(domain, client)),
         )
+        _cb("microsoft_tenant", await aprobe_microsoft_tenant(domain, client))
 
         # Post-process CT — split subdomains out and notify each separately
         del result["_ct_tmp"]
@@ -2140,11 +1955,20 @@ async def _analyze_domain_async(
         _cb("cert_transparency", cert_transparency_raw)
         _cb("subdomains", discovered_subdomains)
 
-        spf_origin_ips = extract_spf_origins(dns_records.get("TXT", []))
-        _cb("spf_origins", spf_origin_ips)
+        dns_records["CAA_parsed"] = parse_caa_records(dns_records.get("CAA", []))
+        _cb("dns", dns_records)
+        _cb("dns_txt_tokens", extract_txt_tenancy_tokens(dns_records.get("TXT", [])))
+
+        spf_details = await acollect_spf_details(domain, dns_records.get("TXT", []))
+        _cb("spf_origins", spf_details.get("origins", []))
 
         nameservers  = dns_records.get("NS", [])
         mx_records   = dns_records.get("MX") or []
+        _cb("nameserver_analysis", _classify_nameservers(nameservers))
+        email_security = result.get("email_security") or {}
+        email_security["spf_includes"] = spf_details.get("includes", [])
+        email_security["spf_records"] = spf_details.get("records", [])
+        _cb("email_security", email_security)
 
         # ── Group 2: origin discovery + zone transfer — all concurrent ────────
         # Zone transfer is included here (not before) so its per-nameserver
@@ -2342,6 +2166,14 @@ async def _analyze_domain_async(
     else:
         non_cloudflare_tls_certs = []
 
+    if tls_probe_targets:
+        log(f"SSH probe: grabbing host keys from {len(tls_probe_targets)} non-Cloudflare IP(s)...")
+        ssh_results = await asyncio.gather(*[
+            asyncio.to_thread(fetch_ssh_host_key, ip_address)
+            for ip_address in tls_probe_targets
+        ])
+        _cb("ssh_host_keys", [entry for entry in ssh_results if entry])
+
     result["non_cf_tls_certs"] = non_cloudflare_tls_certs
     if result.get("ip_details"):
         certs_by_ip = {cert.get("ip"): cert for cert in non_cloudflare_tls_certs if cert and cert.get("ip")}
@@ -2413,6 +2245,7 @@ def analyze_ip(ip: str) -> dict:
         "cloudflare":          False,
         "asn_info":            {},
         "other_domains_on_ip": [],
+        "ssh_host_keys":       [],
     }
 
     log(f"PTR record for {ip}")
@@ -2444,6 +2277,9 @@ def analyze_ip(ip: str) -> dict:
         result["non_cf_tls_certs"] = [cert] if cert else []
         if cert:
             log(f"TLS cert: CN={cert.get('cn')}  issuer={cert.get('issuer_cn')}")
+        ssh_host_key = fetch_ssh_host_key(ip)
+        if ssh_host_key:
+            result["ssh_host_keys"] = [ssh_host_key]
 
     # ── Persist to SQLite ─────────────────────────────────────────────────────
     proxy_details = detect_proxy_details(ip, result.get("ptr"), result.get("asn_info"), result.get("tls_cert"))

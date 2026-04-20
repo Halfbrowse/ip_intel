@@ -1,5 +1,6 @@
 import * as d3 from "d3";
 import { useEffect, useRef, useState } from "react";
+import "./attribution.css";
 
 const RESULT_TABS = [
   { id: "overview", label: "Overview" },
@@ -29,7 +30,7 @@ const EXPLORER_TABS = [
 ];
 
 const EXPLORER_PAGES = [
-  { id: "graph", label: "Graph", subtitle: "Full-screen domain relationship map." },
+  { id: "graph", label: "Dossier", subtitle: "Verdict-first attribution workspace with dossier, graph, and matrix views." },
   { id: "connections", label: "Connections", subtitle: "Why one domain overlaps with others." },
   { id: "recent", label: "Recent", subtitle: "Saved investigations you can reopen." },
   { id: "ip", label: "Shared IPs", subtitle: "Domains touching the same IP or host." },
@@ -206,6 +207,469 @@ const GRAPH_THEME = {
 };
 
 const numberFormatter = new Intl.NumberFormat();
+const ATTRIBUTION_VIEW_TABS = [
+  { id: "dossier", label: "Dossier" },
+  { id: "cluster", label: "Cluster graph" },
+  { id: "matrix", label: "Identifier matrix" }
+];
+const ATTRIBUTION_TIER_META = {
+  tier_1: { order: 4, label: "Tier 1", tone: "tier-1", summary: "Highest attribution value. Strong enough to anchor the verdict." },
+  tier_2: { order: 3, label: "Tier 2", tone: "tier-2", summary: "Strong corroboration. Useful when it supports stronger signals." },
+  tier_3: { order: 2, label: "Tier 3", tone: "tier-3", summary: "Lead-grade overlap. Helpful for discovery, weaker for verdicts." },
+  tier_4: { order: 1, label: "Tier 4", tone: "tier-4", summary: "Supporting context. Keep it out of the headline unless nothing stronger exists." }
+};
+const ATTRIBUTION_CATEGORY_META = {
+  identity: { label: "Identity", color: "#2563eb" },
+  tls: { label: "TLS", color: "#0f766e" },
+  tls_ct: { label: "Certificate timing", color: "#0b9488" },
+  tracking: { label: "Tracking", color: "#7c3aed" },
+  content: { label: "Content", color: "#d9467a" },
+  infrastructure: { label: "Infrastructure", color: "#0f766e" },
+  legal: { label: "Legal", color: "#d97706" },
+  policy: { label: "Policy", color: "#1d4ed8" },
+  email: { label: "Email", color: "#0369a1" },
+  social: { label: "Social", color: "#c2410c" },
+  nameserver: { label: "Nameserver", color: "#475569" },
+  dns: { label: "DNS", color: "#64748b" },
+  generic: { label: "Generic", color: "#334155" },
+  ssh: { label: "SSH", color: "#059669" }
+};
+const ATTRIBUTION_GRAPH_DEFAULTS = {
+  maxFrequency: 30,
+  minScore: 24,
+  maxEdges: 44,
+  focus: ""
+};
+const ATTRIBUTION_GRAPH_HEIGHT = 720;
+
+function titleCaseLabel(value) {
+  return String(value || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function humanizeIdentifierType(idType) {
+  const text = String(idType || "").trim();
+  if (!text) {
+    return "Identifier";
+  }
+  const forced = {
+    ga: "GA",
+    gtm: "GTM",
+    oidc: "OIDC",
+    ssh: "SSH",
+    tls: "TLS",
+    html: "HTML",
+    spf: "SPF",
+    dmarc: "DMARC",
+    dkim: "DKIM",
+    bimi: "BIMI",
+    caa: "CAA",
+    rua: "RUA",
+    ruf: "RUF",
+    ms: "MS"
+  };
+  return text
+    .split("_")
+    .filter(Boolean)
+    .map((part) => {
+      const lower = part.toLowerCase();
+      if (forced[lower]) {
+        return forced[lower];
+      }
+      if (/^\d+$/.test(part)) {
+        return part;
+      }
+      return part.charAt(0).toUpperCase() + part.slice(1);
+    })
+    .join(" ");
+}
+
+function parseDomainTokenInput(value) {
+  const seen = new Set();
+  return String(value || "")
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const normalized = item.toLowerCase();
+      if (seen.has(normalized)) {
+        return false;
+      }
+      seen.add(normalized);
+      return true;
+    });
+}
+
+function getAttributionTierMeta(tier) {
+  return ATTRIBUTION_TIER_META[tier] || ATTRIBUTION_TIER_META.tier_4;
+}
+
+function getAttributionTierOrder(tier) {
+  return getAttributionTierMeta(tier).order;
+}
+
+function getAttributionCategoryMeta(category) {
+  return ATTRIBUTION_CATEGORY_META[category] || {
+    label: titleCaseLabel(String(category || "generic").replace(/_/g, " ")),
+    color: "#334155"
+  };
+}
+
+function getAttributionTierLineWidth(tier) {
+  if (tier === "tier_1") {
+    return 7;
+  }
+  if (tier === "tier_2") {
+    return 5;
+  }
+  if (tier === "tier_3") {
+    return 3.5;
+  }
+  return 2.5;
+}
+
+function getEvidenceIdentity(evidence) {
+  return [
+    evidence?.tier || "",
+    evidence?.id_type || "",
+    evidence?.id_value || "",
+    evidence?.first_seen_a || "",
+    evidence?.first_seen_b || ""
+  ].join("|||");
+}
+
+function sortAttributionEvidence(left, right) {
+  return (
+    getAttributionTierOrder(right?.tier) - getAttributionTierOrder(left?.tier)
+    || Number(right?.score || 0) - Number(left?.score || 0)
+    || String(left?.category || "").localeCompare(String(right?.category || ""))
+    || String(left?.label || "").localeCompare(String(right?.label || ""))
+    || String(left?.id_value || "").localeCompare(String(right?.id_value || ""))
+  );
+}
+
+function evidencePassesFrequency(evidence, maxFrequency) {
+  if (evidence?.domain_frequency === null || evidence?.domain_frequency === undefined) {
+    return true;
+  }
+  return Number(evidence.domain_frequency || 0) <= Number(maxFrequency || 0);
+}
+
+function recomputeComparisonScore(evidenceList) {
+  const evidence = Array.isArray(evidenceList) ? evidenceList : [];
+  const distinctCategories = new Set(evidence.map((item) => `${item.tier}:${item.category}`));
+  const distinctTiers = new Set(evidence.map((item) => item.tier));
+  return Math.min(
+    100,
+    evidence.reduce((sum, item) => sum + Number(item.score || 0), 0)
+      + Math.max(0, distinctCategories.size - 1) * 4
+      + Math.max(0, distinctTiers.size - 1) * 6
+  );
+}
+
+function buildVisibleComparison(comparison, maxFrequency) {
+  if (!comparison) {
+    return null;
+  }
+
+  const visibleEvidence = [];
+  const hiddenByFrequency = [];
+  const tiers = [];
+
+  (comparison.tiers || []).forEach((tierGroup) => {
+    const keptEvidence = [];
+    (tierGroup.evidence || []).forEach((evidence) => {
+      if (evidencePassesFrequency(evidence, maxFrequency)) {
+        keptEvidence.push(evidence);
+        visibleEvidence.push(evidence);
+      } else {
+        hiddenByFrequency.push(evidence);
+      }
+    });
+
+    if (!keptEvidence.length) {
+      return;
+    }
+
+    tiers.push({
+      ...tierGroup,
+      score: Math.min(100, keptEvidence.reduce((sum, item) => sum + Number(item.score || 0), 0)),
+      evidence_count: keptEvidence.length,
+      categories: [...new Set(keptEvidence.map((item) => item.category))].sort(),
+      evidence: keptEvidence.sort(sortAttributionEvidence)
+    });
+  });
+
+  tiers.sort((left, right) => getAttributionTierOrder(right.tier) - getAttributionTierOrder(left.tier));
+
+  const hiddenEvidenceMap = new Map();
+  [...hiddenByFrequency, ...(comparison.filtered_out || [])]
+    .sort(sortAttributionEvidence)
+    .forEach((evidence) => {
+      hiddenEvidenceMap.set(getEvidenceIdentity(evidence), evidence);
+    });
+
+  return {
+    ...comparison,
+    visibleEvidence: visibleEvidence.sort(sortAttributionEvidence),
+    hiddenEvidence: [...hiddenEvidenceMap.values()],
+    visibleTiers: tiers,
+    visibleScore: recomputeComparisonScore(visibleEvidence),
+    visibleCategories: [...new Set(visibleEvidence.map((item) => item.category))].sort(),
+    visibleTierIds: tiers.map((item) => item.tier)
+  };
+}
+
+function getEvidenceRarityBadge(evidence, maxFrequency) {
+  const total = evidence?.domain_frequency;
+  if (total === null || total === undefined) {
+    return {
+      label: "Pair-specific",
+      tone: "unique",
+      detail: "Derived from pairwise timing rather than a broadly reusable identifier."
+    };
+  }
+
+  const totalDomains = Number(total || 0);
+  const otherDomains = Math.max(0, totalDomains - 2);
+  if (totalDomains <= 2) {
+    return {
+      label: "Unique to pair",
+      tone: "unique",
+      detail: "No other stored domains carry this identifier."
+    };
+  }
+  if (totalDomains <= 5) {
+    return {
+      label: `Appears on ${formatNumber(otherDomains)} other domain${otherDomains === 1 ? "" : "s"}`,
+      tone: "rare",
+      detail: `Seen on ${formatNumber(totalDomains)} stored domains total.`
+    };
+  }
+  if (totalDomains > Number(maxFrequency || 0) || evidence?.frequency_status === "excluded") {
+    return {
+      label: `Too common: ${formatNumber(otherDomains)} other domains`,
+      tone: "common",
+      detail: `Hidden by the current rarity filter. Seen on ${formatNumber(totalDomains)} stored domains total.`
+    };
+  }
+  return {
+    label: `Appears on ${formatNumber(otherDomains)} other domain${otherDomains === 1 ? "" : "s"}`,
+    tone: evidence?.frequency_status === "downweighted" ? "warning" : "shared",
+    detail: `Seen on ${formatNumber(totalDomains)} stored domains total.`
+  };
+}
+
+function buildAttributionVerdict(comparison) {
+  if (!comparison || !(comparison.visibleEvidence || []).length) {
+    const hiddenCount = (comparison?.hiddenEvidence || []).length;
+    return {
+      label: hiddenCount ? "Common-only overlap" : "No trusted overlap",
+      tone: hiddenCount ? "caution" : "muted",
+      headline: hiddenCount
+        ? "The pair shares identifiers, but every overlap is currently too common to trust."
+        : "No overlap survives the current rarity filter.",
+      summary: hiddenCount
+        ? `${formatNumber(hiddenCount)} common identifier${hiddenCount === 1 ? "" : "s"} suppressed.`
+        : "Pick another pair or widen the component.",
+      tierCounts: { tier_1: 0, tier_2: 0, tier_3: 0, tier_4: 0 },
+      uniqueCount: 0,
+      rareCount: 0,
+      hiddenCount
+    };
+  }
+
+  const visibleEvidence = comparison.visibleEvidence || [];
+  const headlineEvidence = visibleEvidence.filter((item) => item.category !== "infrastructure" || item.tier === "tier_1");
+  const verdictEvidence = headlineEvidence.length ? headlineEvidence : visibleEvidence;
+  const tierCounts = {
+    tier_1: 0,
+    tier_2: 0,
+    tier_3: 0,
+    tier_4: 0
+  };
+
+  verdictEvidence.forEach((item) => {
+    tierCounts[item.tier] += 1;
+  });
+
+  const tierOneCategories = new Set(verdictEvidence.filter((item) => item.tier === "tier_1").map((item) => item.category));
+  const uniqueCount = verdictEvidence.filter((item) => item.domain_frequency === null || Number(item.domain_frequency || 0) <= 2).length;
+  const rareCount = verdictEvidence.filter((item) => item.domain_frequency === null || Number(item.domain_frequency || 0) <= 5).length;
+  const hiddenCount = (comparison.hiddenEvidence || []).length;
+
+  let label = "Investigative lead";
+  let tone = "lead";
+  let headline = "Useful overlap exists, but it still needs stronger corroboration.";
+
+  if (tierCounts.tier_1 >= 2 && tierOneCategories.size >= 2) {
+    label = "Near-definitive";
+    tone = "strong";
+    headline = "Multiple independent Tier 1 matches agree across different categories.";
+  } else if (tierCounts.tier_1 >= 1 && tierCounts.tier_2 >= 1) {
+    label = "High confidence";
+    tone = "high";
+    headline = "A Tier 1 match is reinforced by a second, independent corroborator.";
+  } else if (tierCounts.tier_1 >= 1) {
+    label = "Strong lead";
+    tone = "high";
+    headline = "The pair shares a Tier 1 signal, but it needs more independent support.";
+  } else if (tierCounts.tier_2 >= 2) {
+    label = "Corroborated lead";
+    tone = "lead";
+    headline = "Several high-value corroborators line up, but none is decisive on its own.";
+  }
+
+  const summaryParts = [];
+  if (tierCounts.tier_1) {
+    summaryParts.push(`${tierCounts.tier_1} Tier 1`);
+  }
+  if (tierCounts.tier_2) {
+    summaryParts.push(`${tierCounts.tier_2} Tier 2`);
+  }
+  if (!summaryParts.length && tierCounts.tier_3) {
+    summaryParts.push(`${tierCounts.tier_3} Tier 3`);
+  }
+  if (uniqueCount) {
+    summaryParts.push(`${uniqueCount} unique-to-pair or pair-specific`);
+  } else if (rareCount) {
+    summaryParts.push(`${rareCount} rare`);
+  }
+  if (hiddenCount) {
+    summaryParts.push(`${hiddenCount} too common to trust`);
+  }
+
+  return {
+    label,
+    tone,
+    headline,
+    summary: summaryParts.join(" | "),
+    tierCounts,
+    uniqueCount,
+    rareCount,
+    hiddenCount
+  };
+}
+
+function buildAttributionGraphModel(cluster, controls) {
+  const candidateEdges = [];
+  const comparisons = Array.isArray(cluster?.edges) ? cluster.edges : [];
+
+  comparisons.forEach((comparison) => {
+    const visible = buildVisibleComparison(comparison, controls.maxFrequency);
+    if (!visible || !(visible.visibleEvidence || []).length) {
+      return;
+    }
+    if (visible.visibleScore < controls.minScore) {
+      return;
+    }
+    if (controls.focus && comparison.domain_a !== controls.focus && comparison.domain_b !== controls.focus) {
+      return;
+    }
+
+    const strongestEvidence = visible.visibleEvidence[0];
+    const primaryCategory = strongestEvidence?.category || "generic";
+    const categoryMeta = getAttributionCategoryMeta(primaryCategory);
+    const strongestTier = visible.visibleTiers[0]?.tier || strongestEvidence?.tier || "tier_4";
+
+    candidateEdges.push({
+      key: pairKey(comparison.domain_a, comparison.domain_b),
+      source: comparison.domain_a,
+      target: comparison.domain_b,
+      comparison: visible,
+      score: visible.visibleScore,
+      strongestTier,
+      primaryCategory,
+      categories: [...new Set(visible.visibleEvidence.map((item) => item.category))],
+      color: categoryMeta.color,
+      width: getAttributionTierLineWidth(strongestTier)
+    });
+  });
+
+  candidateEdges.sort(
+    (left, right) => right.score - left.score
+      || getAttributionTierOrder(right.strongestTier) - getAttributionTierOrder(left.strongestTier)
+      || left.source.localeCompare(right.source)
+      || left.target.localeCompare(right.target)
+  );
+
+  const visibleEdges = candidateEdges.slice(0, controls.maxEdges);
+  const nodeStats = new Map();
+
+  visibleEdges.forEach((edge) => {
+    [edge.source, edge.target].forEach((domain) => {
+      if (!nodeStats.has(domain)) {
+        nodeStats.set(domain, {
+          id: domain,
+          displayWeight: 0,
+          visibleDegree: 0
+        });
+      }
+      const node = nodeStats.get(domain);
+      node.displayWeight += edge.score;
+      node.visibleDegree += 1;
+    });
+  });
+
+  const nodes = [...nodeStats.values()].sort(
+    (left, right) => right.displayWeight - left.displayWeight || left.id.localeCompare(right.id)
+  );
+
+  return {
+    nodes,
+    edges: visibleEdges,
+    hiddenEdgeCount: Math.max(0, candidateEdges.length - visibleEdges.length),
+    maxScore: visibleEdges.length ? visibleEdges[0].score : 0
+  };
+}
+
+function buildDomainFingerprint(cluster, domain) {
+  return (cluster?.component?.identifiers || [])
+    .filter((identifier) => Array.isArray(identifier.domains) && identifier.domains.includes(domain))
+    .sort(
+      (left, right) => (
+        getAttributionTierOrder(right.tier) - getAttributionTierOrder(left.tier)
+        || Number(left.component_domain_count || 0) - Number(right.component_domain_count || 0)
+        || Number(left.domain_count || 0) - Number(right.domain_count || 0)
+        || String(left.id_type || "").localeCompare(String(right.id_type || ""))
+        || String(left.id_value || "").localeCompare(String(right.id_value || ""))
+      )
+    );
+}
+
+function buildIdentifierPivotRows(cluster, maxFrequency) {
+  return (cluster?.component?.identifiers || [])
+    .filter((identifier) => Number(identifier.component_domain_count || 0) >= 2)
+    .filter((identifier) => Number(identifier.domain_count || 0) <= Number(maxFrequency || 0))
+    .sort(
+      (left, right) => (
+        Number(left.component_domain_count || 0) - Number(right.component_domain_count || 0)
+        || Number(left.domain_count || 0) - Number(right.domain_count || 0)
+        || getAttributionTierOrder(right.tier) - getAttributionTierOrder(left.tier)
+        || String(left.id_type || "").localeCompare(String(right.id_type || ""))
+        || String(left.id_value || "").localeCompare(String(right.id_value || ""))
+      )
+    );
+}
+
+function buildPivotDomains(cluster, graph, domainA, domainB) {
+  const priority = [domainA, domainB].filter(Boolean);
+  const seen = new Set(priority);
+  const weightedDomains = (graph?.nodes || []).map((node) => node.id);
+  const componentDomains = cluster?.component?.domains || [];
+
+  [...weightedDomains, ...componentDomains].forEach((domain) => {
+    if (domain && !seen.has(domain)) {
+      seen.add(domain);
+      priority.push(domain);
+    }
+  });
+
+  return priority;
+}
 
 async function apiFetch(path, options) {
   const response = await fetch(path, {
@@ -272,13 +736,17 @@ function formatFriendlyDateRange(start, end) {
   return "Unknown";
 }
 
+function getTlsOverlapIssuer(item) {
+  return String(item?.issuer_cn || item?.issuer_org || item?.issuer || "").trim() || "Unknown issuer";
+}
+
 function getTlsOverlapTitle(item) {
   const commonName = String(item?.cn || "").trim();
   if (commonName) {
     return commonName;
   }
 
-  const issuer = String(item?.issuer_cn || item?.issuer_org || "").trim();
+  const issuer = String(item?.issuer_cn || item?.issuer_org || item?.issuer || "").trim();
   if (issuer) {
     return `Certificate from ${issuer}`;
   }
@@ -1017,7 +1485,7 @@ function ConnectionItemDetails({ sectionKey, item, meta }) {
     return (
       <>
         <p>{getTlsOverlapSummary(item)}</p>
-        {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+        <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
         {item.ip ? <p><strong>Seen on IP:</strong> {item.ip}</p> : null}
         {(item.not_before || item.not_after) ? (
           <p><strong>Certificate valid:</strong> {`${formatDate(item.not_before)} to ${formatDate(item.not_after)}`}</p>
@@ -1036,7 +1504,7 @@ function ConnectionItemDetails({ sectionKey, item, meta }) {
     return (
       <>
         <p>{getTlsOverlapSummary(item)}</p>
-        {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+        <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
         <p><strong>Status:</strong> {getTlsOverlapStatusLabel(item.relationship_status)}</p>
         {item.current_shared_with && item.current_shared_with.length ? (
           <p className="break-word"><strong>Still shared with:</strong> {item.current_shared_with.join(", ")}</p>
@@ -1145,7 +1613,7 @@ function buildNetworkModel(clusters, options) {
         parseTargetList(row.targets),
         "tls",
         getTlsLinkScore(relationshipStatus),
-        `${getTlsOverlapTitle(row)} | ${row.issuer_cn || "Unknown issuer"} | ${relationshipStatus}`,
+        `${getTlsOverlapTitle(row)} | ${getTlsOverlapIssuer(row)} | ${relationshipStatus}`,
         NETWORK_LINK_META.tls.color
       );
     });
@@ -3239,7 +3707,7 @@ function ExplorerPanel({
               <LeadCard key={item.sha256} title={getTlsOverlapTitle(item)} footer={`${formatNumber(getTlsOverlapTargetCount(item))} linked domains | ${getTlsOverlapStatusLabel(item.relationship_status)}`}>
                 <p>{getTlsOverlapSummary(item)}</p>
                 <p className="break-word"><strong>Domains:</strong> {formatListPreview(parseTargetList(item.targets), 6) || "No linked domains recorded"}</p>
-                {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+                <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
                 {item.sha256 ? (
                   <details className="fold-panel">
                     <summary>Raw certificate detail</summary>
@@ -4050,6 +4518,1218 @@ function GraphCanvasD3({ graph, selection, setSelection, theme, graphApiRef, hei
         <g ref={viewportGroupRef} />
       </svg>
     </div>
+  );
+}
+
+function AttributionEvidenceRow({ evidence, domainA, domainB, maxFrequency, compact = false }) {
+  const tierMeta = getAttributionTierMeta(evidence?.tier);
+  const categoryMeta = getAttributionCategoryMeta(evidence?.category);
+  const rarity = getEvidenceRarityBadge(evidence, maxFrequency);
+  const leftTimeline = formatFriendlyDateRange(evidence?.first_seen_a, evidence?.last_seen_a);
+  const rightTimeline = formatFriendlyDateRange(evidence?.first_seen_b, evidence?.last_seen_b);
+  const sourcePreview = [
+    ...new Set([...(evidence?.sources_a || []), ...(evidence?.sources_b || [])].filter(Boolean))
+  ];
+
+  return (
+    <article className={compact ? "attribution-evidence-row compact" : "attribution-evidence-row"}>
+      <div className="attribution-evidence-top">
+        <div className="attribution-evidence-copy">
+          <div className="attribution-evidence-title-row">
+            <strong>{evidence?.label || humanizeIdentifierType(evidence?.id_type)}</strong>
+            <span className={`attribution-tier-pill ${tierMeta.tone}`}>{tierMeta.label}</span>
+            <span className="attribution-category-pill" style={{ "--badge-color": categoryMeta.color }}>
+              {categoryMeta.label}
+            </span>
+            <span className={`attribution-rarity-pill ${rarity.tone}`}>{rarity.label}</span>
+          </div>
+          <code className="attribution-code">{evidence?.id_value}</code>
+        </div>
+        <div className="attribution-score-pill">
+          <strong>{formatNumber(evidence?.score || 0)}</strong>
+          <span>strength</span>
+        </div>
+      </div>
+
+      {!compact ? <p className="muted">{evidence?.rationale || rarity.detail}</p> : null}
+
+      <div className="attribution-evidence-meta">
+        <span>
+          <strong>{shortLabel(domainA, 20) || "Left"}:</strong> {leftTimeline}
+        </span>
+        <span>
+          <strong>{shortLabel(domainB, 20) || "Right"}:</strong> {rightTimeline}
+        </span>
+        {sourcePreview.length ? (
+          <span>
+            <strong>Seen via:</strong> {formatListPreview(sourcePreview, compact ? 3 : 5)}
+          </span>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function AttributionFingerprintRow({ identifier, maxFrequency }) {
+  const tierMeta = getAttributionTierMeta(identifier?.tier);
+  const categoryMeta = getAttributionCategoryMeta(identifier?.category);
+  const rarity = getEvidenceRarityBadge(
+    {
+      domain_frequency: identifier?.domain_count,
+      frequency_status: identifier?.frequency_status
+    },
+    maxFrequency
+  );
+
+  return (
+    <article className="attribution-fingerprint-row">
+      <div className="attribution-fingerprint-top">
+        <div className="attribution-evidence-title-row">
+          <strong>{humanizeIdentifierType(identifier?.id_type)}</strong>
+          <span className={`attribution-tier-pill ${tierMeta.tone}`}>{tierMeta.label}</span>
+          <span className="attribution-category-pill" style={{ "--badge-color": categoryMeta.color }}>
+            {categoryMeta.label}
+          </span>
+        </div>
+        <span className={`attribution-rarity-pill ${rarity.tone}`}>{rarity.label}</span>
+      </div>
+      <code className="attribution-code compact">{identifier?.id_value}</code>
+    </article>
+  );
+}
+
+function AttributionDossierPanel({ comparison, domainA, domainB, maxFrequency }) {
+  if (!comparison) {
+    return <Callout tone="info">Select two stored domains to build the pair dossier.</Callout>;
+  }
+
+  const visibleTiers = comparison.visibleTiers || [];
+  const hiddenEvidence = comparison.hiddenEvidence || [];
+
+  return (
+    <div className="stack">
+      {visibleTiers.length ? (
+        visibleTiers.map((tierGroup) => {
+          const tierMeta = getAttributionTierMeta(tierGroup.tier);
+          return (
+            <SectionCard
+              key={tierGroup.tier}
+              title={`${tierMeta.label} evidence`}
+              subtitle={tierMeta.summary}
+              infoTitle={`${tierMeta.label} evidence`}
+              infoBody="Evidence is grouped by strength so the analyst can judge the verdict before worrying about collection source."
+            >
+              <div className="attribution-evidence-list">
+                {tierGroup.evidence.map((evidence) => (
+                  <AttributionEvidenceRow
+                    key={getEvidenceIdentity(evidence)}
+                    evidence={evidence}
+                    domainA={domainA}
+                    domainB={domainB}
+                    maxFrequency={maxFrequency}
+                  />
+                ))}
+              </div>
+            </SectionCard>
+          );
+        })
+      ) : (
+        <Callout tone="warning">No evidence rows survive the current rarity filter. Relax the cutoff or pick a different pair.</Callout>
+      )}
+
+      <SectionCard
+        title="Common evidence check"
+        subtitle="Rows held back because they are too common to drive attribution safely."
+        infoTitle="Common evidence check"
+        infoBody="This is the template-artifact guardrail. If a value links large numbers of unrelated domains, it belongs here rather than in the verdict."
+      >
+        {hiddenEvidence.length ? (
+          <div className="attribution-evidence-list">
+            {hiddenEvidence.map((evidence) => (
+              <AttributionEvidenceRow
+                key={`hidden-${getEvidenceIdentity(evidence)}`}
+                evidence={evidence}
+                domainA={domainA}
+                domainB={domainB}
+                maxFrequency={maxFrequency}
+              />
+            ))}
+          </div>
+        ) : (
+          <p className="muted">No common or template-style evidence was suppressed for this pair.</p>
+        )}
+      </SectionCard>
+    </div>
+  );
+}
+
+function AttributionGraphSidebar({
+  graph,
+  selection,
+  cluster,
+  maxFrequency,
+  onClose,
+  onOpenDossier,
+  onSetFocus
+}) {
+  if (!selection) {
+    return (
+      <div className="attribution-sidebar-empty">
+        <p className="attribution-sidebar-title">Select a node or edge</p>
+        <p className="muted">
+          Click an edge to load the pair dossier above. Click a domain to inspect its identifier fingerprint here.
+        </p>
+      </div>
+    );
+  }
+
+  if (selection.type === "edge") {
+    const edge = graph.edges.find((item) => item.key === selection.key);
+    if (!edge) {
+      return null;
+    }
+    const verdict = buildAttributionVerdict(edge.comparison);
+    const topEvidence = (edge.comparison.visibleEvidence || []).slice(0, 6);
+
+    return (
+      <div className="attribution-sidebar-stack">
+        <div className="attribution-sidebar-header">
+          <div>
+            <p className="attribution-sidebar-kicker">Pair match</p>
+            <h3>{edge.source} ↔ {edge.target}</h3>
+          </div>
+          <button className="secondary-button" onClick={onClose} type="button">
+            Close
+          </button>
+        </div>
+
+        <div className="attribution-sidebar-badges">
+          <span className={`attribution-verdict-pill ${verdict.tone}`}>{verdict.label}</span>
+          <span className="attribution-meta-chip">{formatNumber(edge.comparison.visibleEvidence.length)} trusted rows</span>
+          <span className="attribution-meta-chip">{getAttributionTierMeta(edge.strongestTier).label}</span>
+        </div>
+
+        <p>{verdict.headline}</p>
+        <p className="muted">{verdict.summary}</p>
+
+        <div className="button-row">
+          <button className="primary-button" onClick={() => onOpenDossier(edge.comparison)} type="button">
+            Open dossier
+          </button>
+          <button className="secondary-button" onClick={() => onSetFocus(edge.source)} type="button">
+            Focus {shortLabel(edge.source, 18)}
+          </button>
+        </div>
+
+        <div className="attribution-sidebar-section">
+          <p className="attribution-sidebar-title">Top matching evidence</p>
+          <div className="attribution-evidence-list compact">
+            {topEvidence.map((evidence) => (
+              <AttributionEvidenceRow
+                key={`${edge.key}-${getEvidenceIdentity(evidence)}`}
+                evidence={evidence}
+                domainA={edge.source}
+                domainB={edge.target}
+                maxFrequency={maxFrequency}
+                compact
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const domain = selection.id;
+  const fingerprint = buildDomainFingerprint(cluster, domain);
+  const relatedEdges = (graph.edges || [])
+    .filter((edge) => edgeTouchesNode(edge, domain))
+    .sort((left, right) => right.score - left.score || left.key.localeCompare(right.key));
+
+  return (
+    <div className="attribution-sidebar-stack">
+      <div className="attribution-sidebar-header">
+        <div>
+          <p className="attribution-sidebar-kicker">Domain fingerprint</p>
+          <h3>{domain}</h3>
+        </div>
+        <button className="secondary-button" onClick={onClose} type="button">
+          Close
+        </button>
+      </div>
+
+      <div className="attribution-sidebar-badges">
+        <span className="attribution-meta-chip">{formatNumber(relatedEdges.length)} visible links</span>
+        <span className="attribution-meta-chip">{formatNumber(fingerprint.length)} identifiers</span>
+      </div>
+
+      <div className="button-row">
+        <button className="secondary-button" onClick={() => onSetFocus(domain)} type="button">
+          Focus this domain
+        </button>
+      </div>
+
+      <div className="attribution-sidebar-section">
+        <p className="attribution-sidebar-title">Full identifier fingerprint</p>
+        {fingerprint.length ? (
+          <div className="attribution-fingerprint-list">
+            {fingerprint.map((identifier) => (
+              <AttributionFingerprintRow
+                key={`${domain}-${identifier.id_type}-${identifier.id_value}`}
+                identifier={identifier}
+                maxFrequency={maxFrequency}
+              />
+            ))}
+          </div>
+        ) : (
+          <p className="muted">No identifiers from the current component are attached to this domain.</p>
+        )}
+      </div>
+
+      <div className="attribution-sidebar-section">
+        <p className="attribution-sidebar-title">Linked pairs</p>
+        {relatedEdges.length ? (
+          <div className="attribution-link-list">
+            {relatedEdges.map((edge) => {
+              const peer = edge.source === domain ? edge.target : edge.source;
+              const verdict = buildAttributionVerdict(edge.comparison);
+              return (
+                <button
+                  className="attribution-link-card"
+                  key={edge.key}
+                  onClick={() => onOpenDossier(edge.comparison)}
+                  type="button"
+                >
+                  <strong>{peer}</strong>
+                  <span>{verdict.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="muted">No visible links remain after the current filters.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AttributionGraphCanvasD3({ graph, selection, setSelection, theme, graphApiRef, height }) {
+  const containerRef = useRef(null);
+  const svgRef = useRef(null);
+  const viewportGroupRef = useRef(null);
+  const positionsRef = useRef(new Map());
+  const selectionRef = useRef(selection);
+  const selectionChangeRef = useRef(setSelection);
+  const currentTransformRef = useRef(null);
+  const zoomBehaviorRef = useRef(null);
+  const simulationRef = useRef(null);
+  const nodeSelectionRef = useRef(null);
+  const edgeSelectionRef = useRef(null);
+  const [size, setSize] = useState({ width: 0, height });
+  const palette = GRAPH_THEME[theme] || GRAPH_THEME.light;
+
+  useEffect(() => {
+    selectionRef.current = selection;
+  }, [selection]);
+
+  useEffect(() => {
+    selectionChangeRef.current = setSelection;
+  }, [setSelection]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return undefined;
+    }
+
+    const observer = new window.ResizeObserver(() => {
+      setSize({
+        width: container.clientWidth,
+        height: container.clientHeight
+      });
+    });
+
+    observer.observe(container);
+    setSize({
+      width: container.clientWidth,
+      height: container.clientHeight
+    });
+
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setSize((current) => ({ ...current, height }));
+  }, [height]);
+
+  useEffect(() => {
+    const svgElement = svgRef.current;
+    const viewportElement = viewportGroupRef.current;
+    if (!svgElement || !viewportElement || size.width <= 0 || size.height <= 0) {
+      return undefined;
+    }
+
+    simulationRef.current && simulationRef.current.stop();
+
+    const svg = d3.select(svgElement);
+    const viewport = d3.select(viewportElement);
+
+    if (!zoomBehaviorRef.current) {
+      zoomBehaviorRef.current = d3.zoom()
+        .scaleExtent([GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM])
+        .on("zoom", (event) => {
+          currentTransformRef.current = event.transform;
+          viewport.attr("transform", event.transform.toString());
+        });
+    }
+
+    svg.call(zoomBehaviorRef.current);
+    svg.on("dblclick.zoom", null);
+    viewport.selectAll("*").remove();
+
+    const nodes = [...graph.nodes]
+      .sort((left, right) => right.displayWeight - left.displayWeight || left.id.localeCompare(right.id))
+      .map((node, index, allNodes) => {
+        const previous = positionsRef.current.get(node.id);
+        const anchor = computeGraphAnchorPosition(node.id, index, allNodes.length);
+        return {
+          ...node,
+          x: previous ? previous.x : anchor.x,
+          y: previous ? previous.y : anchor.y,
+          anchorX: anchor.x,
+          anchorY: anchor.y,
+          radius: getGraphNodeRadius(),
+          vx: 0,
+          vy: 0
+        };
+      });
+
+    const links = graph.edges.map((edge) => ({
+      ...edge,
+      source: edge.source,
+      target: edge.target
+    }));
+
+    const linkLayer = viewport.append("g").attr("class", "attribution-link-layer");
+    const nodeLayer = viewport.append("g").attr("class", "attribution-node-layer");
+
+    const edgeSelection = linkLayer
+      .selectAll("g.attribution-link-wrap")
+      .data(links)
+      .enter()
+      .append("g")
+      .attr("class", "attribution-link-wrap")
+      .attr("data-edge-id", (link) => link.key);
+
+    edgeSelection.each(function buildEdge(link) {
+      const group = d3.select(this);
+      group
+        .append("line")
+        .attr("class", "attribution-link-hit")
+        .attr("stroke", "transparent")
+        .attr("stroke-width", GRAPH_EDGE_HIT_STROKE_WIDTH)
+        .attr("pointer-events", "stroke")
+        .style("cursor", "pointer")
+        .on("click", (event) => {
+          event.stopPropagation();
+          selectionChangeRef.current && selectionChangeRef.current({ type: "edge", key: link.key });
+        });
+      group
+        .append("line")
+        .attr("class", "attribution-link-base")
+        .attr("pointer-events", "none");
+      group
+        .append("line")
+        .attr("class", "attribution-link-highlight")
+        .attr("stroke", palette.edgeHighlight)
+        .attr("stroke-width", Number(link.width || 3) + 4)
+        .attr("opacity", 0)
+        .attr("pointer-events", "none");
+      group.append("title").text(`${link.source} ↔ ${link.target}`);
+    });
+
+    const nodeSelection = nodeLayer
+      .selectAll("g.attribution-node")
+      .data(nodes)
+      .enter()
+      .append("g")
+      .attr("class", "attribution-node")
+      .attr("data-node-id", (node) => node.id)
+      .style("cursor", "pointer")
+      .on("click", (event, node) => {
+        event.stopPropagation();
+        selectionChangeRef.current && selectionChangeRef.current({ type: "node", id: node.id });
+      });
+
+    nodeSelection.each(function buildNode(node) {
+      const group = d3.select(this);
+      group
+        .append("circle")
+        .attr("class", "attribution-node-shape")
+        .attr("r", node.radius)
+        .attr("fill", palette.nodeBase)
+        .attr("stroke", palette.nodeStroke)
+        .attr("stroke-width", 2.25);
+
+      group
+        .append("text")
+        .attr("class", "attribution-node-text")
+        .attr("y", node.radius + 18)
+        .attr("text-anchor", "middle")
+        .text(shortLabel(node.id, 28));
+
+      group.append("title").text(node.id);
+    });
+
+    const applySelectionStyles = () => {
+      const currentSelection = selectionRef.current;
+
+      edgeSelection.each(function styleEdge(link) {
+        const group = d3.select(this);
+        const selectedEdge = Boolean(currentSelection && currentSelection.type === "edge" && currentSelection.key === link.key);
+        const relatedToSelectedNode = Boolean(
+          currentSelection
+          && currentSelection.type === "node"
+          && edgeTouchesNode(link, currentSelection.id)
+        );
+        const dimmed = Boolean(currentSelection) && !selectedEdge && !relatedToSelectedNode;
+
+        group.select("line.attribution-link-base")
+          .attr("opacity", selectedEdge || relatedToSelectedNode ? 1 : dimmed ? 0.18 : 0.9);
+        group.select("line.attribution-link-highlight")
+          .attr("opacity", selectedEdge ? 1 : 0);
+      });
+
+      nodeSelection.each(function styleNode(node) {
+        const group = d3.select(this);
+        const selectedNode = Boolean(currentSelection && currentSelection.type === "node" && currentSelection.id === node.id);
+        const relatedToSelectedNode = Boolean(
+          currentSelection
+          && currentSelection.type === "node"
+          && graph.edges.some(
+            (edge) => edgeTouchesNode(edge, currentSelection.id) && edgeTouchesNode(edge, node.id)
+          )
+        );
+        const relatedToSelectedEdge = Boolean(
+          currentSelection
+          && currentSelection.type === "edge"
+          && graph.edges.some(
+            (edge) => edge.key === currentSelection.key && edgeTouchesNode(edge, node.id)
+          )
+        );
+        const active = selectedNode || relatedToSelectedNode || relatedToSelectedEdge;
+        const dimmed = Boolean(currentSelection) && !active;
+
+        group.select("circle.attribution-node-shape")
+          .attr("fill", selectedNode ? palette.labelText : active ? "#67e8f9" : palette.nodeBase)
+          .attr("opacity", dimmed ? 0.24 : 1)
+          .attr("stroke", selectedNode ? "#f8fafc" : palette.nodeStroke)
+          .attr("stroke-width", selectedNode ? 4 : 2.25);
+        group.select("text.attribution-node-text")
+          .attr("opacity", dimmed ? 0.24 : 1);
+        if (selectedNode) {
+          group.raise();
+        }
+      });
+    };
+
+    const updateFrame = () => {
+      nodeSelection.attr("transform", (node) => `translate(${node.x || 0}, ${node.y || 0})`);
+
+      edgeSelection.each(function drawEdge(link) {
+        const group = d3.select(this);
+        const resolved = resolveGraphLinkNodes(link);
+        if (!resolved) {
+          return;
+        }
+
+        const drawn = {
+          x1: resolved.source.x || 0,
+          y1: resolved.source.y || 0,
+          x2: resolved.target.x || 0,
+          y2: resolved.target.y || 0
+        };
+
+        group.select("line.attribution-link-hit")
+          .attr("x1", drawn.x1)
+          .attr("y1", drawn.y1)
+          .attr("x2", drawn.x2)
+          .attr("y2", drawn.y2);
+
+        group.select("line.attribution-link-base")
+          .attr("x1", drawn.x1)
+          .attr("y1", drawn.y1)
+          .attr("x2", drawn.x2)
+          .attr("y2", drawn.y2)
+          .attr("stroke", link.color)
+          .attr("stroke-width", link.width);
+
+        group.select("line.attribution-link-highlight")
+          .attr("x1", drawn.x1)
+          .attr("y1", drawn.y1)
+          .attr("x2", drawn.x2)
+          .attr("y2", drawn.y2);
+      });
+
+      nodes.forEach((node) => {
+        positionsRef.current.set(node.id, {
+          x: node.x || 0,
+          y: node.y || 0
+        });
+      });
+
+      applySelectionStyles();
+    };
+
+    const simulation = d3.forceSimulation(nodes)
+      .force("charge", d3.forceManyBody().strength(-1320))
+      .force(
+        "link",
+        d3.forceLink(links)
+          .id((node) => node.id)
+          .distance(210)
+          .strength(0.32)
+      )
+      .force("collide", d3.forceCollide().radius((node) => node.radius + 26).iterations(2))
+      .force(
+        "radial",
+        d3.forceRadial(
+          (node) => Math.max(Math.hypot(node.anchorX, node.anchorY), 240),
+          0,
+          0
+        ).strength(0.2)
+      )
+      .force("anchor-x", d3.forceX((node) => node.anchorX).strength(0.15))
+      .force("anchor-y", d3.forceY((node) => node.anchorY).strength(0.15))
+      .force("center", d3.forceCenter(0, 0))
+      .alpha(0.92)
+      .alphaDecay(0.04)
+      .on("tick", updateFrame);
+
+    simulationRef.current = simulation;
+
+    nodeSelection.call(
+      d3.drag()
+        .on("start", (event, node) => {
+          event.sourceEvent && event.sourceEvent.stopPropagation();
+          if (!event.active) {
+            simulation.alphaTarget(0.25).restart();
+          }
+          node.fx = node.x || 0;
+          node.fy = node.y || 0;
+        })
+        .on("drag", (event, node) => {
+          node.fx = event.x;
+          node.fy = event.y;
+          positionsRef.current.set(node.id, { x: event.x, y: event.y });
+          updateFrame();
+        })
+        .on("end", (event, node) => {
+          if (!event.active) {
+            simulation.alphaTarget(0);
+          }
+          node.fx = node.x || 0;
+          node.fy = node.y || 0;
+          positionsRef.current.set(node.id, {
+            x: node.x || 0,
+            y: node.y || 0
+          });
+          updateFrame();
+        })
+    );
+
+    for (let tick = 0; tick < 60; tick += 1) {
+      simulation.tick();
+    }
+    updateFrame();
+    simulation.alpha(0.34).restart();
+
+    nodeSelectionRef.current = nodeSelection;
+    edgeSelectionRef.current = edgeSelection;
+
+    const fitGraph = () => {
+      if (!nodes.length) {
+        return;
+      }
+      const initialViewport = computeGraphInitialViewport(nodes, size.width, size.height);
+      const transform = d3.zoomIdentity
+        .translate(initialViewport.x, initialViewport.y)
+        .scale(initialViewport.k);
+      currentTransformRef.current = transform;
+      svg.call(zoomBehaviorRef.current.transform, transform);
+    };
+
+    graphApiRef.current = {
+      fit: fitGraph,
+      reset: () => {
+        currentTransformRef.current = null;
+        fitGraph();
+      }
+    };
+
+    if (currentTransformRef.current) {
+      viewport.attr("transform", currentTransformRef.current.toString());
+    } else {
+      fitGraph();
+    }
+
+    applySelectionStyles();
+
+    return () => {
+      simulation.stop();
+    };
+  }, [graph, palette.edgeHighlight, palette.labelText, palette.nodeBase, palette.nodeStroke, size.height, size.width]);
+
+  useEffect(() => {
+    return () => {
+      simulationRef.current && simulationRef.current.stop();
+      if (svgRef.current) {
+        d3.select(svgRef.current).on(".zoom", null);
+      }
+    };
+  }, []);
+
+  return (
+    <div
+      ref={containerRef}
+      className="attribution-graph-canvas"
+      style={{ height: `${height}px` }}
+    >
+      <svg
+        ref={svgRef}
+        width="100%"
+        height="100%"
+        className="graph-svg"
+      >
+        <rect
+          width="100%"
+          height="100%"
+          fill={palette.surface}
+          onClick={() => setSelection(null)}
+        />
+        <g ref={viewportGroupRef} />
+      </svg>
+    </div>
+  );
+}
+
+function AttributionPage({ domainTargets, preferredSeed, theme }) {
+  const graphApiRef = useRef({
+    fit: () => {},
+    reset: () => {}
+  });
+  const heroRef = useRef(null);
+  const fallbackSeed = preferredSeed || domainTargets[0] || "";
+  const [seedDraft, setSeedDraft] = useState(fallbackSeed);
+  const [activeSeeds, setActiveSeeds] = useState(fallbackSeed);
+  const [activeView, setActiveView] = useState("dossier");
+  const [domainA, setDomainA] = useState(fallbackSeed);
+  const [domainB, setDomainB] = useState("");
+  const [selection, setSelection] = useState(null);
+  const [controls, setControls] = useState({ ...ATTRIBUTION_GRAPH_DEFAULTS });
+  const [clusterState, setClusterState] = useState({
+    data: null,
+    loading: false,
+    error: ""
+  });
+  const [comparisonState, setComparisonState] = useState({
+    data: null,
+    loading: false,
+    error: ""
+  });
+
+  useEffect(() => {
+    if (!activeSeeds && fallbackSeed) {
+      setSeedDraft(fallbackSeed);
+      setActiveSeeds(fallbackSeed);
+    }
+    if (!domainA && fallbackSeed) {
+      setDomainA(fallbackSeed);
+    }
+  }, [activeSeeds, domainA, fallbackSeed]);
+
+  useEffect(() => {
+    if (!activeSeeds.trim()) {
+      setClusterState({
+        data: null,
+        loading: false,
+        error: ""
+      });
+      return;
+    }
+
+    let ignore = false;
+    setClusterState((current) => ({
+      ...current,
+      loading: true,
+      error: ""
+    }));
+
+    apiFetch(`/api/clusters/identifiers?targets=${encodeURIComponent(activeSeeds)}`)
+      .then((response) => {
+        if (!ignore) {
+          setClusterState({
+            data: response,
+            loading: false,
+            error: ""
+          });
+        }
+      })
+      .catch((error) => {
+        if (!ignore) {
+          setClusterState({
+            data: null,
+            loading: false,
+            error: error.message
+          });
+        }
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [activeSeeds]);
+
+  useEffect(() => {
+    const cluster = clusterState.data;
+    const clusterDomains = cluster?.component?.domains || [];
+    if (!clusterDomains.length) {
+      return;
+    }
+
+    const topEdge = (cluster.edges || [])[0];
+    const fallbackA = topEdge?.domain_a || clusterDomains[0] || "";
+    const fallbackB = topEdge?.domain_b || clusterDomains.find((item) => item !== fallbackA) || "";
+
+    setDomainA((current) => (current && clusterDomains.includes(current) ? current : fallbackA));
+    setDomainB((current) => (current && clusterDomains.includes(current) && current !== fallbackA ? current : fallbackB));
+  }, [clusterState.data]);
+
+  useEffect(() => {
+    const clusterDomains = clusterState.data?.component?.domains || [];
+    if (domainA && domainB && domainA !== domainB) {
+      return;
+    }
+    const fallback = clusterDomains.find((item) => item !== domainA) || "";
+    if (fallback && domainA === domainB) {
+      setDomainB(fallback);
+    }
+  }, [clusterState.data, domainA, domainB]);
+
+  const pairLookupKey = domainA && domainB && domainA !== domainB ? pairKey(domainA, domainB) : "";
+  const clusterEdge = pairLookupKey
+    ? (clusterState.data?.edges || []).find((item) => pairKey(item.domain_a, item.domain_b) === pairLookupKey) || null
+    : null;
+
+  useEffect(() => {
+    if (!domainA || !domainB || domainA === domainB) {
+      setComparisonState({
+        data: null,
+        loading: false,
+        error: ""
+      });
+      return;
+    }
+
+    if (clusterEdge) {
+      setComparisonState({
+        data: clusterEdge,
+        loading: false,
+        error: ""
+      });
+      return;
+    }
+
+    let ignore = false;
+    setComparisonState((current) => ({
+      ...current,
+      loading: true,
+      error: ""
+    }));
+
+    apiFetch(`/api/compare/domains?domain_a=${encodeURIComponent(domainA)}&domain_b=${encodeURIComponent(domainB)}`)
+      .then((response) => {
+        if (!ignore) {
+          setComparisonState({
+            data: response || null,
+            loading: false,
+            error: ""
+          });
+        }
+      })
+      .catch((error) => {
+        if (!ignore) {
+          setComparisonState({
+            data: null,
+            loading: false,
+            error: error.message
+          });
+        }
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [clusterEdge, domainA, domainB]);
+
+  const graph = buildAttributionGraphModel(clusterState.data, controls);
+
+  useEffect(() => {
+    if (!selection) {
+      return;
+    }
+    if (selection.type === "node" && !graph.nodes.some((node) => node.id === selection.id)) {
+      setSelection(null);
+    }
+    if (selection.type === "edge" && !graph.edges.some((edge) => edge.key === selection.key)) {
+      setSelection(null);
+    }
+  }, [graph.edges, graph.nodes, selection]);
+
+  useEffect(() => {
+    if (!selection || selection.type !== "edge") {
+      return;
+    }
+    const edge = graph.edges.find((item) => item.key === selection.key);
+    if (!edge) {
+      return;
+    }
+    setDomainA(edge.comparison.domain_a);
+    setDomainB(edge.comparison.domain_b);
+    heroRef.current && heroRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [graph.edges, selection]);
+
+  const comparison = buildVisibleComparison(comparisonState.data, controls.maxFrequency);
+  const verdict = buildAttributionVerdict(comparison);
+  const matrixRows = buildIdentifierPivotRows(clusterState.data, controls.maxFrequency);
+  const pivotDomains = buildPivotDomains(clusterState.data, graph, domainA, domainB);
+  const pairOptions = clusterState.data?.component?.domains?.length
+    ? clusterState.data.component.domains
+    : domainTargets;
+  const seedTargets = parseDomainTokenInput(activeSeeds);
+  const seedDraftTargets = parseDomainTokenInput(seedDraft);
+
+  const componentDomainCount = clusterState.data?.component?.domains?.length || 0;
+  const componentIdentifierCount = clusterState.data?.component?.identifiers?.length || 0;
+  const matchingEdgeCount = graph.edges.length;
+
+  const openDossierForComparison = (nextComparison) => {
+    if (!nextComparison) {
+      return;
+    }
+    setDomainA(nextComparison.domain_a);
+    setDomainB(nextComparison.domain_b);
+    setComparisonState({
+      data: nextComparison,
+      loading: false,
+      error: ""
+    });
+    setActiveView("dossier");
+    heroRef.current && heroRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  const updateControl = (key, value) => {
+    setControls((current) => ({
+      ...current,
+      [key]: value
+    }));
+  };
+
+  return (
+    <PageFrame
+      eyebrow="Explorer"
+      title="Evidence dossier"
+      subtitle="Answer three questions fast: what is the verdict, what matched, and is any of it too common to trust."
+      infoTitle="How to read this workspace"
+      infoBody="The verdict sits above the evidence. Rows are grouped by tier, not by collection source. Every row carries a rarity badge so you can separate silver bullets from template artifacts."
+      metrics={(
+        <>
+          <Metric label="Component domains" value={formatNumber(componentDomainCount)} detail={seedTargets.length ? `${seedTargets.length} seed${seedTargets.length === 1 ? "" : "s"}` : "No seeds"} />
+          <Metric label="Pair matches shown" value={formatNumber(matchingEdgeCount)} detail={`${formatNumber(graph.hiddenEdgeCount || 0)} weaker edges hidden`} />
+          <Metric label="Identifiers in component" value={formatNumber(componentIdentifierCount)} detail={`${formatNumber(matrixRows.length)} below rarity cutoff`} />
+          <Metric label="Verdict" value={verdict.label} detail={comparison ? verdict.summary : "Choose a pair"} />
+        </>
+      )}
+    >
+      <section className="attribution-toolbar">
+        <div className="attribution-toolbar-top">
+          <div className="field-row">
+            <label htmlFor="attribution-seeds">Seed domains</label>
+            <div className="attribution-seed-row">
+              <input
+                id="attribution-seeds"
+                type="text"
+                value={seedDraft}
+                placeholder="example.com second-example.com"
+                onChange={(event) => setSeedDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && seedDraftTargets.length) {
+                    event.preventDefault();
+                    setActiveSeeds(seedDraftTargets.join(", "));
+                  }
+                }}
+              />
+              <button
+                className="secondary-button"
+                onClick={() => setActiveSeeds(seedDraftTargets.join(", "))}
+                type="button"
+                disabled={!seedDraftTargets.length || clusterState.loading}
+              >
+                {clusterState.loading ? "Loading..." : "Load component"}
+              </button>
+            </div>
+            <small>
+              Build a connected component from one or more stored seed domains, then pivot across pairs, nodes, and identifiers.
+            </small>
+          </div>
+
+          <div className="button-row attribution-toolbar-actions">
+            <button className="secondary-button" onClick={() => graphApiRef.current.fit()} type="button">
+              Fit graph
+            </button>
+            <button className="secondary-button" onClick={() => graphApiRef.current.reset()} type="button">
+              Reset graph
+            </button>
+          </div>
+        </div>
+
+        <div className="attribution-domain-grid">
+          <SearchableDomainField
+            id="attribution-domain-a"
+            label="Pair domain A"
+            value={domainA}
+            onChange={setDomainA}
+            options={pairOptions}
+            placeholder="Pick the left-hand domain"
+            helper={`${formatNumber(pairOptions.length)} domains available in this context`}
+          />
+          <SearchableDomainField
+            id="attribution-domain-b"
+            label="Pair domain B"
+            value={domainB}
+            onChange={setDomainB}
+            options={pairOptions.filter((item) => item !== domainA)}
+            placeholder="Pick the right-hand domain"
+            helper="Choose a second domain to compare."
+          />
+          <SearchableDomainField
+            id="attribution-focus-domain"
+            label="Graph focus"
+            value={controls.focus}
+            onChange={(nextValue) => updateControl("focus", nextValue)}
+            options={clusterState.data?.component?.domains || pairOptions}
+            placeholder="Optional graph focus"
+            emptySelectionLabel="All domains"
+            helper="Hide edges that do not touch this domain."
+          />
+        </div>
+
+        <div className="attribution-slider-grid">
+          <label className="attribution-slider" htmlFor="attribution-frequency-filter">
+            <span>False-positive frequency filter</span>
+            <input
+              id="attribution-frequency-filter"
+              min="2"
+              max="60"
+              type="range"
+              value={controls.maxFrequency}
+              onChange={(event) => updateControl("maxFrequency", Number(event.target.value))}
+            />
+            <strong>{controls.maxFrequency}</strong>
+          </label>
+          <label className="attribution-slider" htmlFor="attribution-min-score">
+            <span>Minimum pair strength</span>
+            <input
+              id="attribution-min-score"
+              min="1"
+              max="100"
+              type="range"
+              value={controls.minScore}
+              onChange={(event) => updateControl("minScore", Number(event.target.value))}
+            />
+            <strong>{controls.minScore}</strong>
+          </label>
+          <label className="attribution-slider" htmlFor="attribution-max-edges">
+            <span>Graph edges shown</span>
+            <input
+              id="attribution-max-edges"
+              min="10"
+              max="120"
+              step="2"
+              type="range"
+              value={controls.maxEdges}
+              onChange={(event) => updateControl("maxEdges", Number(event.target.value))}
+            />
+            <strong>{controls.maxEdges}</strong>
+          </label>
+        </div>
+
+        {clusterState.error ? <Callout tone="danger">{clusterState.error}</Callout> : null}
+        {clusterState.data?.missing?.length ? (
+          <Callout tone="warning">Missing seeds: {clusterState.data.missing.join(", ")}</Callout>
+        ) : null}
+      </section>
+
+      <section className={`attribution-hero ${verdict.tone}`} ref={heroRef}>
+        <div className="attribution-hero-header">
+          <div>
+            <span className="eyebrow">Verdict</span>
+            <h3>{domainA && domainB ? `${domainA} ↔ ${domainB}` : "Choose a pair"}</h3>
+            <p>{comparison ? verdict.headline : "Pick a pair or click a graph edge to populate the dossier."}</p>
+          </div>
+          <div className={`attribution-verdict-pill ${verdict.tone}`}>{verdict.label}</div>
+        </div>
+
+        {comparisonState.error ? <Callout tone="danger">{comparisonState.error}</Callout> : null}
+        {comparisonState.loading ? <Callout tone="info">Loading the pair dossier…</Callout> : null}
+
+        {comparison ? (
+          <>
+            <div className="metric-grid attribution-hero-metrics">
+              <Metric label="Trusted rows" value={formatNumber(comparison.visibleEvidence.length)} detail={`${formatNumber(comparison.hiddenEvidence.length)} hidden as common`} />
+              <Metric label="Tier 1" value={formatNumber(verdict.tierCounts.tier_1)} detail={`${formatNumber(verdict.tierCounts.tier_2)} Tier 2 corroborators`} />
+              <Metric label="Unique or pair-specific" value={formatNumber(verdict.uniqueCount)} detail={`${formatNumber(verdict.rareCount)} rare total`} />
+              <Metric label="Pair strength" value={formatNumber(comparison.visibleScore)} detail="Narrative verdict, not a fake precision percentage" />
+            </div>
+            <p className="attribution-hero-summary">{verdict.summary}</p>
+          </>
+        ) : (
+          <p className="muted">The dossier will appear here once a valid pair is selected.</p>
+        )}
+      </section>
+
+      <div className="tab-row">
+        {ATTRIBUTION_VIEW_TABS.map((tab) => (
+          <TabButton key={tab.id} active={activeView === tab.id} label={tab.label} onClick={() => setActiveView(tab.id)} />
+        ))}
+      </div>
+
+      {activeView === "dossier" ? (
+        <AttributionDossierPanel
+          comparison={comparison}
+          domainA={domainA}
+          domainB={domainB}
+          maxFrequency={controls.maxFrequency}
+        />
+      ) : null}
+
+      {activeView === "cluster" ? (
+        graph.edges.length ? (
+          <div className="attribution-graph-layout">
+            <section className="attribution-graph-card">
+              <div className="attribution-graph-header">
+                <div>
+                  <h3>Force-directed cluster graph</h3>
+                  <p className="muted">
+                    Nodes are domains. Edges are shared identifiers. Thickness tracks the strongest tier on the link, and color tracks the strongest surviving category.
+                  </p>
+                </div>
+                <div className="attribution-sidebar-badges">
+                  <span className="attribution-meta-chip">{formatNumber(graph.nodes.length)} domains</span>
+                  <span className="attribution-meta-chip">{formatNumber(graph.edges.length)} edges</span>
+                  <span className="attribution-meta-chip">Top score {formatNumber(graph.maxScore || 0)}</span>
+                </div>
+              </div>
+              <AttributionGraphCanvasD3
+                graph={graph}
+                selection={selection}
+                setSelection={setSelection}
+                theme={theme}
+                graphApiRef={graphApiRef}
+                height={ATTRIBUTION_GRAPH_HEIGHT}
+              />
+            </section>
+
+            <aside className="attribution-graph-sidebar">
+              <AttributionGraphSidebar
+                graph={graph}
+                selection={selection}
+                cluster={clusterState.data}
+                maxFrequency={controls.maxFrequency}
+                onClose={() => setSelection(null)}
+                onOpenDossier={openDossierForComparison}
+                onSetFocus={(domain) => updateControl("focus", domain)}
+              />
+            </aside>
+          </div>
+        ) : (
+          <Callout tone="info">
+            No links survive the current graph filters. Lower the minimum strength, loosen the rarity cutoff, or load a wider component.
+          </Callout>
+        )
+      ) : null}
+
+      {activeView === "matrix" ? (
+        matrixRows.length ? (
+          <SectionCard
+            title="Identifier pivot table"
+            subtitle="Rows are identifiers, columns are domains, and the table is sorted so the smallest shared sets rise to the top."
+            infoTitle="Identifier pivot table"
+            infoBody="This is the smoking-gun view. Identifiers shared by exactly a few domains surface first, while common template artifacts stay lower or disappear behind the rarity filter."
+          >
+            <div className="attribution-matrix-shell">
+              <table className="attribution-matrix-table">
+                <thead>
+                  <tr>
+                    <th className="sticky">Identifier</th>
+                    {pivotDomains.map((domain) => (
+                      <th key={domain}>{shortLabel(domain, 24)}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {matrixRows.map((identifier) => {
+                    const tierMeta = getAttributionTierMeta(identifier.tier);
+                    const categoryMeta = getAttributionCategoryMeta(identifier.category);
+                    const rarity = getEvidenceRarityBadge(
+                      {
+                        domain_frequency: identifier.domain_count,
+                        frequency_status: identifier.frequency_status
+                      },
+                      controls.maxFrequency
+                    );
+                    return (
+                      <tr key={`${identifier.id_type}-${identifier.id_value}`}>
+                        <td className="sticky">
+                          <div className="attribution-matrix-id">
+                            <div className="attribution-evidence-title-row">
+                              <strong>{humanizeIdentifierType(identifier.id_type)}</strong>
+                              <span className={`attribution-tier-pill ${tierMeta.tone}`}>{tierMeta.label}</span>
+                              <span className="attribution-category-pill" style={{ "--badge-color": categoryMeta.color }}>
+                                {categoryMeta.label}
+                              </span>
+                            </div>
+                            <code className="attribution-code compact">{identifier.id_value}</code>
+                            <span className={`attribution-rarity-pill ${rarity.tone}`}>{rarity.label}</span>
+                          </div>
+                        </td>
+                        {pivotDomains.map((domain) => {
+                          const present = Array.isArray(identifier.domains) && identifier.domains.includes(domain);
+                          return (
+                            <td
+                              key={`${identifier.id_type}-${identifier.id_value}-${domain}`}
+                              className={present ? "present" : "absent"}
+                              title={present ? `${domain} carries this identifier.` : `${domain} does not carry this identifier.`}
+                            >
+                              {present ? <span className="attribution-matrix-mark" /> : null}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </SectionCard>
+        ) : (
+          <Callout tone="info">
+            No identifiers remain below the current rarity cutoff. Raise the filter if you want to inspect more common values.
+          </Callout>
+        )
+      ) : null}
+    </PageFrame>
   );
 }
 
@@ -5119,7 +6799,13 @@ export default function App() {
   }
 
   if (activePage === "graph") {
-    pageContent = <GraphPage clusters={clusters} domainTargets={availableDomainTargets} theme={theme} />;
+    pageContent = (
+      <AttributionPage
+        domainTargets={availableDomainTargets}
+        preferredSeed={selectedTarget || (result && result.type === "domain" ? result.input : "")}
+        theme={theme}
+      />
+    );
   }
 
   if (activePage === "connections") {
@@ -5296,7 +6982,7 @@ export default function App() {
               >
                 <p>{getTlsOverlapSummary(item)}</p>
                 <p className="break-word"><strong>Domains:</strong> {formatListPreview(parseTargetList(item.targets), 6) || "No linked domains recorded"}</p>
-                {item.issuer_cn ? <p><strong>Issued by:</strong> {item.issuer_cn}</p> : null}
+                <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
                 {(item.overlap_start || item.overlap_end) ? (
                   <p><strong>Shared during:</strong> {formatFriendlyDateRange(item.overlap_start, item.overlap_end)}</p>
                 ) : null}

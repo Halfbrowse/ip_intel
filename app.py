@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -32,6 +33,7 @@ from intel_db import (
     cluster_by_ip,
     cluster_by_tls_cert,
     cluster_by_tracking_id,
+    compare_domains,
     get_by_id,
     get_connections_for_target,
     get_domain_targets,
@@ -43,6 +45,7 @@ from intel_db import (
     summarize_hard_connections,
     summarize_result_db_matches,
     summarize_related_targets,
+    traverse_identifier_cluster,
 )
 
 try:
@@ -892,6 +895,27 @@ def tls_clusters(scope: str = "current") -> dict[str, Any]:
 def asn_clusters(scope: str = "current") -> dict[str, Any]:
     try:
         return {"items": cluster_by_asn(scope=scope)}
+    except sqlite3.DatabaseError as exc:
+        _raise_db_http_error(exc)
+
+
+@app.get("/api/clusters/identifiers")
+def identifier_cluster(targets: str) -> dict[str, Any]:
+    seeds = [part.strip() for part in re.split(r"[\s,]+", targets or "") if part.strip()]
+    if not seeds:
+        raise HTTPException(status_code=400, detail="Provide one or more comma-separated domains in the targets parameter.")
+    try:
+        return traverse_identifier_cluster(seeds)
+    except sqlite3.DatabaseError as exc:
+        _raise_db_http_error(exc)
+
+
+@app.get("/api/compare/domains")
+def compare_domain_pair(domain_a: str, domain_b: str) -> dict[str, Any]:
+    if not domain_a.strip() or not domain_b.strip():
+        raise HTTPException(status_code=400, detail="domain_a and domain_b are required.")
+    try:
+        return compare_domains(domain_a, domain_b)
     except sqlite3.DatabaseError as exc:
         _raise_db_http_error(exc)
 

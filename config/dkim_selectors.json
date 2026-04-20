@@ -1,0 +1,407 @@
+{
+  "version": 1,
+  "global": {
+    "selectors": [
+      "default",
+      "google",
+      "googlemail",
+      "gmail",
+      "mail",
+      "mx",
+      "selector1",
+      "selector2",
+      "selector3",
+      "selector4",
+      "yandex",
+      "k1",
+      "k2",
+      "k3",
+      "s1",
+      "s2",
+      "s3",
+      "dkim",
+      "dkim1",
+      "dkim2",
+      "smtp",
+      "smtp1",
+      "smtp2",
+      "newsletter",
+      "email",
+      "mailer"
+    ],
+    "prefix_rules": [
+      {
+        "prefix": "selector",
+        "start": 1,
+        "end": 4
+      },
+      {
+        "prefix": "s",
+        "start": 1,
+        "end": 3
+      },
+      {
+        "prefix": "k",
+        "start": 1,
+        "end": 3
+      },
+      {
+        "prefix": "dkim",
+        "start": 1,
+        "end": 3
+      },
+      {
+        "prefix": "mail",
+        "start": 1,
+        "end": 3
+      },
+      {
+        "prefix": "smtp",
+        "start": 1,
+        "end": 2
+      },
+      {
+        "prefix": "mx",
+        "start": 1,
+        "end": 2
+      },
+      {
+        "prefix": "google",
+        "start": 1,
+        "end": 2
+      }
+    ]
+  },
+  "providers": {
+    "google_workspace": {
+      "selectors": [
+        "google",
+        "googlemail",
+        "gmail",
+        "default",
+        "selector1",
+        "selector2"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "google",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "prefix": "googlemail",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "microsoft_365": {
+      "selectors": [
+        "selector1",
+        "selector2",
+        "default",
+        "onmicrosoft"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "selector",
+          "start": 1,
+          "end": 4
+        }
+      ]
+    },
+    "yandex_360": {
+      "selectors": [
+        "yandex",
+        "mail",
+        "default",
+        "dkim"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "yandex",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "zoho_mail": {
+      "selectors": [
+        "zoho",
+        "zmail",
+        "zm1",
+        "zm2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "zm",
+          "start": 1,
+          "end": 3
+        }
+      ]
+    },
+    "proton_mail": {
+      "selectors": [
+        "protonmail",
+        "proton",
+        "pm",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "proton",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "fastmail": {
+      "selectors": [
+        "fastmail",
+        "fm1",
+        "fm2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "fm",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "amazonses": {
+      "selectors": [
+        "amazonses",
+        "ses",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "ses",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "prefix": "amazonses",
+          "start": 1,
+          "end": 3
+        }
+      ]
+    },
+    "sendgrid": {
+      "selectors": [
+        "sendgrid",
+        "sg",
+        "s1",
+        "s2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "sg",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "prefix": "s",
+          "start": 1,
+          "end": 3
+        }
+      ]
+    },
+    "mailgun": {
+      "selectors": [
+        "mailgun",
+        "mg",
+        "m1",
+        "m2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "mg",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "prefix": "m",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "mailchimp_mandrill": {
+      "selectors": [
+        "mandrill",
+        "k1",
+        "k2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "mandrill",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "prefix": "k",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "sparkpost": {
+      "selectors": [
+        "sparkpost",
+        "scph",
+        "sp",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "scph",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "brevo_sendinblue": {
+      "selectors": [
+        "brevo",
+        "sendinblue",
+        "sib",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "sib",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "mailjet": {
+      "selectors": [
+        "mailjet",
+        "mj",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "mj",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "postmark": {
+      "selectors": [
+        "postmark",
+        "pm",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "pm",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "proofpoint": {
+      "selectors": [
+        "proofpoint",
+        "pphosted",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "pp",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "mimecast": {
+      "selectors": [
+        "mimecast",
+        "mc",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "mc",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "hubspot": {
+      "selectors": [
+        "hubspot",
+        "hs1",
+        "hs2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "hs",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "klaviyo": {
+      "selectors": [
+        "klaviyo",
+        "k1",
+        "k2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "k",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "salesforce_marketing_cloud": {
+      "selectors": [
+        "exacttarget",
+        "mc",
+        "s1",
+        "s2",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "mc",
+          "start": 1,
+          "end": 2
+        },
+        {
+          "prefix": "s",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    },
+    "resend": {
+      "selectors": [
+        "resend",
+        "rs",
+        "default"
+      ],
+      "prefix_rules": [
+        {
+          "prefix": "rs",
+          "start": 1,
+          "end": 2
+        }
+      ]
+    }
+  }
+}
