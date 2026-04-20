@@ -60,41 +60,36 @@ BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 
 PHASES = [
-    "WHOIS",
-    "DNS",
-    "crt.sh",
-    "CIRCL pDNS",
-    "Page metadata",
-    "Subdomain probe",
-    "MX probe",
-    "Wordlist probe",
-    "HackerTarget",
-    "urlscan",
-    "Censys",
-    "Shodan",
-    "Netlas",
-    "Origin scan",
-    "IP enrichment",
-    "TLS probe",
+    "Seed profile",
+    "Expand from seed",
+    "Provider checks",
+    "Targeted sweeps",
+    "ASN/IP enrichment",
+    "TLS validation",
 ]
 
 PHASE_KEYWORDS = {
-    "WHOIS": ["whois"],
-    "DNS": ["dns records"],
-    "crt.sh": ["certificate transparency", "crt.sh"],
-    "CIRCL pDNS": ["circl", "passive dns"],
-    "Page metadata": ["page metadata", "whois / dns / crt.sh / circl pdns / page metadata"],
-    "Subdomain probe": ["subdomain probe"],
-    "MX probe": ["mx probe"],
-    "Wordlist probe": ["wordlist"],
-    "HackerTarget": ["hackertarget"],
-    "urlscan": ["urlscan"],
-    "Censys": ["censys"],
-    "Shodan": ["shodan"],
-    "Netlas": ["netlas"],
-    "Origin scan": ["origin scan", "masscan", "phase 1", "phase 2", "fetching gcp", "fetching ip ranges"],
-    "IP enrichment": ["ip enrichment", "ptr record", "asn"],
-    "TLS probe": ["tls probe"],
+    "Seed profile": [
+        "whois / dns / crt.sh / circl pdns / page metadata",
+        "whois",
+        "dns records",
+        "certificate transparency",
+        "crt.sh",
+        "circl",
+        "page metadata",
+    ],
+    "Expand from seed": [
+        "zone transfer",
+        "subdomain probe",
+        "mx probe",
+        "wordlist",
+        "hackertarget",
+        "urlscan",
+    ],
+    "Provider checks": ["censys", "shodan", "netlas"],
+    "Targeted sweeps": ["origin scan", "masscan", "phase 1", "phase 2", "fetching gcp", "fetching ip ranges"],
+    "ASN/IP enrichment": ["ip enrichment", "ptr record", "asn / network info", "reverse ip lookup"],
+    "TLS validation": ["tls probe", "grabbing tls cert", "tls cert:"],
 }
 
 CERT_TYPE_DEFINITIONS = {
@@ -156,12 +151,12 @@ SERVER_TYPE_DEFINITIONS = {
 }
 
 SCAN_OPTION_DEFINITIONS = {
-    "scan": "Search Google Cloud regions closest to Russia and Ukraine. Best when certificate history already hints at Google hosting.",
-    "scan_europe": "Search all European Google Cloud regions plus Turkey. Broader than the default GCP scan and skips the Google-only hint check.",
-    "scan_providers": "Search known RU/EU hosting providers such as Hetzner, OVH, Selectel, Timeweb, Beget, and similar networks.",
-    "scan_eu_countries": "Search IPv4 space allocated to all EU member states. Useful when hosting is likely somewhere in Europe but the provider is unclear.",
-    "scan_full": "Run the broadest preset: EU countries, provider ranges, and European Google Cloud in one pass.",
-    "scan_all": "Search all published Google Cloud regions globally. This is the slowest option and is best reserved for strong Google-hosting leads.",
+    "scan": "Fan out into the nearest Google Cloud regions when the seed already hints at Google-style hosting.",
+    "scan_europe": "Broaden the Google Cloud check across Europe plus Turkey when the first pass still looks promising.",
+    "scan_providers": "Expand into known RU/EU hosting ASNs when the seed points toward dedicated or regional hosting.",
+    "scan_eu_countries": "Sweep EU country allocations when you have a likely regional match but not a clear provider yet.",
+    "scan_full": "Run the broad fan-out: Google, hosting-provider, and EU country checks together.",
+    "scan_all": "Search every published Google Cloud region globally. Slowest option, best saved for strong Google-hosting leads.",
 }
 
 SOURCE_LABELS = {

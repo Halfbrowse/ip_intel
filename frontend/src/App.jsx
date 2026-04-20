@@ -10,11 +10,11 @@ const RESULT_TABS = [
 ];
 
 const RESULT_PAGES = [
-  { id: "overview", label: "Briefing", subtitle: "Start here for the highest-signal summary." },
-  { id: "dns", label: "DNS & WHOIS", subtitle: "Registration and address-book data for the target." },
-  { id: "certs", label: "Certificates", subtitle: "HTTPS certificate history and certificate overlaps." },
-  { id: "origin", label: "Origin hunt", subtitle: "Possible origin IPs and supporting evidence." },
-  { id: "ips", label: "IP details", subtitle: "What each discovered IP probably means." }
+  { id: "overview", label: "Snapshot", subtitle: "Start here for the seed, the strongest leads, and the next pivots." },
+  { id: "dns", label: "Seed data", subtitle: "The direct DNS and registration facts pulled from the supplied target." },
+  { id: "certs", label: "Certificates", subtitle: "Certificate history and overlaps around the target." },
+  { id: "origin", label: "Expansion", subtitle: "How the analysis spread outward into likely matches." },
+  { id: "ips", label: "Infrastructure", subtitle: "What each discovered IP or network probably means." }
 ];
 
 const EXPLORER_TABS = [
@@ -305,6 +305,232 @@ function collectOriginLeadCount(result) {
     return sum + ((origin[key] || []).length);
   }, 0);
   return scanHits + providerHits + leakHits;
+}
+
+function getProviderHitCount(result) {
+  const origin = result.origin_candidates || {};
+  return ["censys", "shodan", "netlas"].reduce((sum, key) => {
+    const hits = origin[key] && origin[key].hits ? origin[key].hits : [];
+    return sum + hits.length;
+  }, 0);
+}
+
+function getTargetedSweepHitCount(result) {
+  const origin = result.origin_candidates || {};
+  return ["scan", "provider_scan", "country_scan"].reduce((sum, key) => {
+    const hits = origin[key] && origin[key].hits ? origin[key].hits : [];
+    return sum + hits.length;
+  }, 0);
+}
+
+function getCurrentIps(result) {
+  if (!result) {
+    return [];
+  }
+  if (result.type === "ip" && result.input) {
+    return [result.input];
+  }
+  const dns = result.dns || {};
+  return [...(dns.A || []), ...(dns.AAAA || [])]
+    .filter(Boolean)
+    .map((item) => String(item));
+}
+
+function getIpEntries(result) {
+  if (!result) {
+    return [];
+  }
+  if (result.type === "ip") {
+    return result.input
+      ? [[result.input, result]]
+      : [];
+  }
+  return Object.entries(result.ip_details || {});
+}
+
+function getDirectIpCount(result) {
+  return getIpEntries(result).filter(([, info]) => info && info.server_type === "direct").length;
+}
+
+function getLiveTlsCount(result) {
+  if (!result) {
+    return 0;
+  }
+  if (result.type === "ip") {
+    return result.tls_cert ? 1 : 0;
+  }
+  return (result.non_cf_tls_certs || []).length;
+}
+
+function getRelatedTargetsSummary(result) {
+  return result.related_targets_summary || {
+    items: [],
+    total: 0,
+    domains: 0,
+    ips: 0,
+    expandable: 0
+  };
+}
+
+function getPivotCandidates(result, limit = 6) {
+  return (getRelatedTargetsSummary(result).items || [])
+    .filter((item) => item.auto_expand)
+    .slice(0, limit);
+}
+
+function formatRelationList(values, limit = 3) {
+  const items = (values || [])
+    .map((value) => String(value || "").replace(/_/g, " "))
+    .filter(Boolean);
+  return formatListPreview(items, limit) || "No relation labels";
+}
+
+function buildExposureSummary(result) {
+  if (!result) {
+    return {
+      tone: "info",
+      title: "Waiting for a seed",
+      body: "Add a domain or IP and the app will profile the seed before it branches outward."
+    };
+  }
+
+  if (result.type === "ip") {
+    return {
+      tone: result.server_type === "direct" ? "success" : "info",
+      title: result.server_type === "direct" ? "Direct IP investigation" : "Infrastructure IP investigation",
+      body: result.server_type === "direct"
+        ? "This seed is already a direct-looking IP, so the workflow can move straight into ASN, reverse-IP, and TLS validation."
+        : "This seed is an IP address, so the workflow profiles the network first and then looks outward for domains or neighboring infrastructure."
+    };
+  }
+
+  if (result.cloudflare_fronted) {
+    return {
+      tone: "info",
+      title: "Cloudflare is in front right now",
+      body: "The current DNS points at Cloudflare, so the useful work is to spread outward into subdomains, historical infrastructure, provider hits, and non-Cloudflare matches."
+    };
+  }
+
+  const directIpCount = getDirectIpCount(result);
+  if (directIpCount > 0) {
+    return {
+      tone: "success",
+      title: "Direct infrastructure is already visible",
+      body: `${directIpCount} discovered IP${directIpCount === 1 ? "" : "s"} look direct rather than shared or proxied, which makes origin confirmation much faster.`
+    };
+  }
+
+  return {
+    tone: "warning",
+    title: "No direct origin is confirmed yet",
+    body: "The next best path is to follow nearby pivots such as subdomains, history, provider matches, and certificate overlap until a direct host emerges."
+  };
+}
+
+function buildAnalysisStages(payload, job, targetHint = "") {
+  const result = payload || {};
+  const target = result.input || targetHint || job?.target || "";
+  const type = result.type || (job?.target && job.target === target ? (target.includes(".") ? "domain" : "") : "");
+  const relatedSummary = getRelatedTargetsSummary(result);
+  const currentIps = getCurrentIps(result);
+  const providerHitCount = getProviderHitCount(result);
+  const sweepHitCount = getTargetedSweepHitCount(result);
+  const directLeadCount = collectOriginLeadCount(result);
+  const liveTlsCount = getLiveTlsCount(result);
+  const ipCount = getIpEntries(result).length;
+  const cloudflareState = result.cloudflare_fronted ?? result.cloudflare;
+  const progress = job?.progress || null;
+  const completed = new Set(progress?.completed || []);
+  const current = progress?.current || "";
+  const hasMaterialData = Boolean(
+    result.type
+    || result.timestamp
+    || currentIps.length
+    || directLeadCount
+    || providerHitCount
+    || sweepHitCount
+    || ipCount
+    || liveTlsCount
+    || relatedSummary.total
+  );
+
+  const stages = [
+    {
+      phase: "Seed profile",
+      title: "Profile the seed",
+      description: type === "ip"
+        ? "Read the supplied IP directly: PTR, ASN, Cloudflare posture, reverse-IP, and live TLS."
+        : "Read the supplied domain directly: DNS, WHOIS, certificate history, page metadata, and Cloudflare posture.",
+      meta: target
+        ? `${target}${currentIps.length ? ` • ${formatNumber(currentIps.length)} current IPs` : ""}${cloudflareState !== undefined ? ` • ${cloudflareLabel(cloudflareState)}` : ""}`
+        : "Add a domain or IP to begin."
+    },
+    {
+      phase: "Expand from seed",
+      title: "Spread outward from the seed",
+      description: "Use subdomains, historical records, TXT/SPF, urlscan, and discovered pivots to find nearby infrastructure.",
+      meta: target
+        ? `${formatNumber(directLeadCount)} direct leads • ${formatNumber(relatedSummary.expandable || 0)} expandable pivots`
+        : "Nothing to expand yet."
+    },
+    {
+      phase: "Provider checks",
+      title: "Check likely provider matches",
+      description: "Use Censys, Shodan, and Netlas where the seed suggests the same infrastructure may reappear elsewhere.",
+      meta: target ? `${formatNumber(providerHitCount)} provider hits so far` : "Provider checks wait for a seed."
+    },
+    {
+      phase: "Targeted sweeps",
+      title: "Fan out into Google or hoster space",
+      description: "If enabled, branch into Google Cloud, known hosting ASNs, or country allocations once the seed looks promising.",
+      meta: target ? `${formatNumber(sweepHitCount)} targeted sweep hits` : "Targeted sweeps are optional."
+    },
+    {
+      phase: "ASN/IP enrichment",
+      title: "Classify the infrastructure",
+      description: "Attach ASN and server context to each IP so dedicated hosts stand apart from shared or noisy platforms.",
+      meta: target ? `${formatNumber(ipCount)} IPs enriched` : "IP enrichment starts after collection."
+    },
+    {
+      phase: "TLS validation",
+      title: "Confirm with live TLS",
+      description: "Pull live certificates from non-Cloudflare IPs to verify which matches still look real.",
+      meta: target ? `${formatNumber(liveTlsCount)} live TLS cert${liveTlsCount === 1 ? "" : "s"} captured` : "TLS validation happens last."
+    }
+  ];
+
+  if (!job) {
+    if (hasMaterialData) {
+      return stages.map((stage) => ({
+        ...stage,
+        state: "complete"
+      }));
+    }
+    return stages.map((stage, index) => ({
+      ...stage,
+      state: target && index === 0 ? "active" : "pending"
+    }));
+  }
+
+  if (job.status === "completed") {
+    return stages.map((stage) => ({
+      ...stage,
+      state: "complete"
+    }));
+  }
+
+  let activeAssigned = false;
+  return stages.map((stage) => {
+    if (completed.has(stage.phase)) {
+      return { ...stage, state: "complete" };
+    }
+    if (!activeAssigned && (current === stage.phase || job.status === "running" || job.status === "queued")) {
+      activeAssigned = true;
+      return { ...stage, state: "active" };
+    }
+    return { ...stage, state: "pending" };
+  });
 }
 
 function collectInterestingTxt(txtRecords) {
@@ -1100,6 +1326,28 @@ function Metric({ label, value, detail }) {
   );
 }
 
+function AnalysisFlowPanel({ payload, job, targetHint = "", compact = false }) {
+  const stages = buildAnalysisStages(payload, job, targetHint);
+
+  return (
+    <section className={compact ? "analysis-flow compact" : "analysis-flow"}>
+      {stages.map((stage, index) => (
+        <article className={`analysis-step ${stage.state}`} key={stage.phase}>
+          <div className="analysis-step-top">
+            <span className="analysis-step-index">{String(index + 1).padStart(2, "0")}</span>
+            <span className="analysis-step-state">
+              {stage.state === "complete" ? "Done" : stage.state === "active" ? "Live" : "Waiting"}
+            </span>
+          </div>
+          <h3>{stage.title}</h3>
+          <p>{stage.description}</p>
+          <small>{stage.meta}</small>
+        </article>
+      ))}
+    </section>
+  );
+}
+
 function TypePill({ kind, definitions }) {
   if (!kind) {
     return null;
@@ -1143,7 +1391,7 @@ function PageNavButton({ active, label, subtitle, onClick }) {
   return (
     <button className={active ? "page-nav-button active" : "page-nav-button"} onClick={onClick} type="button">
       <strong>{label}</strong>
-      <span>{subtitle}</span>
+      {active && subtitle ? <span>{subtitle}</span> : null}
     </button>
   );
 }
@@ -1177,12 +1425,12 @@ function JobProgress({ job }) {
   const progress = job.progress || { fraction: 0, completed: [], completed_count: 0, total: 0 };
   const partial = job.partial_result || {};
   const dns = partial.dns || {};
-  const ct = partial.cert_transparency || {};
-  const origin = partial.origin_candidates || {};
-  const liveLeakCount =
-    (origin.subdomain_leaks || []).length +
-    (origin.mx_leaks || []).length +
-    (origin.wordlist_leaks || []).length;
+  const flowPayload = job.result || partial;
+  const relatedSummary = getRelatedTargetsSummary(flowPayload);
+  const phasePills = [
+    ...(progress.completed || []).map((phase) => ({ label: phase, tone: "done" })),
+    ...(progress.current ? [{ label: progress.current, tone: "active" }] : [])
+  ];
 
   if (isOpenctiJob) {
     const modeLabel = progress.mode === "full_reanalyse" ? "Re-run all" : "Incremental";
@@ -1217,27 +1465,38 @@ function JobProgress({ job }) {
 
         {job.error ? <Callout tone="warning">{job.error}</Callout> : null}
 
-        <div className="log-shell">
-          {(job.logs || []).slice(-30).map((entry, index) => (
-            <div className="log-line" key={`${index}-${entry}`}>
-              {entry}
-            </div>
-          ))}
-        </div>
+        <details className="fold-panel">
+          <summary>Raw ingestion log</summary>
+          <div className="log-shell">
+            {(job.logs || []).slice(-30).map((entry, index) => (
+              <div className="log-line" key={`${index}-${entry}`}>
+                {entry}
+              </div>
+            ))}
+          </div>
+        </details>
       </SectionCard>
     );
   }
 
   return (
     <SectionCard
-      title={job.status === "completed" ? "Latest result" : "Live scan"}
-      subtitle={job.status === "completed" ? `Completed ${formatDateTime(job.updated_at)}` : `Scanning ${job.target}`}
+      title={job.status === "completed" ? "Latest analysis" : "Live analysis"}
+      subtitle={job.status === "completed" ? `Completed ${formatDateTime(job.updated_at)}` : `Following ${job.target} outward from the supplied seed`}
     >
       <div className="metric-grid">
-        <Metric label="Progress" value={`${Math.round((progress.fraction || 0) * 100)}%`} detail={progress.current || "Wrapping up"} />
-        <Metric label="Phases done" value={`${progress.completed_count || 0}/${progress.total || 0}`} />
-        <Metric label="CT certs" value={ct.total_certs || 0} />
-        <Metric label="Live leads" value={liveLeakCount} detail={`${(dns.A || []).length} A records resolved`} />
+        <Metric
+          label="Current stage"
+          value={progress.current || (job.status === "completed" ? "Complete" : "Queued")}
+          detail={`${Math.round((progress.fraction || 0) * 100)}% of the flow tracked`}
+        />
+        <Metric label="Seed IPs" value={formatNumber(getCurrentIps(flowPayload).length || (dns.A || []).length)} />
+        <Metric label="Origin leads" value={formatNumber(collectOriginLeadCount(flowPayload))} />
+        <Metric
+          label="Pivots"
+          value={formatNumber(relatedSummary.expandable || 0)}
+          detail={`${formatNumber(relatedSummary.total || 0)} total discovered`}
+        />
       </div>
 
       <div className="progress-wrap">
@@ -1245,25 +1504,30 @@ function JobProgress({ job }) {
           <div className="progress-fill" style={{ width: `${(progress.fraction || 0) * 100}%` }} />
         </div>
         <div className="phase-pill-row">
-          {progress.completed && progress.completed.length
-            ? progress.completed.map((phase) => (
-                <span className="phase-pill done" key={phase}>
-                  {phase}
+          {phasePills.length
+            ? phasePills.map((phase) => (
+                <span className={phase.tone === "done" ? "phase-pill done" : "phase-pill active"} key={phase.label}>
+                  {phase.label}
                 </span>
               ))
-            : <span className="phase-pill">Waiting for first results</span>}
+            : <span className="phase-pill">Waiting for the first seed reads</span>}
         </div>
       </div>
 
+      <AnalysisFlowPanel payload={flowPayload} job={job} compact />
+
       {job.error ? <Callout tone="danger">{job.error}</Callout> : null}
 
-      <div className="log-shell">
-        {(job.logs || []).slice(-30).map((entry, index) => (
-          <div className="log-line" key={`${index}-${entry}`}>
-            {entry}
-          </div>
-        ))}
-      </div>
+      <details className="fold-panel">
+        <summary>Raw job log</summary>
+        <div className="log-shell">
+          {(job.logs || []).slice(-30).map((entry, index) => (
+            <div className="log-line" key={`${index}-${entry}`}>
+              {entry}
+            </div>
+          ))}
+        </div>
+      </details>
     </SectionCard>
   );
 }
@@ -1282,6 +1546,10 @@ function OverviewTab({ result, meta }) {
   ];
   const historicalIps = ((result.historical_dns || {}).records || []).filter((item) => ["A", "AAAA"].includes(item.rrtype));
   const interestingTxt = collectInterestingTxt(dns.TXT || []);
+  const relatedSummary = getRelatedTargetsSummary(result);
+  const pivots = getPivotCandidates(result);
+  const exposure = buildExposureSummary(result);
+  const currentIps = getCurrentIps(result);
 
   return (
     <div className="stack">
@@ -1291,42 +1559,84 @@ function OverviewTab({ result, meta }) {
         </Callout>
       ) : null}
 
-      <div className="metric-grid">
-        <Metric label="Target type" value={(result.type || "").toUpperCase()} />
-        <Metric label="Cloudflare" value={cloudflareLabel(result.cloudflare_fronted ?? result.cloudflare)} />
-        <Metric label="Origin leads" value={collectOriginLeadCount(result)} />
-        <Metric label="Search saved" value={formatDateTime(result.timestamp)} />
-      </div>
+      <section className="overview-hero">
+        <div className="overview-hero-main">
+          <div className="overview-hero-copy">
+            <span className="eyebrow">At a glance</span>
+            <h3>{result.input}</h3>
+            <p>
+              Start from the supplied {result.type === "ip" ? "IP" : "domain"}, profile it directly,
+              then spread outward into provider, Google, Cloudflare, ASN, and TLS checks only where the nearby matches look worth chasing.
+            </p>
+          </div>
+          <div className="metric-grid overview-hero-metrics">
+            <Metric label="Target type" value={(result.type || "").toUpperCase()} />
+            <Metric label="Cloudflare" value={cloudflareLabel(result.cloudflare_fronted ?? result.cloudflare)} />
+            <Metric label="Origin leads" value={formatNumber(collectOriginLeadCount(result))} />
+            <Metric label="Expandable pivots" value={formatNumber(relatedSummary.expandable || 0)} detail={`${formatNumber(relatedSummary.total || 0)} total discovered`} />
+          </div>
+        </div>
+        <Callout tone={exposure.tone}>
+          <strong>{exposure.title}.</strong> {exposure.body}
+        </Callout>
+      </section>
 
       <SectionCard
-        title="Registration and hosting"
-        subtitle="A plain-English summary of what the current infrastructure looks like."
-        infoTitle="Registration and hosting"
-        infoBody="This section answers simple questions like who registered the domain, roughly where it sits, and whether the current website seems to be hidden behind a service like Cloudflare."
+        title="Analysis path"
+        subtitle="This is the order the app follows so you can tell what happened without reading the raw logs."
+        infoTitle="Analysis path"
+        infoBody="The workflow starts with the seed you supplied, then fans outward through related infrastructure and finally confirms likely matches with ASN and live TLS checks."
+      >
+        <AnalysisFlowPanel payload={result} compact />
+      </SectionCard>
+
+      <SectionCard
+        title="Seed snapshot"
+        subtitle="The direct facts pulled from the supplied target before the workflow fans outward."
+        infoTitle="Seed snapshot"
+        infoBody="This section keeps the seed evidence together so you can understand the basic shape of the target before you look at pivots or expanded infrastructure."
       >
         <KeyValueList
           items={[
             { label: "Registrar", value: getRegistrar(result) },
             { label: "Created", value: formatDate(result.whois && result.whois.creation_date) },
             { label: "Country", value: result.whois && result.whois.country },
-            { label: "Org", value: result.whois && result.whois.org }
+            { label: "Org", value: result.whois && result.whois.org },
+            { label: "Seed IPs", value: currentIps.length ? formatListPreview(currentIps, 4) : null }
           ]}
         />
 
-        {result.type === "ip" ? (
-          <Callout tone="info">
-            This was an IP lookup. The backend pulled PTR, ASN, reverse-IP, and TLS details directly from the address.
-          </Callout>
-        ) : result.cloudflare_fronted ? (
-          <Callout tone="info">
-            All current A records look like Cloudflare edge nodes, so the public web server is hidden behind Cloudflare right now.
-          </Callout>
-        ) : (
-          <Callout tone="success">
-            At least one current A record is a direct, non-Cloudflare IP. That is usually one of the strongest origin leads.
-          </Callout>
-        )}
+        <div className="card-grid">
+          <LeadCard title="Current routing">
+            <p><strong>Cloudflare:</strong> {cloudflareLabel(result.cloudflare_fronted ?? result.cloudflare)}</p>
+            <p className="break-word"><strong>Current IPs:</strong> {currentIps.length ? formatListPreview(currentIps, 6) : "No A/AAAA records were resolved"}</p>
+            <p><strong>Direct-looking IPs:</strong> {formatNumber(getDirectIpCount(result))}</p>
+          </LeadCard>
+          <LeadCard title="Next pivots">
+            <p><strong>Related domains:</strong> {formatNumber(relatedSummary.domains || 0)}</p>
+            <p><strong>Related IPs:</strong> {formatNumber(relatedSummary.ips || 0)}</p>
+            <p><strong>Auto-expand candidates:</strong> {formatNumber(relatedSummary.expandable || 0)}</p>
+          </LeadCard>
+        </div>
       </SectionCard>
+
+      {pivots.length ? (
+        <SectionCard
+          title="Best expansion pivots"
+          subtitle="These are the strongest nearby domains or IPs the workflow uncovered around the seed."
+          infoTitle="Best expansion pivots"
+          infoBody="These cards show which discovered domains and IPs are worth following next, based on how many higher-signal sources pointed at them."
+        >
+          <div className="card-grid">
+            {pivots.map((item) => (
+              <LeadCard key={`${item.target_type}-${item.target}`} title={item.target} footer={`${item.target_type.toUpperCase()} | score ${formatNumber(item.score || 0)}`}>
+                <p><strong>Why it surfaced:</strong> {formatRelationList(item.relations)}</p>
+                <p><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
+              </LeadCard>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
 
       {currentCerts.length ? (
         <SectionCard
@@ -1615,6 +1925,10 @@ function renderLeadCollection(title, subtitle, items, meta, fallback) {
 
 function OriginTab({ result, meta }) {
   const origin = result.origin_candidates || {};
+  const relatedSummary = getRelatedTargetsSummary(result);
+  const providerHitCount = getProviderHitCount(result);
+  const sweepHitCount = getTargetedSweepHitCount(result);
+  const directLeadCount = collectOriginLeadCount(result);
   const scanSections = [
     {
       key: "scan",
@@ -1652,6 +1966,21 @@ function OriginTab({ result, meta }) {
 
   return (
     <div className="stack">
+      <SectionCard
+        title="Expansion summary"
+        subtitle="The workflow starts at the supplied seed, then only fans outward when the nearby evidence looks promising."
+        infoTitle="Expansion summary"
+        infoBody="Use this section to understand how much the run spread beyond the original domain or IP before you read the raw lead collections underneath."
+      >
+        <div className="metric-grid">
+          <Metric label="Direct leads" value={formatNumber(directLeadCount)} />
+          <Metric label="Provider hits" value={formatNumber(providerHitCount)} />
+          <Metric label="Targeted sweep hits" value={formatNumber(sweepHitCount)} />
+          <Metric label="Expandable pivots" value={formatNumber(relatedSummary.expandable || 0)} />
+        </div>
+        <AnalysisFlowPanel payload={result} compact />
+      </SectionCard>
+
       {renderLeadCollection(
         "Subdomain leaks",
         "Subdomains that resolved away from the main Cloudflare frontage.",
@@ -3738,10 +4067,10 @@ function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyz
   return (
     <PageFrame
       eyebrow="Workflow"
-      title="Investigate"
-      subtitle="Run new collection jobs, watch progress, and control manual OpenCTI ingestion without competing with the rest of the UI for space."
-      infoTitle="What this page is for"
-      infoBody="Use this page to start a fresh analysis job, widen the scan if needed, and watch the backend work. The other pages are for reading the results after the data is in."
+      title="Analyse"
+      subtitle="Start from a domain or IP, then watch the workflow spread outward only where the evidence supports it."
+      infoTitle="How this page works"
+      infoBody="Use this page to launch a seed-first analysis run. The app profiles the supplied domain or IP first, then fans outward into pivots, providers, Google ranges, ASNs, and TLS checks as the run develops."
     >
       <div className="full-page-grid">
         <ControlPanel
@@ -3755,23 +4084,20 @@ function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyz
           onOpenCtiAction={onOpenCtiAction}
         />
         <div className="stack">
-          <SectionCard
-            title="Collection flow"
-            subtitle="What happens when you run a job."
-            infoTitle="Collection flow"
-            infoBody="The backend collects DNS, certificates, page fingerprints, hosting clues, and origin leads. If some outside services fail, the pipeline keeps going and records what was skipped."
-          >
-            <div className="metric-grid">
-              <Metric label="Fallbacks" value="Enabled" detail="Source errors do not stop the whole run" />
-              <Metric label="OpenCTI" value={openctiState.running ? "Running" : "Manual"} detail="Only runs when you press the button" />
-              <Metric label="Pipeline speed" value={form.concurrency} detail="Configured async concurrency" />
-            </div>
-          </SectionCard>
-          {job ? <JobProgress job={job} /> : null}
+          {!job ? (
+            <SectionCard
+              title="Seed-first workflow"
+              subtitle="What the run will do once you press Analyse target."
+              infoTitle="Seed-first workflow"
+              infoBody="The flow starts with the supplied target, then branches outward into pivots and deeper infrastructure checks only when the earlier evidence gives it somewhere useful to go."
+            >
+              <AnalysisFlowPanel targetHint={form.target} />
+            </SectionCard>
+          ) : <JobProgress job={job} />}
           {openctiJob ? <JobProgress job={openctiJob} /> : null}
           {!job && !openctiJob ? (
             <SectionCard title="Ready" subtitle="No job is running right now.">
-              <p className="muted">Start a job on the left, then move to the result pages or the graph once data starts arriving.</p>
+              <p className="muted">Add a seed on the left, start the run, and this column will switch from the planned flow to the live analysis state.</p>
             </SectionCard>
           ) : null}
         </div>
@@ -3815,6 +4141,9 @@ function ResultContentPage({ pageId, result, meta }) {
 }
 
 function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, onProvidersOnly, onOpenCtiAction }) {
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showOpencti, setShowOpencti] = useState(false);
+
   const updateField = (key, value) => {
     setForm((current) => ({
       ...current,
@@ -3835,10 +4164,10 @@ function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, 
 
   return (
     <SectionCard
-      title="Run analysis"
-      subtitle="Start a fresh collection run or trigger manual OpenCTI ingestion."
-      infoTitle="How a run works"
-      infoBody="A run asks the backend to collect DNS, certificate, hosting, and origin clues for a domain or IP. The extra scan options widen the search, but they can take longer."
+      title="Analyse a seed"
+      subtitle="Start with a domain or IP. Keep the default view tight, then widen the fan-out only if you need it."
+      infoTitle="How this run starts"
+      infoBody="The app profiles the supplied seed first. Google, provider, and country sweeps are available, but they stay tucked away until you explicitly open them."
     >
       <div className="stack">
         <div className="field-row">
@@ -3853,60 +4182,6 @@ function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, 
           />
         </div>
 
-        <div className="field-group">
-          <h3>Origin discovery modes</h3>
-          {scanFields.map(([key, label]) => (
-            <label className="checkbox-row" key={key}>
-              <input checked={form[key]} disabled={busy} onChange={() => toggle(key)} type="checkbox" />
-              <span>
-                <strong>{label}</strong>
-                <small>{scanHelp[key]}</small>
-              </span>
-            </label>
-          ))}
-        </div>
-
-        <div className="field-row">
-          <label htmlFor="countries">Custom countries</label>
-          <input
-            id="countries"
-            type="text"
-            value={form.countriesText}
-            placeholder="RU UA BY"
-            onChange={(event) => updateField("countriesText", event.target.value.toUpperCase())}
-            disabled={busy}
-          />
-        </div>
-
-        <div className="split-fields">
-          <div className="field-row">
-            <label htmlFor="concurrency">Async concurrency</label>
-            <input
-              id="concurrency"
-              min="100"
-              max="50000"
-              step="500"
-              type="number"
-              value={form.concurrency}
-              onChange={(event) => updateField("concurrency", Number(event.target.value))}
-              disabled={busy}
-            />
-          </div>
-          <div className="field-row">
-            <label htmlFor="rate">masscan rate (pps)</label>
-            <input
-              id="rate"
-              min="100"
-              max="500000"
-              step="1000"
-              type="number"
-              value={form.rate}
-              onChange={(event) => updateField("rate", Number(event.target.value))}
-              disabled={busy}
-            />
-          </div>
-        </div>
-
         <div className="button-row">
           <button className="primary-button" onClick={onAnalyze} type="button" disabled={busy || !form.target.trim()}>
             {busy ? "Running..." : "Analyse target"}
@@ -3916,29 +4191,99 @@ function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, 
           </button>
         </div>
 
-        <div className="field-group">
-          <h3>OpenCTI ingestion</h3>
-          {openctiState.available === false ? (
-            <p className="muted">OpenCTI ingestion is not available in this environment.</p>
-          ) : (
-            <>
-              <p className="muted">
-                {openctiState.running
-                  ? `Running ${openctiState.done || 0}/${openctiState.total || 0} | ${openctiState.current || "Preparing"}`
-                  : openctiState.completed_at
-                    ? `Last run ${openctiState.completed_at}`
-                    : "Idle. Nothing runs automatically now; press Run when you want to ingest OpenCTI domains."}
-              </p>
-              <div className="button-row">
-                <button className="secondary-button" onClick={() => onOpenCtiAction(false)} type="button" disabled={openctiState.running}>
-                  Run
-                </button>
-                <button className="secondary-button" onClick={() => onOpenCtiAction(true)} type="button" disabled={openctiState.running}>
-                  Re-run all
-                </button>
+        <div className="fold-panel control-fold">
+          <button className="fold-toggle" onClick={() => setShowAdvanced(!showAdvanced)} type="button">
+            {showAdvanced ? "Hide expansion settings" : "Show expansion settings"}
+          </button>
+          {showAdvanced ? (
+            <div className="stack">
+              <div className="field-group">
+                <h3>Expansion modes</h3>
+                {scanFields.map(([key, label]) => (
+                  <label className="checkbox-row" key={key}>
+                    <input checked={form[key]} disabled={busy} onChange={() => toggle(key)} type="checkbox" />
+                    <span>
+                      <strong>{label}</strong>
+                      <small>{scanHelp[key]}</small>
+                    </span>
+                  </label>
+                ))}
               </div>
-            </>
-          )}
+
+              <div className="field-row">
+                <label htmlFor="countries">Custom countries</label>
+                <input
+                  id="countries"
+                  type="text"
+                  value={form.countriesText}
+                  placeholder="RU UA BY"
+                  onChange={(event) => updateField("countriesText", event.target.value.toUpperCase())}
+                  disabled={busy}
+                />
+              </div>
+
+              <div className="split-fields">
+                <div className="field-row">
+                  <label htmlFor="concurrency">Async concurrency</label>
+                  <input
+                    id="concurrency"
+                    min="100"
+                    max="50000"
+                    step="500"
+                    type="number"
+                    value={form.concurrency}
+                    onChange={(event) => updateField("concurrency", Number(event.target.value))}
+                    disabled={busy}
+                  />
+                </div>
+                <div className="field-row">
+                  <label htmlFor="rate">masscan rate (pps)</label>
+                  <input
+                    id="rate"
+                    min="100"
+                    max="500000"
+                    step="1000"
+                    type="number"
+                    value={form.rate}
+                    onChange={(event) => updateField("rate", Number(event.target.value))}
+                    disabled={busy}
+                  />
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="fold-panel control-fold">
+          <button className="fold-toggle" onClick={() => setShowOpencti(!showOpencti)} type="button">
+            {showOpencti ? "Hide OpenCTI controls" : "Show OpenCTI controls"}
+          </button>
+          {showOpencti ? (
+            <div className="field-group">
+              <h3>OpenCTI ingestion</h3>
+              {openctiState.available === false ? (
+                <p className="muted">OpenCTI ingestion is not available in this environment.</p>
+              ) : (
+                <>
+                  <p className="muted">
+                    {openctiState.running
+                      ? `Running ${openctiState.done || 0}/${openctiState.total || 0} | ${openctiState.current || "Preparing"}`
+                      : openctiState.completed_at
+                        ? `Last run ${openctiState.completed_at}`
+                        : "Idle. Nothing runs automatically now; press Run when you want to ingest OpenCTI domains."}
+                  </p>
+                  <div className="button-row">
+                    <button className="secondary-button" onClick={() => onOpenCtiAction(false)} type="button" disabled={openctiState.running}>
+                      Run
+                    </button>
+                    <button className="secondary-button" onClick={() => onOpenCtiAction(true)} type="button" disabled={openctiState.running}>
+                      Re-run all
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          ) : null}
         </div>
       </div>
     </SectionCard>
@@ -4222,8 +4567,19 @@ export default function App() {
     : openctiState.running
       ? "Running"
       : "Manual";
+  const topbarChips = result
+    ? [
+        { label: "Current target", value: shortLabel(result.input, 28), title: result.input },
+        { label: "Origin leads", value: formatNumber(collectOriginLeadCount(result)) },
+        { label: "Expandable pivots", value: formatNumber(getRelatedTargetsSummary(result).expandable || 0) }
+      ]
+    : [
+        { label: "Stored domains", value: formatNumber(storedDomains) },
+        { label: "Shared signals", value: formatNumber(sharedSignalCount) },
+        { label: "OpenCTI", value: openctiLabel }
+      ];
   const workflowPages = [
-    { id: "investigate", label: "Investigate", subtitle: "Run and monitor collection jobs." }
+    { id: "investigate", label: "Analyse", subtitle: "Launch and monitor seed-first collection runs." }
   ];
   const resultPages = result ? RESULT_PAGES : [];
   const explorerPages = EXPLORER_PAGES;
@@ -4272,10 +4628,10 @@ export default function App() {
   let pageContent = (
     <PageFrame
       eyebrow="Workflow"
-      title="Ready to investigate"
+      title="Ready to analyse"
       subtitle="Run a collection job or move through the explorer pages above."
       infoTitle="Where to start"
-      infoBody="If you already have stored data, start on the graph page. If not, run a new job from the investigate page first."
+      infoBody="If you already have stored data, start on the graph page. If not, run a new job from the Analyse page first."
     >
       <p className="muted">Start with a target, then move across the result and explorer pages once the data lands.</p>
     </PageFrame>
@@ -4509,25 +4865,19 @@ export default function App() {
         <div className="app-topbar-main">
           <div className="brand-block">
             <span className="brand-kicker">IP Intel</span>
-            <h1 className="brand-title">Investigation console</h1>
+            <h1 className="brand-title">Seed-first investigation</h1>
             <p className="brand-subtitle">
-              Full-width pages for collection, result review, graph analysis, and domain pivots.
+              Profile the supplied domain or IP first, then fan outward only where the evidence creates a useful lead.
             </p>
           </div>
           <div className="topbar-actions">
             <div className="status-chip-row">
-              <span className="status-chip">
-                <strong>{formatNumber(storedDomains)}</strong>
-                Stored domains
-              </span>
-              <span className="status-chip">
-                <strong>{formatNumber(sharedSignalCount)}</strong>
-                Shared signals
-              </span>
-              <span className="status-chip">
-                <strong>{openctiLabel}</strong>
-                OpenCTI
-              </span>
+              {topbarChips.map((chip) => (
+                <span className="status-chip" key={chip.label} title={chip.title || chip.value}>
+                  <strong>{chip.value}</strong>
+                  {chip.label}
+                </span>
+              ))}
             </div>
             <button className="theme-toggle" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} type="button">
               {theme === "dark" ? "Light mode" : "Dark mode"}
@@ -4553,7 +4903,7 @@ export default function App() {
 
           {resultPages.length ? (
             <div className="page-nav-group">
-              <span className="page-nav-label">Result pages</span>
+              <span className="page-nav-label">Case</span>
               <div className="page-nav-strip">
                 {resultPages.map((page) => (
                   <PageNavButton
@@ -4569,7 +4919,7 @@ export default function App() {
           ) : null}
 
           <div className="page-nav-group">
-            <span className="page-nav-label">Explorer pages</span>
+            <span className="page-nav-label">Explorer</span>
             <div className="page-nav-strip">
               {explorerPages.map((page) => (
                 <PageNavButton
