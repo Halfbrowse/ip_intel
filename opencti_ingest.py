@@ -1,21 +1,25 @@
 """
-opencti_ingest.py — Pull Domain-Name observables from OpenCTI and run
+opencti_ingest.py - Pull Domain-Name observables from OpenCTI and run
 basic ip-intel analysis on each.
 
 This worker is triggered manually through the API/UI. Configuration via env vars:
-  OPENCTI_URL    — e.g. https://opencti.example.com
-  OPENCTI_TOKEN  — API token with read access to observables
+  OPENCTI_URL    - e.g. https://opencti.example.com
+  OPENCTI_TOKEN  - API token with read access to observables
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ip_intel
-from intel_db import get_recent, get_domains_with_source_errors
+from intel_db import get_domains_with_source_errors
 from mattermost_alerts import send_opencti_notification, send_retry_notification
+from pycti import OpenCTIApiClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,44 +29,70 @@ logging.basicConfig(
 )
 log = logging.getLogger("opencti_ingest")
 
-from pycti import OpenCTIApiClient
+_INGEST_WORKERS = max(1, int(os.getenv("OPENCTI_INGEST_WORKERS", "6")))
 
 _started = False
-_start_lock   = threading.Lock()
-_retry_lock   = threading.Lock()
-_ingest_lock  = threading.Lock()
-_retry_running  = False
+_start_lock = threading.Lock()
+_retry_lock = threading.Lock()
+_ingest_lock = threading.Lock()
+_retry_running = False
 _ingest_running = False
 
-# Live status dict — read by the UI without a lock (reads are GIL-safe for simple types)
+# Live status dict - read by the UI without a lock (reads are GIL-safe for simple types)
 _status: dict = {
-    "running":       False,
-    "started_at":    None,
-    "completed_at":  None,
-    "total":         0,
-    "done":          0,
-    "skipped":       0,
-    "current":       None,
-    "last_error":    None,
+    "running": False,
+    "started_at": None,
+    "completed_at": None,
+    "total": 0,
+    "done": 0,
+    "skipped": 0,
+    "current": None,
+    "last_error": None,
 }
 
 
 def get_ingestion_status() -> dict:
-    """Return a snapshot of the current ingestion status (safe to call from any thread)."""
+    """Return a snapshot of the current ingestion status."""
     return dict(_status)
 
 
 def _run_kwargs() -> dict:
     return dict(
-        scan=False, scan_europe=False, scan_all=False,
-        scan_providers=False, scan_eu_countries=False, scan_full=False,
-        scan_countries=None, concurrency=5000, rate=5000,
+        scan=False,
+        scan_europe=False,
+        scan_all=False,
+        scan_providers=False,
+        scan_eu_countries=False,
+        scan_full=False,
+        scan_countries=None,
+        concurrency=5000,
+        rate=5000,
     )
+
+
+def _format_current_domains(active_domains: set[str]) -> str | None:
+    visible = sorted(active_domains)
+    if not visible:
+        return None
+    if len(visible) == 1:
+        return visible[0]
+    preview = visible[:2]
+    if len(visible) == 2:
+        return ", ".join(preview)
+    return f"{', '.join(preview)} (+{len(visible) - 2} more)"
+
+
+def _analyze_opencti_domain(domain: str) -> tuple[str, str | None]:
+    try:
+        ip_intel.analyze_domain(domain, **_run_kwargs())
+        return domain, None
+    except Exception as exc:  # noqa: BLE001
+        return domain, str(exc)
 
 
 def retry_source_errors(source: str | None = None) -> int:
     """
-    Re-analyse all domains that previously had source errors (e.g. urlscan 429).
+    Re-analyse all domains that previously had source errors (for example urlscan 429s).
     The database is append-only, so each retry adds a fresh run instead of
     overwriting the previous one. Returns the number of domains retried.
     Safe to call from a background thread while ingestion is still running.
@@ -70,7 +100,7 @@ def retry_source_errors(source: str | None = None) -> int:
     global _retry_running
     with _retry_lock:
         if _retry_running:
-            log.info("Retry already in progress — skipping")
+            log.info("Retry already in progress - skipping")
             return 0
         _retry_running = True
 
@@ -89,12 +119,11 @@ def retry_source_errors(source: str | None = None) -> int:
             log.info("[retry %d/%d] %s (errors: %s)", i, len(domains), domain, row["errors"])
             try:
                 ip_intel.analyze_domain(domain, **_run_kwargs())
-            except Exception as exc:
-                log.error("Retry error on %s — %s", domain, exc)
+            except Exception as exc:  # noqa: BLE001
+                log.error("Retry error on %s - %s", domain, exc)
                 last_error = f"{domain}: {exc}"
-            time.sleep(2.0)
 
-        log.info("Retry complete — %d domains reanalysed", len(domains))
+        log.info("Retry complete - %d domains reanalysed", len(domains))
         send_retry_notification("completed", {"source": source, "retried": len(domains), "last_error": last_error})
         return len(domains)
     except Exception as exc:
@@ -119,10 +148,10 @@ def start_retry_in_background(source: str | None = None) -> bool:
 
 def _get_domains() -> list[str]:
     """Fetch all Domain-Name STIX cyber observables from OpenCTI."""
-    url   = os.getenv("OPENCTI_URL", "").strip()
+    url = os.getenv("OPENCTI_URL", "").strip()
     token = os.getenv("OPENCTI_TOKEN", "").strip()
     if not url or not token:
-        log.info("OPENCTI_URL or OPENCTI_TOKEN not set — skipping ingestion")
+        log.info("OPENCTI_URL or OPENCTI_TOKEN not set - skipping ingestion")
         return []
 
     log.info("Connecting to OpenCTI at %s", url)
@@ -135,83 +164,106 @@ def _get_domains() -> list[str]:
         )
         domains = []
         for obs in observables:
-            val = obs.get("value") or obs.get("observable_value") or ""
-            val = val.strip().lower()
-            if val:
-                domains.append(val)
+            value = obs.get("value") or obs.get("observable_value") or ""
+            value = value.strip().lower()
+            if value:
+                domains.append(value)
         log.info("Fetched %d Domain-Name observables from OpenCTI", len(domains))
         return domains
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.error("OpenCTI connection error: %s", exc)
         return []
 
 
 def _run(force_reanalyse: bool = False) -> None:
-    """Worker: fetch domains from OpenCTI and analyse each one (basic scan only)."""
+    """Worker: fetch domains from OpenCTI and analyse each one."""
     global _ingest_running
-    mode = "re-run-all" if force_reanalyse else "incremental"
+    mode = "full_reanalyse" if force_reanalyse else "full_queue"
     fatal_error = None
 
     with _ingest_lock:
         if _ingest_running:
-            log.info("Ingestion already running — skipping duplicate start")
+            log.info("Ingestion already running - skipping duplicate start")
             return
         _ingest_running = True
 
-    _status.update({
-        "running":      True,
-        "started_at":   time.strftime("%Y-%m-%d %H:%M:%S"),
-        "completed_at": None,
-        "total":        0,
-        "done":         0,
-        "skipped":      0,
-        "current":      None,
-        "last_error":   None,
-        "mode":         mode,
-    })
+    _status.update(
+        {
+            "running": True,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "completed_at": None,
+            "total": 0,
+            "done": 0,
+            "skipped": 0,
+            "current": None,
+            "last_error": None,
+            "mode": mode,
+        }
+    )
 
     try:
         log.info("OpenCTI ingestion starting (force_reanalyse=%s)", force_reanalyse)
-        domains = _get_domains()
-        if not domains:
+        queue = _get_domains()
+        if not queue:
             log.info("OpenCTI ingestion: nothing to do")
             return
 
-        if force_reanalyse:
-            new_domains = domains
-            skipped_count = 0
-        else:
-            try:
-                recent = get_recent(limit=10_000)
-                already_done = {r["target"].lower() for r in recent}
-            except Exception as exc:
-                log.error("Failed to fetch recent DB entries — %s", exc)
-                already_done = set()
-            new_domains   = [d for d in domains if d not in already_done]
-            skipped_count = len(domains) - len(new_domains)
+        worker_count = min(_INGEST_WORKERS, len(queue))
+        active_domains: set[str] = set()
+        future_to_domain: dict = {}
+        queue_index = 0
 
-        log.info("%d new domains to analyse, %d already in DB", len(new_domains), skipped_count)
-        _status.update({"total": len(new_domains), "skipped": skipped_count})
+        log.info(
+            "Queueing %d OpenCTI domains with %d worker(s) (DB skip filter disabled)",
+            len(queue),
+            worker_count,
+        )
+        _status.update({"total": len(queue), "skipped": 0})
 
-        for i, domain in enumerate(new_domains, 1):
-            _status["current"] = domain
-            _status["done"]    = i - 1
-            log.info("[%d/%d] Analysing %s", i, len(new_domains), domain)
-            try:
-                ip_intel.analyze_domain(domain, **_run_kwargs())
-            except Exception as exc:
-                log.error("Error on %s — %s", domain, exc)
-                _status["last_error"] = f"{domain}: {exc}"
-            time.sleep(1.5)
+        def submit_next(executor: ThreadPoolExecutor) -> bool:
+            nonlocal queue_index
+            if queue_index >= len(queue):
+                return False
+            domain = queue[queue_index]
+            queue_index += 1
+            future = executor.submit(_analyze_opencti_domain, domain)
+            future_to_domain[future] = domain
+            active_domains.add(domain)
+            _status["current"] = _format_current_domains(active_domains)
+            log.info("[queued %d/%d] %s", queue_index, len(queue), domain)
+            return True
 
-        _status["done"]    = len(new_domains)
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="opencti-domain") as executor:
+            for _ in range(worker_count):
+                if not submit_next(executor):
+                    break
+
+            while future_to_domain:
+                completed = next(as_completed(tuple(future_to_domain)))
+                domain = future_to_domain.pop(completed)
+                active_domains.discard(domain)
+                _status["done"] += 1
+
+                completed_domain = domain
+                try:
+                    completed_domain, error = completed.result()
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+
+                if error:
+                    log.error("Error on %s - %s", completed_domain, error)
+                    _status["last_error"] = f"{completed_domain}: {error}"
+
+                submit_next(executor)
+                _status["current"] = _format_current_domains(active_domains)
+
+        _status["done"] = len(queue)
         _status["current"] = None
         log.info("OpenCTI ingestion complete")
     except Exception as exc:
         fatal_error = str(exc)
         _status["last_error"] = fatal_error
         log.exception("OpenCTI ingestion failed")
-
     finally:
         _status.update({"running": False, "completed_at": time.strftime("%Y-%m-%d %H:%M:%S")})
         send_opencti_notification(
@@ -234,7 +286,7 @@ def _run(force_reanalyse: bool = False) -> None:
 def start_background_ingestion() -> None:
     """
     Launch the ingestion worker as a daemon thread on first call.
-    Safe to call multiple times — only starts once per process.
+    Safe to call multiple times - only starts once per process.
     Use restart_ingestion() for the manual UI/API trigger.
     """
     global _started
@@ -252,8 +304,8 @@ def restart_ingestion(force_reanalyse: bool = False) -> bool:
     """
     Manually re-trigger ingestion in a background thread.
 
-    force_reanalyse=False  — skips domains already in the DB
-    force_reanalyse=True   — re-analyses every domain from OpenCTI regardless
+    force_reanalyse=False  - process the full OpenCTI queue
+    force_reanalyse=True   - same full queue, explicitly marked as a rerun
 
     Returns False if ingestion is already running.
     """
@@ -263,11 +315,8 @@ def restart_ingestion(force_reanalyse: bool = False) -> bool:
             log.info("restart_ingestion called but already running")
             return False
 
-    # Allow future calls to start_background_ingestion to be no-ops, but we
-    # are deliberately restarting so reset _started so callers don't need to
-    # track it themselves.
     with _start_lock:
-        _started = True   # keep True so the auto-start guard stays inactive
+        _started = True
 
     t = threading.Thread(
         target=_run,

@@ -80,6 +80,7 @@ from signal_web import (
 RESULTS_DIR = Path(__file__).parent / "results"
 CONFIG_DIR = Path(__file__).parent / "config"
 _LOG_CONTEXT = threading.local()
+_URLSCAN_GATE = threading.Semaphore(max(1, int(os.getenv("URLSCAN_MAX_PARALLEL", "1"))))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1754,6 +1755,14 @@ async def _ahackertarget_host_search(domain: str, client: httpx.AsyncClient) -> 
 
 _RATE_LIMITED = "__rate_limited__"
 
+async def _run_serial_urlscan(coro):
+    await asyncio.to_thread(_URLSCAN_GATE.acquire)
+    try:
+        return await coro
+    finally:
+        _URLSCAN_GATE.release()
+
+
 async def _aurlscan_historical_ips(domain: str, client: httpx.AsyncClient) -> list:
     try:
         resp = await client.get("https://urlscan.io/api/v1/search/", params={"q": f"domain:{domain}", "size": "100"}, timeout=15.0)
@@ -1926,6 +1935,7 @@ async def _analyze_domain_async(
     persist: bool = True,
     enable_wordlist_probe: bool = True,
     enable_wordlist_followups: bool = True,
+    enable_urlscan: bool = True,
 ) -> dict:
     result: dict = {
         "input":             domain,
@@ -1964,7 +1974,7 @@ async def _analyze_domain_async(
 
     RESULTS_DIR.mkdir(exist_ok=True)
     _safe     = re.sub(r"[^a-zA-Z0-9._-]", "_", domain)
-    _ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _ts       = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     _fav_path = RESULTS_DIR / f"{_safe}_{_ts}_favicon.ico"
 
     def _cb(key: str, value) -> None:
@@ -1989,6 +1999,9 @@ async def _analyze_domain_async(
 
     async def _empty_list():
         return []
+
+    async def _empty_dict():
+        return {}
 
     # ── Group 1: all concurrent via shared httpx client ───────────────────────
     log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata / well-known / legal / tenant probe (async)...")
@@ -2034,15 +2047,19 @@ async def _analyze_domain_async(
         # 5 s timeout does not delay the rest of origin discovery.
         if nameservers:
             log(f"Zone transfer attempt on {len(nameservers)} nameserver(s) (concurrent with origin discovery)")
-        log("Zone transfer / subdomain probe / MX / wordlist / HackerTarget / urlscan / Censys / Shodan / Netlas (async)...")
+        group_two_sources = "Zone transfer / subdomain probe / MX / wordlist / HackerTarget"
+        if enable_urlscan:
+            group_two_sources += " / urlscan"
+        group_two_sources += " / Censys / Shodan / Netlas (async)..."
+        log(group_two_sources)
         await asyncio.gather(
             _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
             _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
             _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
             _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain) if enable_wordlist_probe else _empty_list()),
             _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
-            _oc_task("urlscan",         _aurlscan_historical_ips(domain, client)),
-            _task("urlscan_analytics",  _aurlscan_fetch_analytics(domain, client)),
+            _oc_task("urlscan",         _run_serial_urlscan(_aurlscan_historical_ips(domain, client)) if enable_urlscan else _empty_list()),
+            _task("urlscan_analytics",  _run_serial_urlscan(_aurlscan_fetch_analytics(domain, client)) if enable_urlscan else _empty_dict()),
             _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
             _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
             _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
@@ -2293,6 +2310,7 @@ async def _analyze_domain_async(
                     persist=False,
                     enable_wordlist_probe=False,
                     enable_wordlist_followups=False,
+                    enable_urlscan=False,
                 )
                 followups.append(
                     {
@@ -2360,6 +2378,7 @@ def analyze_domain(
     scan_eu_countries: bool = False,
     scan_full: bool = False,
     concurrency: int = 5_000,
+    enable_urlscan: bool = True,
     *,
     rate: int,
     on_partial=None,
@@ -2375,6 +2394,7 @@ def analyze_domain(
         scan_eu_countries=scan_eu_countries,
         scan_full=scan_full,
         concurrency=concurrency,
+        enable_urlscan=enable_urlscan,
         rate=rate,
         on_partial=on_partial,
     ))

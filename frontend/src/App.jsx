@@ -2592,7 +2592,11 @@ function JobProgress({ job }) {
   ];
 
   if (isOpenctiJob) {
-    const modeLabel = progress.mode === "full_reanalyse" ? "Re-run all" : "Incremental";
+      const modeLabel = progress.mode === "full_reanalyse"
+        ? "Re-run all"
+        : progress.mode === "full_queue"
+          ? "Full queue"
+          : "Incremental";
     const done = Number(progress.done || progress.completed_count || 0);
     const total = Number(progress.total || 0);
     const currentTarget = progress.current || "Preparing queue";
@@ -7691,26 +7695,74 @@ export default function App() {
 
   if (activePage === "recent") {
     pageContent = (
-      <SharedSignalPage
+      <PageFrame
         eyebrow="Explorer"
         title="Recent searches"
         subtitle="Saved investigations you can reopen without running the pipeline again."
         infoTitle="Recent searches"
-        infoBody="Think of this page as case history, not live traffic. Open one of these searches to push its result back into the result pages."
-        items={recent}
-        emptyMessage="No saved searches are available yet."
-        renderItem={(item) => (
-          <LeadCard
-            key={item.id}
-            title={item.target}
-            footer={`${item.type.toUpperCase()} | ${cloudflareLabel(item.cloudflare_fronted)} | ${formatDateTime(item.timestamp)}`}
+        infoBody="Think of this page as case history, not live traffic. Search any stored domain below to open older runs, not just the most recent ones."
+      >
+        <div className="stack">
+          <SectionCard
+            title="Run browser"
+            subtitle="Pick any stored domain to see every saved run we have for it."
           >
-            <button className="inline-action" onClick={() => openSavedResult(item.id)} type="button">
-              Open saved result
-            </button>
-          </LeadCard>
-        )}
-      />
+            <SearchableDomainField
+              id="recent-page-target"
+              label="Find a stored domain"
+              value={selectedTarget}
+              onChange={setSelectedTarget}
+              options={availableDomainTargets}
+              placeholder="Search stored domains"
+              helper={`${formatNumber(availableDomainTargets.length)} stored domains available`}
+            />
+
+            {connections && connections.history && connections.history.length ? (
+              <div className="card-grid">
+                {connections.history.map((item) => (
+                  <LeadCard
+                    key={item.id}
+                    title={formatDateTime(item.timestamp)}
+                    footer={item.is_latest ? "Latest run" : "Historical run"}
+                  >
+                    <p><strong>Target:</strong> {item.target}</p>
+                    <p><strong>Cloudflare:</strong> {cloudflareLabel(item.cloudflare_fronted)}</p>
+                    <p><strong>Type:</strong> {String(item.type || "").toUpperCase()}</p>
+                    <button className="inline-action" onClick={() => openSavedResult(item.id)} type="button">
+                      Open run
+                    </button>
+                  </LeadCard>
+                ))}
+              </div>
+            ) : (
+              <Callout tone="info">Select a stored domain to load its full run history.</Callout>
+            )}
+          </SectionCard>
+
+          <SectionCard
+            title="Latest saved runs"
+            subtitle="The newest saved results across every target."
+          >
+            {recent.length ? (
+              <div className="card-grid">
+                {recent.map((item) => (
+                  <LeadCard
+                    key={item.id}
+                    title={item.target}
+                    footer={`${item.type.toUpperCase()} | ${cloudflareLabel(item.cloudflare_fronted)} | ${formatDateTime(item.timestamp)}`}
+                  >
+                    <button className="inline-action" onClick={() => openSavedResult(item.id)} type="button">
+                      Open saved result
+                    </button>
+                  </LeadCard>
+                ))}
+              </div>
+            ) : (
+              <Callout tone="info">No saved searches are available yet.</Callout>
+            )}
+          </SectionCard>
+        </div>
+      </PageFrame>
     );
   }
 
