@@ -666,9 +666,9 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
             "canonical_url": parser.canonical_url,
             "favicon_links": parser.favicon_links,
             "script_assets": parser.script_assets,
-            "script_urls": [item["url"] for item in parser.script_assets if item.get("url")],
+            "script_urls": [item["url"] for item in parser.script_assets if isinstance(item, Mapping) and item.get("url")],
             "script_asset_hosts": _dedupe_preserve(
-                item["host"] for item in parser.script_assets if item.get("host")
+                item["host"] for item in parser.script_assets if isinstance(item, Mapping) and item.get("host")
             ),
             "inline_source_map_urls": _dedupe_preserve(inline_source_maps),
             "inline_bundlers": _dedupe_preserve(inline_bundlers),
@@ -1123,6 +1123,8 @@ def find_favicon_urls(page_url: str, homepage_data: Mapping[str, Any] | None = N
     base_url = page_url if re.match(r"^[a-z][a-z0-9+.-]*://", str(page_url or ""), re.I) else normalize_target_url(page_url)
     urls: list[str] = []
     for entry in (homepage_data or {}).get("favicon_links", []) or []:
+        if not isinstance(entry, Mapping):
+            continue
         href = entry.get("href")
         if href:
             urls.append(urljoin(base_url, str(href)) if base_url else str(href))
@@ -1647,6 +1649,8 @@ def _assemble_script_scan(entries: list[dict[str, Any]]) -> dict[str, Any]:
     source_maps: list[str] = []
     bundlers: list[str] = []
     for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
         source_maps.extend(entry.get("source_map_urls", []))
         bundlers.extend(entry.get("bundlers", []))
     return {
@@ -1978,13 +1982,15 @@ def _sync_probe_mail_client_config(target: str, client: httpx.Client, *, timeout
                 }
             if kind == "autodiscover":
                 autodiscover.append(entry)
-                parsed = entry.get("parsed") or {}
+                parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
                 servers.extend(parsed.get("servers", []))
                 domains.extend(parsed.get("domains", []))
             else:
                 autoconfig.append(entry)
-                parsed = entry.get("parsed") or {}
+                parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
                 for server in parsed.get("incoming_servers", []) + parsed.get("outgoing_servers", []):
+                    if not isinstance(server, Mapping):
+                        continue
                     hostname = server.get("hostname")
                     if hostname:
                         servers.append(hostname)
@@ -2043,13 +2049,15 @@ async def _async_probe_mail_client_config(
                 }
             if kind == "autodiscover":
                 autodiscover.append(entry)
-                parsed = entry.get("parsed") or {}
+                parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
                 servers.extend(parsed.get("servers", []))
                 domains.extend(parsed.get("domains", []))
             else:
                 autoconfig.append(entry)
-                parsed = entry.get("parsed") or {}
+                parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
                 for server in parsed.get("incoming_servers", []) + parsed.get("outgoing_servers", []):
+                    if not isinstance(server, Mapping):
+                        continue
                     hostname = server.get("hostname")
                     if hostname:
                         servers.append(hostname)
@@ -2143,7 +2151,10 @@ def extract_page_enrichment(html_doc: str, *, base_url: str | None = None) -> di
         "homepage_html_hash": parsed.get("homepage_text_hash"),
         "meta_tags": parsed.get("meta_tags") or {},
         "script_assets": parsed.get("script_urls") or [],
-        "bundler_hints": _dedupe_preserve((parsed.get("inline_bundlers") or []) + [item.get("type") for item in parsed.get("script_assets") or [] if item.get("type")]),
+        "bundler_hints": _dedupe_preserve(
+            (parsed.get("inline_bundlers") or [])
+            + [item.get("type") for item in parsed.get("script_assets") or [] if isinstance(item, Mapping) and item.get("type")]
+        ),
     }
 
 
@@ -2188,7 +2199,9 @@ async def afetch_homepage_profile(
         }
     )
     disclosures = await async_fetch_source_map_disclosures(page_metadata, client=client)
-    for entry in disclosures.get("entries") or []:
+    for entry in (disclosures.get("entries") or disclosures.get("scripts") or []):
+        if not isinstance(entry, Mapping):
+            continue
         result["source_map_leaks"].append(
             {
                 "script_url": entry.get("script_url"),
@@ -2235,6 +2248,8 @@ async def ascrape_legal_pages(domain: str, client: httpx.AsyncClient) -> list[di
     raw = await async_scrape_legal_pages(domain, client=client)
     pages = []
     for page in raw.get("pages") or []:
+        if not isinstance(page, Mapping):
+            continue
         pages.append(
             {
                 "url": page.get("url"),
@@ -2269,6 +2284,8 @@ def parse_assetlinks(content: bytes | str | None) -> dict[str, Any]:
     parsed = parse_assetlinks_json(content)
     android_apps = []
     for statement in parsed.get("statements") or []:
+        if not isinstance(statement, Mapping):
+            continue
         if statement.get("namespace") != "android_app":
             continue
         android_apps.append(

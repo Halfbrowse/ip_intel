@@ -87,6 +87,7 @@ def _analyze_opencti_domain(domain: str) -> tuple[str, str | None]:
         ip_intel.analyze_domain(domain, **_run_kwargs())
         return domain, None
     except Exception as exc:  # noqa: BLE001
+        log.exception("Unhandled analysis error for %s", domain)
         return domain, str(exc)
 
 

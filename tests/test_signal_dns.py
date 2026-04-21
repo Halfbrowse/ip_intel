@@ -9,6 +9,7 @@ from signal_dns import (
     extract_mailto_addresses,
     extract_txt_tenancy_tokens,
     lookup_txt_records,
+    probe_microsoft_tenant_guid,
     parse_caa_records,
     parse_dmarc_record,
     parse_spf_record,
@@ -61,6 +62,29 @@ class SignalDnsTests(unittest.TestCase):
             records = asyncio.run(lookup_txt_records("example.com"))
 
         self.assertEqual(records, [])
+
+    def test_probe_microsoft_tenant_guid_handles_non_mapping_json(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return "not-a-json-object"
+
+        class FakeClient:
+            async def get(self, _url):
+                return FakeResponse()
+
+        result = asyncio.run(
+            probe_microsoft_tenant_guid(
+                "example.com",
+                client=FakeClient(),
+                endpoints=("https://example.invalid/{domain}",),
+            )
+        )
+
+        self.assertIsNone(result["tenant_id"])
+        self.assertEqual(result["results"][0]["error"], "invalid_payload:str")
 
 
 if __name__ == "__main__":

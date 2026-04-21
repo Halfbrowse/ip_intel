@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from signal_web import compute_favicon_hashes, extract_page_enrichment, parse_ads_txt, parse_assetlinks, parse_security_txt
+from signal_web import (
+    compute_favicon_hashes,
+    extract_page_enrichment,
+    find_favicon_urls,
+    parse_ads_txt,
+    parse_assetlinks,
+    parse_security_txt,
+)
 
 
 class SignalWebTests(unittest.TestCase):
@@ -43,6 +50,13 @@ class SignalWebTests(unittest.TestCase):
     def test_compute_favicon_hashes(self) -> None:
         hashes = compute_favicon_hashes(b"favicon")
         self.assertIsNotNone(hashes["favicon_md5"])
+
+    def test_find_favicon_urls_ignores_malformed_entries(self) -> None:
+        urls = find_favicon_urls(
+            "https://example.com/",
+            homepage_data={"favicon_links": ["broken", {"href": "/favicon-32.png"}]},
+        )
+        self.assertIn("https://example.com/favicon-32.png", urls)
 
 
 if __name__ == "__main__":

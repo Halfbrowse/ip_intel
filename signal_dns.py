@@ -970,7 +970,9 @@ def lookup_email_security_sync(
     }
 
 
-def extract_microsoft_tenant_guid_from_openid(document: Mapping[str, Any]) -> str | None:
+def extract_microsoft_tenant_guid_from_openid(document: Mapping[str, Any] | Any) -> str | None:
+    if not isinstance(document, Mapping):
+        return None
     for field in (
         "issuer",
         "authorization_endpoint",
@@ -1022,6 +1024,13 @@ async def probe_microsoft_tenant_guid(
                 "ok": False,
                 "status_code": response.status_code,
                 "error": f"invalid_json: {exc}",
+            }
+        if not isinstance(document, Mapping):
+            return {
+                "url": url,
+                "ok": False,
+                "status_code": response.status_code,
+                "error": f"invalid_payload:{type(document).__name__}",
             }
         tenant_id = extract_microsoft_tenant_guid_from_openid(document)
         return {
@@ -1105,6 +1114,16 @@ def probe_microsoft_tenant_guid_sync(
                         "ok": False,
                         "status_code": response.status_code,
                         "error": f"invalid_json: {exc}",
+                    }
+                )
+                continue
+            if not isinstance(document, Mapping):
+                probes.append(
+                    {
+                        "url": url,
+                        "ok": False,
+                        "status_code": response.status_code,
+                        "error": f"invalid_payload:{type(document).__name__}",
                     }
                 )
                 continue
@@ -1192,9 +1211,17 @@ def get_email_security_records(domain: str) -> dict[str, Any]:
 
 async def aprobe_microsoft_tenant(domain: str, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
     result = await probe_microsoft_tenant_guid(domain, client=client)
+    first_issuer = next(
+        (
+            item.get("issuer")
+            for item in result.get("results", [])
+            if isinstance(item, Mapping) and item.get("issuer")
+        ),
+        None,
+    )
     return {
         "tenant_guid": result.get("tenant_id"),
-        "issuer": next((item.get("issuer") for item in result.get("results", []) if item.get("issuer")), None),
+        "issuer": first_issuer,
         "token_endpoint": None,
         "source_url": result.get("source"),
         "error": None if result.get("tenant_id") else "not_found",
@@ -1203,9 +1230,17 @@ async def aprobe_microsoft_tenant(domain: str, client: httpx.AsyncClient | None 
 
 def probe_microsoft_tenant_sync(domain: str) -> dict[str, Any]:
     result = probe_microsoft_tenant_guid_sync(domain)
+    first_issuer = next(
+        (
+            item.get("issuer")
+            for item in result.get("results", [])
+            if isinstance(item, Mapping) and item.get("issuer")
+        ),
+        None,
+    )
     return {
         "tenant_guid": result.get("tenant_id"),
-        "issuer": next((item.get("issuer") for item in result.get("results", []) if item.get("issuer")), None),
+        "issuer": first_issuer,
         "token_endpoint": None,
         "source_url": result.get("source"),
         "error": None if result.get("tenant_id") else "not_found",

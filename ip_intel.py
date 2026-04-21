@@ -33,6 +33,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
@@ -141,6 +142,12 @@ def _warn_dns_fallback(exc: Exception) -> None:
         "DNS resolver configuration is unavailable "
         f"({exc}); falling back to IP_INTEL_DNS_RESOLVERS."
     )
+
+
+def _iter_mapping_items(values):
+    for item in values or []:
+        if isinstance(item, Mapping):
+            yield item
 
 
 def _empty_dns_records(error: str | None = None) -> dict:
@@ -458,7 +465,7 @@ def _parse_crt_sh_entries(entries: list, domain: str) -> dict:
     seen_ids: set[int] = set()
     certs: list[dict] = []
 
-    for entry in entries:
+    for entry in _iter_mapping_items(entries):
         cert_id = entry.get("id")
         if cert_id in seen_ids:
             continue
@@ -551,6 +558,8 @@ def circl_passive_dns(domain: str) -> dict:
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, Mapping):
                 continue
 
             rrtype = entry.get("rrtype", "")
@@ -873,12 +882,12 @@ def shodan_cert_search(domain: str) -> dict:
         api = shodan.Shodan(api_key)
         resp = api.search(f'ssl:"{domain}"', minify=False)
 
-        for match in resp.get("matches", []):
+        for match in _iter_mapping_items(resp.get("matches", [])):
             ip = match.get("ip_str")
             if not ip:
                 continue
 
-            loc = match.get("location", {})
+            loc = match.get("location", {}) if isinstance(match.get("location"), Mapping) else {}
             entry = {
                 "ip":         ip,
                 "cloudflare": is_cloudflare_ip(ip),
@@ -922,8 +931,10 @@ def netlas_cert_search(domain: str) -> dict:
         query = f'certificate.subject.common_name:"{domain}"'
         resp  = conn.query(query=query, datatype="response", page=0)
 
-        for item in (resp or {}).get("items", []):
+        for item in _iter_mapping_items((resp or {}).get("items", [])):
             data = item.get("data", {})
+            if not isinstance(data, Mapping):
+                continue
             ip   = data.get("ip")
             if not ip:
                 continue
@@ -1831,7 +1842,7 @@ async def _aurlscan_historical_ips(domain: str, client: httpx.AsyncClient) -> li
             return []
         seen: set[str] = set()
         results: list[dict] = []
-        for hit in resp.json().get("results", []):
+        for hit in _iter_mapping_items(resp.json().get("results", [])):
             ip   = hit.get("page", {}).get("ip", "")
             date = hit.get("task", {}).get("time", "")[:10]
             if ip and ip not in seen:
@@ -1900,7 +1911,7 @@ async def _aurlscan_fetch_analytics(domain: str, client: httpx.AsyncClient) -> d
 
         # Take the most recent scan that has a result URL
         uuid = None
-        for hit in results:
+        for hit in _iter_mapping_items(results):
             uid = hit.get("task", {}).get("uuid") or hit.get("_id")
             if uid:
                 uuid = uid
@@ -1918,11 +1929,17 @@ async def _aurlscan_fetch_analytics(domain: str, client: httpx.AsyncClient) -> d
         if result_resp.status_code == 200:
             result_json = result_resp.json()
             requests_list = result_json.get("data", {}).get("requests", [])
-            for req_entry in requests_list:
+            for req_entry in _iter_mapping_items(requests_list):
+                nested_requests = req_entry.get("requests")
+                nested_request = None
+                if isinstance(nested_requests, list) and nested_requests:
+                    first_nested = nested_requests[0]
+                    if isinstance(first_nested, Mapping):
+                        nested_request = first_nested.get("request", {})
                 url = (
                     req_entry.get("request", {}).get("url")
-                    or req_entry.get("requests", [{}])[0].get("request", {}).get("url", "")
-                    if isinstance(req_entry.get("requests"), list)
+                    or nested_request.get("url", "")
+                    if isinstance(nested_request, Mapping)
                     else req_entry.get("request", {}).get("url", "")
                 )
                 if not url:
@@ -2226,38 +2243,39 @@ async def _analyze_domain_async(
 
     origin_candidates_result = result.get("origin_candidates", {})
 
-    for candidate_entry in origin_candidates_result.get("hackertarget", []):
+    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("hackertarget", [])):
         ip_address = candidate_entry.get("ip", "")
         if ip_address and not candidate_entry.get("cf", False):
             ip_sources.setdefault(ip_address, []).append("hackertarget")
 
-    for candidate_entry in origin_candidates_result.get("wordlist_leaks", []):
+    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("wordlist_leaks", [])):
         ip_address = candidate_entry.get("ip", "")
         if ip_address:
             ip_sources.setdefault(ip_address, []).append("wordlist_probe")
 
-    for candidate_entry in origin_candidates_result.get("mx_leaks", []):
+    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("mx_leaks", [])):
         ip_address = candidate_entry.get("ip", "")
         if ip_address:
             ip_sources.setdefault(ip_address, []).append("mx_record")
 
-    for candidate_entry in origin_candidates_result.get("subdomain_leaks", []):
+    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("subdomain_leaks", [])):
         ip_address = candidate_entry.get("ip", "")
         if ip_address:
             ip_sources.setdefault(ip_address, []).append("subdomain_probe")
 
-    for candidate_entry in origin_candidates_result.get("urlscan", []):
+    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("urlscan", [])):
         ip_address = candidate_entry.get("ip", "")
         if ip_address and not candidate_entry.get("cf", False):
             ip_sources.setdefault(ip_address, []).append("urlscan")
 
-    for historical_record in result.get("historical_dns", {}).get("records", []):
+    historical_dns = result.get("historical_dns") if isinstance(result.get("historical_dns"), Mapping) else {}
+    for historical_record in _iter_mapping_items(historical_dns.get("records", [])):
         if historical_record.get("rrtype") in ("A", "AAAA"):
             ip_address = historical_record.get("rdata", "")
             if ip_address and not is_cloudflare_ip(ip_address):
                 ip_sources.setdefault(ip_address, []).append("historical_dns")
 
-    for spf_entry in result.get("spf_origins", []):
+    for spf_entry in _iter_mapping_items(result.get("spf_origins", [])):
         ip_address = spf_entry.get("ip", "")
         if ip_address and not is_cloudflare_ip(ip_address):
             ip_sources.setdefault(ip_address, []).append("spf")
@@ -2269,7 +2287,9 @@ async def _analyze_domain_async(
     }
     for provider_key, source_name in provider_source_map.items():
         provider_result = origin_candidates_result.get(provider_key, {})
-        for hit in provider_result.get("hits", []):
+        if not isinstance(provider_result, Mapping):
+            continue
+        for hit in _iter_mapping_items(provider_result.get("hits", [])):
             ip_address = hit.get("ip", "")
             if ip_address:
                 ip_sources.setdefault(ip_address, []).append(source_name)
@@ -2281,7 +2301,9 @@ async def _analyze_domain_async(
     }
     for scan_key, source_name in scan_source_map.items():
         scan_result = origin_candidates_result.get(scan_key, {})
-        for hit in scan_result.get("hits", []):
+        if not isinstance(scan_result, Mapping):
+            continue
+        for hit in _iter_mapping_items(scan_result.get("hits", [])):
             ip_address = hit.get("ip", "")
             if ip_address:
                 ip_sources.setdefault(ip_address, []).append(source_name)
@@ -2330,7 +2352,7 @@ async def _analyze_domain_async(
 
     result["non_cf_tls_certs"] = non_cloudflare_tls_certs
     if result.get("ip_details"):
-        certs_by_ip = {cert.get("ip"): cert for cert in non_cloudflare_tls_certs if cert and cert.get("ip")}
+        certs_by_ip = {cert.get("ip"): cert for cert in _iter_mapping_items(non_cloudflare_tls_certs) if cert.get("ip")}
         for ip_address, details in result["ip_details"].items():
             proxy_details = detect_proxy_details(
                 ip_address,
