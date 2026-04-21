@@ -7435,11 +7435,14 @@ export default function App() {
   }, [job]);
 
   useEffect(() => {
-    const intervalMs = openctiState.running ? 1500 : 10000;
+    loadOpencti();
+  }, []);
+
+  useEffect(() => {
+    if (!openctiState.running) return undefined;
     const timer = window.setInterval(() => {
       loadOpencti();
-    }, intervalMs);
-
+    }, 1500);
     return () => {
       window.clearInterval(timer);
     };

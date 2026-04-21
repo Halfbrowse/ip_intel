@@ -21,13 +21,34 @@ from intel_db import get_domains_with_source_errors
 from mattermost_alerts import send_opencti_notification, send_retry_notification
 from pycti import OpenCTIApiClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    stream=sys.stdout,
-    format="%(asctime)s [%(name)s] %(levelname)s  %(message)s",
+log = logging.getLogger("opencti_ingest")
+log.setLevel(logging.INFO)
+
+_LOG_FMT = logging.Formatter(
+    "%(asctime)s [%(name)s] %(levelname)s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("opencti_ingest")
+
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(_LOG_FMT)
+    log.addHandler(_h)
+    log.propagate = False
+
+
+class _StatusLogHandler(logging.Handler):
+    """Appends formatted log lines to _status["logs"] for the UI."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _status["logs"].append(self.format(record))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_status_handler = _StatusLogHandler()
+_status_handler.setFormatter(_LOG_FMT)
+log.addHandler(_status_handler)
 
 _INGEST_WORKERS = max(1, int(os.getenv("OPENCTI_INGEST_WORKERS", "6")))
 
@@ -48,6 +69,7 @@ _status: dict = {
     "skipped": 0,
     "current": None,
     "last_error": None,
+    "logs": [],
 }
 
 
@@ -199,6 +221,7 @@ def _run(force_reanalyse: bool = False) -> None:
             "current": None,
             "last_error": None,
             "mode": mode,
+            "logs": [],
         }
     )
 

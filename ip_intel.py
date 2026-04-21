@@ -1826,7 +1826,11 @@ async def _ahackertarget_host_search(domain: str, client: httpx.AsyncClient) -> 
 _RATE_LIMITED = "__rate_limited__"
 
 async def _run_serial_urlscan(coro):
-    await asyncio.to_thread(_URLSCAN_GATE.acquire)
+    try:
+        await asyncio.to_thread(_URLSCAN_GATE.acquire)
+    except asyncio.CancelledError:
+        coro.close()
+        raise
     try:
         return await coro
     finally:
@@ -2111,7 +2115,8 @@ async def _analyze_domain_async(
         _cb("spf_origins", spf_details.get("origins", []))
 
         nameservers  = dns_records.get("NS", [])
-        mx_records   = dns_records.get("MX") or []
+        _mx_raw      = dns_records.get("MX") or []
+        mx_records   = _mx_raw if isinstance(_mx_raw, list) else []
         _cb("nameserver_analysis", _classify_nameservers(nameservers))
         email_security = result.get("email_security") or {}
         email_security["spf_includes"] = spf_details.get("includes", [])
@@ -2126,7 +2131,7 @@ async def _analyze_domain_async(
         group_two_sources = "Zone transfer / subdomain probe / MX / wordlist / HackerTarget"
         if enable_urlscan:
             group_two_sources += " / urlscan"
-        group_two_sources += " / Censys / Shodan / Netlas (async)..."
+        group_two_sources += " (async)..."
         log(group_two_sources)
         await asyncio.gather(
             _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
@@ -2136,9 +2141,9 @@ async def _analyze_domain_async(
             _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
             _oc_task("urlscan",         _run_serial_urlscan(_aurlscan_historical_ips(domain, client)) if enable_urlscan else _empty_list()),
             _task("urlscan_analytics",  _run_serial_urlscan(_aurlscan_fetch_analytics(domain, client)) if enable_urlscan else _empty_dict()),
-            _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
-            _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
-            _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
+            # _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
+            # _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
+            # _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
         )
 
     wordlist_hits = (result.get("origin_candidates", {}) or {}).get("wordlist_leaks", [])
