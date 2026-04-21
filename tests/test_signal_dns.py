@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
+from unittest.mock import patch
 
+import signal_dns
 from signal_dns import (
     extract_mailto_addresses,
     extract_txt_tenancy_tokens,
+    lookup_txt_records,
     parse_caa_records,
     parse_dmarc_record,
     parse_spf_record,
@@ -46,6 +50,17 @@ class SignalDnsTests(unittest.TestCase):
         parsed = parse_caa_records(['0 issue "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/123"'])
         self.assertEqual(parsed[0]["tag"], "issue")
         self.assertEqual(parsed[0]["accounturi"], "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+
+    def test_lookup_txt_records_handles_resolver_init_failure(self) -> None:
+        with patch.object(
+            signal_dns.dns.asyncresolver,
+            "Resolver",
+            side_effect=RuntimeError("cannot open /etc/resolv.conf"),
+            create=True,
+        ):
+            records = asyncio.run(lookup_txt_records("example.com"))
+
+        self.assertEqual(records, [])
 
 
 if __name__ == "__main__":

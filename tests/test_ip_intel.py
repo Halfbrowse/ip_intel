@@ -99,6 +99,19 @@ class IpIntelTests(unittest.TestCase):
         self.assertEqual(selected[0]["ips"], ["203.0.113.10", "203.0.113.11"])
         self.assertEqual(len(selected[0]["hits"]), 3)
 
+    def test_aget_dns_records_handles_resolver_init_failure(self) -> None:
+        with patch.object(
+            ip_intel.dns.asyncresolver,
+            "Resolver",
+            side_effect=RuntimeError("cannot open /etc/resolv.conf"),
+            create=True,
+        ):
+            records = asyncio.run(ip_intel._aget_dns_records("example.com"))
+
+        self.assertEqual(records["A"], [])
+        self.assertEqual(records["NS"], [])
+        self.assertEqual(records["_resolver_error"], "cannot open /etc/resolv.conf")
+
     def test_analyze_domain_async_skips_urlscan_when_disabled(self) -> None:
         async def fake_dns(_domain):
             return {"A": [], "AAAA": [], "CAA": [], "CNAME": [], "MX": [], "NS": [], "TXT": [], "SOA": []}

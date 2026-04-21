@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any
@@ -19,6 +20,11 @@ TxtFetcher = Callable[[str], Awaitable[Iterable[Any]]]
 SyncTxtFetcher = Callable[[str], Iterable[Any]]
 
 DEFAULT_BIMI_SELECTORS = ("default",)
+DNS_FALLBACK_NAMESERVERS = tuple(
+    item.strip()
+    for item in os.getenv("IP_INTEL_DNS_RESOLVERS", "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4").split(",")
+    if item.strip()
+)
 MICROSOFT_OPENID_CONFIG_URLS = (
     "https://login.microsoftonline.com/{domain}/v2.0/.well-known/openid-configuration",
     "https://login.microsoftonline.com/{domain}/.well-known/openid-configuration",
@@ -228,6 +234,32 @@ def normalize_txt_records(records: Iterable[Any] | Any) -> list[str]:
     return result
 
 
+def _build_async_resolver(*, timeout: float, lifetime: float):
+    try:
+        resolver = dns.asyncresolver.Resolver()
+    except Exception:
+        if not DNS_FALLBACK_NAMESERVERS:
+            raise
+        resolver = dns.asyncresolver.Resolver(configure=False)
+        resolver.nameservers = list(DNS_FALLBACK_NAMESERVERS)
+    resolver.timeout = timeout
+    resolver.lifetime = lifetime
+    return resolver
+
+
+def _build_sync_resolver(*, timeout: float, lifetime: float):
+    try:
+        resolver = dns.resolver.Resolver()
+    except Exception:
+        if not DNS_FALLBACK_NAMESERVERS:
+            raise
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = list(DNS_FALLBACK_NAMESERVERS)
+    resolver.timeout = timeout
+    resolver.lifetime = lifetime
+    return resolver
+
+
 def build_dmarc_name(domain: str) -> str:
     return f"_dmarc.{_normalize_domain(domain)}"
 
@@ -412,9 +444,10 @@ async def lookup_txt_records(name: str, resolver: Any | None = None) -> list[str
     if resolver is None:
         if dns is None:
             raise RuntimeError("dnspython is required for TXT lookups")
-        resolver = dns.asyncresolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 8
+        try:
+            resolver = _build_async_resolver(timeout=5, lifetime=8)
+        except Exception:
+            return []
 
     try:
         answers = await resolver.resolve(name, "TXT")
@@ -437,9 +470,10 @@ def lookup_txt_records_sync(name: str, resolver: Any | None = None) -> list[str]
     if resolver is None:
         if dns is None:
             raise RuntimeError("dnspython is required for TXT lookups")
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 8
+        try:
+            resolver = _build_sync_resolver(timeout=5, lifetime=8)
+        except Exception:
+            return []
 
     try:
         answers = resolver.resolve(name, "TXT")

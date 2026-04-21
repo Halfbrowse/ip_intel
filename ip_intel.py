@@ -81,6 +81,14 @@ RESULTS_DIR = Path(__file__).parent / "results"
 CONFIG_DIR = Path(__file__).parent / "config"
 _LOG_CONTEXT = threading.local()
 _URLSCAN_GATE = threading.Semaphore(max(1, int(os.getenv("URLSCAN_MAX_PARALLEL", "1"))))
+_DNS_RECORD_TYPES = ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")
+_DNS_FALLBACK_NAMESERVERS = tuple(
+    item.strip()
+    for item in os.getenv("IP_INTEL_DNS_RESOLVERS", "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4").split(",")
+    if item.strip()
+)
+_DNS_FALLBACK_LOCK = threading.Lock()
+_DNS_FALLBACK_WARNED = False
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -121,6 +129,53 @@ def clean_target(target: str) -> str:
     """Strip protocol prefix and trailing slashes so bare hostnames/IPs remain."""
     target = re.sub(r'^https?://', '', target)
     return target.rstrip('/').strip()
+
+
+def _warn_dns_fallback(exc: Exception) -> None:
+    global _DNS_FALLBACK_WARNED
+    with _DNS_FALLBACK_LOCK:
+        if _DNS_FALLBACK_WARNED:
+            return
+        _DNS_FALLBACK_WARNED = True
+    log(
+        "DNS resolver configuration is unavailable "
+        f"({exc}); falling back to IP_INTEL_DNS_RESOLVERS."
+    )
+
+
+def _empty_dns_records(error: str | None = None) -> dict:
+    payload = {rtype: [] for rtype in _DNS_RECORD_TYPES}
+    if error:
+        payload["_resolver_error"] = error
+    return payload
+
+
+def _build_sync_resolver(*, timeout: float, lifetime: float):
+    try:
+        resolver = dns.resolver.Resolver()
+    except Exception as exc:
+        if not _DNS_FALLBACK_NAMESERVERS:
+            raise
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = list(_DNS_FALLBACK_NAMESERVERS)
+        _warn_dns_fallback(exc)
+    resolver.timeout = timeout
+    resolver.lifetime = lifetime
+    return resolver
+
+
+def _build_async_resolver(*, timeout: float, lifetime: float):
+    try:
+        resolver = dns.asyncresolver.Resolver()
+    except Exception as exc:
+        if not _DNS_FALLBACK_NAMESERVERS:
+            raise
+        resolver = dns.asyncresolver.Resolver(configure=False)
+        resolver.nameservers = list(_DNS_FALLBACK_NAMESERVERS)
+        _warn_dns_fallback(exc)
+    resolver.timeout = timeout
+    resolver.lifetime = lifetime
+    return resolver
 
 
 def is_ip(target: str) -> bool:
@@ -305,9 +360,10 @@ def detect_proxy_details(
 
 def resolve_ips(hostname: str) -> list[str]:
     """Return A + AAAA records for hostname, empty list on failure."""
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = 5
-    resolver.lifetime = 8
+    try:
+        resolver = _build_sync_resolver(timeout=5, lifetime=8)
+    except Exception:
+        return []
     ips: list[str] = []
     for rtype in ("A", "AAAA"):
         try:
@@ -320,9 +376,10 @@ def resolve_ips(hostname: str) -> list[str]:
 # ── DNS ───────────────────────────────────────────────────────────────────────
 
 def get_dns_records(domain: str) -> dict:
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = 5
-    resolver.lifetime = 10
+    try:
+        resolver = _build_sync_resolver(timeout=5, lifetime=10)
+    except Exception as exc:
+        return _empty_dns_records(str(exc))
 
     def _resolve(rtype: str) -> tuple[str, object]:
         try:
@@ -356,15 +413,16 @@ def get_dns_records(domain: str) -> dict:
         except dns.exception.DNSException as exc:
             return rtype, {"error": str(exc)}
 
-    rtypes = ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")
+    rtypes = _DNS_RECORD_TYPES
     with ThreadPoolExecutor(max_workers=len(rtypes)) as ex:
         return dict(ex.map(_resolve, rtypes))
 
 
 def get_ptr(ip: str) -> str | None:
     try:
+        resolver = _build_sync_resolver(timeout=5, lifetime=5)
         rev = dns.reversename.from_address(ip)
-        answers = dns.resolver.resolve(rev, "PTR", lifetime=5)
+        answers = resolver.resolve(rev, "PTR", lifetime=5)
         return str(answers[0]).rstrip(".")
     except Exception:
         return None
@@ -1668,9 +1726,10 @@ _HTTPX_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
 
 async def _aget_dns_records(domain: str) -> dict:
     """True-async DNS resolution using dns.asyncresolver (no threads)."""
-    resolver = dns.asyncresolver.Resolver()
-    resolver.timeout = 5
-    resolver.lifetime = 10
+    try:
+        resolver = _build_async_resolver(timeout=5, lifetime=10)
+    except Exception as exc:
+        return _empty_dns_records(str(exc))
 
     async def _resolve(rtype: str):
         try:
@@ -1690,7 +1749,7 @@ async def _aget_dns_records(domain: str) -> dict:
         except dns.exception.DNSException as exc:
             return rtype, {"error": str(exc)}
 
-    pairs = await asyncio.gather(*[_resolve(rt) for rt in ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")])
+    pairs = await asyncio.gather(*[_resolve(rt) for rt in _DNS_RECORD_TYPES])
     return dict(pairs)
 
 
