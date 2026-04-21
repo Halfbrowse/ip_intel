@@ -47,6 +47,11 @@ const CONNECTION_SECTIONS = [
     infoBody: "If two domains share the same analytics or ad code, there is a decent chance they are run by the same team, contractor, or toolkit."
   },
   {
+    key: "identifiers",
+    title: "Attributed identifiers",
+    infoBody: "These cards show the higher-level identity, policy, legal, content, and social signals extracted into the identifiers table."
+  },
+  {
     key: "tls_certs",
     title: "Shared certificates",
     infoBody: "These cards show exact HTTPS certificates that multiple domains reused. Current certificate reuse is one of the stronger technical links in the app."
@@ -85,6 +90,16 @@ const CONNECTION_SECTIONS = [
     key: "nameservers",
     title: "Nameservers",
     infoBody: "Nameservers are where the domain’s DNS is hosted. Shared nameservers can be useful background context, but they are not always a strong ownership signal."
+  },
+  {
+    key: "discovered_domains",
+    title: "Discovered domains",
+    infoBody: "These are domain pivots that earlier stored runs already surfaced and which also overlap with other stored targets."
+  },
+  {
+    key: "discovered_ips",
+    title: "Discovered IPs",
+    infoBody: "These are IP pivots that earlier stored runs already surfaced and which also overlap with other stored targets."
   }
 ];
 
@@ -1248,6 +1263,166 @@ function summarizeWellKnownArtifacts(wellKnown) {
     .map(([, label]) => label);
 }
 
+function normalizeTextList(value) {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  const rawValues = Array.isArray(value) ? value : [value];
+  const seen = new Set();
+  const values = [];
+  rawValues.forEach((entry) => {
+    const text = String(entry || "").trim();
+    if (!text || seen.has(text)) {
+      return;
+    }
+    seen.add(text);
+    values.push(text);
+  });
+  return values;
+}
+
+function flattenScalarValues(value, maxDepth = 4) {
+  if (maxDepth < 0 || value === null || value === undefined) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => flattenScalarValues(entry, maxDepth - 1));
+  }
+  if (typeof value === "object") {
+    return Object.values(value).flatMap((entry) => flattenScalarValues(entry, maxDepth - 1));
+  }
+  const text = String(value).trim();
+  return text ? [text] : [];
+}
+
+function collectValuesForKeyFragments(value, fragments, maxDepth = 4) {
+  if (maxDepth < 0 || value === null || value === undefined) {
+    return [];
+  }
+  const output = [];
+  if (Array.isArray(value)) {
+    value.forEach((entry) => {
+      output.push(...collectValuesForKeyFragments(entry, fragments, maxDepth - 1));
+    });
+    return output;
+  }
+  if (typeof value === "object") {
+    Object.entries(value).forEach(([key, nested]) => {
+      const keyText = String(key || "").toLowerCase();
+      if (fragments.some((fragment) => keyText.includes(fragment))) {
+        output.push(...flattenScalarValues(nested, 2));
+      }
+      output.push(...collectValuesForKeyFragments(nested, fragments, maxDepth - 1));
+    });
+  }
+  return output;
+}
+
+function collectUrlLikeValues(value) {
+  return flattenScalarValues(value).filter((entry) => entry.includes("://") || entry.toLowerCase().startsWith("mailto:"));
+}
+
+function collectMailClientProbeEntries(config) {
+  const entries = [];
+  if (!config || typeof config !== "object") {
+    return entries;
+  }
+
+  Object.entries(config).forEach(([kind, payload]) => {
+    const sourceItems = Array.isArray(payload)
+      ? payload
+      : payload && typeof payload === "object"
+        ? [payload]
+        : payload
+          ? [{ [kind]: payload }]
+          : [];
+
+    sourceItems.forEach((item, index) => {
+      if (!item || typeof item !== "object") {
+        const values = normalizeTextList(item);
+        if (!values.length) {
+          return;
+        }
+        entries.push({
+          kind,
+          label: `${kind} ${index + 1}`,
+          urls: [],
+          domains: kind === "domains" ? values : [],
+          emails: kind === "emails" ? values : [],
+          servers: kind === "servers" ? values : [],
+          statusCode: null,
+          contentType: "",
+          error: ""
+        });
+        return;
+      }
+
+      const parsed = item.parsed && typeof item.parsed === "object" ? item.parsed : {};
+      const domains = Array.from(new Set([
+        ...normalizeTextList(item.domains),
+        ...normalizeTextList(parsed.domains)
+      ]));
+      const emails = Array.from(new Set([
+        ...normalizeTextList(item.emails),
+        ...normalizeTextList(parsed.emails)
+      ]));
+      const servers = Array.from(new Set([
+        ...normalizeTextList(item.servers),
+        ...normalizeTextList(parsed.servers),
+        ...collectValuesForKeyFragments(parsed, ["server", "hostname", "host"])
+      ]));
+      const urls = Array.from(new Set([
+        ...collectUrlLikeValues(item),
+        ...collectUrlLikeValues(parsed)
+      ]));
+
+      entries.push({
+        kind,
+        label: item.label || `${kind} ${index + 1}`,
+        urls,
+        domains,
+        emails,
+        servers,
+        statusCode: item.status_code ?? null,
+        contentType: item.content_type || "",
+        error: item.error || "",
+        parseError: parsed.parse_error || ""
+      });
+    });
+  });
+
+  return entries;
+}
+
+function collectEmailReportUris(email) {
+  const reportUris = email && email.dmarc_report_uris && typeof email.dmarc_report_uris === "object"
+    ? email.dmarc_report_uris
+    : {};
+  return {
+    rua: normalizeTextList(email && email.dmarc_rua).concat(normalizeTextList(reportUris.rua)),
+    ruf: normalizeTextList(email && email.dmarc_ruf).concat(normalizeTextList(reportUris.ruf)),
+    tlsRptRua: normalizeTextList(email && email.tls_rpt_rua)
+  };
+}
+
+function collectEmailPolicyTargets(payload) {
+  const seen = new Set();
+  const items = [];
+  collectUrlLikeValues(payload).forEach((value) => {
+    if (!seen.has(value)) {
+      seen.add(value);
+      items.push(value);
+    }
+  });
+  collectValuesForKeyFragments(payload, ["name", "host", "domain", "location"]).forEach((value) => {
+    if (!seen.has(value)) {
+      seen.add(value);
+      items.push(value);
+    }
+  });
+  return items;
+}
+
 function getDomainTargets(items) {
   const seen = new Set();
   const targets = [];
@@ -1492,6 +1667,9 @@ function getConnectionItemTitle(sectionKey, item) {
   if (sectionKey === "tracking_ids") {
     return item.id_value ? `${item.id_type}: ${item.id_value}` : "Tracking ID";
   }
+  if (sectionKey === "identifiers") {
+    return item.id_value ? `${humanizeIdentifierType(item.id_type)}: ${item.id_value}` : "Identifier";
+  }
   if (sectionKey === "tls_certs" || sectionKey === "tls_history") {
     return getTlsOverlapTitle(item);
   }
@@ -1516,12 +1694,32 @@ function getConnectionItemTitle(sectionKey, item) {
   if (sectionKey === "nameservers") {
     return item.nameserver || "Nameserver";
   }
+  if (sectionKey === "discovered_domains" || sectionKey === "discovered_ips") {
+    return item.target || "Discovered target";
+  }
   return item.id_value || item.email || item.ip || item.nameserver || item.md5 || item.cn || "Link";
 }
 
 function ConnectionItemDetails({ sectionKey, item, meta }) {
   if (sectionKey === "tracking_ids") {
     return <p><strong>Type:</strong> {item.id_type || "Unknown"}</p>;
+  }
+
+  if (sectionKey === "identifiers") {
+    return (
+      <>
+        <p><strong>Type:</strong> {humanizeIdentifierType(item.id_type)}</p>
+        <p><strong>Tier:</strong> {item.tier_label || titleCaseLabel(String(item.tier || "").replace(/_/g, " "))}</p>
+        <p><strong>Category:</strong> {titleCaseLabel(String(item.category || "generic").replace(/_/g, " "))}</p>
+        {item.sources && item.sources.length ? (
+          <p className="break-word"><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
+        ) : null}
+        {item.domain_frequency ? (
+          <p><strong>Stored domains:</strong> {formatNumber(item.domain_frequency)}</p>
+        ) : null}
+        {item.score ? <p><strong>Score:</strong> {formatNumber(item.score)}</p> : null}
+      </>
+    );
   }
 
   if (sectionKey === "ips") {
@@ -1604,6 +1802,21 @@ function ConnectionItemDetails({ sectionKey, item, meta }) {
             <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
           </details>
         ) : null}
+      </>
+    );
+  }
+
+  if (sectionKey === "discovered_domains" || sectionKey === "discovered_ips") {
+    return (
+      <>
+        <p><strong>Pivot type:</strong> {String(item.target_type || "").toUpperCase() || "Unknown"}</p>
+        {item.relations && item.relations.length ? (
+          <p><strong>Why it surfaced:</strong> {formatRelationList(item.relations, 4)}</p>
+        ) : null}
+        {item.sources && item.sources.length ? (
+          <p className="break-word"><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
+        ) : null}
+        {item.score ? <p><strong>Score:</strong> {formatNumber(item.score)}</p> : null}
       </>
     );
   }
@@ -2482,8 +2695,44 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
   const dns = result.dns || {};
   const page = result.page_metadata || {};
   const email = result.email_security || {};
+  const wellKnown = result.well_known || {};
   const currentCerts = result.non_cf_tls_certs || (result.tls_cert ? [result.tls_cert] : []);
   const trackingIds = collectTrackingSignals(page);
+  const dnsTxtTokens = result.dns_txt_tokens || [];
+  const nonCfIps = normalizeTextList(result.non_cf_ips || []);
+  const spfOrigins = result.spf_origins || [];
+  const mailClientEntries = collectMailClientProbeEntries(result.mail_client_config || result.mail_config || {});
+  const legalPages = (result.legal_pages || []).filter((entry) => entry && typeof entry === "object");
+  const sshHostKeys = (result.ssh_host_keys || []).filter((entry) => entry && typeof entry === "object");
+  const emailReportUris = collectEmailReportUris(email);
+  const bimiTargets = collectEmailPolicyTargets(email.bimi);
+  const mtaStsTargets = collectEmailPolicyTargets(email.mta_sts);
+  const tlsRptTargets = collectEmailPolicyTargets(email.tls_rpt);
+  const securityTxtContacts = Array.from(new Set([
+    ...normalizeTextList((wellKnown.security_txt || {}).contacts),
+    ...normalizeTextList((wellKnown.security_txt || {}).emails)
+  ]));
+  const securityTxtUrls = Array.from(new Set([
+    ...normalizeTextList((wellKnown.security_txt || {}).urls),
+    ...normalizeTextList((wellKnown.security_txt || {}).policy),
+    ...normalizeTextList((wellKnown.security_txt || {}).canonical)
+  ]));
+  const appleApps = Array.from(new Set([
+    ...normalizeTextList((wellKnown.apple_app_site_association || {}).app_ids),
+    ...normalizeTextList((wellKnown.apple_app_site_association || {}).webcredentials_apps),
+    ...normalizeTextList((wellKnown.apple_app_site_association || {}).activitycontinuation_apps)
+  ]));
+  const assetlinksPackages = Array.from(new Set(collectValuesForKeyFragments(wellKnown.assetlinks, ["package"])));
+  const assetlinksFingerprints = Array.from(new Set(collectValuesForKeyFragments(wellKnown.assetlinks, ["sha256", "fingerprint"])));
+  const openIdEndpoints = Array.from(new Set([
+    ...normalizeTextList((wellKnown.openid_configuration || {}).issuer),
+    ...normalizeTextList((wellKnown.openid_configuration || {}).authorization_endpoint),
+    ...normalizeTextList((wellKnown.openid_configuration || {}).token_endpoint),
+    ...normalizeTextList((wellKnown.openid_configuration || {}).userinfo_endpoint),
+    ...normalizeTextList((wellKnown.openid_configuration || {}).jwks_uri),
+    ...normalizeTextList((wellKnown.openid_configuration || {}).registration_endpoint)
+  ]));
+  const wellKnownArtifacts = summarizeWellKnownArtifacts(wellKnown);
   const historicalIps = ((result.historical_dns || {}).records || []).filter((item) => ["A", "AAAA"].includes(item.rrtype));
   const interestingTxt = collectInterestingTxt(dns.TXT || []);
   const relatedSummary = getRelatedTargetsSummary(result);
@@ -2491,6 +2740,22 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
   const pivots = getPivotCandidates(result);
   const exposure = buildExposureSummary(result);
   const currentIps = getCurrentIps(result);
+  const hasExtendedPageContext = Boolean(
+    (page.social_handles && Object.keys(page.social_handles).length)
+    || (page.social_links && Object.keys(page.social_links).length)
+    || page.html_lang
+    || page.cms_generator
+    || page.favicon_md5
+    || page.favicon_mmh3
+    || page.final_url
+    || page.homepage_html_hash
+    || (page.authors && page.authors.length)
+    || normalizeTextList(page.twitter_site).length
+    || normalizeTextList(page.twitter_creator).length
+    || normalizeTextList(page.rel_me).length
+    || (page.script_assets && page.script_assets.length)
+    || (page.source_map_leaks && page.source_map_leaks.length)
+  );
   const hasPageContext = Boolean(
     (page.social_handles && Object.keys(page.social_handles).length)
     || (page.social_links && Object.keys(page.social_links).length)
@@ -2498,14 +2763,46 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
     || page.cms_generator
     || page.favicon_md5
   );
-  const hasEmailContext = Boolean(email.dmarc || (email.dkim && Object.keys(email.dkim).length));
+  const hasEmailContext = Boolean(
+    email.dmarc
+    || email.dmarc_name
+    || (email.dkim && Object.keys(email.dkim).length)
+    || (email.spf_includes && email.spf_includes.length)
+    || emailReportUris.rua.length
+    || emailReportUris.ruf.length
+    || emailReportUris.tlsRptRua.length
+    || bimiTargets.length
+    || mtaStsTargets.length
+    || tlsRptTargets.length
+  );
+  const hasWellKnownContext = Boolean(
+    wellKnownArtifacts.length
+    || appleApps.length
+    || assetlinksPackages.length
+    || assetlinksFingerprints.length
+    || securityTxtContacts.length
+    || securityTxtUrls.length
+    || openIdEndpoints.length
+    || normalizeTextList((wellKnown.mta_sts_file || {}).mx).length
+    || Object.keys((wellKnown.humans_txt || {}).sections || {}).length
+    || (wellKnown.ads_txt && typeof wellKnown.ads_txt === "object" && Object.keys(wellKnown.ads_txt).length)
+  );
+  const microsoftTenant = result.microsoft_tenant || {};
   const hasSupportingContext = Boolean(
     currentCerts.length
     || trackingIds.length
+    || dnsTxtTokens.length
+    || nonCfIps.length
+    || spfOrigins.length
     || interestingTxt.length
-    || hasPageContext
+    || hasExtendedPageContext
     || historicalIps.length
     || hasEmailContext
+    || hasWellKnownContext
+    || mailClientEntries.length
+    || legalPages.length
+    || sshHostKeys.length
+    || Object.values(microsoftTenant).some(Boolean)
   );
 
   return (
@@ -2636,6 +2933,18 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
               </SectionCard>
             ) : null}
 
+            {dnsTxtTokens.length ? (
+              <SectionCard title="DNS verification tokens" subtitle="TXT-based ownership tokens and platform verification codes.">
+                <div className="card-grid">
+                  {dnsTxtTokens.map((item, index) => (
+                    <LeadCard key={`${item.provider || "token"}-${item.token || item.value || index}`} title={String(item.provider || "Verification token").replace(/_/g, " ")}>
+                      <p className="break-word">{item.token || item.value || "Unknown token"}</p>
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
+
             {interestingTxt.length ? (
               <SectionCard title="Interesting TXT records" subtitle="Ownership and platform tokens translated into normal English.">
                 <div className="card-grid">
@@ -2648,7 +2957,7 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
               </SectionCard>
             ) : null}
 
-            {hasPageContext ? (
+            {hasExtendedPageContext ? (
               <SectionCard title="Social accounts and content signals" subtitle="Useful for operator mapping and template clues.">
                 <div className="card-grid">
                   {Object.entries(page.social_handles || {}).map(([platform, handles]) => (
@@ -2676,6 +2985,68 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
                       <p className="break-word">{page.favicon_md5}</p>
                     </LeadCard>
                   ) : null}
+                  {page.favicon_mmh3 ? (
+                    <LeadCard title="Favicon MMH3">
+                      <p className="break-word">{page.favicon_mmh3}</p>
+                    </LeadCard>
+                  ) : null}
+                  {page.final_url ? (
+                    <LeadCard title="Final URL">
+                      <p className="break-word">{page.final_url}</p>
+                    </LeadCard>
+                  ) : null}
+                  {page.homepage_html_hash ? (
+                    <LeadCard title="Homepage HTML hash">
+                      <p className="break-word">{page.homepage_html_hash}</p>
+                    </LeadCard>
+                  ) : null}
+                  {normalizeTextList(page.authors).length ? (
+                    <LeadCard title="Authors">
+                      <p className="break-word">{formatListPreview(normalizeTextList(page.authors), 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {normalizeTextList(page.twitter_site).length ? (
+                    <LeadCard title="Twitter site">
+                      <p className="break-word">{formatListPreview(normalizeTextList(page.twitter_site), 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {normalizeTextList(page.twitter_creator).length ? (
+                    <LeadCard title="Twitter creator">
+                      <p className="break-word">{formatListPreview(normalizeTextList(page.twitter_creator), 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {normalizeTextList(page.rel_me).length ? (
+                    <LeadCard title="rel=me links">
+                      <p className="break-word">{formatListPreview(normalizeTextList(page.rel_me), 3)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {page.script_assets && page.script_assets.length ? (
+                    <LeadCard title="Script assets">
+                      <p>{formatNumber(page.script_assets.length)} loaded script assets captured</p>
+                    </LeadCard>
+                  ) : null}
+                  {page.source_map_leaks && page.source_map_leaks.length ? (
+                    <LeadCard title="Source map leaks">
+                      <p>{formatNumber(page.source_map_leaks.length)} source map leads were recorded</p>
+                    </LeadCard>
+                  ) : null}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {nonCfIps.length || spfOrigins.length ? (
+              <SectionCard title="Direct infrastructure inventory" subtitle="Non-Cloudflare hosts and SPF-origin clues collected around the seed.">
+                <div className="card-grid">
+                  {nonCfIps.length ? (
+                    <LeadCard title="Non-Cloudflare IPs">
+                      <p className="break-word">{formatListPreview(nonCfIps, 8)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {spfOrigins.map((entry, index) => (
+                    <LeadCard key={`${entry.ip || "spf"}-${index}`} title={entry.ip || "SPF origin"}>
+                      <p><strong>CIDR:</strong> {entry.cidr || "Unknown"}</p>
+                    </LeadCard>
+                  ))}
                 </div>
               </SectionCard>
             ) : null}
@@ -2711,11 +3082,200 @@ function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, bus
                       <p>No DMARC record was found, which makes spoofing easier.</p>
                     </LeadCard>
                   )}
+                  {email.dmarc_name ? (
+                    <LeadCard title="DMARC hostname">
+                      <p className="break-word">{email.dmarc_name}</p>
+                    </LeadCard>
+                  ) : null}
                   {Object.entries(email.dkim || {}).map(([selector, value]) => (
                     <LeadCard key={selector} title={`DKIM: ${selector}`}>
                       <p className="break-word">{value}</p>
                     </LeadCard>
                   ))}
+                  {(email.spf_includes || []).length ? (
+                    <LeadCard title="SPF includes">
+                      <p className="break-word">{formatListPreview(email.spf_includes, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {emailReportUris.rua.length ? (
+                    <LeadCard title="DMARC RUA">
+                      <p className="break-word">{formatListPreview(emailReportUris.rua, 3)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {emailReportUris.ruf.length ? (
+                    <LeadCard title="DMARC RUF">
+                      <p className="break-word">{formatListPreview(emailReportUris.ruf, 3)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {emailReportUris.tlsRptRua.length ? (
+                    <LeadCard title="TLS-RPT RUA">
+                      <p className="break-word">{formatListPreview(emailReportUris.tlsRptRua, 3)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {bimiTargets.length ? (
+                    <LeadCard title="BIMI">
+                      <p className="break-word">{formatListPreview(bimiTargets, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {mtaStsTargets.length ? (
+                    <LeadCard title="MTA-STS">
+                      <p className="break-word">{formatListPreview(mtaStsTargets, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {tlsRptTargets.length ? (
+                    <LeadCard title="TLS-RPT">
+                      <p className="break-word">{formatListPreview(tlsRptTargets, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {mailClientEntries.length ? (
+              <SectionCard title="Mail client discovery" subtitle="Autodiscover and autoconfig endpoints plus any parsed mail settings.">
+                <div className="card-grid">
+                  {mailClientEntries.map((entry, index) => (
+                    <LeadCard key={`${entry.kind}-${entry.label}-${index}`} title={`${entry.kind}: ${entry.label}`}>
+                      {entry.urls.length ? <p className="break-word"><strong>URL:</strong> {formatListPreview(entry.urls, 2)}</p> : null}
+                      {entry.statusCode !== null ? <p><strong>Status:</strong> {entry.statusCode}</p> : null}
+                      {entry.contentType ? <p className="break-word"><strong>Content type:</strong> {entry.contentType}</p> : null}
+                      {entry.domains.length ? <p className="break-word"><strong>Domains:</strong> {formatListPreview(entry.domains, 4)}</p> : null}
+                      {entry.emails.length ? <p className="break-word"><strong>Emails:</strong> {formatListPreview(entry.emails, 4)}</p> : null}
+                      {entry.servers.length ? <p className="break-word"><strong>Servers:</strong> {formatListPreview(entry.servers, 4)}</p> : null}
+                      {entry.parseError ? <p className="break-word"><strong>Parse error:</strong> {entry.parseError}</p> : null}
+                      {entry.error ? <p className="break-word"><strong>Error:</strong> {entry.error}</p> : null}
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {hasWellKnownContext ? (
+              <SectionCard title="Well-known files and policy artifacts" subtitle="Artifacts collected from standard paths such as security.txt, assetlinks, and OpenID configuration.">
+                <div className="card-grid">
+                  {wellKnownArtifacts.length ? (
+                    <LeadCard title="Artifacts present">
+                      <p className="break-word">{formatListPreview(wellKnownArtifacts, 6)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {securityTxtContacts.length ? (
+                    <LeadCard title="security.txt contacts">
+                      <p className="break-word">{formatListPreview(securityTxtContacts, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {securityTxtUrls.length ? (
+                    <LeadCard title="security.txt URLs">
+                      <p className="break-word">{formatListPreview(securityTxtUrls, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {appleApps.length ? (
+                    <LeadCard title="Apple app IDs">
+                      <p className="break-word">{formatListPreview(appleApps, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {assetlinksPackages.length ? (
+                    <LeadCard title="Android packages">
+                      <p className="break-word">{formatListPreview(assetlinksPackages, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {assetlinksFingerprints.length ? (
+                    <LeadCard title="Android certificates">
+                      <p className="break-word">{formatListPreview(assetlinksFingerprints, 3)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {openIdEndpoints.length ? (
+                    <LeadCard title="OpenID endpoints">
+                      <p className="break-word">{formatListPreview(openIdEndpoints, 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {normalizeTextList((wellKnown.mta_sts_file || {}).mx).length ? (
+                    <LeadCard title="MTA-STS MX">
+                      <p className="break-word">{formatListPreview(normalizeTextList((wellKnown.mta_sts_file || {}).mx), 4)}</p>
+                    </LeadCard>
+                  ) : null}
+                  {Object.keys((wellKnown.humans_txt || {}).sections || {}).length ? (
+                    <LeadCard title="humans.txt">
+                      <p>{formatNumber(Object.keys((wellKnown.humans_txt || {}).sections || {}).length)} sections captured</p>
+                    </LeadCard>
+                  ) : null}
+                  {(wellKnown.ads_txt || {}).normalized_text_hash ? (
+                    <LeadCard title="ads.txt hash">
+                      <p className="break-word">{wellKnown.ads_txt.normalized_text_hash}</p>
+                    </LeadCard>
+                  ) : null}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {legalPages.length ? (
+              <SectionCard title="Legal pages" subtitle="Contact, entity, and registration details extracted from legal or imprint-style pages.">
+                <div className="card-grid">
+                  {legalPages.map((pageEntry, index) => (
+                    <LeadCard key={`${pageEntry.url || "legal"}-${index}`} title={pageEntry.url || `Legal page ${index + 1}`}>
+                      {pageEntry.entities && pageEntry.entities.length ? (
+                        <p className="break-word"><strong>Entities:</strong> {formatListPreview(pageEntry.entities, 3)}</p>
+                      ) : null}
+                      {pageEntry.emails && pageEntry.emails.length ? (
+                        <p className="break-word"><strong>Emails:</strong> {formatListPreview(pageEntry.emails, 3)}</p>
+                      ) : null}
+                      {pageEntry.phone_numbers && pageEntry.phone_numbers.length ? (
+                        <p className="break-word"><strong>Phone numbers:</strong> {formatListPreview(pageEntry.phone_numbers, 3)}</p>
+                      ) : null}
+                      {pageEntry.registration_numbers && pageEntry.registration_numbers.length ? (
+                        <p className="break-word"><strong>Registration:</strong> {formatListPreview(pageEntry.registration_numbers, 3)}</p>
+                      ) : null}
+                      {pageEntry.text_hash ? (
+                        <p className="break-word"><strong>Text hash:</strong> {pageEntry.text_hash}</p>
+                      ) : null}
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {sshHostKeys.length ? (
+              <SectionCard title="SSH host keys" subtitle="Keys collected from directly reachable hosts discovered during the run.">
+                <div className="card-grid">
+                  {sshHostKeys.map((entry, index) => (
+                    <LeadCard key={`${entry.host || entry.ip || "ssh"}-${index}`} title={entry.host || entry.ip || "SSH host"}>
+                      <p><strong>IP:</strong> {entry.ip || "Unknown"}</p>
+                      <p><strong>Key type:</strong> {entry.key_type || "Unknown"}</p>
+                      <p><strong>Bits:</strong> {entry.bits || "Unknown"}</p>
+                      <p className="break-word"><strong>SHA256:</strong> {entry.fingerprint_sha256 || entry.sha256 || "Unknown"}</p>
+                    </LeadCard>
+                  ))}
+                </div>
+              </SectionCard>
+            ) : null}
+
+            {Object.values(microsoftTenant).some(Boolean) ? (
+              <SectionCard title="Microsoft tenant" subtitle="Tenant and endpoint details discovered from Microsoft identity metadata.">
+                <div className="card-grid">
+                  {microsoftTenant.tenant_guid ? (
+                    <LeadCard title="Tenant GUID">
+                      <p className="break-word">{microsoftTenant.tenant_guid}</p>
+                    </LeadCard>
+                  ) : null}
+                  {microsoftTenant.issuer ? (
+                    <LeadCard title="Issuer">
+                      <p className="break-word">{microsoftTenant.issuer}</p>
+                    </LeadCard>
+                  ) : null}
+                  {microsoftTenant.token_endpoint ? (
+                    <LeadCard title="Token endpoint">
+                      <p className="break-word">{microsoftTenant.token_endpoint}</p>
+                    </LeadCard>
+                  ) : null}
+                  {microsoftTenant.source_url ? (
+                    <LeadCard title="Source URL">
+                      <p className="break-word">{microsoftTenant.source_url}</p>
+                    </LeadCard>
+                  ) : null}
+                  {microsoftTenant.error ? (
+                    <LeadCard title="Lookup status">
+                      <p>{microsoftTenant.error}</p>
+                    </LeadCard>
+                  ) : null}
                 </div>
               </SectionCard>
             ) : null}
@@ -2730,7 +3290,11 @@ function DnsTab({ result }) {
   const dns = result.dns || {};
   const whois = result.whois || {};
   const zoneTransfer = result.zone_transfer || [];
-  const dnsTypes = ["A", "AAAA", "CNAME", "NS", "MX", "TXT", "SOA"];
+  const dnsTxtTokens = result.dns_txt_tokens || [];
+  const spfOrigins = result.spf_origins || [];
+  const historicalRecords = ((result.historical_dns || {}).records || []);
+  const nameserverAnalysis = result.nameserver_analysis || {};
+  const dnsTypes = ["A", "AAAA", "CAA", "CNAME", "NS", "MX", "TXT", "SOA"];
 
   return (
     <div className="stack">
@@ -2754,9 +3318,19 @@ function DnsTab({ result }) {
       </SectionCard>
 
       {zoneTransfer.length ? (
-        <Callout tone="warning">
-          A zone transfer succeeded and exposed {zoneTransfer.length} additional records. That is a serious DNS configuration leak.
-        </Callout>
+        <SectionCard
+          title="Zone transfer records"
+          subtitle="Records exposed because a DNS server allowed an AXFR response."
+        >
+          <Callout tone="warning">
+            A zone transfer succeeded and exposed {zoneTransfer.length} additional records. That is a serious DNS configuration leak.
+          </Callout>
+          <div className="tag-grid">
+            {zoneTransfer.map((item) => (
+              <span className="tag" key={item}>{item}</span>
+            ))}
+          </div>
+        </SectionCard>
       ) : null}
 
       <SectionCard
@@ -2789,6 +3363,78 @@ function DnsTab({ result }) {
           })}
         </div>
       </SectionCard>
+
+      {dns.CAA_parsed && dns.CAA_parsed.length ? (
+        <SectionCard title="CAA issuers" subtitle="Certificate authorities explicitly allowed to issue for this domain.">
+          <div className="card-grid">
+            {dns.CAA_parsed.map((item, index) => (
+              <LeadCard key={`${item.value || item.ca || index}`} title={item.value || item.ca || "CAA"}>
+                {item.tag ? <p><strong>Tag:</strong> {item.tag}</p> : null}
+                {item.flags !== undefined ? <p><strong>Flags:</strong> {item.flags}</p> : null}
+              </LeadCard>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {dnsTxtTokens.length ? (
+        <SectionCard title="DNS TXT verification tokens" subtitle="Platform verification tokens lifted out of TXT records.">
+          <div className="card-grid">
+            {dnsTxtTokens.map((item, index) => (
+              <LeadCard key={`${item.provider || "token"}-${item.token || item.value || index}`} title={String(item.provider || "Verification token").replace(/_/g, " ")}>
+                <p className="break-word">{item.token || item.value || "Unknown token"}</p>
+              </LeadCard>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {spfOrigins.length ? (
+        <SectionCard title="SPF-origin IPs" subtitle="IPs and ranges explicitly trusted to send mail for the domain.">
+          <div className="card-grid">
+            {spfOrigins.map((entry, index) => (
+              <LeadCard key={`${entry.ip || "spf"}-${index}`} title={entry.ip || "SPF origin"}>
+                <p><strong>CIDR:</strong> {entry.cidr || "Unknown"}</p>
+              </LeadCard>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {(nameserverAnalysis.boring && nameserverAnalysis.boring.length) || (nameserverAnalysis.vanity_candidates && nameserverAnalysis.vanity_candidates.length) ? (
+        <SectionCard title="Nameserver analysis" subtitle="A quick split between commodity DNS and potential vanity infrastructure.">
+          <div className="card-grid">
+            {nameserverAnalysis.boring && nameserverAnalysis.boring.length ? (
+              <LeadCard title="Commodity nameservers">
+                <p className="break-word">
+                  {formatListPreview(nameserverAnalysis.boring.map((entry) => `${entry.nameserver}${entry.apex ? ` (${entry.apex})` : ""}`), 6)}
+                </p>
+              </LeadCard>
+            ) : null}
+            {nameserverAnalysis.vanity_candidates && nameserverAnalysis.vanity_candidates.length ? (
+              <LeadCard title="Vanity candidates">
+                <p className="break-word">{formatListPreview(nameserverAnalysis.vanity_candidates, 6)}</p>
+              </LeadCard>
+            ) : null}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {historicalRecords.length ? (
+        <SectionCard title="Historical DNS records" subtitle="Observed historical DNS records, not just the old A and AAAA answers.">
+          <div className="card-grid">
+            {historicalRecords.map((item, index) => (
+              <LeadCard
+                key={`${item.rrtype || "record"}-${item.rdata || index}-${item.last_seen || ""}`}
+                title={item.rdata || "Historical record"}
+                footer={`First seen ${item.first_seen || "unknown"} | Last seen ${item.last_seen || "unknown"}`}
+              >
+                <p><strong>Type:</strong> {item.rrtype || "Unknown"}</p>
+              </LeadCard>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
     </div>
   );
 }

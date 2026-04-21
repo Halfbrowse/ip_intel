@@ -1423,7 +1423,10 @@ def _normalize_identifier_url(value: Any) -> str | None:
         return email
 
     candidate = text if "://" in text else f"https://{text.lstrip('/')}"
-    parts = urlsplit(candidate)
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return None
     host = (parts.hostname or "").strip().lower()
     if not host:
         return None
@@ -1446,7 +1449,10 @@ def _normalize_identifier_host(value: Any, *, allow_generic: bool = False) -> st
         return target
 
     if "://" in text:
-        host = urlsplit(text).hostname
+        try:
+            host = urlsplit(text).hostname
+        except ValueError:
+            host = None
         if host:
             target, _ = _normalize_candidate_target(host)
             if target:
@@ -1475,7 +1481,12 @@ def _normalize_identifier_value(id_type: str, value: Any) -> str | None:
     if id_type in _IDENTIFIER_EMAIL_TYPES:
         return _normalize_identifier_email(value)
     if id_type in _IDENTIFIER_URL_TYPES:
-        return _normalize_identifier_url(value)
+        normalized_url = _normalize_identifier_url(value)
+        if normalized_url:
+            return normalized_url
+        if id_type in {"bimi", "mta_sts", "tls_rpt"}:
+            return _normalize_identifier_host(value)
+        return None
     if id_type in _IDENTIFIER_HOST_TYPES:
         return _normalize_identifier_host(value, allow_generic=id_type == "nameserver_vanity")
     if id_type in _IDENTIFIER_HANDLE_TYPES:
@@ -1537,6 +1548,14 @@ def _collect_url_like_values(value: Any) -> list[str]:
         if "://" in item or item.lower().startswith("mailto:"):
             values.append(item)
     return values
+
+
+def _iter_mapping_entries(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        return [value]
+    if isinstance(value, list | tuple | set):
+        return [item for item in value if isinstance(item, Mapping)]
+    return []
 
 
 def _extract_dns_txt_token_candidates(dns: Mapping[str, Any]) -> list[tuple[str, str]]:
@@ -1938,6 +1957,7 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
     for include in _normalize_text_list(email_security.get("spf_includes") or []):
         add(include, id_type="spf_include", tier="tier_4", category="email", source="email_security.spf_includes")
 
+    dmarc_report_uris = email_security.get("dmarc_report_uris") or {}
     for key, id_type in [
         ("dmarc_rua", "dmarc_rua"),
         ("dmarc_ruf", "dmarc_ruf"),
@@ -1945,14 +1965,28 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
     ]:
         for value in _normalize_text_list(email_security.get(key)):
             add(value, id_type=id_type, tier="tier_3", category="email", source=f"email_security.{key}")
+    for key, id_type in [
+        ("rua", "dmarc_rua"),
+        ("ruf", "dmarc_ruf"),
+    ]:
+        for value in _normalize_text_list((dmarc_report_uris or {}).get(key)):
+            add(value, id_type=id_type, tier="tier_3", category="email", source=f"email_security.dmarc_report_uris.{key}")
 
     for key, id_type in [
         ("tls_rpt", "tls_rpt"),
         ("bimi", "bimi"),
         ("mta_sts", "mta_sts"),
     ]:
-        if email_security.get(key):
-            add(email_security.get(key), id_type=id_type, tier="tier_3", category="policy", source=f"email_security.{key}")
+        field = email_security.get(key)
+        if not field:
+            continue
+        if isinstance(field, Mapping):
+            for value in _collect_url_like_values(field):
+                add(value, id_type=id_type, tier="tier_3", category="policy", source=f"email_security.{key}", raw=field)
+            for value in _collect_values_for_key_substrings(field, ("name", "url", "location", "host", "domain")):
+                add(value, id_type=id_type, tier="tier_3", category="policy", source=f"email_security.{key}", raw=field)
+        else:
+            add(field, id_type=id_type, tier="tier_3", category="policy", source=f"email_security.{key}", raw=field)
 
     microsoft_tenant = result.get("microsoft_tenant") or {}
     add(
@@ -1976,13 +2010,26 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
 
     mail_client_config = result.get("mail_client_config") or result.get("mail_config") or {}
     for key, payload in (mail_client_config.items() if isinstance(mail_client_config, Mapping) else []):
-        add((payload or {}).get("url"), id_type="mail_client_url", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
-        for domain in _normalize_text_list((payload or {}).get("domains") or []):
-            add(domain, id_type="mail_client_domain", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
-        for email in _normalize_text_list((payload or {}).get("emails") or []):
-            add(email, id_type="mail_client_email", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
-        for server in _normalize_text_list((payload or {}).get("servers") or []):
-            add(server, id_type="mail_client_server", tier="tier_3", category="email", source=f"mail_client_config.{key}", raw=payload)
+        source = f"mail_client_config.{key}"
+        mapping_entries = _iter_mapping_entries(payload)
+        if not mapping_entries:
+            mapping_entries = [{key: payload}]
+
+        for entry in mapping_entries:
+            for value in _collect_url_like_values(entry):
+                add(value, id_type="mail_client_url", tier="tier_3", category="email", source=source, raw=entry)
+            for domain in _normalize_text_list(entry.get("domains") or []):
+                add(domain, id_type="mail_client_domain", tier="tier_3", category="email", source=source, raw=entry)
+            for domain in _collect_values_for_key_substrings(entry.get("parsed"), ("domain",)):
+                add(domain, id_type="mail_client_domain", tier="tier_3", category="email", source=source, raw=entry)
+            for email in _normalize_text_list(entry.get("emails") or []):
+                add(email, id_type="mail_client_email", tier="tier_3", category="email", source=source, raw=entry)
+            for email in _collect_values_for_key_substrings(entry.get("parsed"), ("email",)):
+                add(email, id_type="mail_client_email", tier="tier_3", category="email", source=source, raw=entry)
+            for server in _normalize_text_list(entry.get("servers") or []):
+                add(server, id_type="mail_client_server", tier="tier_3", category="email", source=source, raw=entry)
+            for server in _collect_values_for_key_substrings(entry.get("parsed"), ("server", "hostname", "host")):
+                add(server, id_type="mail_client_server", tier="tier_3", category="email", source=source, raw=entry)
 
     well_known = result.get("well_known") or {}
     apple = well_known.get("apple_app_site_association") or {}
