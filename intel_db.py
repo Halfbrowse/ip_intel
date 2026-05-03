@@ -28,9 +28,6 @@ if not DB_PATH.is_absolute():
 else:
     DB_PATH = DB_PATH.resolve()
 
-_RELATED_TARGET_BACKFILL_COMPLETE = False
-_IDENTIFIER_BACKFILL_COMPLETE = False
-
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
@@ -311,6 +308,15 @@ CREATE INDEX IF NOT EXISTS idx_discovered_search_id      ON discovered_targets(s
 CREATE INDEX IF NOT EXISTS idx_discovered_target         ON discovered_targets(target);
 CREATE INDEX IF NOT EXISTS idx_discovered_target_type    ON discovered_targets(target_type);
 CREATE INDEX IF NOT EXISTS idx_discovered_target_source  ON discovered_targets(target, source);
+
+CREATE TABLE IF NOT EXISTS search_fields (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    key         TEXT    NOT NULL,
+    json_value  TEXT    NOT NULL,
+    UNIQUE(search_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_sf_search_id ON search_fields(search_id);
 
 """
 
@@ -625,6 +631,8 @@ def _migrate_schema(c: sqlite3.Connection) -> None:
     _add_column_if_missing(c, "scan_hits", "spki_sha256", "TEXT")
     _add_column_if_missing(c, "scan_hits", "observed_at", "TEXT")
 
+    _add_column_if_missing(c, "searches", "source_errors", "TEXT")
+
     identifier_columns = _table_columns(c, "identifiers")
     required_identifier_columns = {
         "id",
@@ -646,9 +654,8 @@ def _migrate_schema(c: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
-    global _RELATED_TARGET_BACKFILL_COMPLETE, _IDENTIFIER_BACKFILL_COMPLETE
-
     with _conn() as c:
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         schema_statements = [stmt.strip() for stmt in _SCHEMA.strip().split(";") if stmt.strip()]
         table_statements = [stmt for stmt in schema_statements if not stmt.upper().startswith("CREATE INDEX")]
         index_statements = [stmt for stmt in schema_statements if stmt.upper().startswith("CREATE INDEX")]
@@ -659,12 +666,6 @@ def init_db() -> None:
         _migrate_schema(c)
         for stmt in index_statements:
             c.execute(stmt)
-        if not _IDENTIFIER_BACKFILL_COMPLETE:
-            _backfill_identifier_metadata(c)
-            _IDENTIFIER_BACKFILL_COMPLETE = True
-        if not _RELATED_TARGET_BACKFILL_COMPLETE:
-            _backfill_related_target_metadata(c)
-            _RELATED_TARGET_BACKFILL_COMPLETE = True
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1147,66 +1148,6 @@ def summarize_hard_connections(
         "ips": sum(1 for item in all_items if item.get("target_type") == "ip"),
     }
 
-
-def _backfill_related_target_metadata(c: sqlite3.Connection) -> None:
-    rows = c.execute(
-        """
-        SELECT
-            s.id,
-            s.raw_json,
-            s.timestamp,
-            EXISTS(
-                SELECT 1
-                FROM discovered_targets d
-                WHERE d.search_id = s.id
-            ) AS has_discovered_targets
-        FROM searches s
-        WHERE json_extract(s.raw_json, '$.related_targets_summary.total') IS NULL
-        ORDER BY s.id ASC
-        """
-    ).fetchall()
-
-    for row in rows:
-        raw_json = row["raw_json"]
-        if not raw_json:
-            continue
-
-        try:
-            payload = json.loads(raw_json)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-
-        summary = summarize_related_targets(payload)
-        stored_payload = dict(payload)
-        stored_payload["search_id"] = int(row["id"])
-        stored_payload["related_targets_summary"] = summary
-        c.execute(
-            "UPDATE searches SET raw_json = ? WHERE id = ?",
-            (json.dumps(stored_payload, default=str), int(row["id"])),
-        )
-
-        if row["has_discovered_targets"]:
-            continue
-
-        observed_at = str(payload.get("timestamp") or row["timestamp"] or datetime.now(timezone.utc).isoformat())
-        for item in extract_related_targets(payload):
-            c.execute(
-                """INSERT INTO discovered_targets
-                   (search_id, target, target_type, relation, source, score, observed_at, raw_json)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    int(row["id"]),
-                    item["target"],
-                    item["target_type"],
-                    item["relation"],
-                    item["source"],
-                    int(item.get("score") or 0),
-                    observed_at,
-                    _json(item.get("raw_json")),
-                ),
-            )
 
 
 def _dedup_targets(targets_str: str) -> list[str]:
@@ -2186,343 +2127,330 @@ def _refresh_search_identifiers(c: sqlite3.Connection, search_id: int, payload: 
         )
 
 
-def _backfill_identifier_metadata(c: sqlite3.Connection) -> None:
-    c.execute("DELETE FROM identifiers")
-    rows = c.execute(
-        """
-        SELECT s.id, s.raw_json
-        FROM searches s
-        ORDER BY s.id ASC
-        """
-    ).fetchall()
 
+# ── Incremental persistence helpers ──────────────────────────────────────────
+
+def _load_result_from_fields(c: sqlite3.Connection, search_id: int) -> dict | None:
+    rows = c.execute(
+        "SELECT key, json_value FROM search_fields WHERE search_id = ?", (search_id,)
+    ).fetchall()
+    if not rows:
+        return None
+    result = {}
     for row in rows:
-        raw_json = row["raw_json"]
-        if not raw_json:
-            continue
         try:
-            payload = json.loads(raw_json)
-        except json.JSONDecodeError:
+            result[row["key"]] = json.loads(row["json_value"])
+        except (json.JSONDecodeError, TypeError):
+            result[row["key"]] = row["json_value"]
+    return result
+
+
+def create_search(target: str, typ: str, timestamp: str) -> int:
+    """Insert the searches row upfront and return search_id; fields written later."""
+    init_db()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO searches (target, type, timestamp, raw_json) VALUES (?,?,?,'')",
+            (target, typ, timestamp),
+        )
+        return int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def save_search_fields(search_id: int, fields: dict[str, Any]) -> None:
+    """Upsert a batch of result fields into search_fields."""
+    with _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        for key, value in fields.items():
+            c.execute(
+                "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
+                (search_id, key, json.dumps(value, default=str)),
+            )
+
+
+def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp: str) -> None:
+    """Write all structured child table rows from a result dict."""
+    typ = result.get("type", "unknown")
+    ip_details = result.get("ip_details", {})
+    ip_ports = _extract_ip_port_map(result)
+
+    if typ == "domain":
+        for ip, info in ip_details.items():
+            sources = sorted(set(info.get("sources") or []))
+            asn = info.get("asn_info") or {}
+            info_cf = info.get("cloudflare")
+            cf_value = 1 if info_cf else (0 if info_cf is not None else None)
+            for source in sources:
+                c.execute(
+                    """INSERT INTO ips
+                       (search_id, ip, source, cloudflare, ptr, asn, asn_desc, asn_registry, country,
+                        network_name, network_cidr, proxy_family, proxy_confidence, observed_at, port)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        sid, ip, source, cf_value,
+                        info.get("ptr"),
+                        _normalize_asn(asn.get("asn")),
+                        asn.get("asn_description"),
+                        asn.get("asn_registry"),
+                        asn.get("asn_country") or asn.get("network_country"),
+                        asn.get("network_name"),
+                        asn.get("network_cidr") or asn.get("asn_cidr"),
+                        info.get("proxy_family"),
+                        info.get("proxy_confidence"),
+                        timestamp,
+                        ip_ports.get((ip, source)),
+                    ),
+                )
+    elif typ == "ip":
+        asn = result.get("asn_info", {})
+        c.execute(
+            """INSERT INTO ips
+               (search_id, ip, source, cloudflare, ptr, asn, asn_desc, asn_registry, country,
+                network_name, network_cidr, proxy_family, proxy_confidence, observed_at, port)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                sid, result.get("input", ""), "direct",
+                1 if result.get("cloudflare") else 0,
+                result.get("ptr"),
+                _normalize_asn(asn.get("asn")),
+                asn.get("asn_description"),
+                asn.get("asn_registry"),
+                asn.get("asn_country") or asn.get("network_country"),
+                asn.get("network_name"),
+                asn.get("network_cidr") or asn.get("asn_cidr"),
+                result.get("proxy_family"),
+                result.get("proxy_confidence"),
+                timestamp,
+                443,
+            ),
+        )
+
+    tls_list = result.get("non_cf_tls_certs") or ([result["tls_cert"]] if result.get("tls_cert") else [])
+    for cert in tls_list:
+        if not cert:
             continue
-        if not isinstance(payload, dict):
+        c.execute(
+            """INSERT INTO tls_certs
+               (search_id, ip, port, sni_used, cn, sans, issuer_cn, issuer_org, not_before, not_after, sha256, spki_sha256, observed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                sid,
+                cert.get("ip"), cert.get("port", 443), cert.get("sni_used"),
+                cert.get("cn"), _json(cert.get("sans", [])),
+                cert.get("issuer_cn"), cert.get("issuer_org"),
+                cert.get("not_before"), cert.get("not_after"),
+                cert.get("sha256"), cert.get("spki_sha256"), timestamp,
+            ),
+        )
+
+    origin = result.get("origin_candidates") or {}
+    for scan_key, scan_label in [("scan", "gcp"), ("provider_scan", "asn"), ("country_scan", "country")]:
+        scan_result = origin.get(scan_key) or {}
+        if not isinstance(scan_result, dict) or scan_result.get("skipped"):
             continue
-        _refresh_search_identifiers(c, int(row["id"]), payload)
+        for hit in scan_result.get("hits") or []:
+            if not hit.get("ip"):
+                continue
+            c.execute(
+                """INSERT INTO scan_hits
+                   (search_id, scan_type, ip, port, cn, sans, issuer, not_before, not_after, sha256, spki_sha256, cloudflare, observed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sid, scan_label, hit.get("ip"), hit.get("port", 443),
+                    hit.get("cn"), _json(hit.get("sans", [])),
+                    hit.get("issuer") or hit.get("issuer_cn"),
+                    hit.get("not_before"), hit.get("not_after"),
+                    hit.get("sha256"), hit.get("spki_sha256"),
+                    1 if hit.get("cloudflare") else 0, timestamp,
+                ),
+            )
+
+    for provider in ("censys", "shodan", "netlas"):
+        provider_result = origin.get(provider) or {}
+        if not isinstance(provider_result, dict):
+            continue
+        for hit in provider_result.get("hits") or []:
+            c.execute(
+                """INSERT INTO provider_hits
+                   (search_id, provider, ip, port, protocol, asn, asn_desc, org, country, cloudflare,
+                    services, hostnames, mode, status, query_type, total, observed_at, raw_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sid, provider, hit.get("ip"), hit.get("port"), hit.get("protocol"),
+                    _normalize_asn(hit.get("asn")),
+                    hit.get("asn_name") or hit.get("asn_desc"),
+                    hit.get("org"), hit.get("country"),
+                    1 if hit.get("cloudflare") else 0,
+                    _json(hit.get("services", [])), _json(hit.get("hostnames", [])),
+                    provider_result.get("mode"), provider_result.get("status"),
+                    provider_result.get("query_type"), provider_result.get("total"),
+                    timestamp, _json(hit),
+                ),
+            )
+
+    ct = result.get("cert_transparency", {})
+    for cert in ct.get("certs", []):
+        c.execute(
+            "INSERT INTO ct_certs (search_id, cert_id, issuer, not_before, not_after, sans, observed_at) VALUES (?,?,?,?,?,?,?)",
+            (sid, cert.get("id"), cert.get("issuer"), cert.get("not_before"), cert.get("not_after"), _json(cert.get("sans", [])), timestamp),
+        )
+    for san in ct.get("cross_domain_sans", []):
+        c.execute("INSERT INTO cross_sans (search_id, san) VALUES (?,?)", (sid, san))
+
+    for sub in result.get("subdomains", []):
+        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (?,?,?)", (sid, sub, "crt.sh"))
+    for sub in result.get("zone_transfer", []):
+        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (?,?,?)", (sid, sub, "zone_transfer"))
+
+    dns = result.get("dns", {})
+    for rtype, values in dns.items():
+        if not values:
+            continue
+        if isinstance(values, list):
+            for value in values:
+                c.execute(
+                    "INSERT INTO dns_records (search_id, rtype, value) VALUES (?,?,?)",
+                    (sid, rtype, _json(value) if isinstance(value, dict) else str(value)),
+                )
+        elif isinstance(values, dict):
+            c.execute("INSERT INTO dns_records (search_id, rtype, value) VALUES (?,?,?)", (sid, rtype, _json(values)))
+
+    for rec in result.get("historical_dns", {}).get("records", []):
+        c.execute(
+            "INSERT INTO historical_dns (search_id, rrtype, rdata, first_seen, last_seen) VALUES (?,?,?,?,?)",
+            (sid, rec.get("rrtype"), rec.get("rdata"), rec.get("first_seen"), rec.get("last_seen")),
+        )
+
+    for entry in result.get("spf_origins", []):
+        c.execute("INSERT INTO spf_origins (search_id, ip, cidr) VALUES (?,?,?)", (sid, entry.get("ip"), entry.get("cidr")))
+
+    whois_row = result.get("whois", {})
+    if whois_row and not whois_row.get("error"):
+        emails_raw = whois_row.get("emails") or []
+        if isinstance(emails_raw, str):
+            emails_raw = [emails_raw]
+        ns_raw = _normalize_nameservers(whois_row.get("nameservers") or [])
+        c.execute(
+            """INSERT INTO whois_data
+               (search_id, registrar, creation_date, expiry_date, org, country, emails, nameservers)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                sid,
+                str(whois_row.get("registrar") or ""),
+                str(whois_row.get("creation_date") or "")[:30],
+                str(whois_row.get("expiry_date") or "")[:30],
+                str(whois_row.get("org") or ""),
+                str(whois_row.get("country") or ""),
+                _json(emails_raw), _json(ns_raw),
+            ),
+        )
+        for email in emails_raw:
+            if email and isinstance(email, str):
+                c.execute("INSERT INTO registrant_emails (search_id, email) VALUES (?,?)", (sid, email.lower().strip()))
+        for nameserver in ns_raw:
+            c.execute("INSERT INTO nameservers (search_id, nameserver) VALUES (?,?)", (sid, nameserver))
+
+    meta = result.get("page_metadata", {})
+    for id_type, key in [
+        ("ga", "google_analytics"), ("gtm", "gtm_ids"), ("fb_pixel", "facebook_pixel"),
+        ("tiktok_pixel", "tiktok_pixel"), ("yandex_metrika", "yandex_metrika"), ("adsense", "adsense_publisher_ids"),
+    ]:
+        for value in (meta.get(key) or []):
+            c.execute("INSERT INTO tracking_ids (search_id, id_type, id_value) VALUES (?,?,?)", (sid, id_type, str(value)))
+
+    handles = meta.get("social_handles", {})
+    links = meta.get("social_links", {})
+    for platform in set(handles) | set(links):
+        urls = links.get(platform) or []
+        for handle in (handles.get(platform) or []):
+            c.execute(
+                "INSERT INTO social_accounts (search_id, platform, handle, url) VALUES (?,?,?,?)",
+                (sid, platform, handle, urls[0] if urls else None),
+            )
+
+    favicon_md5 = meta.get("favicon_md5")
+    if favicon_md5:
+        c.execute("INSERT INTO favicons (search_id, md5) VALUES (?,?)", (sid, favicon_md5))
+
+    email_security = result.get("email_security", {})
+    c.execute(
+        "INSERT INTO page_metadata (search_id, html_lang, cms_generator, favicon_md5, dmarc) VALUES (?,?,?,?,?)",
+        (sid, meta.get("html_lang"), meta.get("cms_generator"), favicon_md5, email_security.get("dmarc")),
+    )
+
+    for item in extract_related_targets(result):
+        c.execute(
+            """INSERT INTO discovered_targets
+               (search_id, target, target_type, relation, source, score, observed_at, raw_json)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                sid, item["target"], item["target_type"], item["relation"],
+                item["source"], int(item.get("score") or 0), timestamp, _json(item.get("raw_json")),
+            ),
+        )
+
+    _refresh_search_identifiers(c, sid, result)
+
+
+def finalize_search(search_id: int, result: dict, *, timestamp: str) -> None:
+    """Complete a search: save all fields to search_fields + child tables, update searches row."""
+    cf = result.get("cloudflare_fronted")
+    cf_val = 1 if cf else (0 if cf is not None else None)
+    source_errors = result.get("source_errors")
+    related_summary = summarize_related_targets(result)
+
+    result["search_id"] = search_id
+    result["related_targets_summary"] = related_summary
+
+    with _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            "UPDATE searches SET cloudflare_fronted = ?, source_errors = ? WHERE id = ?",
+            (cf_val, json.dumps(source_errors, default=str) if source_errors else None, search_id),
+        )
+        _save_child_tables(c, search_id, result, timestamp)
+        for key, value in result.items():
+            c.execute(
+                "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
+                (search_id, key, json.dumps(value, default=str)),
+            )
+        c.execute(
+            "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
+            (search_id, "related_targets_summary", json.dumps(related_summary, default=str)),
+        )
+
+
+def get_result(search_id: int) -> dict | None:
+    init_db()
+    with _conn() as c:
+        meta = c.execute(
+            "SELECT target, type, timestamp, cloudflare_fronted FROM searches WHERE id = ?",
+            (search_id,),
+        ).fetchone()
+        if not meta:
+            return None
+        result = _load_result_from_fields(c, search_id)
+    if result is None:
+        return None
+    result.setdefault("input", meta["target"])
+    result.setdefault("type", meta["type"])
+    result.setdefault("timestamp", meta["timestamp"])
+    result["search_id"] = search_id
+    return result
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
 def save_search(result: dict) -> int:
-    """
-    Insert a completed analysis result append-only and persist all observations.
-    """
+    """Insert a completed analysis result; delegates to create_search + finalize_search."""
     init_db()
-
     target = result.get("input", "")
     typ = result.get("type", "unknown")
     timestamp = result.get("timestamp", datetime.now(timezone.utc).isoformat())
-    cf = result.get("cloudflare_fronted")
-    cf_val = 1 if cf else (0 if cf is not None else None)
-    related_summary = summarize_related_targets(result)
-
-    payload = json.dumps(result, default=str)
-
-    with _conn() as c:
-        c.execute("BEGIN IMMEDIATE")
-        c.execute(
-            "INSERT INTO searches (target, type, timestamp, cloudflare_fronted, raw_json) VALUES (?,?,?,?,?)",
-            (target, typ, timestamp, cf_val, payload),
-        )
-        sid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
-
-        ip_details = result.get("ip_details", {})
-        ip_ports = _extract_ip_port_map(result)
-
-        if typ == "domain":
-            for ip, info in ip_details.items():
-                sources = sorted(set(info.get("sources") or []))
-                asn = info.get("asn_info") or {}
-                info_cf = info.get("cloudflare")
-                cf_value = 1 if info_cf else (0 if info_cf is not None else None)
-                for source in sources:
-                    c.execute(
-                        """INSERT INTO ips
-                           (search_id, ip, source, cloudflare, ptr, asn, asn_desc, asn_registry, country,
-                            network_name, network_cidr, proxy_family, proxy_confidence, observed_at, port)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            sid,
-                            ip,
-                            source,
-                            cf_value,
-                            info.get("ptr"),
-                            _normalize_asn(asn.get("asn")),
-                            asn.get("asn_description"),
-                            asn.get("asn_registry"),
-                            asn.get("asn_country") or asn.get("network_country"),
-                            asn.get("network_name"),
-                            asn.get("network_cidr") or asn.get("asn_cidr"),
-                            info.get("proxy_family"),
-                            info.get("proxy_confidence"),
-                            timestamp,
-                            ip_ports.get((ip, source)),
-                        ),
-                    )
-        elif typ == "ip":
-            asn = result.get("asn_info", {})
-            c.execute(
-                """INSERT INTO ips
-                   (search_id, ip, source, cloudflare, ptr, asn, asn_desc, asn_registry, country,
-                    network_name, network_cidr, proxy_family, proxy_confidence, observed_at, port)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    sid,
-                    target,
-                    "direct",
-                    1 if result.get("cloudflare") else 0,
-                    result.get("ptr"),
-                    _normalize_asn(asn.get("asn")),
-                    asn.get("asn_description"),
-                    asn.get("asn_registry"),
-                    asn.get("asn_country") or asn.get("network_country"),
-                    asn.get("network_name"),
-                    asn.get("network_cidr") or asn.get("asn_cidr"),
-                    result.get("proxy_family"),
-                    result.get("proxy_confidence"),
-                    timestamp,
-                    443,
-                ),
-            )
-
-        tls_list = result.get("non_cf_tls_certs") or ([result["tls_cert"]] if result.get("tls_cert") else [])
-        for cert in tls_list:
-            if not cert:
-                continue
-            c.execute(
-                """INSERT INTO tls_certs
-                   (search_id, ip, port, sni_used, cn, sans, issuer_cn, issuer_org, not_before, not_after, sha256, spki_sha256, observed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    sid,
-                    cert.get("ip"),
-                    cert.get("port", 443),
-                    cert.get("sni_used"),
-                    cert.get("cn"),
-                    _json(cert.get("sans", [])),
-                    cert.get("issuer_cn"),
-                    cert.get("issuer_org"),
-                    cert.get("not_before"),
-                    cert.get("not_after"),
-                    cert.get("sha256"),
-                    cert.get("spki_sha256"),
-                    timestamp,
-                ),
-            )
-
-        origin = result.get("origin_candidates") or {}
-        for scan_key, scan_label in [
-            ("scan", "gcp"),
-            ("provider_scan", "asn"),
-            ("country_scan", "country"),
-        ]:
-            scan_result = origin.get(scan_key) or {}
-            if not isinstance(scan_result, dict) or scan_result.get("skipped"):
-                continue
-            for hit in scan_result.get("hits") or []:
-                if not hit.get("ip"):
-                    continue
-                c.execute(
-                    """INSERT INTO scan_hits
-                       (search_id, scan_type, ip, port, cn, sans, issuer, not_before, not_after, sha256, spki_sha256, cloudflare, observed_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        sid,
-                        scan_label,
-                        hit.get("ip"),
-                        hit.get("port", 443),
-                        hit.get("cn"),
-                        _json(hit.get("sans", [])),
-                        hit.get("issuer") or hit.get("issuer_cn"),
-                        hit.get("not_before"),
-                        hit.get("not_after"),
-                        hit.get("sha256"),
-                        hit.get("spki_sha256"),
-                        1 if hit.get("cloudflare") else 0,
-                        timestamp,
-                    ),
-                )
-
-        for provider in ("censys", "shodan", "netlas"):
-            provider_result = origin.get(provider) or {}
-            if not isinstance(provider_result, dict):
-                continue
-            for hit in provider_result.get("hits") or []:
-                c.execute(
-                    """INSERT INTO provider_hits
-                       (search_id, provider, ip, port, protocol, asn, asn_desc, org, country, cloudflare,
-                        services, hostnames, mode, status, query_type, total, observed_at, raw_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        sid,
-                        provider,
-                        hit.get("ip"),
-                        hit.get("port"),
-                        hit.get("protocol"),
-                        _normalize_asn(hit.get("asn")),
-                        hit.get("asn_name") or hit.get("asn_desc"),
-                        hit.get("org"),
-                        hit.get("country"),
-                        1 if hit.get("cloudflare") else 0,
-                        _json(hit.get("services", [])),
-                        _json(hit.get("hostnames", [])),
-                        provider_result.get("mode"),
-                        provider_result.get("status"),
-                        provider_result.get("query_type"),
-                        provider_result.get("total"),
-                        timestamp,
-                        _json(hit),
-                    ),
-                )
-
-        ct = result.get("cert_transparency", {})
-        for cert in ct.get("certs", []):
-            c.execute(
-                "INSERT INTO ct_certs (search_id, cert_id, issuer, not_before, not_after, sans, observed_at) VALUES (?,?,?,?,?,?,?)",
-                (
-                    sid,
-                    cert.get("id"),
-                    cert.get("issuer"),
-                    cert.get("not_before"),
-                    cert.get("not_after"),
-                    _json(cert.get("sans", [])),
-                    timestamp,
-                ),
-            )
-
-        for san in ct.get("cross_domain_sans", []):
-            c.execute("INSERT INTO cross_sans (search_id, san) VALUES (?,?)", (sid, san))
-
-        for sub in result.get("subdomains", []):
-            c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (?,?,?)", (sid, sub, "crt.sh"))
-        for sub in result.get("zone_transfer", []):
-            c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (?,?,?)", (sid, sub, "zone_transfer"))
-
-        dns = result.get("dns", {})
-        for rtype, values in dns.items():
-            if not values:
-                continue
-            if isinstance(values, list):
-                for value in values:
-                    c.execute(
-                        "INSERT INTO dns_records (search_id, rtype, value) VALUES (?,?,?)",
-                        (sid, rtype, _json(value) if isinstance(value, dict) else str(value)),
-                    )
-            elif isinstance(values, dict):
-                c.execute("INSERT INTO dns_records (search_id, rtype, value) VALUES (?,?,?)", (sid, rtype, _json(values)))
-
-        for rec in result.get("historical_dns", {}).get("records", []):
-            c.execute(
-                "INSERT INTO historical_dns (search_id, rrtype, rdata, first_seen, last_seen) VALUES (?,?,?,?,?)",
-                (sid, rec.get("rrtype"), rec.get("rdata"), rec.get("first_seen"), rec.get("last_seen")),
-            )
-
-        for entry in result.get("spf_origins", []):
-            c.execute(
-                "INSERT INTO spf_origins (search_id, ip, cidr) VALUES (?,?,?)",
-                (sid, entry.get("ip"), entry.get("cidr")),
-            )
-
-        whois_row = result.get("whois", {})
-        if whois_row and not whois_row.get("error"):
-            emails_raw = whois_row.get("emails") or []
-            if isinstance(emails_raw, str):
-                emails_raw = [emails_raw]
-            ns_raw = _normalize_nameservers(whois_row.get("nameservers") or [])
-
-            c.execute(
-                """INSERT INTO whois_data
-                   (search_id, registrar, creation_date, expiry_date, org, country, emails, nameservers)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    sid,
-                    str(whois_row.get("registrar") or ""),
-                    str(whois_row.get("creation_date") or "")[:30],
-                    str(whois_row.get("expiry_date") or "")[:30],
-                    str(whois_row.get("org") or ""),
-                    str(whois_row.get("country") or ""),
-                    _json(emails_raw),
-                    _json(ns_raw),
-                ),
-            )
-
-            for email in emails_raw:
-                if email and isinstance(email, str):
-                    c.execute("INSERT INTO registrant_emails (search_id, email) VALUES (?,?)", (sid, email.lower().strip()))
-
-            for nameserver in ns_raw:
-                c.execute("INSERT INTO nameservers (search_id, nameserver) VALUES (?,?)", (sid, nameserver))
-
-        meta = result.get("page_metadata", {})
-        for id_type, key in [
-            ("ga", "google_analytics"),
-            ("gtm", "gtm_ids"),
-            ("fb_pixel", "facebook_pixel"),
-            ("tiktok_pixel", "tiktok_pixel"),
-            ("yandex_metrika", "yandex_metrika"),
-            ("adsense", "adsense_publisher_ids"),
-        ]:
-            for value in (meta.get(key) or []):
-                c.execute("INSERT INTO tracking_ids (search_id, id_type, id_value) VALUES (?,?,?)", (sid, id_type, str(value)))
-
-        handles = meta.get("social_handles", {})
-        links = meta.get("social_links", {})
-        for platform in set(handles) | set(links):
-            urls = links.get(platform) or []
-            for handle in (handles.get(platform) or []):
-                c.execute(
-                    "INSERT INTO social_accounts (search_id, platform, handle, url) VALUES (?,?,?,?)",
-                    (sid, platform, handle, urls[0] if urls else None),
-                )
-
-        favicon_md5 = meta.get("favicon_md5")
-        if favicon_md5:
-            c.execute("INSERT INTO favicons (search_id, md5) VALUES (?,?)", (sid, favicon_md5))
-
-        email_security = result.get("email_security", {})
-        c.execute(
-            "INSERT INTO page_metadata (search_id, html_lang, cms_generator, favicon_md5, dmarc) VALUES (?,?,?,?,?)",
-            (sid, meta.get("html_lang"), meta.get("cms_generator"), favicon_md5, email_security.get("dmarc")),
-        )
-
-        for item in extract_related_targets(result):
-            c.execute(
-                """INSERT INTO discovered_targets
-                   (search_id, target, target_type, relation, source, score, observed_at, raw_json)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    sid,
-                    item["target"],
-                    item["target_type"],
-                    item["relation"],
-                    item["source"],
-                    int(item.get("score") or 0),
-                    timestamp,
-                    _json(item.get("raw_json")),
-                ),
-            )
-
-        _refresh_search_identifiers(c, sid, result)
-
-        stored_result = dict(result)
-        stored_result["search_id"] = sid
-        stored_result["related_targets_summary"] = related_summary
-        c.execute(
-            "UPDATE searches SET raw_json = ? WHERE id = ?",
-            (json.dumps(stored_result, default=str), sid),
-        )
-
-    result["search_id"] = sid
-    result["related_targets_summary"] = related_summary
+    sid = create_search(target, typ, timestamp)
+    finalize_search(sid, result, timestamp=timestamp)
     return sid
+
+
 
 
 # ── Queries ───────────────────────────────────────────────────────────────────
@@ -2553,14 +2481,18 @@ def get_domains_with_source_errors(source: str | None = None) -> list[dict]:
     init_db()
     with _conn() as c:
         rows = c.execute(
-            "SELECT id, target, timestamp, json_extract(raw_json, '$.source_errors') AS errors "
-            "FROM searches WHERE json_extract(raw_json, '$.source_errors') IS NOT NULL "
-            "ORDER BY timestamp DESC, id DESC"
+            "SELECT id, target, timestamp, source_errors FROM searches "
+            "WHERE source_errors IS NOT NULL ORDER BY timestamp DESC, id DESC"
         ).fetchall()
 
     results = []
     for row in rows:
-        errors = _parse_json_list(row["errors"])
+        try:
+            errors = json.loads(row["source_errors"]) if row["source_errors"] else []
+        except (json.JSONDecodeError, TypeError):
+            errors = []
+        if not isinstance(errors, list):
+            errors = [errors] if errors else []
         if source is None or source in errors:
             results.append({"id": row["id"], "target": row["target"], "timestamp": row["timestamp"], "errors": errors})
     return results
@@ -2569,7 +2501,10 @@ def get_domains_with_source_errors(source: str | None = None) -> list[dict]:
 def get_by_id(sid: int) -> dict | None:
     init_db()
     with _conn() as c:
-        row = c.execute("SELECT * FROM searches WHERE id = ?", (sid,)).fetchone()
+        row = c.execute(
+            "SELECT id, target, type, timestamp, cloudflare_fronted, source_errors FROM searches WHERE id = ?",
+            (sid,),
+        ).fetchone()
     return dict(row) if row else None
 
 
@@ -2582,16 +2517,15 @@ def get_latest_search_id_for_target(target: str) -> int | None:
 
 def update_search_payload(search_id: int, payload: dict[str, Any]) -> None:
     init_db()
+    timestamp = str(payload.get("timestamp") or datetime.now(timezone.utc).isoformat())
     with _conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        c.execute(
-            "UPDATE searches SET raw_json = ?, timestamp = ? WHERE id = ?",
-            (
-                json.dumps(payload, default=str),
-                str(payload.get("timestamp") or datetime.now(timezone.utc).isoformat()),
-                search_id,
-            ),
-        )
+        c.execute("UPDATE searches SET timestamp = ? WHERE id = ?", (timestamp, search_id))
+        for key, value in payload.items():
+            c.execute(
+                "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
+                (search_id, key, json.dumps(value, default=str)),
+            )
         _refresh_search_identifiers(c, search_id, payload)
 
 

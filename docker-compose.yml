@@ -1,4 +1,19 @@
 services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ip_intel
+      POSTGRES_USER: ip_intel
+      POSTGRES_PASSWORD: ip_intel
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ip_intel -d ip_intel"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   ip-intel:
     build: .
     ports:
@@ -6,11 +21,20 @@ services:
     env_file:
       - .env
     environment:
-      IP_INTEL_DB_PATH: /app/data/ip_intel.db
+      DATABASE_URL: postgresql://ip_intel:ip_intel@postgres:5432/ip_intel
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:9000}
     volumes:
       - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+    mem_limit: 6g
+    memswap_limit: 6g
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
+
+volumes:
+  postgres_data:

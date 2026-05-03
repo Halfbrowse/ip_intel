@@ -1,8017 +1,1341 @@
-import * as d3 from "d3";
-import { useEffect, useRef, useState } from "react";
-import "./attribution.css";
+import { useDeferredValue, useState } from "react";
+import {
+  Link,
+  NavLink,
+  Navigate,
+  Outlet,
+  Route,
+  Routes,
+  useOutletContext,
+  useParams,
+} from "./router.jsx";
 
-const RESULT_TABS = [
-  { id: "overview", label: "Overview" },
-  { id: "dns", label: "DNS & WHOIS" },
-  { id: "certs", label: "Certificates" },
-  { id: "origin", label: "Origin discovery" },
-  { id: "ips", label: "IP details" }
+import {
+  formatDate,
+  formatLabel,
+  formatNumber,
+  formatPercent,
+  isTerminalStatus,
+  normalizeCaseDetail,
+  normalizeCases,
+  normalizeClusterGroups,
+  normalizeEvidenceMeta,
+  normalizeJob,
+  normalizePairDetail,
+  normalizePairs,
+  useApi,
+} from "./api.js";
+
+const CASE_NAV_ITEMS = [
+  { to: "summary", label: "Summary" },
+  { to: "progress", label: "Progress" },
+  { to: "clusters", label: "Clusters" },
 ];
 
-const RESULT_PAGES = [
-  { id: "overview", label: "Snapshot", subtitle: "Start here for the seed, the strongest leads, and the next pivots." },
-  { id: "dns", label: "Seed data", subtitle: "The direct DNS and registration facts pulled from the supplied target." },
-  { id: "certs", label: "Certificates", subtitle: "Certificate history and overlaps around the target." },
-  { id: "origin", label: "Expansion", subtitle: "How the analysis spread outward into likely matches." },
-  { id: "ips", label: "Infrastructure", subtitle: "What each discovered IP or network probably means." }
-];
+const RAW_CASE_EXCLUDES = new Set([
+  "id",
+  "case_id",
+  "caseId",
+  "uuid",
+  "title",
+  "name",
+  "label",
+  "summary",
+  "overview",
+  "description",
+  "job",
+  "latest_job",
+  "latestJob",
+  "current_job",
+  "currentJob",
+  "metrics",
+  "counts",
+  "pairs",
+  "pair_count",
+  "pairCount",
+  "clusters",
+  "cluster_count",
+  "clusterCount",
+  "targets",
+  "subjects",
+  "entities",
+  "members",
+  "highlights",
+  "findings",
+  "notes",
+  "evidence",
+  "evidence_items",
+  "evidenceItems",
+]);
 
-const EXPLORER_TABS = [
-  { id: "network", label: "Network graph" },
-  { id: "recent", label: "Recent searches" },
-  { id: "ip", label: "Shared IPs" },
-  { id: "asn", label: "Shared ASNs" },
-  { id: "tracking", label: "Tracking IDs" },
-  { id: "favicon", label: "Favicons" },
-  { id: "tls", label: "Shared certificates" },
-  { id: "connections", label: "Domain connections" }
-];
+const RAW_PAIR_EXCLUDES = new Set([
+  "id",
+  "pair_id",
+  "pairId",
+  "left",
+  "right",
+  "lhs",
+  "rhs",
+  "domain_a",
+  "domain_b",
+  "score",
+  "confidence",
+  "strength",
+  "status",
+  "classification",
+  "verdict",
+  "summary",
+  "description",
+  "explanation",
+  "entities",
+  "subjects",
+  "members",
+  "evidence",
+  "evidence_items",
+  "evidenceItems",
+]);
 
-const EXPLORER_PAGES = [
-  { id: "graph", label: "Dossier", subtitle: "Verdict-first attribution workspace with dossier, graph, and matrix views." },
-  { id: "connections", label: "Connections", subtitle: "Why one domain overlaps with others." },
-  { id: "recent", label: "Recent", subtitle: "Saved investigations you can reopen." },
-  { id: "ip", label: "Shared IPs", subtitle: "Domains touching the same IP or host." },
-  { id: "asn", label: "ASNs", subtitle: "Domains clustering around the same autonomous system." },
-  { id: "tracking", label: "Tracking IDs", subtitle: "Analytics and ad codes reused across domains." },
-  { id: "favicon", label: "Favicons", subtitle: "Sites sharing the same browser-tab icon." },
-  { id: "tls", label: "Shared certificates", subtitle: "Domains that reused the same HTTPS certificate." }
-];
-
-const CONNECTION_SECTIONS = [
-  {
-    key: "tracking_ids",
-    title: "Tracking and analytics IDs",
-    infoBody: "If two domains share the same analytics or ad code, there is a decent chance they are run by the same team, contractor, or toolkit."
-  },
-  {
-    key: "identifiers",
-    title: "Attributed identifiers",
-    infoBody: "These cards show the higher-level identity, policy, legal, content, and social signals extracted into the identifiers table."
-  },
-  {
-    key: "tls_certs",
-    title: "Shared certificates",
-    infoBody: "These cards show exact HTTPS certificates that multiple domains reused. Current certificate reuse is one of the stronger technical links in the app."
-  },
-  {
-    key: "favicons",
-    title: "Favicons",
-    infoBody: "Favicons are the little tab icons websites use. Matching ones can point to a shared template or operator."
-  },
-  {
-    key: "registrant_emails",
-    title: "Registrant emails",
-    infoBody: "If the same registration email appears across domains, that is a direct ownership clue."
-  },
-  {
-    key: "ips",
-    title: "IP addresses",
-    infoBody: "Shared IPs can mean the same server is involved. Large CDN, managed WordPress, mail, and shared-hosting overlaps are treated as background noise, so the IP links shown here aim to stay higher-signal."
-  },
-  {
-    key: "asns",
-    title: "ASNs and networks",
-    infoBody: "ASN overlap shows that domains lived inside the same provider network. Broad CDN, managed WordPress, mail, and shared-hosting ASNs are filtered as low-signal noise, so the remaining overlaps are meant to be more actionable."
-  },
-  {
-    key: "tls_history",
-    title: "Certificate reuse over time",
-    infoBody: "This section explains whether the certificate sharing is still live or only happened in the past, plus when that overlap was seen."
-  },
-  {
-    key: "provider_hits",
-    title: "Provider hits",
-    infoBody: "These are normalized hits from search providers such as Censys, Shodan, and Netlas, including whether the lookup ran in a supported or degraded mode."
-  },
-  {
-    key: "nameservers",
-    title: "Nameservers",
-    infoBody: "Nameservers are where the domain’s DNS is hosted. Shared nameservers can be useful background context, but they are not always a strong ownership signal."
-  },
-  {
-    key: "discovered_domains",
-    title: "Discovered domains",
-    infoBody: "These are domain pivots that earlier stored runs already surfaced and which also overlap with other stored targets."
-  },
-  {
-    key: "discovered_ips",
-    title: "Discovered IPs",
-    infoBody: "These are IP pivots that earlier stored runs already surfaced and which also overlap with other stored targets."
-  }
-];
-
-const NETWORK_LINK_META = {
-  tracking: {
-    label: "Tracking ID",
-    headline: "Shared tracking or ad code",
-    color: "#f08b57",
-    summary: "The same analytics or advertising code appeared on both domains.",
-    meaning: "In plain English: the same measurement or marketing setup was copied onto both sites, which often points to the same operator, agency, or site kit.",
-    caution: "This is a strong clue, but some templates and resellers can reuse the same tags across unrelated customers."
-  },
-  tls: {
-    label: "TLS cert",
-    headline: "Shared TLS certificate",
-    color: "#34b67f",
-    summary: "Both domains presented the same HTTPS certificate.",
-    meaning: "In plain English: the same secure-web identity card showed up on both sites. When that overlap is current, it is one of the stronger technical links in the graph.",
-    caution: "Managed hosts sometimes reuse certificates for multiple customers, so the issuer, the SAN list, and the surrounding infrastructure still matter."
-  },
-  favicon: {
-    label: "Favicon",
-    headline: "Shared favicon",
-    color: "#d2a14d",
-    summary: "The domains use the same small browser-tab icon.",
-    meaning: "In plain English: the sites may share a template, a branding pack, or the same person who built them.",
-    caution: "This is useful supporting evidence, but by itself it is weaker than a shared certificate or direct-server overlap."
-  },
-  ip: {
-    label: "Shared IP",
-    headline: "Shared server address",
-    color: "#63a8ff",
-    summary: "The domains resolved to the same IP address or hosting endpoint.",
-    meaning: "In plain English: the sites touched the same server address. The graph already filters broad CDN, managed WordPress, mail, and shared-hosting overlaps, so what remains should skew toward more dedicated-looking infrastructure.",
-    caution: "A shared IP is still supportive evidence rather than proof, but the noisier platform overlaps are already suppressed here."
-  },
-  asn: {
-    label: "ASN/network",
-    headline: "Shared provider network",
-    color: "#2fb6c4",
-    summary: "The domains were observed inside the same autonomous system or network range.",
-    meaning: "In plain English: the domains lived in the same provider network. That is useful context, especially on smaller or dedicated-looking networks, but it is usually weaker than an exact TLS or direct-IP match.",
-    caution: "Broad CDN, managed WordPress, mail, and shared-hosting providers are filtered out of the overlap views, but ASN matches should still be treated as weighted context rather than proof."
-  }
-};
-
-const NETWORK_LINK_ORDER = ["tls", "tracking", "ip", "asn", "favicon"];
-
-const IP_LINK_SCORES = {
-  direct: 8,
-  shared_hosting: 3,
-  cdn_proxy: 1,
-  mail: 2
-};
-
-const TLS_LINK_SCORES = {
-  current: 12,
-  historical: 8
-};
-
-const ASN_LINK_SCORES = {
-  current: {
-    direct: 5,
-    shared_hosting: 2,
-    cdn_proxy: 1,
-    mail: 2
-  },
-  historical: {
-    direct: 3,
-    shared_hosting: 1,
-    cdn_proxy: 1,
-    mail: 1
-  }
-};
-
-const GRAPH_DEFAULT_CONTROLS = {
-  includeIp: true,
-  includeAsn: true,
-  includeTracking: true,
-  includeFavicon: true,
-  includeTls: true,
-  minScore: 5,
-  maxLinks: 30,
-  focus: ""
-};
-
-const GRAPH_DEFAULT_HEIGHT = 860;
-const GRAPH_MIN_HEIGHT = 640;
-const GRAPH_MAX_HEIGHT = 1480;
-const GRAPH_DEFAULT_SIDEBAR_WIDTH = 360;
-const GRAPH_MIN_SIDEBAR_WIDTH = 300;
-const GRAPH_MAX_SIDEBAR_WIDTH = 520;
-const GRAPH_OVERLAP_COLOR = "rgba(244, 63, 94, 0.34)";
-
-const GRAPH_THEME = {
-  light: {
-    background: "rgba(7, 16, 29, 0)",
-    surface: "#07131f",
-    label: "rgba(7, 19, 31, 0.82)",
-    labelText: "#f7fbff",
-    nodeBase: "#d7e4ff",
-    nodeMuted: "#86a1c3",
-    nodeText: "#f7fbff",
-    nodeStroke: "rgba(247, 251, 255, 0.22)",
-    edgeMuted: "rgba(122, 162, 255, 0.16)",
-    edgeHighlight: "#f8fafc"
-  },
-  dark: {
-    background: "rgba(4, 10, 17, 0)",
-    surface: "#040a11",
-    label: "rgba(4, 10, 17, 0.86)",
-    labelText: "#eff6ff",
-    nodeBase: "#9bb8ff",
-    nodeMuted: "#516884",
-    nodeText: "#eff6ff",
-    nodeStroke: "rgba(239, 246, 255, 0.22)",
-    edgeMuted: "rgba(148, 163, 184, 0.22)",
-    edgeHighlight: "#f8fafc"
-  }
-};
-
-const numberFormatter = new Intl.NumberFormat();
-const ATTRIBUTION_VIEW_TABS = [
-  { id: "dossier", label: "Dossier" },
-  { id: "cluster", label: "Cluster graph" },
-  { id: "matrix", label: "Identifier matrix" }
-];
-const ATTRIBUTION_TIER_META = {
-  tier_1: { order: 4, label: "Tier 1", tone: "tier-1", summary: "Highest attribution value. Strong enough to anchor the verdict." },
-  tier_2: { order: 3, label: "Tier 2", tone: "tier-2", summary: "Strong corroboration. Useful when it supports stronger signals." },
-  tier_3: { order: 2, label: "Tier 3", tone: "tier-3", summary: "Lead-grade overlap. Helpful for discovery, weaker for verdicts." },
-  tier_4: { order: 1, label: "Tier 4", tone: "tier-4", summary: "Supporting context. Keep it out of the headline unless nothing stronger exists." }
-};
-const ATTRIBUTION_CATEGORY_META = {
-  identity: { label: "Identity", color: "#2563eb" },
-  tls: { label: "TLS", color: "#0f766e" },
-  tls_ct: { label: "Certificate timing", color: "#0b9488" },
-  tracking: { label: "Tracking", color: "#7c3aed" },
-  content: { label: "Content", color: "#d9467a" },
-  infrastructure: { label: "Infrastructure", color: "#0f766e" },
-  legal: { label: "Legal", color: "#d97706" },
-  policy: { label: "Policy", color: "#1d4ed8" },
-  email: { label: "Email", color: "#0369a1" },
-  social: { label: "Social", color: "#c2410c" },
-  nameserver: { label: "Nameserver", color: "#475569" },
-  dns: { label: "DNS", color: "#64748b" },
-  generic: { label: "Generic", color: "#334155" },
-  ssh: { label: "SSH", color: "#059669" }
-};
-const ATTRIBUTION_GRAPH_DEFAULTS = {
-  maxFrequency: 30,
-  minScore: 24,
-  maxEdges: 44,
-  focus: ""
-};
-const ATTRIBUTION_GRAPH_HEIGHT = 720;
-
-function titleCaseLabel(value) {
-  return String(value || "")
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function humanizeIdentifierType(idType) {
-  const text = String(idType || "").trim();
-  if (!text) {
-    return "Identifier";
-  }
-  const forced = {
-    ga: "GA",
-    gtm: "GTM",
-    oidc: "OIDC",
-    ssh: "SSH",
-    tls: "TLS",
-    html: "HTML",
-    spf: "SPF",
-    dmarc: "DMARC",
-    dkim: "DKIM",
-    bimi: "BIMI",
-    caa: "CAA",
-    rua: "RUA",
-    ruf: "RUF",
-    ms: "MS"
-  };
-  return text
-    .split("_")
-    .filter(Boolean)
-    .map((part) => {
-      const lower = part.toLowerCase();
-      if (forced[lower]) {
-        return forced[lower];
-      }
-      if (/^\d+$/.test(part)) {
-        return part;
-      }
-      return part.charAt(0).toUpperCase() + part.slice(1);
-    })
-    .join(" ");
-}
-
-function parseDomainTokenInput(value) {
-  const seen = new Set();
-  return String(value || "")
-    .split(/[\s,]+/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .filter((item) => {
-      const normalized = item.toLowerCase();
-      if (seen.has(normalized)) {
-        return false;
-      }
-      seen.add(normalized);
-      return true;
-    });
-}
-
-function getAttributionTierMeta(tier) {
-  return ATTRIBUTION_TIER_META[tier] || ATTRIBUTION_TIER_META.tier_4;
-}
-
-function getAttributionTierOrder(tier) {
-  return getAttributionTierMeta(tier).order;
-}
-
-function getAttributionCategoryMeta(category) {
-  return ATTRIBUTION_CATEGORY_META[category] || {
-    label: titleCaseLabel(String(category || "generic").replace(/_/g, " ")),
-    color: "#334155"
-  };
-}
-
-function getAttributionTierLineWidth(tier) {
-  if (tier === "tier_1") {
-    return 7;
-  }
-  if (tier === "tier_2") {
-    return 5;
-  }
-  if (tier === "tier_3") {
-    return 3.5;
-  }
-  return 2.5;
-}
-
-function getEvidenceIdentity(evidence) {
-  return [
-    evidence?.tier || "",
-    evidence?.id_type || "",
-    evidence?.id_value || "",
-    evidence?.first_seen_a || "",
-    evidence?.first_seen_b || ""
-  ].join("|||");
-}
-
-function sortAttributionEvidence(left, right) {
+export default function App() {
   return (
-    getAttributionTierOrder(right?.tier) - getAttributionTierOrder(left?.tier)
-    || Number(right?.score || 0) - Number(left?.score || 0)
-    || String(left?.category || "").localeCompare(String(right?.category || ""))
-    || String(left?.label || "").localeCompare(String(right?.label || ""))
-    || String(left?.id_value || "").localeCompare(String(right?.id_value || ""))
+    <Routes>
+      <Route path="/" element={<HomePage />} />
+      <Route path="/cases/:caseId" element={<CaseLayout />}>
+        <Route index element={<Navigate replace to="summary" />} />
+        <Route path="progress" element={<CaseProgressPage />} />
+        <Route path="summary" element={<CaseSummaryPage />} />
+        <Route path="pairs/:pairId" element={<CasePairPage />} />
+        <Route path="clusters" element={<CaseClustersPage />} />
+      </Route>
+      <Route path="*" element={<NotFoundPage />} />
+    </Routes>
   );
 }
 
-function evidencePassesFrequency(evidence, maxFrequency) {
-  if (evidence?.domain_frequency === null || evidence?.domain_frequency === undefined) {
-    return true;
-  }
-  return Number(evidence.domain_frequency || 0) <= Number(maxFrequency || 0);
-}
-
-function recomputeComparisonScore(evidenceList) {
-  const evidence = Array.isArray(evidenceList) ? evidenceList : [];
-  const distinctCategories = new Set(evidence.map((item) => `${item.tier}:${item.category}`));
-  const distinctTiers = new Set(evidence.map((item) => item.tier));
-  return Math.min(
-    100,
-    evidence.reduce((sum, item) => sum + Number(item.score || 0), 0)
-      + Math.max(0, distinctCategories.size - 1) * 4
-      + Math.max(0, distinctTiers.size - 1) * 6
-  );
-}
-
-function buildVisibleComparison(comparison, maxFrequency) {
-  if (!comparison) {
-    return null;
-  }
-
-  const visibleEvidence = [];
-  const hiddenByFrequency = [];
-  const tiers = [];
-
-  (comparison.tiers || []).forEach((tierGroup) => {
-    const keptEvidence = [];
-    (tierGroup.evidence || []).forEach((evidence) => {
-      if (evidencePassesFrequency(evidence, maxFrequency)) {
-        keptEvidence.push(evidence);
-        visibleEvidence.push(evidence);
-      } else {
-        hiddenByFrequency.push(evidence);
-      }
-    });
-
-    if (!keptEvidence.length) {
-      return;
-    }
-
-    tiers.push({
-      ...tierGroup,
-      score: Math.min(100, keptEvidence.reduce((sum, item) => sum + Number(item.score || 0), 0)),
-      evidence_count: keptEvidence.length,
-      categories: [...new Set(keptEvidence.map((item) => item.category))].sort(),
-      evidence: keptEvidence.sort(sortAttributionEvidence)
-    });
+function HomePage() {
+  const casesRequest = useApi("/api/cases");
+  const [search, setSearch] = useState("");
+  const [targetInput, setTargetInput] = useState("");
+  const [csvFile, setCsvFile] = useState(null);
+  const [submitState, setSubmitState] = useState({
+    busy: false,
+    error: null,
   });
-
-  tiers.sort((left, right) => getAttributionTierOrder(right.tier) - getAttributionTierOrder(left.tier));
-
-  const hiddenEvidenceMap = new Map();
-  [...hiddenByFrequency, ...(comparison.filtered_out || [])]
-    .sort(sortAttributionEvidence)
-    .forEach((evidence) => {
-      hiddenEvidenceMap.set(getEvidenceIdentity(evidence), evidence);
-    });
-
-  return {
-    ...comparison,
-    visibleEvidence: visibleEvidence.sort(sortAttributionEvidence),
-    hiddenEvidence: [...hiddenEvidenceMap.values()],
-    visibleTiers: tiers,
-    visibleScore: recomputeComparisonScore(visibleEvidence),
-    visibleCategories: [...new Set(visibleEvidence.map((item) => item.category))].sort(),
-    visibleTierIds: tiers.map((item) => item.tier)
-  };
-}
-
-function getEvidenceRarityBadge(evidence, maxFrequency) {
-  const total = evidence?.domain_frequency;
-  if (total === null || total === undefined) {
-    return {
-      label: "Pair-specific",
-      tone: "unique",
-      detail: "Derived from pairwise timing rather than a broadly reusable identifier."
-    };
-  }
-
-  const totalDomains = Number(total || 0);
-  const otherDomains = Math.max(0, totalDomains - 2);
-  if (totalDomains <= 2) {
-    return {
-      label: "Unique to pair",
-      tone: "unique",
-      detail: "No other stored domains carry this identifier."
-    };
-  }
-  if (totalDomains <= 5) {
-    return {
-      label: `Appears on ${formatNumber(otherDomains)} other domain${otherDomains === 1 ? "" : "s"}`,
-      tone: "rare",
-      detail: `Seen on ${formatNumber(totalDomains)} stored domains total.`
-    };
-  }
-  if (totalDomains > Number(maxFrequency || 0) || evidence?.frequency_status === "excluded") {
-    return {
-      label: `Too common: ${formatNumber(otherDomains)} other domains`,
-      tone: "common",
-      detail: `Hidden by the current rarity filter. Seen on ${formatNumber(totalDomains)} stored domains total.`
-    };
-  }
-  return {
-    label: `Appears on ${formatNumber(otherDomains)} other domain${otherDomains === 1 ? "" : "s"}`,
-    tone: evidence?.frequency_status === "downweighted" ? "warning" : "shared",
-    detail: `Seen on ${formatNumber(totalDomains)} stored domains total.`
-  };
-}
-
-function buildAttributionVerdict(comparison) {
-  if (!comparison || !(comparison.visibleEvidence || []).length) {
-    const hiddenCount = (comparison?.hiddenEvidence || []).length;
-    return {
-      label: hiddenCount ? "Common-only overlap" : "No trusted overlap",
-      tone: hiddenCount ? "caution" : "muted",
-      headline: hiddenCount
-        ? "The pair shares identifiers, but every overlap is currently too common to trust."
-        : "No overlap survives the current rarity filter.",
-      summary: hiddenCount
-        ? `${formatNumber(hiddenCount)} common identifier${hiddenCount === 1 ? "" : "s"} suppressed.`
-        : "Pick another pair or widen the component.",
-      tierCounts: { tier_1: 0, tier_2: 0, tier_3: 0, tier_4: 0 },
-      uniqueCount: 0,
-      rareCount: 0,
-      hiddenCount
-    };
-  }
-
-  const visibleEvidence = comparison.visibleEvidence || [];
-  const headlineEvidence = visibleEvidence.filter((item) => item.category !== "infrastructure" || item.tier === "tier_1");
-  const verdictEvidence = headlineEvidence.length ? headlineEvidence : visibleEvidence;
-  const tierCounts = {
-    tier_1: 0,
-    tier_2: 0,
-    tier_3: 0,
-    tier_4: 0
-  };
-
-  verdictEvidence.forEach((item) => {
-    tierCounts[item.tier] += 1;
-  });
-
-  const tierOneCategories = new Set(verdictEvidence.filter((item) => item.tier === "tier_1").map((item) => item.category));
-  const uniqueCount = verdictEvidence.filter((item) => item.domain_frequency === null || Number(item.domain_frequency || 0) <= 2).length;
-  const rareCount = verdictEvidence.filter((item) => item.domain_frequency === null || Number(item.domain_frequency || 0) <= 5).length;
-  const hiddenCount = (comparison.hiddenEvidence || []).length;
-
-  let label = "Investigative lead";
-  let tone = "lead";
-  let headline = "Useful overlap exists, but it still needs stronger corroboration.";
-
-  if (tierCounts.tier_1 >= 2 && tierOneCategories.size >= 2) {
-    label = "Near-definitive";
-    tone = "strong";
-    headline = "Multiple independent Tier 1 matches agree across different categories.";
-  } else if (tierCounts.tier_1 >= 1 && tierCounts.tier_2 >= 1) {
-    label = "High confidence";
-    tone = "high";
-    headline = "A Tier 1 match is reinforced by a second, independent corroborator.";
-  } else if (tierCounts.tier_1 >= 1) {
-    label = "Strong lead";
-    tone = "high";
-    headline = "The pair shares a Tier 1 signal, but it needs more independent support.";
-  } else if (tierCounts.tier_2 >= 2) {
-    label = "Corroborated lead";
-    tone = "lead";
-    headline = "Several high-value corroborators line up, but none is decisive on its own.";
-  }
-
-  const summaryParts = [];
-  if (tierCounts.tier_1) {
-    summaryParts.push(`${tierCounts.tier_1} Tier 1`);
-  }
-  if (tierCounts.tier_2) {
-    summaryParts.push(`${tierCounts.tier_2} Tier 2`);
-  }
-  if (!summaryParts.length && tierCounts.tier_3) {
-    summaryParts.push(`${tierCounts.tier_3} Tier 3`);
-  }
-  if (uniqueCount) {
-    summaryParts.push(`${uniqueCount} unique-to-pair or pair-specific`);
-  } else if (rareCount) {
-    summaryParts.push(`${rareCount} rare`);
-  }
-  if (hiddenCount) {
-    summaryParts.push(`${hiddenCount} too common to trust`);
-  }
-
-  return {
-    label,
-    tone,
-    headline,
-    summary: summaryParts.join(" | "),
-    tierCounts,
-    uniqueCount,
-    rareCount,
-    hiddenCount
-  };
-}
-
-function buildAttributionGraphModel(cluster, controls) {
-  const candidateEdges = [];
-  const comparisons = Array.isArray(cluster?.edges) ? cluster.edges : [];
-
-  comparisons.forEach((comparison) => {
-    const visible = buildVisibleComparison(comparison, controls.maxFrequency);
-    if (!visible || !(visible.visibleEvidence || []).length) {
-      return;
-    }
-    if (visible.visibleScore < controls.minScore) {
-      return;
-    }
-    if (controls.focus && comparison.domain_a !== controls.focus && comparison.domain_b !== controls.focus) {
-      return;
-    }
-
-    const strongestEvidence = visible.visibleEvidence[0];
-    const primaryCategory = strongestEvidence?.category || "generic";
-    const categoryMeta = getAttributionCategoryMeta(primaryCategory);
-    const strongestTier = visible.visibleTiers[0]?.tier || strongestEvidence?.tier || "tier_4";
-
-    candidateEdges.push({
-      key: pairKey(comparison.domain_a, comparison.domain_b),
-      source: comparison.domain_a,
-      target: comparison.domain_b,
-      comparison: visible,
-      score: visible.visibleScore,
-      strongestTier,
-      primaryCategory,
-      categories: [...new Set(visible.visibleEvidence.map((item) => item.category))],
-      color: categoryMeta.color,
-      width: getAttributionTierLineWidth(strongestTier)
-    });
-  });
-
-  candidateEdges.sort(
-    (left, right) => right.score - left.score
-      || getAttributionTierOrder(right.strongestTier) - getAttributionTierOrder(left.strongestTier)
-      || left.source.localeCompare(right.source)
-      || left.target.localeCompare(right.target)
-  );
-
-  const visibleEdges = candidateEdges.slice(0, controls.maxEdges);
-  const nodeStats = new Map();
-
-  visibleEdges.forEach((edge) => {
-    [edge.source, edge.target].forEach((domain) => {
-      if (!nodeStats.has(domain)) {
-        nodeStats.set(domain, {
-          id: domain,
-          displayWeight: 0,
-          visibleDegree: 0
-        });
-      }
-      const node = nodeStats.get(domain);
-      node.displayWeight += edge.score;
-      node.visibleDegree += 1;
-    });
-  });
-
-  const nodes = [...nodeStats.values()].sort(
-    (left, right) => right.displayWeight - left.displayWeight || left.id.localeCompare(right.id)
-  );
-
-  return {
-    nodes,
-    edges: visibleEdges,
-    hiddenEdgeCount: Math.max(0, candidateEdges.length - visibleEdges.length),
-    maxScore: visibleEdges.length ? visibleEdges[0].score : 0
-  };
-}
-
-function buildDomainFingerprint(cluster, domain) {
-  return (cluster?.component?.identifiers || [])
-    .filter((identifier) => Array.isArray(identifier.domains) && identifier.domains.includes(domain))
-    .sort(
-      (left, right) => (
-        getAttributionTierOrder(right.tier) - getAttributionTierOrder(left.tier)
-        || Number(left.component_domain_count || 0) - Number(right.component_domain_count || 0)
-        || Number(left.domain_count || 0) - Number(right.domain_count || 0)
-        || String(left.id_type || "").localeCompare(String(right.id_type || ""))
-        || String(left.id_value || "").localeCompare(String(right.id_value || ""))
-      )
-    );
-}
-
-function buildIdentifierPivotRows(cluster, maxFrequency) {
-  return (cluster?.component?.identifiers || [])
-    .filter((identifier) => Number(identifier.component_domain_count || 0) >= 2)
-    .filter((identifier) => Number(identifier.domain_count || 0) <= Number(maxFrequency || 0))
-    .sort(
-      (left, right) => (
-        Number(left.component_domain_count || 0) - Number(right.component_domain_count || 0)
-        || Number(left.domain_count || 0) - Number(right.domain_count || 0)
-        || getAttributionTierOrder(right.tier) - getAttributionTierOrder(left.tier)
-        || String(left.id_type || "").localeCompare(String(right.id_type || ""))
-        || String(left.id_value || "").localeCompare(String(right.id_value || ""))
-      )
-    );
-}
-
-function buildPivotDomains(cluster, graph, domainA, domainB) {
-  const priority = [domainA, domainB].filter(Boolean);
-  const seen = new Set(priority);
-  const weightedDomains = (graph?.nodes || []).map((node) => node.id);
-  const componentDomains = cluster?.component?.domains || [];
-
-  [...weightedDomains, ...componentDomains].forEach((domain) => {
-    if (domain && !seen.has(domain)) {
-      seen.add(domain);
-      priority.push(domain);
-    }
-  });
-
-  return priority;
-}
-
-async function apiFetch(path, options) {
-  const response = await fetch(path, {
-    headers: {
-      "Content-Type": "application/json"
-    },
-    ...options
-  });
-
-  if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`;
-    try {
-      const error = await response.json();
-      message = error.detail || message;
-    } catch (_error) {
-      // Ignore parse errors and use the HTTP status instead.
-    }
-    throw new Error(message);
-  }
-
-  return response.json();
-}
-
-function isDatabaseCorruptionMessage(message) {
-  const text = String(message || "").toLowerCase();
-  return text.includes("database is corrupted")
-    || text.includes("database disk image is malformed")
-    || text.includes("database or disk is full")
-    || text.includes("database is malformed")
-    || text.includes("sqlite");
-}
-
-function formatDate(value) {
-  if (!value) {
-    return "Unknown";
-  }
-  return String(value).slice(0, 10);
-}
-
-function formatDateTime(value) {
-  if (!value) {
-    return "Unknown";
-  }
-  return String(value).replace("T", " ").slice(0, 16);
-}
-
-function formatNumber(value) {
-  if (value === null || value === undefined) {
-    return "0";
-  }
-  return numberFormatter.format(value);
-}
-
-function formatFriendlyDateRange(start, end) {
-  if (start && end) {
-    return `${formatDateTime(start)} to ${formatDateTime(end)}`;
-  }
-  if (start) {
-    return `From ${formatDateTime(start)}`;
-  }
-  if (end) {
-    return `Until ${formatDateTime(end)}`;
-  }
-  return "Unknown";
-}
-
-function getTlsOverlapIssuer(item) {
-  return String(item?.issuer_cn || item?.issuer_org || item?.issuer || "").trim() || "Unknown issuer";
-}
-
-function getTlsOverlapTitle(item) {
-  const commonName = String(item?.cn || "").trim();
-  if (commonName) {
-    return commonName;
-  }
-
-  const issuer = String(item?.issuer_cn || item?.issuer_org || item?.issuer || "").trim();
-  if (issuer) {
-    return `Certificate from ${issuer}`;
-  }
-
-  const fingerprint = String(item?.sha256 || "").trim();
-  if (!fingerprint) {
-    return "Shared certificate";
-  }
-  return `Certificate ${fingerprint.length > 24 ? `${fingerprint.slice(0, 12)}...${fingerprint.slice(-8)}` : fingerprint}`;
-}
-
-function getTlsOverlapTargetCount(item) {
-  const directCount = Number(item?.target_count || 0);
-  if (Number.isFinite(directCount) && directCount > 0) {
-    return directCount;
-  }
-  return parseTargetList(item?.targets).length;
-}
-
-function getTlsOverlapStatusLabel(value) {
-  return normalizeEvidenceStatus(value) === "current" ? "Still shared now" : "Past sharing only";
-}
-
-function getTlsOverlapSummary(item) {
-  const status = normalizeEvidenceStatus(item?.relationship_status);
-  const domainCount = getTlsOverlapTargetCount(item);
-  const domainLabel = `${formatNumber(domainCount)} stored domain${domainCount === 1 ? "" : "s"}`;
-  const commonName = String(item?.cn || "").trim();
-
-  if (status === "current") {
-    return commonName
-      ? `The HTTPS certificate for ${commonName} is still shared across ${domainLabel}, which makes this one of the stronger technical overlaps in the app.`
-      : `This exact HTTPS certificate is still shared across ${domainLabel}, which makes it one of the stronger technical overlaps in the app.`;
-  }
-
-  return commonName
-    ? `The HTTPS certificate for ${commonName} linked ${domainLabel} in the past. That can reveal older hosting, migrations, or previous common control.`
-    : `This exact HTTPS certificate linked ${domainLabel} in the past. That can reveal older hosting, migrations, or previous common control.`;
-}
-
-function filterLowSignalClusterItems(items) {
-  return (items || []).filter((item) => !item?.is_noise);
-}
-
-function getVisibleClusters(clusters) {
-  return {
-    ...clusters,
-    ip: filterLowSignalClusterItems(clusters?.ip),
-    asn: filterLowSignalClusterItems(clusters?.asn)
-  };
-}
-
-function downloadResult(result) {
-  const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${result.input || "ip-intel"}_${formatDate(result.timestamp)}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-function cloudflareLabel(value) {
-  if (value === true || value === 1) {
-    return "Cloudflare fronted";
-  }
-  if (value === false || value === 0) {
-    return "Direct";
-  }
-  return "Unknown";
-}
-
-function collectOriginLeadCount(result) {
-  const origin = result.origin_candidates || {};
-  const scanHits = ["scan", "provider_scan", "country_scan"].reduce((sum, key) => {
-    const hits = origin[key] && origin[key].hits ? origin[key].hits : [];
-    return sum + hits.length;
-  }, 0);
-  const providerHits = ["censys", "shodan", "netlas"].reduce((sum, key) => {
-    const hits = origin[key] && origin[key].hits ? origin[key].hits : [];
-    return sum + hits.length;
-  }, 0);
-  const leakHits = ["subdomain_leaks", "mx_leaks", "wordlist_leaks", "hackertarget", "urlscan"].reduce((sum, key) => {
-    return sum + ((origin[key] || []).length);
-  }, 0);
-  return scanHits + providerHits + leakHits;
-}
-
-function getProviderHitCount(result) {
-  const origin = result.origin_candidates || {};
-  return ["censys", "shodan", "netlas"].reduce((sum, key) => {
-    const hits = origin[key] && origin[key].hits ? origin[key].hits : [];
-    return sum + hits.length;
-  }, 0);
-}
-
-function getTargetedSweepHitCount(result) {
-  const origin = result.origin_candidates || {};
-  return ["scan", "provider_scan", "country_scan"].reduce((sum, key) => {
-    const hits = origin[key] && origin[key].hits ? origin[key].hits : [];
-    return sum + hits.length;
-  }, 0);
-}
-
-function getCurrentIps(result) {
-  if (!result) {
-    return [];
-  }
-  if (result.type === "ip" && result.input) {
-    return [result.input];
-  }
-  const dns = result.dns || {};
-  return [...(dns.A || []), ...(dns.AAAA || [])]
-    .filter(Boolean)
-    .map((item) => String(item));
-}
-
-function getIpEntries(result) {
-  if (!result) {
-    return [];
-  }
-  if (result.type === "ip") {
-    return result.input
-      ? [[result.input, result]]
-      : [];
-  }
-  return Object.entries(result.ip_details || {});
-}
-
-function getDirectIpCount(result) {
-  return getIpEntries(result).filter(([, info]) => info && info.server_type === "direct").length;
-}
-
-function getLiveTlsCount(result) {
-  if (!result) {
-    return 0;
-  }
-  if (result.type === "ip") {
-    return result.tls_cert ? 1 : 0;
-  }
-  return (result.non_cf_tls_certs || []).length;
-}
-
-function getRelatedTargetsSummary(result) {
-  return result.related_targets_summary || {
-    items: [],
-    total: 0,
-    domains: 0,
-    ips: 0,
-    expandable: 0,
-    hard_total: 0
-  };
-}
-
-function getHardConnections(result) {
-  return result.hard_connections || {
-    items: [],
-    total: 0,
-    shown: 0,
-    domains: 0,
-    ips: 0
-  };
-}
-
-function getPivotCandidates(result, limit = 6) {
-  return (getRelatedTargetsSummary(result).items || [])
-    .filter((item) => item.auto_expand && item.connection_strength !== "hard")
-    .slice(0, limit);
-}
-
-function formatRelationList(values, limit = 3) {
-  const items = (values || [])
-    .map((value) => String(value || "").replace(/_/g, " "))
-    .filter(Boolean);
-  return formatListPreview(items, limit) || "No relation labels";
-}
-
-function buildExposureSummary(result) {
-  if (!result) {
-    return {
-      tone: "info",
-      title: "Waiting for a seed",
-      body: "Add a domain or IP and the app will profile the seed before it branches outward."
-    };
-  }
-
-  if (result.type === "ip") {
-    return {
-      tone: result.server_type === "direct" ? "success" : "info",
-      title: result.server_type === "direct" ? "Direct IP investigation" : "Infrastructure IP investigation",
-      body: result.server_type === "direct"
-        ? "This seed is already a direct-looking IP, so the workflow can move straight into ASN, reverse-IP, and TLS validation."
-        : "This seed is an IP address, so the workflow profiles the network first and then looks outward for domains or neighboring infrastructure."
-    };
-  }
-
-  if (result.cloudflare_fronted) {
-    return {
-      tone: "info",
-      title: "Cloudflare is in front right now",
-      body: "The current DNS points at Cloudflare, so the useful work is to spread outward into subdomains, historical infrastructure, provider hits, and non-Cloudflare matches."
-    };
-  }
-
-  const directIpCount = getDirectIpCount(result);
-  if (directIpCount > 0) {
-    return {
-      tone: "success",
-      title: "Direct infrastructure is already visible",
-      body: `${directIpCount} discovered IP${directIpCount === 1 ? "" : "s"} look direct rather than shared or proxied, which makes origin confirmation much faster.`
-    };
-  }
-
-  return {
-    tone: "warning",
-    title: "No direct origin is confirmed yet",
-    body: "The next best path is to follow nearby pivots such as subdomains, history, provider matches, and certificate overlap until a direct host emerges."
-  };
-}
-
-function looksLikeIpTarget(value) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return false;
-  }
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) {
-    return text.split(".").every((part) => {
-      const numeric = Number(part);
-      return numeric >= 0 && numeric <= 255;
-    });
-  }
-  return text.includes(":");
-}
-
-function getCompletedAnalysisPhases(payload) {
-  const result = payload || {};
-  const origin = result.origin_candidates || {};
-  const relatedSummary = getRelatedTargetsSummary(result);
-  const providerChecksRan = ["censys", "shodan", "netlas"]
-    .some((key) => Object.prototype.hasOwnProperty.call(origin, key));
-  const targetedSweepsRan = ["scan", "provider_scan", "country_scan"]
-    .some((key) => {
-      const entry = origin[key];
-      return Boolean(entry) && !entry.skipped;
-    });
-  const ipEnrichmentRan = Boolean(
-    getIpEntries(result).length
-    || (result.type === "ip" && (result.ptr || (result.asn_info && Object.keys(result.asn_info).length)))
-  );
-  const tlsValidationRan = Object.prototype.hasOwnProperty.call(result, "non_cf_tls_certs")
-    || Object.prototype.hasOwnProperty.call(result, "tls_cert");
-
-  const completed = new Set();
-  if (result.type || result.timestamp || getCurrentIps(result).length) {
-    completed.add("Seed profile");
-  }
-  if (result.type || relatedSummary.total || collectOriginLeadCount(result) || (result.subdomains || []).length || (((result.historical_dns || {}).records) || []).length) {
-    completed.add("Expand from seed");
-  }
-  if (providerChecksRan) {
-    completed.add("Provider checks");
-  }
-  if (targetedSweepsRan) {
-    completed.add("Targeted sweeps");
-  }
-  if (ipEnrichmentRan) {
-    completed.add("ASN/IP enrichment");
-  }
-  if (tlsValidationRan) {
-    completed.add("TLS validation");
-  }
-  return completed;
-}
-
-function buildAnalysisStages(payload, job, targetHint = "") {
-  const result = payload || {};
-  const target = result.input || targetHint || job?.target || "";
-  const type = result.type || (target ? (looksLikeIpTarget(target) ? "ip" : "domain") : "");
-  const relatedSummary = getRelatedTargetsSummary(result);
-  const currentIps = getCurrentIps(result);
-  const providerHitCount = getProviderHitCount(result);
-  const sweepHitCount = getTargetedSweepHitCount(result);
-  const directLeadCount = collectOriginLeadCount(result);
-  const liveTlsCount = getLiveTlsCount(result);
-  const ipCount = getIpEntries(result).length;
-  const cloudflareState = result.cloudflare_fronted ?? result.cloudflare;
-  const completedPhases = getCompletedAnalysisPhases(result);
-  const progress = job?.progress || null;
-  const completed = new Set(progress?.completed || []);
-  const current = progress?.current || "";
-  const hasMaterialData = Boolean(
-    result.type
-    || result.timestamp
-    || currentIps.length
-    || directLeadCount
-    || providerHitCount
-    || sweepHitCount
-    || ipCount
-    || liveTlsCount
-    || relatedSummary.total
-  );
-
-  const stages = [
-    {
-      phase: "Seed profile",
-      title: "Profile the seed",
-      description: type === "ip"
-        ? "Read the supplied IP directly: PTR, ASN, Cloudflare posture, reverse-IP, and live TLS."
-        : "Read the supplied domain directly: DNS, WHOIS, certificate history, page metadata, and Cloudflare posture.",
-      meta: target
-        ? `${target}${currentIps.length ? ` • ${formatNumber(currentIps.length)} current IPs` : ""}${cloudflareState !== undefined ? ` • ${cloudflareLabel(cloudflareState)}` : ""}`
-        : "Add a domain or IP to begin."
-    },
-    {
-      phase: "Expand from seed",
-      title: "Spread outward from the seed",
-      description: "Use subdomains, historical records, TXT/SPF, urlscan, and discovered pivots to find nearby infrastructure.",
-      meta: target
-        ? `${formatNumber(directLeadCount)} direct leads • ${formatNumber(relatedSummary.expandable || 0)} expandable pivots`
-        : "Nothing to expand yet."
-    },
-    {
-      phase: "Provider checks",
-      title: "Check likely provider matches",
-      description: "Use Censys, Shodan, and Netlas where the seed suggests the same infrastructure may reappear elsewhere.",
-      meta: target ? `${formatNumber(providerHitCount)} provider hits so far` : "Provider checks wait for a seed."
-    },
-    {
-      phase: "Targeted sweeps",
-      title: "Fan out into Google or hoster space",
-      description: "If enabled, branch into Google Cloud, known hosting ASNs, or country allocations once the seed looks promising.",
-      meta: target ? `${formatNumber(sweepHitCount)} targeted sweep hits` : "Targeted sweeps are optional."
-    },
-    {
-      phase: "ASN/IP enrichment",
-      title: "Classify the infrastructure",
-      description: "Attach ASN and server context to each IP so dedicated hosts stand apart from shared or noisy platforms.",
-      meta: target ? `${formatNumber(ipCount)} IPs enriched` : "IP enrichment starts after collection."
-    },
-    {
-      phase: "TLS validation",
-      title: "Confirm with live TLS",
-      description: "Pull live certificates from non-Cloudflare IPs to verify which matches still look real.",
-      meta: target ? `${formatNumber(liveTlsCount)} live TLS cert${liveTlsCount === 1 ? "" : "s"} captured` : "TLS validation happens last."
-    }
-  ];
-
-  if (!job) {
-    if (hasMaterialData) {
-      return stages.map((stage) => ({
-        ...stage,
-        state: completedPhases.has(stage.phase) ? "complete" : "pending"
-      }));
-    }
-    return stages.map((stage, index) => ({
-      ...stage,
-      state: target && index === 0 ? "active" : "pending"
-    }));
-  }
-
-  if (job.status === "completed") {
-    return stages.map((stage) => ({
-      ...stage,
-      state: completedPhases.has(stage.phase) ? "complete" : "pending"
-    }));
-  }
-
-  let activeAssigned = false;
-  return stages.map((stage) => {
-    if (completed.has(stage.phase)) {
-      return { ...stage, state: "complete" };
-    }
-    if (!activeAssigned && (current === stage.phase || job.status === "running" || job.status === "queued")) {
-      activeAssigned = true;
-      return { ...stage, state: "active" };
-    }
-    return { ...stage, state: "pending" };
-  });
-}
-
-function collectInterestingTxt(txtRecords) {
-  const output = [];
-  (txtRecords || []).forEach((txt) => {
-    const value = String(txt);
-    const lower = value.toLowerCase();
-    if (lower.includes("google-site-verification")) {
-      output.push({
-        label: "Google Search Console",
-        value,
-        note: "This verification token can link the domain back to a specific Google account."
-      });
-    } else if (lower.includes("ms=")) {
-      output.push({
-        label: "Microsoft 365",
-        value,
-        note: "This token usually ties the domain to a Microsoft tenant."
-      });
-    } else if (lower.includes("tiktok-developers")) {
-      output.push({
-        label: "TikTok developer",
-        value,
-        note: "This suggests a TikTok developer or advertising setup."
-      });
-    } else if (lower.includes("apple-domain")) {
-      output.push({
-        label: "Apple domain token",
-        value,
-        note: "This token is used to prove ownership inside Apple services."
-      });
-    } else if (lower.includes("loaderio=")) {
-      output.push({
-        label: "Loader.io",
-        value,
-        note: "This usually means the operator used Loader.io for load testing."
-      });
-    } else if (lower.includes("spf1")) {
-      output.push({
-        label: "SPF / mail",
-        value,
-        note: "SPF records often reveal which email services or sending IPs are trusted."
-      });
-    }
-  });
-  return output;
-}
-
-function getRegistrar(result) {
-  const value = result.whois && result.whois.registrar;
-  if (Array.isArray(value)) {
-    return value[0];
-  }
-  return value || "Unknown";
-}
-
-function collectTrackingSignals(page) {
-  const payload = page || {};
-  return [
-    ...(payload.google_analytics || []).map((value) => ({ label: "Google Analytics", value })),
-    ...(payload.gtm_ids || []).map((value) => ({ label: "Google Tag Manager", value })),
-    ...(payload.facebook_pixel || []).map((value) => ({ label: "Facebook Pixel", value })),
-    ...(payload.tiktok_pixel || []).map((value) => ({ label: "TikTok Pixel", value })),
-    ...(payload.yandex_metrika || []).map((value) => ({ label: "Yandex Metrika", value })),
-    ...(payload.adsense_publisher_ids || []).map((value) => ({ label: "AdSense publisher", value })),
-    ...(payload.fb_app_id || []).map((value) => ({ label: "Facebook app ID", value }))
-  ];
-}
-
-function extractDnsValues(values, key = null) {
-  if (!values) {
-    return [];
-  }
-  if (Array.isArray(values)) {
-    return values
-      .map((item) => {
-        if (item && typeof item === "object") {
-          if (key && item[key]) {
-            return String(item[key]);
-          }
-          return String(item.value || item.exchange || item.host || "");
-        }
-        return String(item || "");
+  const deferredSearch = useDeferredValue(search);
+  const cases = normalizeCases(casesRequest.data).sort(sortCases);
+  const query = deferredSearch.trim().toLowerCase();
+  const filteredCases = query
+    ? cases.filter((caseItem) => {
+        const haystack = [
+          caseItem.id,
+          caseItem.title,
+          caseItem.summaryText,
+          caseItem.status,
+          caseItem.jobId,
+          caseItem.targets.join(" "),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(query);
       })
-      .filter(Boolean);
-  }
-  if (typeof values === "object") {
-    if (key && values[key]) {
-      return [String(values[key])];
-    }
-    if (values.value || values.exchange || values.host) {
-      return [String(values.value || values.exchange || values.host)];
-    }
-    return [];
-  }
-  return [String(values)];
-}
+    : cases;
 
-function summarizeWellKnownArtifacts(wellKnown) {
-  const payload = wellKnown || {};
-  const definitions = [
-    ["apple_app_site_association", "Apple app links"],
-    ["assetlinks", "Android asset links"],
-    ["security_txt", "security.txt"],
-    ["openid_configuration", "OpenID config"],
-    ["mta_sts_file", "MTA-STS"],
-    ["ads_txt", "ads.txt"],
-    ["humans_txt", "humans.txt"]
-  ];
-  return definitions
-    .filter(([key]) => {
-      const value = payload[key];
-      if (Array.isArray(value)) {
-        return value.length > 0;
-      }
-      if (value && typeof value === "object") {
-        return Object.keys(value).length > 0;
-      }
-      return Boolean(value);
-    })
-    .map(([, label]) => label);
-}
-
-function normalizeTextList(value) {
-  if (value === null || value === undefined) {
-    return [];
-  }
-  const rawValues = Array.isArray(value) ? value : [value];
-  const seen = new Set();
-  const values = [];
-  rawValues.forEach((entry) => {
-    const text = String(entry || "").trim();
-    if (!text || seen.has(text)) {
-      return;
-    }
-    seen.add(text);
-    values.push(text);
-  });
-  return values;
-}
-
-function flattenScalarValues(value, maxDepth = 4) {
-  if (maxDepth < 0 || value === null || value === undefined) {
-    return [];
-  }
-  if (Array.isArray(value)) {
-    return value.flatMap((entry) => flattenScalarValues(entry, maxDepth - 1));
-  }
-  if (typeof value === "object") {
-    return Object.values(value).flatMap((entry) => flattenScalarValues(entry, maxDepth - 1));
-  }
-  const text = String(value).trim();
-  return text ? [text] : [];
-}
-
-function collectValuesForKeyFragments(value, fragments, maxDepth = 4) {
-  if (maxDepth < 0 || value === null || value === undefined) {
-    return [];
-  }
-  const output = [];
-  if (Array.isArray(value)) {
-    value.forEach((entry) => {
-      output.push(...collectValuesForKeyFragments(entry, fragments, maxDepth - 1));
-    });
-    return output;
-  }
-  if (typeof value === "object") {
-    Object.entries(value).forEach(([key, nested]) => {
-      const keyText = String(key || "").toLowerCase();
-      if (fragments.some((fragment) => keyText.includes(fragment))) {
-        output.push(...flattenScalarValues(nested, 2));
-      }
-      output.push(...collectValuesForKeyFragments(nested, fragments, maxDepth - 1));
-    });
-  }
-  return output;
-}
-
-function collectUrlLikeValues(value) {
-  return flattenScalarValues(value).filter((entry) => entry.includes("://") || entry.toLowerCase().startsWith("mailto:"));
-}
-
-function collectMailClientProbeEntries(config) {
-  const entries = [];
-  if (!config || typeof config !== "object") {
-    return entries;
-  }
-
-  Object.entries(config).forEach(([kind, payload]) => {
-    const sourceItems = Array.isArray(payload)
-      ? payload
-      : payload && typeof payload === "object"
-        ? [payload]
-        : payload
-          ? [{ [kind]: payload }]
-          : [];
-
-    sourceItems.forEach((item, index) => {
-      if (!item || typeof item !== "object") {
-        const values = normalizeTextList(item);
-        if (!values.length) {
-          return;
-        }
-        entries.push({
-          kind,
-          label: `${kind} ${index + 1}`,
-          urls: [],
-          domains: kind === "domains" ? values : [],
-          emails: kind === "emails" ? values : [],
-          servers: kind === "servers" ? values : [],
-          statusCode: null,
-          contentType: "",
-          error: ""
-        });
-        return;
-      }
-
-      const parsed = item.parsed && typeof item.parsed === "object" ? item.parsed : {};
-      const domains = Array.from(new Set([
-        ...normalizeTextList(item.domains),
-        ...normalizeTextList(parsed.domains)
-      ]));
-      const emails = Array.from(new Set([
-        ...normalizeTextList(item.emails),
-        ...normalizeTextList(parsed.emails)
-      ]));
-      const servers = Array.from(new Set([
-        ...normalizeTextList(item.servers),
-        ...normalizeTextList(parsed.servers),
-        ...collectValuesForKeyFragments(parsed, ["server", "hostname", "host"])
-      ]));
-      const urls = Array.from(new Set([
-        ...collectUrlLikeValues(item),
-        ...collectUrlLikeValues(parsed)
-      ]));
-
-      entries.push({
-        kind,
-        label: item.label || `${kind} ${index + 1}`,
-        urls,
-        domains,
-        emails,
-        servers,
-        statusCode: item.status_code ?? null,
-        contentType: item.content_type || "",
-        error: item.error || "",
-        parseError: parsed.parse_error || ""
-      });
-    });
-  });
-
-  return entries;
-}
-
-function collectEmailReportUris(email) {
-  const reportUris = email && email.dmarc_report_uris && typeof email.dmarc_report_uris === "object"
-    ? email.dmarc_report_uris
-    : {};
-  return {
-    rua: normalizeTextList(email && email.dmarc_rua).concat(normalizeTextList(reportUris.rua)),
-    ruf: normalizeTextList(email && email.dmarc_ruf).concat(normalizeTextList(reportUris.ruf)),
-    tlsRptRua: normalizeTextList(email && email.tls_rpt_rua)
-  };
-}
-
-function collectEmailPolicyTargets(payload) {
-  const seen = new Set();
-  const items = [];
-  collectUrlLikeValues(payload).forEach((value) => {
-    if (!seen.has(value)) {
-      seen.add(value);
-      items.push(value);
-    }
-  });
-  collectValuesForKeyFragments(payload, ["name", "host", "domain", "location"]).forEach((value) => {
-    if (!seen.has(value)) {
-      seen.add(value);
-      items.push(value);
-    }
-  });
-  return items;
-}
-
-function getDomainTargets(items) {
-  const seen = new Set();
-  const targets = [];
-  items.forEach((item) => {
-    if (item.type !== "domain") {
-      return;
-    }
-    const target = String(item.target || "");
-    const normalized = target.toLowerCase();
-    if (!target || seen.has(normalized)) {
-      return;
-    }
-    seen.add(normalized);
-    targets.push(target);
-  });
-  return targets;
-}
-
-function SearchableDomainField({
-  id,
-  label,
-  value,
-  onChange,
-  options,
-  placeholder = "Search stored domains",
-  emptySelectionLabel = "",
-  helper = "",
-  className = "field-row"
-}) {
-  const [query, setQuery] = useState(value || "");
-  const [open, setOpen] = useState(false);
-
-  useEffect(() => {
-    if (!open) {
-      setQuery(value || "");
-    }
-  }, [open, value]);
-
-  const normalizedQuery = String(query || "").trim().toLowerCase();
-  const visibleLimit = normalizedQuery ? 18 : 10;
-  const filteredOptions = [];
-  let matchCount = 0;
-
-  options.forEach((item) => {
-    if (normalizedQuery && !item.toLowerCase().includes(normalizedQuery)) {
-      return;
-    }
-    matchCount += 1;
-    if (filteredOptions.length < visibleLimit) {
-      filteredOptions.push(item);
-    }
-  });
-
-  const showResults = open && (Boolean(emptySelectionLabel) || Boolean(matchCount) || Boolean(normalizedQuery));
-  const metaText = normalizedQuery && query !== value
-    ? `${formatNumber(matchCount)} match${matchCount === 1 ? "" : "es"}${matchCount ? ". Press Enter to choose the first." : ""}`
-    : helper || `${formatNumber(options.length)} stored domain${options.length === 1 ? "" : "s"}`;
-  const exactMatch = options.find((item) => item.toLowerCase() === normalizedQuery) || "";
-
-  const handleSelect = (nextValue) => {
-    setQuery(nextValue);
-    onChange(nextValue);
-    setOpen(false);
-  };
+  const runningCases = cases.filter((caseItem) => !isTerminalStatus(caseItem.status)).length;
+  const readySummaries = cases.filter((caseItem) => caseItem.summaryText).length;
 
   return (
-    <div className={`${className} domain-search-field`}>
-      <label htmlFor={id}>{label}</label>
-      <div className="domain-search-shell">
-        <input
-          id={id}
-          type="text"
-          autoComplete="off"
-          value={query}
-          placeholder={placeholder}
-          aria-expanded={showResults}
-          onFocus={() => setOpen(true)}
-          onBlur={() => {
-            const querySnapshot = query;
-            const exactMatchSnapshot = options.find((item) => item.toLowerCase() === String(querySnapshot || "").trim().toLowerCase()) || "";
-            window.setTimeout(() => {
-              if (exactMatchSnapshot && exactMatchSnapshot !== value) {
-                handleSelect(exactMatchSnapshot);
-                return;
-              }
-              setOpen(false);
-            }, 120);
-          }}
-          onChange={(event) => {
-            const nextQuery = event.target.value;
-            setQuery(nextQuery);
-            setOpen(true);
-            if (!nextQuery.trim()) {
-              onChange("");
-            }
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              if (!query.trim()) {
-                handleSelect("");
-                return;
-              }
-              if (exactMatch) {
-                handleSelect(exactMatch);
-                return;
-              }
-              if (filteredOptions.length) {
-                handleSelect(filteredOptions[0]);
-              }
-            }
-            if (event.key === "Escape") {
-              event.preventDefault();
-              setQuery(value || "");
-              setOpen(false);
-            }
-          }}
-        />
-
-        {showResults ? (
-          <div className="domain-search-results" role="listbox" aria-label={`${label} results`}>
-            {emptySelectionLabel ? (
-              <button
-                className={!value ? "domain-search-option active" : "domain-search-option"}
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => handleSelect("")}
-                type="button"
-              >
-                {emptySelectionLabel}
-              </button>
-            ) : null}
-
-            {filteredOptions.map((item) => (
-              <button
-                className={item === value ? "domain-search-option active" : "domain-search-option"}
-                key={item}
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => handleSelect(item)}
-                type="button"
-              >
-                {item}
-              </button>
-            ))}
-
-            {!matchCount && normalizedQuery ? (
-              <div className="domain-search-empty">No stored domains match this search.</div>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-      <small className="domain-search-meta">{metaText}</small>
-    </div>
-  );
-}
-
-function parseTargetList(value) {
-  return String(value || "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function pairKey(a, b) {
-  return a < b ? `${a}|||${b}` : `${b}|||${a}`;
-}
-
-function shortLabel(value, max = 22) {
-  if (!value) {
-    return "";
-  }
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-}
-
-function formatListPreview(values, limit = 6) {
-  const items = Array.isArray(values)
-    ? values
-    : String(values || "")
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean);
-  if (!items.length) {
-    return "";
-  }
-  if (items.length <= limit) {
-    return items.join(", ");
-  }
-  return `${items.slice(0, limit).join(", ")} +${items.length - limit} more`;
-}
-
-function formatConfidence(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return "n/a";
-  }
-  return `${Math.round(numeric * 100)}%`;
-}
-
-function formatFacetBuckets(values) {
-  if (!Array.isArray(values) || !values.length) {
-    return "No facet data";
-  }
-  return values
-    .slice(0, 5)
-    .map((item) => `${item.value || item.name || "unknown"} (${formatNumber(item.count || 0)})`)
-    .join(", ");
-}
-
-function buildOpenctiJob(openctiState) {
-  if (!openctiState || openctiState.available === false) {
-    return null;
-  }
-  if (!openctiState.running && !openctiState.started_at && !openctiState.completed_at) {
-    return null;
-  }
-
-  const total = Number(openctiState.total || 0);
-  const done = Number(openctiState.done || 0);
-  const fraction = total > 0 ? Math.max(0, Math.min(1, done / total)) : (!openctiState.running && openctiState.completed_at ? 1 : 0);
-
-  return {
-    id: "opencti-ingestion",
-    kind: "opencti_ingestion",
-    target: openctiState.current || "OpenCTI domains",
-    status: openctiState.running ? "running" : openctiState.completed_at ? "completed" : "queued",
-    created_at: openctiState.started_at || null,
-    updated_at: openctiState.completed_at || openctiState.started_at || null,
-    error: openctiState.last_error || null,
-    logs: openctiState.logs || [],
-    progress: {
-      fraction,
-      total,
-      done,
-      completed_count: done,
-      current: openctiState.current || null,
-      skipped: Number(openctiState.skipped || 0),
-      mode: openctiState.mode || "incremental"
-    }
-  };
-}
-
-function getConnectionItemTitle(sectionKey, item) {
-  if (sectionKey === "tracking_ids") {
-    return item.id_value ? `${item.id_type}: ${item.id_value}` : "Tracking ID";
-  }
-  if (sectionKey === "identifiers") {
-    return item.id_value ? `${humanizeIdentifierType(item.id_type)}: ${item.id_value}` : "Identifier";
-  }
-  if (sectionKey === "tls_certs" || sectionKey === "tls_history") {
-    return getTlsOverlapTitle(item);
-  }
-  if (sectionKey === "favicons") {
-    return item.md5 || "Favicon";
-  }
-  if (sectionKey === "registrant_emails") {
-    return item.email || "Registrant email";
-  }
-  if (sectionKey === "ips") {
-    return item.ip || "IP address";
-  }
-  if (sectionKey === "asns") {
-    return item.asn ? `AS${item.asn}` : "ASN";
-  }
-  if (sectionKey === "provider_hits") {
-    if (item.provider && item.ip) {
-      return `${item.provider} ${item.ip}`;
-    }
-    return item.provider || item.ip || "Provider hit";
-  }
-  if (sectionKey === "nameservers") {
-    return item.nameserver || "Nameserver";
-  }
-  if (sectionKey === "discovered_domains" || sectionKey === "discovered_ips") {
-    return item.target || "Discovered target";
-  }
-  return item.id_value || item.email || item.ip || item.nameserver || item.md5 || item.cn || "Link";
-}
-
-function ConnectionItemDetails({ sectionKey, item, meta }) {
-  if (sectionKey === "tracking_ids") {
-    return <p><strong>Type:</strong> {item.id_type || "Unknown"}</p>;
-  }
-
-  if (sectionKey === "identifiers") {
-    return (
-      <>
-        <p><strong>Type:</strong> {humanizeIdentifierType(item.id_type)}</p>
-        <p><strong>Tier:</strong> {item.tier_label || titleCaseLabel(String(item.tier || "").replace(/_/g, " "))}</p>
-        <p><strong>Category:</strong> {titleCaseLabel(String(item.category || "generic").replace(/_/g, " "))}</p>
-        {item.sources && item.sources.length ? (
-          <p className="break-word"><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
-        ) : null}
-        {item.domain_frequency ? (
-          <p><strong>Stored domains:</strong> {formatNumber(item.domain_frequency)}</p>
-        ) : null}
-        {item.score ? <p><strong>Score:</strong> {formatNumber(item.score)}</p> : null}
-      </>
-    );
-  }
-
-  if (sectionKey === "ips") {
-    return (
-      <>
-        {item.label ? (
-          <div className="pill-row">
-            <TypePill kind={item.label} definitions={meta.server_types || {}} />
-          </div>
-        ) : null}
-        {item.asn_desc || item.asn ? <p><strong>ASN:</strong> {item.asn_desc || `AS${item.asn}`}</p> : null}
-        {item.network_cidr ? <p><strong>Network:</strong> {item.network_cidr}</p> : null}
-        {item.proxy_family ? <p><strong>Reverse proxy:</strong> {item.proxy_family}</p> : null}
-        {item.ptr ? <p className="break-word"><strong>PTR:</strong> {item.ptr}</p> : null}
-        {item.shared_network_with && item.shared_network_with.length ? (
-          <p className="break-word"><strong>Shared network:</strong> {item.shared_network_with.join(", ")}</p>
-        ) : null}
-      </>
-    );
-  }
-
-  if (sectionKey === "asns") {
-    return (
-      <>
-        {item.label ? (
-          <div className="pill-row">
-            <TypePill kind={item.label} definitions={meta.server_types || {}} />
-          </div>
-        ) : null}
-        {item.asn_desc ? <p><strong>Owner:</strong> {item.asn_desc}</p> : null}
-        {item.network_cidr ? <p><strong>Network:</strong> {item.network_cidr}</p> : null}
-        {item.proxy_family ? <p><strong>Proxy family:</strong> {item.proxy_family}</p> : null}
-        {item.shared_network_with && item.shared_network_with.length ? (
-          <p className="break-word"><strong>Same CIDR also seen on:</strong> {item.shared_network_with.join(", ")}</p>
-        ) : null}
-      </>
-    );
-  }
-
-  if (sectionKey === "tls_certs") {
-    return (
-      <>
-        <p>{getTlsOverlapSummary(item)}</p>
-        <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
-        {item.ip ? <p><strong>Seen on IP:</strong> {item.ip}</p> : null}
-        {(item.not_before || item.not_after) ? (
-          <p><strong>Certificate valid:</strong> {`${formatDate(item.not_before)} to ${formatDate(item.not_after)}`}</p>
-        ) : null}
-        {item.sha256 ? (
-          <details className="fold-panel">
-            <summary>Raw certificate detail</summary>
-            <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
-          </details>
-        ) : null}
-      </>
-    );
-  }
-
-  if (sectionKey === "tls_history") {
-    return (
-      <>
-        <p>{getTlsOverlapSummary(item)}</p>
-        <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
-        <p><strong>Status:</strong> {getTlsOverlapStatusLabel(item.relationship_status)}</p>
-        {item.current_shared_with && item.current_shared_with.length ? (
-          <p className="break-word"><strong>Still shared with:</strong> {item.current_shared_with.join(", ")}</p>
-        ) : null}
-        {item.historical_shared_with && item.historical_shared_with.length ? (
-          <p className="break-word"><strong>Previously shared with:</strong> {item.historical_shared_with.join(", ")}</p>
-        ) : null}
-        {(item.first_observed || item.last_observed) ? (
-          <p><strong>Seen in our data:</strong> {formatFriendlyDateRange(item.first_observed, item.last_observed)}</p>
-        ) : null}
-        {(item.overlap_start || item.overlap_end) ? (
-          <p><strong>Shared during:</strong> {formatFriendlyDateRange(item.overlap_start, item.overlap_end)}</p>
-        ) : null}
-        {item.sha256 ? (
-          <details className="fold-panel">
-            <summary>Raw certificate detail</summary>
-            <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
-          </details>
-        ) : null}
-      </>
-    );
-  }
-
-  if (sectionKey === "discovered_domains" || sectionKey === "discovered_ips") {
-    return (
-      <>
-        <p><strong>Pivot type:</strong> {String(item.target_type || "").toUpperCase() || "Unknown"}</p>
-        {item.relations && item.relations.length ? (
-          <p><strong>Why it surfaced:</strong> {formatRelationList(item.relations, 4)}</p>
-        ) : null}
-        {item.sources && item.sources.length ? (
-          <p className="break-word"><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
-        ) : null}
-        {item.score ? <p><strong>Score:</strong> {formatNumber(item.score)}</p> : null}
-      </>
-    );
-  }
-
-  if (sectionKey === "provider_hits") {
-    return (
-      <>
-        <p><strong>Status:</strong> {item.status || "unknown"} | <strong>Mode:</strong> {item.mode || "unknown"}</p>
-        {item.query_type ? <p><strong>Query:</strong> {item.query_type}</p> : null}
-        {item.asn_desc || item.asn ? <p><strong>ASN:</strong> {item.asn_desc || `AS${item.asn}`}</p> : null}
-        {item.org ? <p><strong>Org:</strong> {item.org}</p> : null}
-        {item.country ? <p><strong>Country:</strong> {item.country}</p> : null}
-      </>
-    );
-  }
-
-  return null;
-}
-
-function buildNetworkModel(clusters, options) {
-  const edgeMap = new Map();
-  const nodeMap = new Map();
-
-  function ensureNode(id) {
-    if (!nodeMap.has(id)) {
-      nodeMap.set(id, { id, totalWeight: 0, degree: 0 });
-    }
-    return nodeMap.get(id);
-  }
-
-  function registerCluster(targets, kind, score, descriptor, color) {
-    for (let i = 0; i < targets.length; i += 1) {
-      for (let j = i + 1; j < targets.length; j += 1) {
-        const source = targets[i];
-        const target = targets[j];
-        const key = pairKey(source, target);
-        const sourceNode = ensureNode(source);
-        const targetNode = ensureNode(target);
-        sourceNode.totalWeight += score;
-        sourceNode.degree += 1;
-        targetNode.totalWeight += score;
-        targetNode.degree += 1;
-
-        if (!edgeMap.has(key)) {
-          edgeMap.set(key, {
-            key,
-            source: source < target ? source : target,
-            target: source < target ? target : source,
-            score: 0,
-            details: [],
-            kinds: new Set(),
-            primaryKind: kind,
-            primaryColor: color,
-            primaryScore: score
-          });
-        }
-
-        const edge = edgeMap.get(key);
-        edge.score += score;
-        edge.details.push({ kind, descriptor, score });
-        edge.kinds.add(kind);
-        if (score >= edge.primaryScore) {
-          edge.primaryKind = kind;
-          edge.primaryColor = color;
-          edge.primaryScore = score;
-        }
-      }
-    }
-  }
-
-  if (options.includeTracking) {
-    (clusters.tracking || []).forEach((row) => {
-      registerCluster(
-        parseTargetList(row.targets),
-        "tracking",
-        9,
-        `${row.id_type}: ${row.id_value}`,
-        NETWORK_LINK_META.tracking.color
-      );
-    });
-  }
-
-  if (options.includeTls) {
-    (clusters.tls || []).forEach((row) => {
-      const relationshipStatus = normalizeEvidenceStatus(row.relationship_status);
-      registerCluster(
-        parseTargetList(row.targets),
-        "tls",
-        getTlsLinkScore(relationshipStatus),
-        `${getTlsOverlapTitle(row)} | ${getTlsOverlapIssuer(row)} | ${relationshipStatus}`,
-        NETWORK_LINK_META.tls.color
-      );
-    });
-  }
-
-  if (options.includeFavicon) {
-    (clusters.favicon || []).forEach((row) => {
-      registerCluster(
-        parseTargetList(row.targets),
-        "favicon",
-        4,
-        `MD5 ${shortLabel(row.md5, 14)}`,
-        NETWORK_LINK_META.favicon.color
-      );
-    });
-  }
-
-  if (options.includeIp) {
-    (clusters.ip || []).forEach((row) => {
-      registerCluster(
-        parseTargetList(row.targets),
-        "ip",
-        IP_LINK_SCORES[row.label] || 2,
-        `${row.ip} | ${row.label.replace("_", " ")}`,
-        NETWORK_LINK_META.ip.color
-      );
-    });
-  }
-
-  if (options.includeAsn) {
-    (clusters.asn || []).forEach((row) => {
-      const relationshipStatus = normalizeEvidenceStatus(row.relationship_status);
-      const networkHint = Array.isArray(row.network_cidrs) && row.network_cidrs.length
-        ? row.network_cidrs.slice(0, 2).join(", ")
-        : "Unknown network";
-      registerCluster(
-        parseTargetList(row.targets),
-        "asn",
-        getAsnLinkScore(row.label, relationshipStatus),
-        `AS${row.asn} | ${row.asn_desc || "Unknown owner"} | ${row.label || "direct"} | ${relationshipStatus} | ${networkHint}`,
-        NETWORK_LINK_META.asn.color
-      );
-    });
-  }
-
-  const focusValue = (options.focus || "").trim().toLowerCase();
-  const allEdges = [...edgeMap.values()]
-    .filter((edge) => edge.score >= options.minScore)
-    .filter((edge) => {
-      if (!focusValue) {
-        return true;
-      }
-      return edge.source.toLowerCase() === focusValue || edge.target.toLowerCase() === focusValue;
-    })
-    .map((edge) => ({
-      ...edge,
-      kinds: [...edge.kinds],
-      details: edge.details.sort((a, b) => b.score - a.score || a.kind.localeCompare(b.kind))
-    }))
-    .sort((a, b) => b.score - a.score || b.details.length - a.details.length || a.source.localeCompare(b.source));
-
-  const visibleEdges = allEdges.slice(0, options.maxLinks);
-  const visibleNodeIds = new Set();
-  visibleEdges.forEach((edge) => {
-    visibleNodeIds.add(edge.source);
-    visibleNodeIds.add(edge.target);
-  });
-
-  const visibleNodes = [...nodeMap.values()]
-    .filter((node) => visibleNodeIds.has(node.id))
-    .map((node) => {
-      const displayWeight = visibleEdges.reduce((sum, edge) => {
-        return edge.source === node.id || edge.target === node.id ? sum + edge.score : sum;
-      }, 0);
-      const visibleDegree = visibleEdges.reduce((sum, edge) => {
-        return edge.source === node.id || edge.target === node.id ? sum + 1 : sum;
-      }, 0);
-      return {
-        ...node,
-        displayWeight,
-        visibleDegree
-      };
-    })
-    .sort((a, b) => b.displayWeight - a.displayWeight || a.id.localeCompare(b.id));
-
-  return {
-    nodes: visibleNodes,
-    edges: visibleEdges,
-    hiddenEdgeCount: Math.max(allEdges.length - visibleEdges.length, 0),
-    maxScore: visibleEdges.reduce((highest, edge) => Math.max(highest, edge.score), 0)
-  };
-}
-
-function describeLinkStrength(score) {
-  if (score >= 20) {
-    return "Very strong overlap";
-  }
-  if (score >= 12) {
-    return "Strong overlap";
-  }
-  if (score >= 5) {
-    return "Useful lead";
-  }
-  return "Weak signal";
-}
-
-function formatList(values) {
-  const items = (values || []).filter(Boolean);
-  if (!items.length) {
-    return "";
-  }
-  if (items.length === 1) {
-    return items[0];
-  }
-  if (items.length === 2) {
-    return `${items[0]} and ${items[1]}`;
-  }
-  return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
-}
-
-function getOrderedNetworkKinds(kinds) {
-  const set = new Set(kinds || []);
-  return NETWORK_LINK_ORDER.filter((kind) => set.has(kind));
-}
-
-function normalizeIpDescriptorLabel(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[ -]+/g, "_");
-}
-
-function normalizeEvidenceStatus(value) {
-  return String(value || "").trim().toLowerCase() === "historical" ? "historical" : "current";
-}
-
-function getTlsLinkScore(status) {
-  return TLS_LINK_SCORES[normalizeEvidenceStatus(status)] || TLS_LINK_SCORES.current;
-}
-
-function getAsnLinkScore(label, status) {
-  const normalizedStatus = normalizeEvidenceStatus(status);
-  const normalizedLabel = normalizeIpDescriptorLabel(label) || "direct";
-  const statusScores = ASN_LINK_SCORES[normalizedStatus] || ASN_LINK_SCORES.current;
-  return statusScores[normalizedLabel] || statusScores.direct;
-}
-
-function describeGraphDetail(detail) {
-  const meta = NETWORK_LINK_META[detail.kind] || {
-    label: detail.kind,
-    summary: "This is one of the overlap signals used to link domains.",
-    meaning: "It means both domains shared the same underlying clue.",
-    caution: "Use it alongside the other signals in the graph."
-  };
-
-  if (detail.kind === "ip") {
-    const [ip, rawLabel] = String(detail.descriptor || "")
-      .split("|")
-      .map((part) => part.trim())
-      .filter(Boolean);
-    const label = normalizeIpDescriptorLabel(rawLabel);
-
-    if (label === "direct") {
-      return {
-        ...meta,
-        evidence: ip ? `Observed IP: ${ip}` : detail.descriptor,
-        summary: ip
-          ? `Both domains pointed at ${ip}, and that address looks like a direct server rather than a shared front door.`
-          : "Both domains pointed at the same IP, and it looks like a direct server.",
-        meaning: "In plain English: these sites may be sitting on the same real web server, which is one of the more useful infrastructure links.",
-        caution: "A direct IP is usually stronger than a CDN or shared-hosting overlap, but you should still sanity-check the rest of the evidence."
-      };
-    }
-
-    if (label === "shared_hosting") {
-      return {
-        ...meta,
-        evidence: ip ? `Observed IP: ${ip}` : detail.descriptor,
-        summary: ip
-          ? `Both domains touched ${ip}, but that address looks like shared hosting used by multiple customers.`
-          : "Both domains touched the same shared-hosting IP.",
-        meaning: "In plain English: the sites were placed on the same hosting platform, which is useful context but not strong proof of a shared owner.",
-        caution: "Shared-hosting overlaps are best treated as supporting evidence unless you also see TLS, tracking, or other stronger links."
-      };
-    }
-
-    if (label === "cdn_proxy") {
-      return {
-        ...meta,
-        evidence: ip ? `Observed edge IP: ${ip}` : detail.descriptor,
-        summary: ip
-          ? `Both domains were seen on ${ip}, but that address looks like a CDN or reverse-proxy edge rather than the hidden origin server.`
-          : "Both domains shared a CDN or proxy edge IP.",
-        meaning: "In plain English: they passed through the same front-door service. That can happen for many unrelated sites, so it is a weak clue by itself.",
-        caution: "Treat CDN overlaps as background context, not a strong ownership signal."
-      };
-    }
-
-    if (label === "mail") {
-      return {
-        ...meta,
-        evidence: ip ? `Observed mail IP: ${ip}` : detail.descriptor,
-        summary: ip
-          ? `Both domains touched ${ip}, but that address looks like mail or collaboration infrastructure rather than a dedicated web origin.`
-          : "Both domains touched the same mail or collaboration IP.",
-        meaning: "In plain English: the sites may share the same mail, Exchange, or hosted messaging setup. That can still be useful organizational evidence, just not as strong as a direct web-origin match.",
-        caution: "Mail overlaps are best treated as supporting evidence unless the certificate, SAN list, or other infrastructure clues also line up."
-      };
-    }
-
-    return {
-      ...meta,
-      evidence: ip ? `Observed IP: ${ip}` : detail.descriptor,
-      summary: meta.summary,
-      meaning: meta.meaning,
-      caution: meta.caution
-    };
-  }
-
-  if (detail.kind === "tls") {
-    const [subject, issuer, rawStatus] = String(detail.descriptor || "")
-      .split("|")
-      .map((part) => part.trim())
-      .filter(Boolean);
-    const status = normalizeEvidenceStatus(rawStatus);
-    return {
-      ...meta,
-      evidence: subject
-        ? `${subject}${issuer ? ` issued by ${issuer}` : ""}`
-        : detail.descriptor,
-      summary: subject
-        ? `Both domains ${status === "current" ? "still use" : "used in the past"} the same HTTPS certificate: ${subject}.`
-        : meta.summary,
-      meaning: status === "current"
-        ? "In plain English: the same HTTPS certificate is still live on both domains. That is one of the strongest technical links this graph can make from cert and IP data."
-        : "In plain English: the same HTTPS certificate was shared in the past. That still matters because it can reveal migrations, legacy hosting, or older common control that is no longer live.",
-      caution: status === "current"
-        ? meta.caution
-        : "Historical certificate overlap is valuable, but it can reflect an old migration or temporary shared platform instead of a current live relationship."
-    };
-  }
-
-  if (detail.kind === "asn") {
-    const [asn, owner, rawLabel, rawStatus, networkHint] = String(detail.descriptor || "")
-      .split("|")
-      .map((part) => part.trim())
-      .filter(Boolean);
-    const label = normalizeIpDescriptorLabel(rawLabel);
-    const status = normalizeEvidenceStatus(rawStatus);
-    const tense = status === "current" ? "currently sit" : "were historically seen";
-    const ownerLabel = owner && owner !== "Unknown owner" ? ` (${owner})` : "";
-    const networkLabel = networkHint && networkHint !== "Unknown network" ? ` on ${networkHint}` : "";
-
-    if (label === "direct") {
-      return {
-        ...meta,
-        evidence: `${asn || "ASN"}${networkLabel}`,
-        summary: `${asn || "The domains"} ${tense} inside the same provider network${ownerLabel}${networkLabel}.`,
-        meaning: status === "current"
-          ? "In plain English: both domains are currently operating from the same non-noisy network neighborhood. That is useful context, but it is still weaker than a shared exact certificate or direct IP."
-          : "In plain English: both domains lived in the same network in the past. That can reveal historical common infrastructure even after the hosts moved.",
-        caution: "ASN overlap helps build the case, especially on smaller networks, but it should be combined with stronger host-level evidence before you treat it as near-proof."
-      };
-    }
-
-    if (label === "shared_hosting") {
-      return {
-        ...meta,
-        evidence: `${asn || "ASN"}${networkLabel}`,
-        summary: `${asn || "The domains"} ${tense} inside the same shared-hosting network${ownerLabel}${networkLabel}.`,
-        meaning: "In plain English: both domains were placed on the same broader hosting provider. That is useful background, but plenty of unrelated sites can land there too.",
-        caution: "Shared-hosting ASN overlap is supporting context, not a strong ownership link on its own."
-      };
-    }
-
-    if (label === "mail") {
-      return {
-        ...meta,
-        evidence: `${asn || "ASN"}${networkLabel}`,
-        summary: `${asn || "The domains"} ${tense} inside the same mail or collaboration network${ownerLabel}${networkLabel}.`,
-        meaning: "In plain English: the domains may share the same messaging or Exchange environment, which can be useful organization-level context.",
-        caution: "Mail-network overlap is worth keeping, but it is usually weaker than direct web-origin or exact TLS evidence."
-      };
-    }
-
-    if (label === "cdn_proxy") {
-      return {
-        ...meta,
-        evidence: `${asn || "ASN"}${networkLabel}`,
-        summary: `${asn || "The domains"} ${tense} inside the same CDN or reverse-proxy network${ownerLabel}${networkLabel}.`,
-        meaning: "In plain English: both domains used the same front-door delivery network. That can happen for many unrelated sites, so it is mainly background context.",
-        caution: "CDN ASN overlap should stay low-weight unless stronger direct-host evidence also appears."
-      };
-    }
-
-    return {
-      ...meta,
-      evidence: `${asn || "ASN"}${networkLabel}`,
-      summary: meta.summary,
-      meaning: meta.meaning,
-      caution: meta.caution
-    };
-  }
-
-  if (detail.kind === "tracking") {
-    const descriptor = String(detail.descriptor || "").trim();
-    const splitIndex = descriptor.indexOf(":");
-    const idType = splitIndex >= 0 ? descriptor.slice(0, splitIndex).trim() : "Tracking code";
-    const idValue = splitIndex >= 0 ? descriptor.slice(splitIndex + 1).trim() : descriptor;
-    return {
-      ...meta,
-      evidence: descriptor,
-      summary: idValue
-        ? `Both domains contain the same ${idType}: ${shortLabel(idValue, 34)}.`
-        : meta.summary,
-      meaning: meta.meaning,
-      caution: meta.caution
-    };
-  }
-
-  if (detail.kind === "favicon") {
-    return {
-      ...meta,
-      evidence: detail.descriptor,
-      summary: "Both domains use the same small browser-tab icon or favicon hash.",
-      meaning: meta.meaning,
-      caution: meta.caution
-    };
-  }
-
-  return {
-    ...meta,
-    evidence: detail.descriptor,
-    summary: meta.summary,
-    meaning: meta.meaning,
-    caution: meta.caution
-  };
-}
-
-function buildEdgeNarrative(edge) {
-  const kindLabels = getOrderedNetworkKinds(edge.kinds).map((kind) => NETWORK_LINK_META[kind].headline.toLowerCase());
-  if (!kindLabels.length) {
-    return "These domains share at least one technical clue, so the graph is treating them as related.";
-  }
-  return `These domains share ${formatList(kindLabels)}. In plain English, that makes this a ${describeLinkStrength(edge.score).toLowerCase()} that the same operator, infrastructure, or deployment process touched both of them.`;
-}
-
-function collectNodeSignalCounts(edges, nodeId) {
-  const counts = {
-    tls: 0,
-    tracking: 0,
-    ip: 0,
-    asn: 0,
-    favicon: 0
-  };
-
-  (edges || []).forEach((edge) => {
-    if (!edgeTouchesNode(edge, nodeId)) {
-      return;
-    }
-    getOrderedNetworkKinds(edge.kinds).forEach((kind) => {
-      counts[kind] += 1;
-    });
-  });
-
-  return counts;
-}
-
-function getEdgeEndpointId(endpoint) {
-  return typeof endpoint === "string" ? endpoint : endpoint.id;
-}
-
-function edgeTouchesNode(edge, nodeId) {
-  return getEdgeEndpointId(edge.source) === nodeId || getEdgeEndpointId(edge.target) === nodeId;
-}
-
-function TabButton({ active, label, onClick }) {
-  return (
-    <button className={active ? "tab-button active" : "tab-button"} onClick={onClick} type="button">
-      {label}
-    </button>
-  );
-}
-
-function InfoPopover({ title, body }) {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <span className="info-popover">
-      <button
-        className="info-button"
-        onClick={(event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          setOpen(!open);
-        }}
-        type="button"
-        aria-label={`Explain ${title}`}
-      >
-        i
-      </button>
-      {open ? (
-        <span className="popover-card">
-          <strong>{title}</strong>
-          <span>{body}</span>
-        </span>
-      ) : null}
-    </span>
-  );
-}
-
-function SectionCard({ title, subtitle, actions, infoTitle, infoBody, children }) {
-  return (
-    <section className="panel">
-      <div className="panel-header">
-        <div>
-          <div className="panel-title-row">
-            <h2>{title}</h2>
-            {infoTitle && infoBody ? <InfoPopover title={infoTitle} body={infoBody} /> : null}
-          </div>
-          {subtitle ? <p>{subtitle}</p> : null}
+    <AppShell>
+      <section className="hero-panel">
+        <div className="hero-copy">
+          <p className="eyebrow">Submission workspace</p>
+          <h1>Submit domains or IPs and follow the overlap case as it runs.</h1>
+          <p>
+            Start with one target or a CSV, then move through progress, overlap summary,
+            pair evidence, and cluster review without the old monolithic explorer.
+          </p>
         </div>
-        {actions ? <div className="panel-actions">{actions}</div> : null}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function Callout({ tone = "info", children }) {
-  return <div className={`callout ${tone}`}>{children}</div>;
-}
-
-function Metric({ label, value, detail }) {
-  return (
-    <div className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      {detail ? <small>{detail}</small> : null}
-    </div>
-  );
-}
-
-function AnalysisFlowPanel({ payload, job, targetHint = "", compact = false }) {
-  const stages = buildAnalysisStages(payload, job, targetHint);
-
-  return (
-    <section className={compact ? "analysis-flow compact" : "analysis-flow"}>
-      {stages.map((stage, index) => (
-        <article className={`analysis-step ${stage.state}`} key={stage.phase}>
-          <div className="analysis-step-top">
-            <span className="analysis-step-index">{String(index + 1).padStart(2, "0")}</span>
-            <span className="analysis-step-state">
-              {stage.state === "complete" ? "Done" : stage.state === "active" ? "Live" : "Waiting"}
-            </span>
-          </div>
-          <h3>{stage.title}</h3>
-          <p>{stage.description}</p>
-          <small>{stage.meta}</small>
-        </article>
-      ))}
-    </section>
-  );
-}
-
-function RecommendedScansPanel({ recommendations, onRunRecommendation, busy }) {
-  const items = recommendations && recommendations.items ? recommendations.items : [];
-  if (!items.length) {
-    return null;
-  }
-
-  return (
-    <SectionCard
-      title="Recommended next scans"
-      subtitle="The normal pass is done. These are the deeper scans the current evidence makes worth trying next."
-      infoTitle="Recommended next scans"
-      infoBody="These suggestions are generated from the finished seed analysis. They stay targeted so you can widen the search deliberately instead of running every heavy scan by default."
-    >
-      <div className="card-grid">
-        {items.map((item) => (
-          <LeadCard
-            key={item.id}
-            title={item.label}
-            footer={item.options && Array.isArray(item.options.scan_countries) && item.options.scan_countries.length
-              ? `Countries: ${item.options.scan_countries.join(", ")}`
-              : null}
-          >
-            <p>{item.reason}</p>
-            {onRunRecommendation ? (
-              <button className="inline-action" onClick={() => onRunRecommendation(item)} type="button" disabled={busy}>
-                {busy ? "Running..." : "Run this scan"}
-              </button>
-            ) : null}
-          </LeadCard>
-        ))}
-      </div>
-    </SectionCard>
-  );
-}
-
-function HardConnectionsPanel({ summary }) {
-  const items = summary && summary.items ? summary.items : [];
-  if (!items.length) {
-    return null;
-  }
-
-  return (
-    <SectionCard
-      title="Hard connections"
-      subtitle="These are the concrete IP or domain links the run can already defend with direct technical evidence."
-      infoTitle="Hard connections"
-      infoBody="Hard connections are the main point of the app: direct DNS links, certificate overlaps, discovered origin IPs, and other exact technical ties. They should be treated differently from softer pivots or broad similarity hints."
-    >
-      <div className="metric-grid">
-        <Metric label="Total hard links" value={formatNumber(summary.total || 0)} />
-        <Metric label="Domains" value={formatNumber(summary.domains || 0)} />
-        <Metric label="IPs" value={formatNumber(summary.ips || 0)} />
-        <Metric
-          label="Shown now"
-          value={formatNumber(summary.shown || items.length)}
-          detail={summary.total > items.length ? "Top-ranked evidence only" : "All hard links shown"}
-        />
-      </div>
-
-      <div className="card-grid">
-        {items.map((item) => (
-          <LeadCard
-            key={`${item.target_type}-${item.target}`}
-            title={item.target}
-            footer={`${item.target_type.toUpperCase()} | ${formatNumber(item.hard_evidence_count || 0)} hard evidence signal${(item.hard_evidence_count || 0) === 1 ? "" : "s"}`}
-          >
-            <p>{item.evidence_rationale || "Concrete technical overlap discovered around the seed."}</p>
-            <p><strong>Hard evidence:</strong> {formatRelationList(item.hard_relations && item.hard_relations.length ? item.hard_relations : item.relations, 4)}</p>
-            <p><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
-          </LeadCard>
-        ))}
-      </div>
-    </SectionCard>
-  );
-}
-
-function DatabaseMatchesPanel({ matches, onOpenSavedResult }) {
-  const items = matches && matches.items ? matches.items : [];
-  if (!items.length) {
-    return null;
-  }
-
-  return (
-    <SectionCard
-      title="Already in the database"
-      subtitle="These top exposed IPs or domains already touch searches we’ve stored before."
-      infoTitle="Already in the database"
-      infoBody="This section answers the question: did any of the pivots uncovered in this run already appear in our own history? The cards below are a ranked shortlist, not an exhaustive export. A direct target hit is stronger than a passive discovered-target hit."
-    >
-      <div className="metric-grid">
-        <Metric label="Top pivots shown" value={formatNumber(matches.total || 0)} />
-        <Metric label="Top domains shown" value={formatNumber(matches.matched_domains || 0)} />
-        <Metric label="Top IPs shown" value={formatNumber(matches.matched_ips || 0)} />
-        <Metric label="Direct hits shown" value={formatNumber(matches.direct_target_hits || 0)} />
-      </div>
-
-      <div className="card-grid">
-        {items.map((item) => (
-          <LeadCard
-            key={`${item.target_type}-${item.target}`}
-            title={item.target}
-            footer={item.match_count > item.matches.length
-              ? `Showing ${item.matches.length} of ${item.match_count} stored matches`
-              : `${item.match_count} stored match${item.match_count === 1 ? "" : "es"}`}
-          >
-            <p><strong>Pivot type:</strong> {item.target_type.toUpperCase()}</p>
-            <p><strong>Why it surfaced:</strong> {formatRelationList(item.relations)}</p>
-            <p><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
-            <div className="match-snippet-list">
-              {item.matches.map((match) => (
-                <div className="match-snippet" key={`${item.target}-${match.search_id}`}>
-                  <p><strong>{match.target}</strong> | {formatDateTime(match.timestamp)} | {cloudflareLabel(match.cloudflare_fronted)}</p>
-                  <p>
-                    {match.matched_as_target
-                      ? "Matched as a searched target."
-                      : `Matched via ${formatRelationList(match.matched_relations)}.`}
-                  </p>
-                  {!match.matched_as_target && match.matched_sources && match.matched_sources.length ? (
-                    <p><strong>Stored via:</strong> {formatListPreview(match.matched_sources, 4)}</p>
-                  ) : null}
-                  {onOpenSavedResult ? (
-                    <button className="inline-action" onClick={() => onOpenSavedResult(match.search_id)} type="button">
-                      Open match
-                    </button>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-          </LeadCard>
-        ))}
-      </div>
-    </SectionCard>
-  );
-}
-
-function TypePill({ kind, definitions }) {
-  if (!kind) {
-    return null;
-  }
-  const definition = definitions[kind];
-  if (!definition) {
-    return <span className="type-pill">{kind}</span>;
-  }
-  return (
-    <span className="type-pill">
-      {definition.label}
-      <InfoPopover title={definition.label} body={definition.summary} />
-    </span>
-  );
-}
-
-function KeyValueList({ items }) {
-  return (
-    <div className="key-value-grid">
-      {items.filter((item) => item.value).map((item) => (
-        <div className="key-value-item" key={item.label}>
-          <span>{item.label}</span>
-          <strong>{item.value}</strong>
+        <div className="hero-stats">
+          <MetricCard label="Cases available" value={cases.length} />
+          <MetricCard label="Jobs in flight" value={runningCases} />
+          <MetricCard label="Cases with summaries" value={readySummaries} />
         </div>
-      ))}
-    </div>
-  );
-}
-
-function LeadCard({ title, children, footer }) {
-  return (
-    <article className="lead-card">
-      <h4>{title}</h4>
-      <div>{children}</div>
-      {footer ? <small>{footer}</small> : null}
-    </article>
-  );
-}
-
-function PageNavButton({ active, label, subtitle, onClick }) {
-  return (
-    <button className={active ? "page-nav-button active" : "page-nav-button"} onClick={onClick} type="button">
-      <strong>{label}</strong>
-      {active && subtitle ? <span>{subtitle}</span> : null}
-    </button>
-  );
-}
-
-function PageFrame({ eyebrow, title, subtitle, infoTitle, infoBody, actions, metrics, children }) {
-  return (
-    <section className="page-frame">
-      <div className="page-heading">
-        <div>
-          {eyebrow ? <span className="eyebrow">{eyebrow}</span> : null}
-          <div className="page-title-row">
-            <h2>{title}</h2>
-            {infoTitle && infoBody ? <InfoPopover title={infoTitle} body={infoBody} /> : null}
-          </div>
-          {subtitle ? <p>{subtitle}</p> : null}
-        </div>
-        {actions ? <div className="panel-actions">{actions}</div> : null}
-      </div>
-      {metrics ? <div className="metric-grid page-metrics">{metrics}</div> : null}
-      <div className="stack">{children}</div>
-    </section>
-  );
-}
-
-function JobProgress({ job }) {
-  if (!job) {
-    return null;
-  }
-
-  const isOpenctiJob = job.kind === "opencti_ingestion";
-  const progress = job.progress || { fraction: 0, completed: [], completed_count: 0, total: 0 };
-  const partial = job.partial_result || {};
-  const dns = partial.dns || {};
-  const flowPayload = job.result || partial;
-  const relatedSummary = getRelatedTargetsSummary(flowPayload);
-  const phasePills = [
-    ...(progress.completed || []).map((phase) => ({ label: phase, tone: "done" })),
-    ...(progress.current ? [{ label: progress.current, tone: "active" }] : [])
-  ];
-
-  if (isOpenctiJob) {
-      const modeLabel = progress.mode === "full_reanalyse"
-        ? "Re-run all"
-        : progress.mode === "full_queue"
-          ? "Full queue"
-          : "Incremental";
-    const done = Number(progress.done || progress.completed_count || 0);
-    const total = Number(progress.total || 0);
-    const currentTarget = progress.current || "Preparing queue";
-
-    return (
-      <SectionCard
-        title={job.status === "completed" ? "Latest OpenCTI ingestion" : "OpenCTI ingestion"}
-        subtitle={job.status === "completed" ? `Completed ${formatDateTime(job.updated_at)}` : `Processing ${currentTarget}`}
-      >
-        <div className="metric-grid">
-          <Metric label="Progress" value={`${Math.round((progress.fraction || 0) * 100)}%`} detail={currentTarget} />
-          <Metric label="Domains done" value={`${formatNumber(done)}/${formatNumber(total)}`} />
-          <Metric label="Skipped existing" value={formatNumber(progress.skipped || 0)} />
-          <Metric label="Mode" value={modeLabel} detail={job.status === "running" ? "Polling live" : "Last recorded run"} />
-        </div>
-
-        <div className="progress-wrap">
-          <div className="progress-track">
-            <div className="progress-fill" style={{ width: `${(progress.fraction || 0) * 100}%` }} />
-          </div>
-          <div className="phase-pill-row">
-            <span className="phase-pill done">Fetch OpenCTI domains</span>
-            <span className="phase-pill done">{modeLabel}</span>
-            {total ? <span className="phase-pill done">{`Queued ${formatNumber(total)}`}</span> : null}
-            {progress.skipped ? <span className="phase-pill">{`Skipped ${formatNumber(progress.skipped)}`}</span> : null}
-            {progress.current ? <span className="phase-pill">{shortLabel(progress.current, 36)}</span> : null}
-          </div>
-        </div>
-
-        {job.error ? <Callout tone="warning">{job.error}</Callout> : null}
-
-        <details className="fold-panel">
-          <summary>Raw ingestion log</summary>
-          <div className="log-shell">
-            {(job.logs || []).slice(-30).map((entry, index) => (
-              <div className="log-line" key={`${index}-${entry}`}>
-                {entry}
-              </div>
-            ))}
-          </div>
-        </details>
-      </SectionCard>
-    );
-  }
-
-  return (
-    <SectionCard
-      title={job.status === "completed" ? "Latest analysis" : "Live analysis"}
-      subtitle={job.status === "completed" ? `Completed ${formatDateTime(job.updated_at)}` : `Following ${job.target} outward from the supplied seed`}
-    >
-      <div className="metric-grid">
-        <Metric
-          label="Current stage"
-          value={progress.current || (job.status === "completed" ? "Complete" : "Queued")}
-          detail={`${Math.round((progress.fraction || 0) * 100)}% of the flow tracked`}
-        />
-        <Metric label="Seed IPs" value={formatNumber(getCurrentIps(flowPayload).length || (dns.A || []).length)} />
-        <Metric label="Origin leads" value={formatNumber(collectOriginLeadCount(flowPayload))} />
-        <Metric
-          label="Pivots"
-          value={formatNumber(relatedSummary.expandable || 0)}
-          detail={`${formatNumber(relatedSummary.total || 0)} total discovered`}
-        />
-      </div>
-
-      <div className="progress-wrap">
-        <div className="progress-track">
-          <div className="progress-fill" style={{ width: `${(progress.fraction || 0) * 100}%` }} />
-        </div>
-        <div className="phase-pill-row">
-          {phasePills.length
-            ? phasePills.map((phase) => (
-                <span className={phase.tone === "done" ? "phase-pill done" : "phase-pill active"} key={phase.label}>
-                  {phase.label}
-                </span>
-              ))
-            : <span className="phase-pill">Waiting for the first seed reads</span>}
-        </div>
-      </div>
-
-      <AnalysisFlowPanel payload={flowPayload} job={job} compact />
-
-      {job.error ? <Callout tone="danger">{job.error}</Callout> : null}
-
-      <details className="fold-panel">
-        <summary>Raw job log</summary>
-        <div className="log-shell">
-          {(job.logs || []).slice(-30).map((entry, index) => (
-            <div className="log-line" key={`${index}-${entry}`}>
-              {entry}
-            </div>
-          ))}
-        </div>
-      </details>
-    </SectionCard>
-  );
-}
-
-function OverviewTab({ result, meta, onRunRecommendation, onOpenSavedResult, busy }) {
-  const dns = result.dns || {};
-  const page = result.page_metadata || {};
-  const email = result.email_security || {};
-  const wellKnown = result.well_known || {};
-  const currentCerts = result.non_cf_tls_certs || (result.tls_cert ? [result.tls_cert] : []);
-  const trackingIds = collectTrackingSignals(page);
-  const dnsTxtTokens = result.dns_txt_tokens || [];
-  const nonCfIps = normalizeTextList(result.non_cf_ips || []);
-  const spfOrigins = result.spf_origins || [];
-  const mailClientEntries = collectMailClientProbeEntries(result.mail_client_config || result.mail_config || {});
-  const legalPages = (result.legal_pages || []).filter((entry) => entry && typeof entry === "object");
-  const sshHostKeys = (result.ssh_host_keys || []).filter((entry) => entry && typeof entry === "object");
-  const emailReportUris = collectEmailReportUris(email);
-  const bimiTargets = collectEmailPolicyTargets(email.bimi);
-  const mtaStsTargets = collectEmailPolicyTargets(email.mta_sts);
-  const tlsRptTargets = collectEmailPolicyTargets(email.tls_rpt);
-  const securityTxtContacts = Array.from(new Set([
-    ...normalizeTextList((wellKnown.security_txt || {}).contacts),
-    ...normalizeTextList((wellKnown.security_txt || {}).emails)
-  ]));
-  const securityTxtUrls = Array.from(new Set([
-    ...normalizeTextList((wellKnown.security_txt || {}).urls),
-    ...normalizeTextList((wellKnown.security_txt || {}).policy),
-    ...normalizeTextList((wellKnown.security_txt || {}).canonical)
-  ]));
-  const appleApps = Array.from(new Set([
-    ...normalizeTextList((wellKnown.apple_app_site_association || {}).app_ids),
-    ...normalizeTextList((wellKnown.apple_app_site_association || {}).webcredentials_apps),
-    ...normalizeTextList((wellKnown.apple_app_site_association || {}).activitycontinuation_apps)
-  ]));
-  const assetlinksPackages = Array.from(new Set(collectValuesForKeyFragments(wellKnown.assetlinks, ["package"])));
-  const assetlinksFingerprints = Array.from(new Set(collectValuesForKeyFragments(wellKnown.assetlinks, ["sha256", "fingerprint"])));
-  const openIdEndpoints = Array.from(new Set([
-    ...normalizeTextList((wellKnown.openid_configuration || {}).issuer),
-    ...normalizeTextList((wellKnown.openid_configuration || {}).authorization_endpoint),
-    ...normalizeTextList((wellKnown.openid_configuration || {}).token_endpoint),
-    ...normalizeTextList((wellKnown.openid_configuration || {}).userinfo_endpoint),
-    ...normalizeTextList((wellKnown.openid_configuration || {}).jwks_uri),
-    ...normalizeTextList((wellKnown.openid_configuration || {}).registration_endpoint)
-  ]));
-  const wellKnownArtifacts = summarizeWellKnownArtifacts(wellKnown);
-  const historicalIps = ((result.historical_dns || {}).records || []).filter((item) => ["A", "AAAA"].includes(item.rrtype));
-  const interestingTxt = collectInterestingTxt(dns.TXT || []);
-  const relatedSummary = getRelatedTargetsSummary(result);
-  const hardConnections = getHardConnections(result);
-  const pivots = getPivotCandidates(result);
-  const exposure = buildExposureSummary(result);
-  const currentIps = getCurrentIps(result);
-  const hasExtendedPageContext = Boolean(
-    (page.social_handles && Object.keys(page.social_handles).length)
-    || (page.social_links && Object.keys(page.social_links).length)
-    || page.html_lang
-    || page.cms_generator
-    || page.favicon_md5
-    || page.favicon_mmh3
-    || page.final_url
-    || page.homepage_html_hash
-    || (page.authors && page.authors.length)
-    || normalizeTextList(page.twitter_site).length
-    || normalizeTextList(page.twitter_creator).length
-    || normalizeTextList(page.rel_me).length
-    || (page.script_assets && page.script_assets.length)
-    || (page.source_map_leaks && page.source_map_leaks.length)
-  );
-  const hasPageContext = Boolean(
-    (page.social_handles && Object.keys(page.social_handles).length)
-    || (page.social_links && Object.keys(page.social_links).length)
-    || page.html_lang
-    || page.cms_generator
-    || page.favicon_md5
-  );
-  const hasEmailContext = Boolean(
-    email.dmarc
-    || email.dmarc_name
-    || (email.dkim && Object.keys(email.dkim).length)
-    || (email.spf_includes && email.spf_includes.length)
-    || emailReportUris.rua.length
-    || emailReportUris.ruf.length
-    || emailReportUris.tlsRptRua.length
-    || bimiTargets.length
-    || mtaStsTargets.length
-    || tlsRptTargets.length
-  );
-  const hasWellKnownContext = Boolean(
-    wellKnownArtifacts.length
-    || appleApps.length
-    || assetlinksPackages.length
-    || assetlinksFingerprints.length
-    || securityTxtContacts.length
-    || securityTxtUrls.length
-    || openIdEndpoints.length
-    || normalizeTextList((wellKnown.mta_sts_file || {}).mx).length
-    || Object.keys((wellKnown.humans_txt || {}).sections || {}).length
-    || (wellKnown.ads_txt && typeof wellKnown.ads_txt === "object" && Object.keys(wellKnown.ads_txt).length)
-  );
-  const microsoftTenant = result.microsoft_tenant || {};
-  const hasSupportingContext = Boolean(
-    currentCerts.length
-    || trackingIds.length
-    || dnsTxtTokens.length
-    || nonCfIps.length
-    || spfOrigins.length
-    || interestingTxt.length
-    || hasExtendedPageContext
-    || historicalIps.length
-    || hasEmailContext
-    || hasWellKnownContext
-    || mailClientEntries.length
-    || legalPages.length
-    || sshHostKeys.length
-    || Object.values(microsoftTenant).some(Boolean)
-  );
-
-  return (
-    <div className="stack">
-      {result.source_errors && result.source_errors.length ? (
-        <Callout tone="warning">
-          Some external sources failed or rate-limited during this run: {result.source_errors.join(", ")}.
-        </Callout>
-      ) : null}
-
-      <section className="overview-hero">
-        <div className="overview-hero-main">
-          <div className="overview-hero-copy">
-            <span className="eyebrow">At a glance</span>
-            <h3>{result.input}</h3>
-            <p>
-              Seed first, then widen into provider, Google, Cloudflare, ASN, and TLS checks only where nearby matches look worth chasing.
-            </p>
-          </div>
-          <div className="metric-grid overview-hero-metrics">
-            <Metric label="Target type" value={(result.type || "").toUpperCase()} />
-            <Metric label="Cloudflare" value={cloudflareLabel(result.cloudflare_fronted ?? result.cloudflare)} />
-            <Metric label="Hard connections" value={formatNumber(hardConnections.total || 0)} detail={`${formatNumber(hardConnections.domains || 0)} domains • ${formatNumber(hardConnections.ips || 0)} IPs`} />
-            <Metric label="Broader pivots" value={formatNumber(Math.max((relatedSummary.expandable || 0) - (hardConnections.total || 0), 0))} detail={`${formatNumber(relatedSummary.total || 0)} total discovered`} />
-          </div>
-        </div>
-        <Callout tone={exposure.tone}>
-          <strong>{exposure.title}.</strong> {exposure.body}
-        </Callout>
       </section>
 
-      <SectionCard
-        title="Analysis path"
-        subtitle="Seed first, then outward only where the evidence supports it."
-      >
-        <AnalysisFlowPanel payload={result} compact />
-      </SectionCard>
-
-      <HardConnectionsPanel summary={hardConnections} />
-
-      <RecommendedScansPanel
-        recommendations={result.scan_recommendations}
-        onRunRecommendation={onRunRecommendation}
-        busy={busy}
-      />
-
-      <SectionCard
-        title="Seed snapshot"
-        subtitle="The direct facts pulled from the supplied target before the workflow fans outward."
-      >
-        <KeyValueList
-          items={[
-            { label: "Registrar", value: getRegistrar(result) },
-            { label: "Created", value: formatDate(result.whois && result.whois.creation_date) },
-            { label: "Country", value: result.whois && result.whois.country },
-            { label: "Org", value: result.whois && result.whois.org },
-            { label: "Seed IPs", value: currentIps.length ? formatListPreview(currentIps, 4) : null }
-          ]}
-        />
-
-        <div className="card-grid">
-          <LeadCard title="Current routing">
-            <p><strong>Cloudflare:</strong> {cloudflareLabel(result.cloudflare_fronted ?? result.cloudflare)}</p>
-            <p className="break-word"><strong>Current IPs:</strong> {currentIps.length ? formatListPreview(currentIps, 6) : "No A/AAAA records were resolved"}</p>
-            <p><strong>Direct-looking IPs:</strong> {formatNumber(getDirectIpCount(result))}</p>
-          </LeadCard>
-          <LeadCard title="Connection evidence">
-            <p><strong>Hard connections:</strong> {formatNumber(hardConnections.total || 0)}</p>
-            <p><strong>Related domains:</strong> {formatNumber(relatedSummary.domains || 0)}</p>
-            <p><strong>Related IPs:</strong> {formatNumber(relatedSummary.ips || 0)}</p>
-          </LeadCard>
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">New case</p>
+            <h2>Submit targets</h2>
+            <p className="section-copy">
+              Add one domain or IP directly, or upload a CSV and we will process the first
+              column only.
+            </p>
+          </div>
         </div>
-      </SectionCard>
 
-      {pivots.length ? (
-        <SectionCard
-          title="Broader pivots"
-          subtitle="Useful next leads, but weaker than the hard evidence links above."
-        >
-          <div className="card-grid">
-            {pivots.map((item) => (
-              <LeadCard key={`${item.target_type}-${item.target}`} title={item.target} footer={`${item.target_type.toUpperCase()} | score ${formatNumber(item.score || 0)}`}>
-                <p><strong>Why it surfaced:</strong> {formatRelationList(item.relations)}</p>
-                <p><strong>Seen via:</strong> {formatListPreview(item.sources, 4)}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      <DatabaseMatchesPanel matches={result.db_matches} onOpenSavedResult={onOpenSavedResult} />
-
-      {hasSupportingContext ? (
-        <details className="fold-panel">
-          <summary>Supporting context and technical detail</summary>
-
-          <div className="stack">
-            {currentCerts.length ? (
-              <SectionCard
-                title="Live TLS certificates"
-                subtitle="Certificates pulled directly from discovered non-Cloudflare IPs."
-              >
-                <div className="card-grid">
-                  {currentCerts.map((cert) => (
-                    <LeadCard key={`${cert.ip}-${cert.sha256 || cert.cn}`} title={`${cert.ip}:${cert.port || 443}`} footer={`Valid ${formatDate(cert.not_before)} to ${formatDate(cert.not_after)}`}>
-                      <p><strong>CN:</strong> {cert.cn || "None"}</p>
-                      <p><strong>Issuer:</strong> {cert.issuer_cn || cert.issuer_org || "Unknown"}</p>
-                      <TypePill kind={cert.cert_type} definitions={meta.cert_types || {}} />
-                      <p className="muted break-word">{(cert.sans || []).slice(0, 8).join(", ") || "No SANs listed"}</p>
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {trackingIds.length ? (
-              <SectionCard
-                title="Tracking and attribution IDs"
-                subtitle="Useful pivot points when you want to find related domains."
-              >
-                <div className="card-grid">
-                  {trackingIds.map((item) => (
-                    <LeadCard key={`${item.label}-${item.value}`} title={item.label}>
-                      <p className="break-word">{item.value}</p>
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {dnsTxtTokens.length ? (
-              <SectionCard title="DNS verification tokens" subtitle="TXT-based ownership tokens and platform verification codes.">
-                <div className="card-grid">
-                  {dnsTxtTokens.map((item, index) => (
-                    <LeadCard key={`${item.provider || "token"}-${item.token || item.value || index}`} title={String(item.provider || "Verification token").replace(/_/g, " ")}>
-                      <p className="break-word">{item.token || item.value || "Unknown token"}</p>
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {interestingTxt.length ? (
-              <SectionCard title="Interesting TXT records" subtitle="Ownership and platform tokens translated into normal English.">
-                <div className="card-grid">
-                  {interestingTxt.map((item) => (
-                    <LeadCard key={`${item.label}-${item.value}`} title={item.label} footer={item.note}>
-                      <p className="break-word">{item.value}</p>
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {hasExtendedPageContext ? (
-              <SectionCard title="Social accounts and content signals" subtitle="Useful for operator mapping and template clues.">
-                <div className="card-grid">
-                  {Object.entries(page.social_handles || {}).map(([platform, handles]) => (
-                    <LeadCard key={platform} title={platform.replace("_", " ")}>
-                      <p className="break-word">{handles.join(", ")}</p>
-                    </LeadCard>
-                  ))}
-                  {Object.entries(page.social_links || {}).map(([platform, links]) => (
-                    <LeadCard key={`link-${platform}`} title={`${platform.replace("_", " ")} links`}>
-                      <p className="break-word">{links.join(", ")}</p>
-                    </LeadCard>
-                  ))}
-                  {page.html_lang ? (
-                    <LeadCard title="Page language">
-                      <p>{page.html_lang}</p>
-                    </LeadCard>
-                  ) : null}
-                  {page.cms_generator ? (
-                    <LeadCard title="CMS generator">
-                      <p>{page.cms_generator}</p>
-                    </LeadCard>
-                  ) : null}
-                  {page.favicon_md5 ? (
-                    <LeadCard title="Favicon hash">
-                      <p className="break-word">{page.favicon_md5}</p>
-                    </LeadCard>
-                  ) : null}
-                  {page.favicon_mmh3 ? (
-                    <LeadCard title="Favicon MMH3">
-                      <p className="break-word">{page.favicon_mmh3}</p>
-                    </LeadCard>
-                  ) : null}
-                  {page.final_url ? (
-                    <LeadCard title="Final URL">
-                      <p className="break-word">{page.final_url}</p>
-                    </LeadCard>
-                  ) : null}
-                  {page.homepage_html_hash ? (
-                    <LeadCard title="Homepage HTML hash">
-                      <p className="break-word">{page.homepage_html_hash}</p>
-                    </LeadCard>
-                  ) : null}
-                  {normalizeTextList(page.authors).length ? (
-                    <LeadCard title="Authors">
-                      <p className="break-word">{formatListPreview(normalizeTextList(page.authors), 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {normalizeTextList(page.twitter_site).length ? (
-                    <LeadCard title="Twitter site">
-                      <p className="break-word">{formatListPreview(normalizeTextList(page.twitter_site), 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {normalizeTextList(page.twitter_creator).length ? (
-                    <LeadCard title="Twitter creator">
-                      <p className="break-word">{formatListPreview(normalizeTextList(page.twitter_creator), 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {normalizeTextList(page.rel_me).length ? (
-                    <LeadCard title="rel=me links">
-                      <p className="break-word">{formatListPreview(normalizeTextList(page.rel_me), 3)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {page.script_assets && page.script_assets.length ? (
-                    <LeadCard title="Script assets">
-                      <p>{formatNumber(page.script_assets.length)} loaded script assets captured</p>
-                    </LeadCard>
-                  ) : null}
-                  {page.source_map_leaks && page.source_map_leaks.length ? (
-                    <LeadCard title="Source map leaks">
-                      <p>{formatNumber(page.source_map_leaks.length)} source map leads were recorded</p>
-                    </LeadCard>
-                  ) : null}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {nonCfIps.length || spfOrigins.length ? (
-              <SectionCard title="Direct infrastructure inventory" subtitle="Non-Cloudflare hosts and SPF-origin clues collected around the seed.">
-                <div className="card-grid">
-                  {nonCfIps.length ? (
-                    <LeadCard title="Non-Cloudflare IPs">
-                      <p className="break-word">{formatListPreview(nonCfIps, 8)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {spfOrigins.map((entry, index) => (
-                    <LeadCard key={`${entry.ip || "spf"}-${index}`} title={entry.ip || "SPF origin"}>
-                      <p><strong>CIDR:</strong> {entry.cidr || "Unknown"}</p>
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {historicalIps.length ? (
-              <SectionCard
-                title="Historical IP history"
-                subtitle="Older A and AAAA records can expose previous hosting even when the current site is proxied."
-              >
-                <div className="card-grid">
-                  {historicalIps.map((item) => (
-                    <LeadCard
-                      key={`${item.rdata}-${item.last_seen}`}
-                      title={item.rdata}
-                      footer={`First seen ${item.first_seen || "unknown"} | Last seen ${item.last_seen || "unknown"}`}
-                    >
-                      <p>Record type: {item.rrtype}</p>
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {hasEmailContext ? (
-              <SectionCard title="Email security" subtitle="Mail infrastructure can reveal who actually runs the domain.">
-                <div className="card-grid">
-                  {email.dmarc ? (
-                    <LeadCard title="DMARC policy">
-                      <p className="break-word">{email.dmarc}</p>
-                    </LeadCard>
-                  ) : (
-                    <LeadCard title="DMARC policy">
-                      <p>No DMARC record was found, which makes spoofing easier.</p>
-                    </LeadCard>
-                  )}
-                  {email.dmarc_name ? (
-                    <LeadCard title="DMARC hostname">
-                      <p className="break-word">{email.dmarc_name}</p>
-                    </LeadCard>
-                  ) : null}
-                  {Object.entries(email.dkim || {}).map(([selector, value]) => (
-                    <LeadCard key={selector} title={`DKIM: ${selector}`}>
-                      <p className="break-word">{value}</p>
-                    </LeadCard>
-                  ))}
-                  {(email.spf_includes || []).length ? (
-                    <LeadCard title="SPF includes">
-                      <p className="break-word">{formatListPreview(email.spf_includes, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {emailReportUris.rua.length ? (
-                    <LeadCard title="DMARC RUA">
-                      <p className="break-word">{formatListPreview(emailReportUris.rua, 3)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {emailReportUris.ruf.length ? (
-                    <LeadCard title="DMARC RUF">
-                      <p className="break-word">{formatListPreview(emailReportUris.ruf, 3)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {emailReportUris.tlsRptRua.length ? (
-                    <LeadCard title="TLS-RPT RUA">
-                      <p className="break-word">{formatListPreview(emailReportUris.tlsRptRua, 3)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {bimiTargets.length ? (
-                    <LeadCard title="BIMI">
-                      <p className="break-word">{formatListPreview(bimiTargets, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {mtaStsTargets.length ? (
-                    <LeadCard title="MTA-STS">
-                      <p className="break-word">{formatListPreview(mtaStsTargets, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {tlsRptTargets.length ? (
-                    <LeadCard title="TLS-RPT">
-                      <p className="break-word">{formatListPreview(tlsRptTargets, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {mailClientEntries.length ? (
-              <SectionCard title="Mail client discovery" subtitle="Autodiscover and autoconfig endpoints plus any parsed mail settings.">
-                <div className="card-grid">
-                  {mailClientEntries.map((entry, index) => (
-                    <LeadCard key={`${entry.kind}-${entry.label}-${index}`} title={`${entry.kind}: ${entry.label}`}>
-                      {entry.urls.length ? <p className="break-word"><strong>URL:</strong> {formatListPreview(entry.urls, 2)}</p> : null}
-                      {entry.statusCode !== null ? <p><strong>Status:</strong> {entry.statusCode}</p> : null}
-                      {entry.contentType ? <p className="break-word"><strong>Content type:</strong> {entry.contentType}</p> : null}
-                      {entry.domains.length ? <p className="break-word"><strong>Domains:</strong> {formatListPreview(entry.domains, 4)}</p> : null}
-                      {entry.emails.length ? <p className="break-word"><strong>Emails:</strong> {formatListPreview(entry.emails, 4)}</p> : null}
-                      {entry.servers.length ? <p className="break-word"><strong>Servers:</strong> {formatListPreview(entry.servers, 4)}</p> : null}
-                      {entry.parseError ? <p className="break-word"><strong>Parse error:</strong> {entry.parseError}</p> : null}
-                      {entry.error ? <p className="break-word"><strong>Error:</strong> {entry.error}</p> : null}
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {hasWellKnownContext ? (
-              <SectionCard title="Well-known files and policy artifacts" subtitle="Artifacts collected from standard paths such as security.txt, assetlinks, and OpenID configuration.">
-                <div className="card-grid">
-                  {wellKnownArtifacts.length ? (
-                    <LeadCard title="Artifacts present">
-                      <p className="break-word">{formatListPreview(wellKnownArtifacts, 6)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {securityTxtContacts.length ? (
-                    <LeadCard title="security.txt contacts">
-                      <p className="break-word">{formatListPreview(securityTxtContacts, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {securityTxtUrls.length ? (
-                    <LeadCard title="security.txt URLs">
-                      <p className="break-word">{formatListPreview(securityTxtUrls, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {appleApps.length ? (
-                    <LeadCard title="Apple app IDs">
-                      <p className="break-word">{formatListPreview(appleApps, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {assetlinksPackages.length ? (
-                    <LeadCard title="Android packages">
-                      <p className="break-word">{formatListPreview(assetlinksPackages, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {assetlinksFingerprints.length ? (
-                    <LeadCard title="Android certificates">
-                      <p className="break-word">{formatListPreview(assetlinksFingerprints, 3)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {openIdEndpoints.length ? (
-                    <LeadCard title="OpenID endpoints">
-                      <p className="break-word">{formatListPreview(openIdEndpoints, 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {normalizeTextList((wellKnown.mta_sts_file || {}).mx).length ? (
-                    <LeadCard title="MTA-STS MX">
-                      <p className="break-word">{formatListPreview(normalizeTextList((wellKnown.mta_sts_file || {}).mx), 4)}</p>
-                    </LeadCard>
-                  ) : null}
-                  {Object.keys((wellKnown.humans_txt || {}).sections || {}).length ? (
-                    <LeadCard title="humans.txt">
-                      <p>{formatNumber(Object.keys((wellKnown.humans_txt || {}).sections || {}).length)} sections captured</p>
-                    </LeadCard>
-                  ) : null}
-                  {(wellKnown.ads_txt || {}).normalized_text_hash ? (
-                    <LeadCard title="ads.txt hash">
-                      <p className="break-word">{wellKnown.ads_txt.normalized_text_hash}</p>
-                    </LeadCard>
-                  ) : null}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {legalPages.length ? (
-              <SectionCard title="Legal pages" subtitle="Contact, entity, and registration details extracted from legal or imprint-style pages.">
-                <div className="card-grid">
-                  {legalPages.map((pageEntry, index) => (
-                    <LeadCard key={`${pageEntry.url || "legal"}-${index}`} title={pageEntry.url || `Legal page ${index + 1}`}>
-                      {pageEntry.entities && pageEntry.entities.length ? (
-                        <p className="break-word"><strong>Entities:</strong> {formatListPreview(pageEntry.entities, 3)}</p>
-                      ) : null}
-                      {pageEntry.emails && pageEntry.emails.length ? (
-                        <p className="break-word"><strong>Emails:</strong> {formatListPreview(pageEntry.emails, 3)}</p>
-                      ) : null}
-                      {pageEntry.phone_numbers && pageEntry.phone_numbers.length ? (
-                        <p className="break-word"><strong>Phone numbers:</strong> {formatListPreview(pageEntry.phone_numbers, 3)}</p>
-                      ) : null}
-                      {pageEntry.registration_numbers && pageEntry.registration_numbers.length ? (
-                        <p className="break-word"><strong>Registration:</strong> {formatListPreview(pageEntry.registration_numbers, 3)}</p>
-                      ) : null}
-                      {pageEntry.text_hash ? (
-                        <p className="break-word"><strong>Text hash:</strong> {pageEntry.text_hash}</p>
-                      ) : null}
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {sshHostKeys.length ? (
-              <SectionCard title="SSH host keys" subtitle="Keys collected from directly reachable hosts discovered during the run.">
-                <div className="card-grid">
-                  {sshHostKeys.map((entry, index) => (
-                    <LeadCard key={`${entry.host || entry.ip || "ssh"}-${index}`} title={entry.host || entry.ip || "SSH host"}>
-                      <p><strong>IP:</strong> {entry.ip || "Unknown"}</p>
-                      <p><strong>Key type:</strong> {entry.key_type || "Unknown"}</p>
-                      <p><strong>Bits:</strong> {entry.bits || "Unknown"}</p>
-                      <p className="break-word"><strong>SHA256:</strong> {entry.fingerprint_sha256 || entry.sha256 || "Unknown"}</p>
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            ) : null}
-
-            {Object.values(microsoftTenant).some(Boolean) ? (
-              <SectionCard title="Microsoft tenant" subtitle="Tenant and endpoint details discovered from Microsoft identity metadata.">
-                <div className="card-grid">
-                  {microsoftTenant.tenant_guid ? (
-                    <LeadCard title="Tenant GUID">
-                      <p className="break-word">{microsoftTenant.tenant_guid}</p>
-                    </LeadCard>
-                  ) : null}
-                  {microsoftTenant.issuer ? (
-                    <LeadCard title="Issuer">
-                      <p className="break-word">{microsoftTenant.issuer}</p>
-                    </LeadCard>
-                  ) : null}
-                  {microsoftTenant.token_endpoint ? (
-                    <LeadCard title="Token endpoint">
-                      <p className="break-word">{microsoftTenant.token_endpoint}</p>
-                    </LeadCard>
-                  ) : null}
-                  {microsoftTenant.source_url ? (
-                    <LeadCard title="Source URL">
-                      <p className="break-word">{microsoftTenant.source_url}</p>
-                    </LeadCard>
-                  ) : null}
-                  {microsoftTenant.error ? (
-                    <LeadCard title="Lookup status">
-                      <p>{microsoftTenant.error}</p>
-                    </LeadCard>
-                  ) : null}
-                </div>
-              </SectionCard>
-            ) : null}
-          </div>
-        </details>
-      ) : null}
-    </div>
-  );
-}
-
-function DnsTab({ result }) {
-  const dns = result.dns || {};
-  const whois = result.whois || {};
-  const zoneTransfer = result.zone_transfer || [];
-  const dnsTxtTokens = result.dns_txt_tokens || [];
-  const spfOrigins = result.spf_origins || [];
-  const historicalRecords = ((result.historical_dns || {}).records || []);
-  const nameserverAnalysis = result.nameserver_analysis || {};
-  const dnsTypes = ["A", "AAAA", "CAA", "CNAME", "NS", "MX", "TXT", "SOA"];
-
-  return (
-    <div className="stack">
-      <SectionCard
-        title="WHOIS"
-        subtitle="The most useful registration fields, without the noisy registry boilerplate."
-        infoTitle="WHOIS"
-        infoBody="WHOIS is the public registration record for a domain name. It can show dates, registrar details, and sometimes contact or organisation clues."
-      >
-        <KeyValueList
-          items={[
-            { label: "Registrar", value: Array.isArray(whois.registrar) ? whois.registrar[0] : whois.registrar },
-            { label: "Created", value: formatDate(whois.creation_date) },
-            { label: "Updated", value: formatDate(whois.updated_date) },
-            { label: "Expires", value: formatDate(whois.expiry_date) },
-            { label: "Org", value: whois.org },
-            { label: "Country", value: whois.country },
-            { label: "Emails", value: Array.isArray(whois.emails) ? whois.emails.join(", ") : whois.emails }
-          ]}
-        />
-      </SectionCard>
-
-      {zoneTransfer.length ? (
-        <SectionCard
-          title="Zone transfer records"
-          subtitle="Records exposed because a DNS server allowed an AXFR response."
-        >
-          <Callout tone="warning">
-            A zone transfer succeeded and exposed {zoneTransfer.length} additional records. That is a serious DNS configuration leak.
-          </Callout>
-          <div className="tag-grid">
-            {zoneTransfer.map((item) => (
-              <span className="tag" key={item}>{item}</span>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      <SectionCard
-        title="DNS records"
-        subtitle="Current DNS answers from live resolution."
-        infoTitle="DNS records"
-        infoBody="DNS records are the address book entries for a domain. They tell browsers and mail servers where to go when someone tries to use the domain."
-      >
-        <div className="card-grid">
-          {dnsTypes.map((type) => {
-            const value = dns[type];
-            if (!value || (Array.isArray(value) && !value.length)) {
-              return null;
-            }
-            return (
-              <LeadCard key={type} title={type}>
-                {Array.isArray(value) ? (
-                  <ul className="plain-list">
-                    {value.map((item, index) => (
-                      <li key={`${type}-${index}`} className="break-word">
-                        {typeof item === "object" ? JSON.stringify(item) : String(item)}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="break-word">{JSON.stringify(value)}</p>
-                )}
-              </LeadCard>
-            );
-          })}
-        </div>
-      </SectionCard>
-
-      {dns.CAA_parsed && dns.CAA_parsed.length ? (
-        <SectionCard title="CAA issuers" subtitle="Certificate authorities explicitly allowed to issue for this domain.">
-          <div className="card-grid">
-            {dns.CAA_parsed.map((item, index) => (
-              <LeadCard key={`${item.value || item.ca || index}`} title={item.value || item.ca || "CAA"}>
-                {item.tag ? <p><strong>Tag:</strong> {item.tag}</p> : null}
-                {item.flags !== undefined ? <p><strong>Flags:</strong> {item.flags}</p> : null}
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {dnsTxtTokens.length ? (
-        <SectionCard title="DNS TXT verification tokens" subtitle="Platform verification tokens lifted out of TXT records.">
-          <div className="card-grid">
-            {dnsTxtTokens.map((item, index) => (
-              <LeadCard key={`${item.provider || "token"}-${item.token || item.value || index}`} title={String(item.provider || "Verification token").replace(/_/g, " ")}>
-                <p className="break-word">{item.token || item.value || "Unknown token"}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {spfOrigins.length ? (
-        <SectionCard title="SPF-origin IPs" subtitle="IPs and ranges explicitly trusted to send mail for the domain.">
-          <div className="card-grid">
-            {spfOrigins.map((entry, index) => (
-              <LeadCard key={`${entry.ip || "spf"}-${index}`} title={entry.ip || "SPF origin"}>
-                <p><strong>CIDR:</strong> {entry.cidr || "Unknown"}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {(nameserverAnalysis.boring && nameserverAnalysis.boring.length) || (nameserverAnalysis.vanity_candidates && nameserverAnalysis.vanity_candidates.length) ? (
-        <SectionCard title="Nameserver analysis" subtitle="A quick split between commodity DNS and potential vanity infrastructure.">
-          <div className="card-grid">
-            {nameserverAnalysis.boring && nameserverAnalysis.boring.length ? (
-              <LeadCard title="Commodity nameservers">
-                <p className="break-word">
-                  {formatListPreview(nameserverAnalysis.boring.map((entry) => `${entry.nameserver}${entry.apex ? ` (${entry.apex})` : ""}`), 6)}
-                </p>
-              </LeadCard>
-            ) : null}
-            {nameserverAnalysis.vanity_candidates && nameserverAnalysis.vanity_candidates.length ? (
-              <LeadCard title="Vanity candidates">
-                <p className="break-word">{formatListPreview(nameserverAnalysis.vanity_candidates, 6)}</p>
-              </LeadCard>
-            ) : null}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {historicalRecords.length ? (
-        <SectionCard title="Historical DNS records" subtitle="Observed historical DNS records, not just the old A and AAAA answers.">
-          <div className="card-grid">
-            {historicalRecords.map((item, index) => (
-              <LeadCard
-                key={`${item.rrtype || "record"}-${item.rdata || index}-${item.last_seen || ""}`}
-                title={item.rdata || "Historical record"}
-                footer={`First seen ${item.first_seen || "unknown"} | Last seen ${item.last_seen || "unknown"}`}
-              >
-                <p><strong>Type:</strong> {item.rrtype || "Unknown"}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-    </div>
-  );
-}
-
-function CertificatesTab({ result, meta }) {
-  const certs = ((result.cert_transparency || {}).certs) || [];
-  const issuers = ((result.cert_transparency || {}).issuer_details) || [];
-  const crossSans = ((result.cert_transparency || {}).cross_domain_sans) || [];
-  const subdomains = result.subdomains || [];
-
-  return (
-    <div className="stack">
-      <SectionCard
-        title="Certificate issuer types"
-        subtitle="Every certificate family is explained in normal English so you can interpret it quickly."
-        infoTitle="Certificate issuer types"
-        infoBody="This groups certificates into easy-to-read categories so you can tell whether a certificate looks like a normal public website certificate, a hosting default, or something more specialised."
-      >
-        <div className="card-grid">
-          {issuers.map((item) => (
-            <LeadCard key={item.issuer} title={item.issuer}>
-              <TypePill kind={item.cert_type} definitions={meta.cert_types || {}} />
-            </LeadCard>
-          ))}
-        </div>
-      </SectionCard>
-
-      {crossSans.length ? (
-        <SectionCard
-          title="Cross-domain SANs"
-          subtitle="Other domains that appeared on the same certificates. These can be strong infrastructure links."
-          infoTitle="Cross-domain SANs"
-          infoBody="A SAN list is the set of names covered by one certificate. If two domains appear on the same certificate, that is often a useful clue that they were managed together."
-        >
-          <div className="tag-grid">
-            {crossSans.map((item) => (
-              <span className="tag" key={item}>{item}</span>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      {subdomains.length ? (
-        <SectionCard title="Subdomains found in certificate history" subtitle="Subdomains discovered through certificate transparency.">
-          <div className="tag-grid">
-            {subdomains.map((item) => (
-              <span className="tag" key={item}>{item}</span>
-            ))}
-          </div>
-        </SectionCard>
-      ) : null}
-
-      <SectionCard
-        title="Certificate timeline"
-        subtitle="Raw crt.sh history, sorted newest first."
-        infoTitle="Certificate timeline"
-        infoBody="This is the certificate history for the domain over time. It can show old providers, reused certificates, or additional names that were attached to the same setup."
-      >
-        <div className="card-grid">
-          {certs.map((cert) => (
-            <LeadCard
-              key={`${cert.id}-${cert.issuer}`}
-              title={cert.issuer || "Unknown issuer"}
-              footer={`${formatDate(cert.not_before)} to ${formatDate(cert.not_after)}`}
+        <div className="submission-grid">
+          <div className="submission-card">
+            <label className="search-field">
+              <span>Single domain or IP</span>
+              <input
+                name="target"
+                onChange={(event) => setTargetInput(event.target.value)}
+                placeholder="example.com or 203.0.113.10"
+                type="text"
+                value={targetInput}
+              />
+            </label>
+            <button
+              className="primary-button"
+              disabled={submitState.busy || !targetInput.trim()}
+              onClick={() => submitCase({ target: targetInput.trim() })}
+              type="button"
             >
-              <TypePill kind={cert.cert_type} definitions={meta.cert_types || {}} />
-              <p className="muted break-word">{(cert.sans || []).slice(0, 12).join(", ") || "No SANs listed"}</p>
-            </LeadCard>
-          ))}
+              {submitState.busy ? "Submitting..." : "Start single-target case"}
+            </button>
+          </div>
+
+          <div className="submission-card">
+            <label className="search-field file-field">
+              <span>CSV upload</span>
+              <input
+                accept=".csv,text/csv"
+                onChange={(event) => setCsvFile(event.target.files?.[0] || null)}
+                type="file"
+              />
+            </label>
+            <button
+              className="primary-button"
+              disabled={submitState.busy || !csvFile}
+              onClick={() => submitCase({ file: csvFile })}
+              type="button"
+            >
+              {submitState.busy ? "Submitting..." : "Upload CSV case"}
+            </button>
+          </div>
         </div>
-      </SectionCard>
-    </div>
-  );
-}
 
-function renderLeadCollection(title, subtitle, items, meta, fallback) {
-  if (!items || !items.length) {
-    return fallback ? <Callout tone="info">{fallback}</Callout> : null;
-  }
+        <div className="callout subtle">
+          <p>
+            Accepted input: one domain or IP in the text field, or a CSV where the first
+            column contains domains or IPs. Duplicate rows are deduplicated server-side.
+          </p>
+        </div>
 
-  return (
-    <SectionCard title={title} subtitle={subtitle}>
-      <div className="card-grid">
-        {items.map((item, index) => (
-          <LeadCard key={`${title}-${item.ip || item.subdomain || index}`} title={item.subdomain || item.ip || "Lead"}>
-            {item.ip ? <p><strong>IP:</strong> {item.ip}</p> : null}
-            {item.date ? <p><strong>Date:</strong> {item.date}</p> : null}
-            {item.url ? <p className="break-word"><strong>URL:</strong> {item.url}</p> : null}
-            {item.cn ? <p><strong>CN:</strong> {item.cn}</p> : null}
-            {item.issuer || item.issuer_cn ? <p><strong>Issuer:</strong> {item.issuer || item.issuer_cn}</p> : null}
-            <div className="pill-row">
-              <TypePill kind={item.cert_type} definitions={meta.cert_types || {}} />
-              <TypePill kind={item.server_type} definitions={meta.server_types || {}} />
-            </div>
-          </LeadCard>
-        ))}
-      </div>
-    </SectionCard>
-  );
-}
+        {submitState.error ? <ErrorState message={submitState.error} /> : null}
+      </section>
 
-function SubdomainFollowupsSection({ result, meta }) {
-  const followups = result.subdomain_followups || [];
-  const summary = result.subdomain_followup_summary || {};
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">API</p>
+            <h2>Cases</h2>
+            <p className="section-copy">Loaded from `/api/cases` and ready to drill into.</p>
+          </div>
+          <button className="secondary-button" onClick={casesRequest.refresh} type="button">
+            Refresh
+          </button>
+        </div>
 
-  if (!followups.length && !summary.enabled) {
-    return null;
-  }
+        <label className="search-field">
+          <span>Search cases</span>
+          <input
+            name="case-search"
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Filter by title, case ID, target, or status"
+            type="search"
+            value={search}
+          />
+        </label>
 
-  return (
-    <SectionCard
-      title="Subdomain follow-ups"
-      subtitle="Full nested scans run against selected wordlist hits so you can inspect each leaked host directly."
-      infoTitle="Subdomain follow-ups"
-      infoBody="These are the full secondary scans kicked off from wordlist leak hits. Each card gives you the leaked host, then the nested WHOIS, DNS, page, well-known, IP, and TLS details collected from that host."
-    >
-      <div className="metric-grid">
-        <Metric label="Candidates" value={formatNumber(summary.candidate_count || 0)} />
-        <Metric label="Scanned" value={formatNumber(summary.completed || followups.length)} detail={`${formatNumber(summary.failed || 0)} failed`} />
-        <Metric label="Cap" value={formatNumber(summary.limit || followups.length)} />
-        <Metric label="Skipped by cap" value={formatNumber(summary.truncated || 0)} detail={summary.status || "unknown"} />
-      </div>
+        {casesRequest.loading && !casesRequest.data ? (
+          <LoadingState message="Loading cases..." />
+        ) : null}
 
-      {summary.truncated ? (
-        <Callout tone="info">
-          The backend capped follow-up scans at {formatNumber(summary.limit || 0)} subdomains for this run, so {formatNumber(summary.truncated || 0)} additional wordlist hits were not expanded.
-        </Callout>
-      ) : null}
+        {casesRequest.error ? <ErrorState message={casesRequest.error} /> : null}
 
-      {!followups.length ? (
-        <Callout tone="info">No nested follow-up scans were attached to this run yet.</Callout>
-      ) : (
-        <div className="card-grid">
-          {followups.map((followup, index) => {
-            const nested = followup.result || {};
-            const dns = nested.dns || {};
-            const whois = nested.whois || {};
-            const page = nested.page_metadata || {};
-            const email = nested.email_security || {};
-            const currentIps = getCurrentIps(nested);
-            const liveCerts = nested.non_cf_tls_certs || (nested.tls_cert ? [nested.tls_cert] : []);
-            const ipEntries = getIpEntries(nested);
-            const trackingIds = collectTrackingSignals(page);
-            const interestingTxt = collectInterestingTxt(dns.TXT || []);
-            const wellKnownArtifacts = summarizeWellKnownArtifacts(nested.well_known || {});
-            const mxHosts = extractDnsValues(dns.MX, "exchange");
-            const nameservers = extractDnsValues(dns.NS);
-            const dnsAliases = extractDnsValues(dns.CNAME);
-            const discoveredIpPreview = ipEntries.map(([ipAddress, info]) => {
-              const sourcePreview = formatListPreview((info && info.sources) || [], 2);
-              return sourcePreview ? `${ipAddress} (${sourcePreview})` : ipAddress;
-            });
-            const legalPageUrls = (nested.legal_pages || [])
-              .map((item) => item && item.url)
-              .filter(Boolean);
+        {!casesRequest.loading && !casesRequest.error && filteredCases.length === 0 ? (
+          <EmptyState
+            message={
+              cases.length === 0
+                ? "No cases were returned by the backend yet."
+                : "No cases match the current search."
+            }
+          />
+        ) : null}
 
-            return (
-              <LeadCard
-                key={`${followup.subdomain || index}-${followup.status || "unknown"}`}
-                title={followup.subdomain || nested.input || `Follow-up ${index + 1}`}
-                footer={
-                  followup.status === "failed"
-                    ? "Nested scan failed"
-                    : `Scanned ${formatDateTime(nested.timestamp)}`
-                }
-              >
-                <p><strong>Status:</strong> {followup.status || "unknown"}</p>
-                {followup.error ? <p className="break-word"><strong>Error:</strong> {followup.error}</p> : null}
-                {(followup.ips || []).length ? (
-                  <p className="break-word"><strong>Leaked IPs:</strong> {formatListPreview(followup.ips, 4)}</p>
-                ) : null}
-                <p><strong>Registrar:</strong> {Array.isArray(whois.registrar) ? whois.registrar[0] : whois.registrar || "Unknown"}</p>
-                <p><strong>Org:</strong> {whois.org || "Unknown"}</p>
-                <p><strong>Country:</strong> {whois.country || "Unknown"}</p>
-                <p className="break-word"><strong>Current IPs:</strong> {currentIps.length ? formatListPreview(currentIps, 5) : "None resolved"}</p>
-                {trackingIds.length ? (
-                  <p className="break-word"><strong>Tracking IDs:</strong> {formatListPreview(trackingIds.map((item) => `${item.label}: ${item.value}`), 3)}</p>
-                ) : null}
-                {liveCerts.length ? (
-                  <p className="break-word"><strong>Live TLS:</strong> {formatListPreview(liveCerts.map((cert) => cert.cn || cert.ip || "Unknown"), 3)}</p>
-                ) : null}
-
-                <details className="fold-panel">
-                  <summary>Nested scan detail</summary>
-                  <div className="stack">
-                    <KeyValueList
-                      items={[
-                        { label: "Created", value: formatDate(whois.creation_date) },
-                        { label: "Updated", value: formatDate(whois.updated_date) },
-                        { label: "Expires", value: formatDate(whois.expiry_date) },
-                        { label: "Cloudflare", value: cloudflareLabel(nested.cloudflare_fronted) },
-                        { label: "Nested IPs", value: currentIps.length ? formatNumber(currentIps.length) : null },
-                        { label: "Live certs", value: liveCerts.length ? formatNumber(liveCerts.length) : null },
-                        { label: "Legal pages", value: nested.legal_pages && nested.legal_pages.length ? formatNumber(nested.legal_pages.length) : null }
-                      ]}
-                    />
-
-                    <p className="break-word"><strong>DNS A/AAAA:</strong> {currentIps.length ? formatListPreview(currentIps, 6) : "None"}</p>
-                    {dnsAliases.length ? <p className="break-word"><strong>CNAME:</strong> {formatListPreview(dnsAliases, 4)}</p> : null}
-                    {nameservers.length ? <p className="break-word"><strong>Nameservers:</strong> {formatListPreview(nameservers, 4)}</p> : null}
-                    {mxHosts.length ? <p className="break-word"><strong>MX:</strong> {formatListPreview(mxHosts, 4)}</p> : null}
-                    {interestingTxt.length ? (
-                      <p className="break-word"><strong>Interesting TXT:</strong> {formatListPreview(interestingTxt.map((item) => `${item.label}: ${item.value}`), 3)}</p>
-                    ) : null}
-                    {trackingIds.length ? (
-                      <p className="break-word"><strong>Page signals:</strong> {formatListPreview(trackingIds.map((item) => `${item.label}: ${item.value}`), 4)}</p>
-                    ) : null}
-                    {page.cms_generator || page.html_lang ? (
-                      <p className="break-word"><strong>Page context:</strong> {formatListPreview([page.cms_generator, page.html_lang].filter(Boolean), 3)}</p>
-                    ) : null}
-                    {wellKnownArtifacts.length ? (
-                      <p className="break-word"><strong>Well-known files:</strong> {formatListPreview(wellKnownArtifacts, 6)}</p>
-                    ) : null}
-                    {email.dmarc ? <p className="break-word"><strong>DMARC:</strong> {email.dmarc}</p> : null}
-                    {(email.spf_includes || []).length ? (
-                      <p className="break-word"><strong>SPF includes:</strong> {formatListPreview(email.spf_includes, 4)}</p>
-                    ) : null}
-                    {nested.microsoft_tenant && nested.microsoft_tenant.tenant_guid ? (
-                      <p className="break-word"><strong>Microsoft tenant:</strong> {nested.microsoft_tenant.tenant_guid}</p>
-                    ) : null}
-                    {legalPageUrls.length ? (
-                      <p className="break-word"><strong>Legal pages:</strong> {formatListPreview(legalPageUrls, 3)}</p>
-                    ) : null}
-                    {discoveredIpPreview.length ? (
-                      <p className="break-word"><strong>Discovered IP context:</strong> {formatListPreview(discoveredIpPreview, 4)}</p>
-                    ) : null}
-                    {liveCerts.length ? (
-                      <div className="pill-row">
-                        {liveCerts.slice(0, 4).map((cert, certIndex) => (
-                          <TypePill
-                            key={`${followup.subdomain || "followup"}-cert-${cert.ip || certIndex}`}
-                            kind={cert.cert_type}
-                            definitions={meta.cert_types || {}}
-                          />
-                        ))}
-                      </div>
-                    ) : null}
+        {filteredCases.length > 0 ? (
+          <div className="case-grid">
+            {filteredCases.map((caseItem) => (
+              <article className="case-card" key={caseItem.id}>
+                <div className="case-card-header">
+                  <div>
+                    <p className="eyebrow">Case {caseItem.id}</p>
+                    <h3>{caseItem.title}</h3>
+                    <p className="card-copy">
+                      {caseItem.summaryText || "Open the summary page to inspect the case detail."}
+                    </p>
                   </div>
-                </details>
-              </LeadCard>
-            );
-          })}
-        </div>
-      )}
-    </SectionCard>
-  );
-}
+                  <StatusBadge status={caseItem.status} />
+                </div>
 
-function OriginTab({ result, meta }) {
-  const origin = result.origin_candidates || {};
-  const relatedSummary = getRelatedTargetsSummary(result);
-  const providerHitCount = getProviderHitCount(result);
-  const sweepHitCount = getTargetedSweepHitCount(result);
-  const directLeadCount = collectOriginLeadCount(result);
-  const scanSections = [
-    {
-      key: "scan",
-      title: "Google Cloud scan hits",
-      subtitle: "Two-phase scan hits from targeted Google Cloud ranges."
-    },
-    {
-      key: "provider_scan",
-      title: "Provider scan hits",
-      subtitle: "Hits from known RU/EU hosting providers."
-    },
-    {
-      key: "country_scan",
-      title: "Country scan hits",
-      subtitle: "Hits from country-wide IPv4 allocations."
-    }
-  ];
-  const providerSections = [
-    {
-      key: "censys",
-      title: "Censys",
-      subtitle: "Indexed TLS observations from Censys that matched the target certificate."
-    },
-    {
-      key: "shodan",
-      title: "Shodan",
-      subtitle: "Indexed banner matches from Shodan that looked like the target infrastructure."
-    },
-    {
-      key: "netlas",
-      title: "Netlas",
-      subtitle: "Netlas certificate-search hits that can reveal current or recent origin hosts."
-    }
-  ];
+                {caseItem.targets.length > 0 ? (
+                  <div className="chip-row">
+                    {caseItem.targets.slice(0, 4).map((target) => (
+                      <span className="chip" key={target}>
+                        {target}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
 
-  return (
-    <div className="stack">
-      <SectionCard
-        title="Expansion summary"
-        subtitle="The workflow starts at the supplied seed, then only fans outward when the nearby evidence looks promising."
-        infoTitle="Expansion summary"
-        infoBody="Use this section to understand how much the run spread beyond the original domain or IP before you read the raw lead collections underneath."
-      >
-        <div className="metric-grid">
-          <Metric label="Direct leads" value={formatNumber(directLeadCount)} />
-          <Metric label="Provider hits" value={formatNumber(providerHitCount)} />
-          <Metric label="Targeted sweep hits" value={formatNumber(sweepHitCount)} />
-          <Metric label="Expandable pivots" value={formatNumber(relatedSummary.expandable || 0)} />
-        </div>
-        <AnalysisFlowPanel payload={result} compact />
-      </SectionCard>
+                <div className="inline-metrics">
+                  <InlineMetric label="Pairs" value={formatMaybeNumber(caseItem.pairCount)} />
+                  <InlineMetric label="Clusters" value={formatMaybeNumber(caseItem.clusterCount)} />
+                  <InlineMetric label="Updated" value={formatMaybeDate(caseItem.updatedAt)} />
+                </div>
 
-      {renderLeadCollection(
-        "Subdomain leaks",
-        "Subdomains that resolved away from the main Cloudflare frontage.",
-        origin.subdomain_leaks || [],
-        meta,
-        "No subdomain leak was found in this run."
-      )}
-      {renderLeadCollection(
-        "MX and mail leads",
-        "Mail hosts can reveal infrastructure relationships even when they are not the web origin.",
-        origin.mx_leaks || [],
-        meta
-      )}
-      {renderLeadCollection(
-        "Wordlist hits",
-        "Fast subdomain probing across common hostnames.",
-        origin.wordlist_leaks || [],
-        meta
-      )}
-      <SubdomainFollowupsSection result={result} meta={meta} />
-      {renderLeadCollection(
-        "HackerTarget",
-        "Historical hostsearch results surfaced for the target.",
-        origin.hackertarget || [],
-        meta
-      )}
-      {renderLeadCollection(
-        "urlscan.io",
-        "Historical browser captures that exposed non-Cloudflare IPs.",
-        origin.urlscan || [],
-        meta
-      )}
-
-      {providerSections.map((section) => {
-        const entry = origin[section.key] || {};
-        const hits = entry.hits || [];
-        const facetEntries = Object.entries(entry.summary_facets || {});
-
-        return (
-          <SectionCard key={section.key} title={section.title} subtitle={section.subtitle}>
-            <div className="metric-grid">
-              <Metric label="Status" value={entry.status || (entry.skipped ? "skipped" : "unknown")} />
-              <Metric label="Mode" value={entry.mode || "unknown"} />
-              <Metric label="Query" value={entry.query_type || "n/a"} />
-              <Metric label="Hits" value={formatNumber(entry.total !== undefined ? entry.total : hits.length)} />
-            </div>
-            {entry.account ? (
-              <Callout tone="info">
-                {`Account plan: ${entry.account.plan || "unknown"} | unlocked: ${entry.account.unlocked ? "yes" : "no"} | query credits: ${formatNumber(entry.account.query_credits || 0)}`}
-              </Callout>
-            ) : null}
-            {entry.reason ? (
-              <Callout tone={entry.status === "paid_only" ? "warning" : "info"}>
-                {entry.reason}
-              </Callout>
-            ) : null}
-            {entry.error ? <Callout tone="warning">{entry.error}</Callout> : null}
-            {facetEntries.length ? (
-              <LeadCard title="Facet summary">
-                {facetEntries.map(([facetName, values]) => (
-                  <p key={facetName} className="break-word">
-                    <strong>{facetName}:</strong> {formatFacetBuckets(values)}
-                  </p>
-                ))}
-              </LeadCard>
-            ) : null}
-            {hits.length ? (
-              <div className="card-grid">
-                {hits.map((hit, index) => (
-                  <LeadCard key={`${section.key}-${hit.ip || index}`} title={hit.ip || "Lead"}>
-                    {hit.asn || hit.asn_name ? <p><strong>ASN:</strong> {hit.asn_name || hit.asn}</p> : null}
-                    {hit.network_name || hit.network_cidr ? (
-                      <p><strong>Network:</strong> {hit.network_name || hit.network_cidr}</p>
-                    ) : null}
-                    {hit.country ? <p><strong>Country:</strong> {hit.country}</p> : null}
-                    {hit.proxy_family ? <p><strong>Reverse proxy:</strong> {hit.proxy_family} ({formatConfidence(hit.proxy_confidence)})</p> : null}
-                    {hit.url ? <p className="break-word"><strong>URL:</strong> {hit.url}</p> : null}
-                    <div className="pill-row">
-                      <TypePill kind={hit.server_type} definitions={meta.server_types || {}} />
+                {caseItem.progress !== null ? (
+                  <div className="mini-progress">
+                    <div className="mini-progress-top">
+                      <span>Progress</span>
+                      <strong>{formatPercent(caseItem.progress)}</strong>
                     </div>
-                  </LeadCard>
-                ))}
-              </div>
-            ) : entry.skipped ? (
-              <Callout tone="info">{entry.reason || `${section.title} was skipped in this run.`}</Callout>
-            ) : (
-              <Callout tone="info">{`No ${section.title} hits were found in this run.`}</Callout>
-            )}
-          </SectionCard>
-        );
-      })}
-
-      {scanSections.map((section) => {
-        const entry = origin[section.key];
-        if (!entry || entry.skipped) {
-          return (
-            <Callout key={section.key} tone="info">
-              {entry && entry.reason ? entry.reason : `${section.title} was not run in this analysis.`}
-            </Callout>
-          );
-        }
-
-        return (
-          <SectionCard key={section.key} title={section.title} subtitle={section.subtitle}>
-            <div className="metric-grid">
-              <Metric label="CIDRs" value={formatNumber(entry.cidrs_scanned || 0)} />
-              <Metric label="IPs attempted" value={formatNumber(entry.hosts_attempted || 0)} />
-              <Metric label="Port 443 open" value={formatNumber(entry.open_port_count || 0)} />
-              <Metric label="Hits" value={formatNumber((entry.hits || []).length)} detail={entry.phase1_method || "n/a"} />
-            </div>
-            <div className="card-grid">
-              {(entry.hits || []).map((hit) => (
-                <LeadCard key={`${section.key}-${hit.ip}-${hit.port || 443}`} title={`${hit.ip}:${hit.port || 443}`}>
-                  <p><strong>CN:</strong> {hit.cn || "Unknown"}</p>
-                  <p><strong>Issuer:</strong> {hit.issuer || "Unknown"}</p>
-                  <div className="pill-row">
-                    <TypePill kind={hit.cert_type} definitions={meta.cert_types || {}} />
-                    <TypePill kind={hit.server_type} definitions={meta.server_types || {}} />
+                    <ProgressBar value={caseItem.progress} />
                   </div>
-                </LeadCard>
-              ))}
-            </div>
-          </SectionCard>
-        );
-      })}
-    </div>
+                ) : null}
+
+                <div className="action-row">
+                  <Link className="primary-button" to={`/cases/${caseItem.id}/summary`}>
+                    Open summary
+                  </Link>
+                  <Link className="text-link" to={`/cases/${caseItem.id}/progress`}>
+                    Progress
+                  </Link>
+                  <Link className="text-link" to={`/cases/${caseItem.id}/clusters`}>
+                    Clusters
+                  </Link>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+      </section>
+    </AppShell>
   );
-}
 
-function IpDetailsTab({ result, meta }) {
-  if (result.type === "ip") {
-    return (
-      <SectionCard
-        title="IP details"
-        subtitle="Everything the backend learned directly from this IP."
-        infoTitle="IP details"
-        infoBody="This is the direct profile for one IP address: what name points back to it, what network owns it, and whether it looks like a hidden origin server or just shared infrastructure."
-      >
-        <div className="card-grid">
-          <LeadCard title={result.input}>
-            <p><strong>PTR:</strong> {result.ptr || "None"}</p>
-            <div className="pill-row">
-              <TypePill kind={result.server_type} definitions={meta.server_types || {}} />
-            </div>
-            <p><strong>Cloudflare:</strong> {result.cloudflare ? "Yes" : "No"}</p>
-            {result.proxy_family ? <p><strong>Reverse proxy:</strong> {result.proxy_family} ({formatConfidence(result.proxy_confidence)})</p> : null}
-          </LeadCard>
-          <LeadCard title="ASN and network">
-            <p><strong>ASN:</strong> {(result.asn_info || {}).asn_description || (result.asn_info || {}).asn || "Unknown"}</p>
-            <p><strong>Registry:</strong> {result.asn_registry || "Unknown"}</p>
-            <p><strong>Network name:</strong> {result.network_name || "Unknown"}</p>
-            <p><strong>Network CIDR:</strong> {result.network_cidr || "Unknown"}</p>
-            <p><strong>Country:</strong> {(result.asn_info || {}).asn_country || (result.asn_info || {}).network_country || "Unknown"}</p>
-          </LeadCard>
-        </div>
-      </SectionCard>
-    );
-  }
-
-  const ipDetails = result.ip_details || {};
-  const entries = Object.entries(ipDetails);
-  if (!entries.length) {
-    return <Callout tone="info">No IP detail records were produced for this result.</Callout>;
-  }
-
-  return (
-    <SectionCard
-      title="IP details"
-      subtitle="Each discovered IP is classified in plain English to help separate useful leads from infrastructure noise."
-      infoTitle="IP details"
-      infoBody="These are the IP addresses the app found around the target. The labels are there to help you tell the difference between a meaningful origin lead and a generic shared host."
-    >
-      <div className="card-grid">
-        {entries.map(([ipAddress, info]) => (
-          <LeadCard key={ipAddress} title={ipAddress}>
-            <div className="pill-row">
-              <TypePill kind={info.server_type} definitions={meta.server_types || {}} />
-            </div>
-            <p><strong>PTR:</strong> {info.ptr || "None"}</p>
-            <p><strong>Sources:</strong> {(info.sources || []).join(", ") || "Unknown"}</p>
-            {info.asn_info ? (
-              <p><strong>ASN:</strong> {info.asn_info.asn_description || info.asn_info.network_name || info.asn_info.asn || "Unknown"}</p>
-            ) : null}
-            {info.asn_registry ? <p><strong>Registry:</strong> {info.asn_registry}</p> : null}
-            {info.network_name ? <p><strong>Network name:</strong> {info.network_name}</p> : null}
-            {info.network_cidr ? <p><strong>Network CIDR:</strong> {info.network_cidr}</p> : null}
-            {info.proxy_family ? <p><strong>Reverse proxy:</strong> {info.proxy_family} ({formatConfidence(info.proxy_confidence)})</p> : null}
-            {(info.other_domains_on_ip || []).length ? (
-              <p className="break-word"><strong>Co-hosted:</strong> {(info.other_domains_on_ip || []).slice(0, 10).join(", ")}</p>
-            ) : null}
-          </LeadCard>
-        ))}
-      </div>
-    </SectionCard>
-  );
-}
-
-function ResultPanel({ result, meta, onRunRecommendation, onOpenSavedResult, busy }) {
-  const [activeTab, setActiveTab] = useState("overview");
-
-  useEffect(() => {
-    setActiveTab("overview");
-  }, [result]);
-
-  return (
-    <SectionCard
-      title={`Results for ${result.input}`}
-      subtitle="Collected evidence, grouped into the views investigators actually use."
-      infoTitle="How to read the results"
-      infoBody="The tabs split the evidence into plain buckets: ownership clues, DNS and registration data, certificate clues, origin leads, and IP details. You do not need to read every section to spot useful overlap."
-      actions={
-        <button className="secondary-button" onClick={() => downloadResult(result)} type="button">
-          Download JSON
-        </button>
+  async function submitCase({ file, target }) {
+    setSubmitState({ busy: true, error: null });
+    try {
+      let response;
+      if (file) {
+        const formData = new FormData();
+        formData.append("file", file);
+        response = await fetch("/api/cases", {
+          method: "POST",
+          body: formData,
+          headers: {
+            Accept: "application/json",
+          },
+        });
+      } else {
+        response = await fetch("/api/cases", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({ target }),
+        });
       }
-    >
-      <div className="tab-row">
-        {RESULT_TABS.map((tab) => (
-          <TabButton key={tab.id} active={activeTab === tab.id} label={tab.label} onClick={() => setActiveTab(tab.id)} />
-        ))}
-      </div>
 
-      {activeTab === "overview" ? (
-        <OverviewTab
-          result={result}
-          meta={meta}
-          onRunRecommendation={onRunRecommendation}
-          onOpenSavedResult={onOpenSavedResult}
-          busy={busy}
-        />
-      ) : null}
-      {activeTab === "dns" ? <DnsTab result={result} /> : null}
-      {activeTab === "certs" ? <CertificatesTab result={result} meta={meta} /> : null}
-      {activeTab === "origin" ? <OriginTab result={result} meta={meta} /> : null}
-      {activeTab === "ips" ? <IpDetailsTab result={result} meta={meta} /> : null}
-    </SectionCard>
-  );
-}
+      const payload = await parseSubmitPayload(response);
+      if (!response.ok) {
+        const message =
+          (payload && typeof payload === "object" && (payload.detail || payload.message || payload.error)) ||
+          (typeof payload === "string" ? payload : null) ||
+          `Case submission failed with status ${response.status}.`;
+        throw new Error(message);
+      }
 
-function NetworkGraphTab({ clusters, domainTargets, theme }) {
-  const graphRef = useRef(null);
-  const focusOptions = domainTargets || [];
-  const visibleClusters = getVisibleClusters(clusters);
-  const [controls, setControls] = useState({
-    includeIp: true,
-    includeAsn: true,
-    includeTracking: true,
-    includeFavicon: true,
-    includeTls: true,
-    minScore: 5,
-    maxLinks: 24,
-    focus: ""
-  });
-  const [selection, setSelection] = useState(null);
-  const [hoveredId, setHoveredId] = useState("");
-
-  const graph = buildNetworkModel(visibleClusters, controls);
-  const updateControl = (key, value) => {
-    setControls((current) => ({
-      ...current,
-      [key]: value
-    }));
-  };
-  const graphData = {
-    nodes: graph.nodes,
-    links: graph.edges
-  };
-  const colors = GRAPH_THEME[theme] || GRAPH_THEME.dark;
-  const activeNodeId = selection && selection.type === "node" ? selection.id : "";
-  const activeEdgeKey = selection && selection.type === "edge" ? selection.key : "";
-  const relatedNodeIds = new Set();
-
-  graph.edges.forEach((edge) => {
-    if (activeNodeId && edgeTouchesNode(edge, activeNodeId)) {
-      relatedNodeIds.add(getEdgeEndpointId(edge.source));
-      relatedNodeIds.add(getEdgeEndpointId(edge.target));
-    }
-  });
-
-  const selectedNode = activeNodeId
-    ? graph.nodes.find((node) => node.id === activeNodeId) || null
-    : null;
-  const selectedEdge = activeEdgeKey
-    ? graph.edges.find((edge) => edge.key === activeEdgeKey) || null
-    : null;
-  const linkedNeighbors = selectedNode
-    ? graph.edges
-      .filter((edge) => edgeTouchesNode(edge, selectedNode.id))
-      .map((edge) => ({
-        edge,
-        peer: getEdgeEndpointId(edge.source) === selectedNode.id ? getEdgeEndpointId(edge.target) : getEdgeEndpointId(edge.source)
-      }))
-      .sort((a, b) => b.edge.score - a.edge.score || a.peer.localeCompare(b.peer))
-    : [];
-
-  useEffect(() => {
-    if (!selection) {
+      const caseId = payload?.case_id || payload?.case?.id;
+      if (!caseId) {
+        throw new Error("The backend did not return a case ID.");
+      }
+      window.location.assign(`/cases/${caseId}/progress`);
+    } catch (error) {
+      setSubmitState({
+        busy: false,
+        error: error.message || "Case submission failed.",
+      });
       return;
     }
-
-    if (selection.type === "node" && !graph.nodes.some((node) => node.id === selection.id)) {
-      setSelection(null);
-    }
-
-    if (selection.type === "edge" && !graph.edges.some((edge) => edge.key === selection.key)) {
-      setSelection(null);
-    }
-  }, [graph.edges, graph.nodes, selection]);
-
-  useEffect(() => {
-    if (!graphRef.current || !graph.nodes.length) {
-      return undefined;
-    }
-
-    const timer = window.setTimeout(() => {
-      graphRef.current.zoomToFit(650, 90);
-    }, 220);
-
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [
-    controls.focus,
-    controls.includeAsn,
-    controls.includeFavicon,
-    controls.includeIp,
-    controls.includeTls,
-    controls.includeTracking,
-    controls.maxLinks,
-    controls.minScore,
-    graph.edges.length,
-    graph.nodes.length
-  ]);
-
-  return (
-    <div className="stack">
-      <div className="network-intro">
-        <div>
-          <h3>Interactive relationship map</h3>
-          <p className="muted">
-            Each line connects domains that share something meaningful, like the same TLS fingerprint, tracking code, direct IP, or provider network. Broad CDN, managed WordPress, mail, and shared-hosting overlaps are filtered out before they reach this graph.
-          </p>
-        </div>
-        <div className="graph-legend">
-          {Object.entries(NETWORK_LINK_META).map(([key, value]) => (
-            <span className="legend-chip" key={key}>
-              <span className="legend-swatch" style={{ background: value.color }} />
-              {value.label}
-            </span>
-          ))}
-        </div>
-      </div>
-
-      <div className="network-grid">
-        <div className="graph-wrap">
-          <div className="network-controls">
-            <div className="network-toggle-group">
-              <label className="checkbox-chip">
-                <input
-                  checked={controls.includeTracking}
-                  onChange={() => updateControl("includeTracking", !controls.includeTracking)}
-                  type="checkbox"
-                />
-                <span>Tracking IDs</span>
-                <InfoPopover
-                  title="Tracking IDs"
-                  body="These are analytics or advertising codes. If two domains share one, there is a good chance the same team, agency, or operator controls both sites."
-                />
-              </label>
-              <label className="checkbox-chip">
-                <input
-                  checked={controls.includeTls}
-                  onChange={() => updateControl("includeTls", !controls.includeTls)}
-                  type="checkbox"
-                />
-                <span>TLS certs</span>
-                <InfoPopover
-                  title="TLS certificates"
-                  body="A TLS certificate is the digital ID card a site shows when it uses HTTPS. Shared certificates often mean the same operator or hosting setup is behind multiple domains."
-                />
-              </label>
-              <label className="checkbox-chip">
-                <input
-                  checked={controls.includeFavicon}
-                  onChange={() => updateControl("includeFavicon", !controls.includeFavicon)}
-                  type="checkbox"
-                />
-                <span>Favicons</span>
-                <InfoPopover
-                  title="Favicons"
-                  body="A favicon is the small browser-tab icon for a site. Matching favicons can be a useful clue that sites were built from the same template or by the same group."
-                />
-              </label>
-              <label className="checkbox-chip">
-                <input
-                  checked={controls.includeIp}
-                  onChange={() => updateControl("includeIp", !controls.includeIp)}
-                  type="checkbox"
-                />
-                <span>Shared IPs</span>
-                <InfoPopover
-                  title="Shared IPs"
-                  body="A shared IP means two domains point to the same server address. Broad CDN, managed WordPress, mail, and shared-hosting overlaps are filtered from the graph, so the remaining IP links are meant to be higher-signal."
-                />
-              </label>
-              <label className="checkbox-chip">
-                <input
-                  checked={controls.includeAsn}
-                  onChange={() => updateControl("includeAsn", !controls.includeAsn)}
-                  type="checkbox"
-                />
-                <span>ASNs</span>
-                <InfoPopover
-                  title="ASNs and networks"
-                  body="ASN overlap means domains were seen in the same provider network. Broad CDN, managed WordPress, mail, and shared-hosting networks are filtered as low-signal noise before they reach the graph."
-                />
-              </label>
-            </div>
-
-            <div className="network-range-row">
-              <label className="range-control" htmlFor="graph-min-score">
-                <span>
-                  Minimum strength
-                  <InfoPopover
-                    title="Minimum strength"
-                    body="Higher numbers hide weaker links so you can focus on the strongest evidence first."
-                  />
-                </span>
-                <input
-                  id="graph-min-score"
-                  min="1"
-                  max="30"
-                  type="range"
-                  value={controls.minScore}
-                  onChange={(event) => updateControl("minScore", Number(event.target.value))}
-                />
-                <strong>{controls.minScore}</strong>
-              </label>
-
-              <label className="range-control" htmlFor="graph-max-links">
-                <span>
-                  Links shown
-                  <InfoPopover
-                    title="Links shown"
-                    body="This controls how many domain-to-domain relationships are visible at once. The graph keeps the highest-scoring ones first."
-                  />
-                </span>
-                <input
-                  id="graph-max-links"
-                  min="8"
-                  max="60"
-                  step="2"
-                  type="range"
-                  value={controls.maxLinks}
-                  onChange={(event) => updateControl("maxLinks", Number(event.target.value))}
-                />
-                <strong>{controls.maxLinks}</strong>
-              </label>
-
-              <SearchableDomainField
-                className="control-inline control-inline-wide"
-                id="graph-focus"
-                label="Focus on a domain"
-                value={controls.focus}
-                onChange={(nextValue) => updateControl("focus", nextValue)}
-                options={focusOptions}
-                placeholder="Search stored domains"
-                emptySelectionLabel="All domains"
-                helper={`${formatNumber(focusOptions.length)} stored domains available`}
-              />
-
-              <div className="button-row">
-                <button
-                  className="secondary-button"
-                  onClick={() => {
-                    if (graphRef.current) {
-                      graphRef.current.zoomToFit(500, 90);
-                    }
-                  }}
-                  type="button"
-                >
-                  Fit graph
-                </button>
-                <button
-                  className="secondary-button"
-                  onClick={() => {
-                    setSelection(null);
-                    setHoveredId("");
-                    setControls({
-                      includeIp: true,
-                      includeAsn: true,
-                      includeTracking: true,
-                      includeFavicon: true,
-                      includeTls: true,
-                      minScore: 5,
-                      maxLinks: 24,
-                      focus: ""
-                    });
-                  }}
-                  type="button"
-                >
-                  Reset view
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {graph.edges.length ? (
-            <div className="graph-canvas">
-              <div className="graph-meta-bar">
-                <span>{graph.nodes.length} domains in view</span>
-                <span>{graph.edges.length} strongest links shown</span>
-                <span>Top score {graph.maxScore || 0}</span>
-                {graph.hiddenEdgeCount ? <span>{graph.hiddenEdgeCount} weaker links hidden</span> : null}
-              </div>
-
-              <ForceGraph2D
-                ref={graphRef}
-                graphData={graphData}
-                backgroundColor={colors.background}
-                cooldownTicks={120}
-                d3AlphaDecay={0.035}
-                d3VelocityDecay={0.25}
-                enableNodeDrag
-                linkColor={(edge) => {
-                  if (activeEdgeKey && edge.key === activeEdgeKey) {
-                    return colors.edgeHighlight;
-                  }
-                  if (hoveredId && edge.key === hoveredId) {
-                    return colors.edgeHighlight;
-                  }
-                  if (activeNodeId && edgeTouchesNode(edge, activeNodeId)) {
-                    return edge.primaryColor;
-                  }
-                  return edge.primaryColor;
-                }}
-                linkCurvature={0.08}
-                linkDirectionalParticles={0}
-                linkWidth={(edge) => {
-                  if (activeEdgeKey && edge.key === activeEdgeKey) {
-                    return 6;
-                  }
-                  return 1.2 + edge.score * 0.32;
-                }}
-                linkLabel={(edge) => {
-                  const source = getEdgeEndpointId(edge.source);
-                  const target = getEdgeEndpointId(edge.target);
-                  return `${source} ↔ ${target} | ${describeLinkStrength(edge.score)} | score ${edge.score}`;
-                }}
-                nodeAutoColorBy="id"
-                nodeCanvasObject={(node, context, globalScale) => {
-                  const label = shortLabel(node.id, 30);
-                  const isActive = activeNodeId === node.id;
-                  const isRelated = activeNodeId && relatedNodeIds.has(node.id);
-                  const isHovered = hoveredId === node.id;
-                  const fontSize = Math.max(11, 15 / globalScale);
-                  const paddingX = 7 / globalScale;
-                  const paddingY = 5 / globalScale;
-                  context.font = `600 ${fontSize}px "Space Grotesk", "Manrope", sans-serif`;
-                  const textWidth = context.measureText(label).width;
-                  const labelWidth = textWidth + paddingX * 2;
-                  const labelHeight = fontSize + paddingY * 2;
-
-                  context.fillStyle = colors.label;
-                  context.fillRect(node.x - labelWidth / 2, node.y + 13 / globalScale, labelWidth, labelHeight);
-                  context.fillStyle = colors.nodeText;
-                  context.fillText(label, node.x - textWidth / 2, node.y + labelHeight + 5 / globalScale);
-
-                  context.beginPath();
-                  context.arc(node.x, node.y, 6 + Math.min(node.displayWeight, 24) * 0.34, 0, Math.PI * 2);
-                  context.fillStyle = isActive
-                    ? colors.edgeHighlight
-                    : isHovered || isRelated || controls.focus === node.id
-                      ? colors.nodeBase
-                      : colors.nodeMuted;
-                  context.fill();
-                  context.lineWidth = 1.6 / globalScale;
-                  context.strokeStyle = colors.nodeStroke;
-                  context.stroke();
-                }}
-                nodeCanvasObjectMode={() => "after"}
-                nodeColor={(node) => {
-                  if (activeNodeId === node.id) {
-                    return colors.edgeHighlight;
-                  }
-                  if (activeNodeId && relatedNodeIds.has(node.id)) {
-                    return colors.nodeBase;
-                  }
-                  if (controls.focus === node.id) {
-                    return colors.nodeBase;
-                  }
-                  return colors.nodeMuted;
-                }}
-                nodeLabel={(node) => `${node.id} | visible strength ${node.displayWeight}`}
-                nodeRelSize={7}
-                nodeVal={(node) => Math.max(2, node.displayWeight)}
-                onLinkClick={(edge) => {
-                  setSelection({ type: "edge", key: edge.key });
-                }}
-                onLinkHover={(edge) => {
-                  setHoveredId(edge ? `${getEdgeEndpointId(edge.source)}|||${getEdgeEndpointId(edge.target)}` : "");
-                }}
-                onNodeClick={(node) => {
-                  setSelection({ type: "node", id: node.id });
-                  if (graphRef.current) {
-                    graphRef.current.centerAt(node.x, node.y, 500);
-                    graphRef.current.zoom(2.2, 500);
-                  }
-                }}
-                onNodeHover={(node) => {
-                  setHoveredId(node ? node.id : "");
-                }}
-              />
-            </div>
-          ) : (
-            <Callout tone="info">
-              No links match the current graph filters. Lower the minimum strength, raise the link limit, or clear the domain focus.
-            </Callout>
-          )}
-        </div>
-
-        <div className="graph-sidebar">
-          <SectionCard
-            title={selectedEdge ? "Selected connection" : selectedNode ? "Selected domain" : "How to read this"}
-            subtitle={
-              selectedEdge
-                ? "This is why the two domains are connected."
-                : selectedNode
-                  ? "This shows the domain's strongest visible relationships."
-                  : "Click a domain or a line in the graph to inspect it."
-            }
-            infoTitle="How domain links work"
-            infoBody="A connection between domains means they share one or more signals. That does not always prove the same owner, but it does tell you they are close enough to investigate together."
-          >
-            {selectedEdge ? (
-              <div className="stack">
-                <div className="metric-grid">
-                  <Metric
-                    label="Domains"
-                    value={`${getEdgeEndpointId(selectedEdge.source)} ↔ ${getEdgeEndpointId(selectedEdge.target)}`}
-                  />
-                  <Metric label="Strength" value={describeLinkStrength(selectedEdge.score)} detail={`Score ${selectedEdge.score}`} />
-                  <Metric label="Signals" value={selectedEdge.kinds.map((kind) => NETWORK_LINK_META[kind].label).join(", ")} />
-                </div>
-                <div className="strength-list">
-                  {selectedEdge.details.map((detail, index) => (
-                    <div className="edge-rank" key={`${selectedEdge.key}-${detail.kind}-${index}`}>
-                      <div className="edge-rank-header">
-                        <strong>{NETWORK_LINK_META[detail.kind].label}</strong>
-                        <span>Score {detail.score}</span>
-                      </div>
-                      <p className="muted">
-                        {detail.kind === "ip"
-                          ? "These domains touched the same server address or hosting network."
-                          : detail.kind === "tls"
-                            ? "These domains reused the same HTTPS certificate."
-                            : detail.kind === "tracking"
-                              ? "These domains shared the same analytics or advertising identifier."
-                              : "These domains used the same browser-tab icon."}
-                      </p>
-                      <p>{detail.descriptor}</p>
-                    </div>
-                  ))}
-                </div>
-                <div className="button-row">
-                  <button className="secondary-button" onClick={() => setSelection(null)} type="button">
-                    Clear selection
-                  </button>
-                  <button
-                    className="secondary-button"
-                    onClick={() => updateControl("focus", getEdgeEndpointId(selectedEdge.source))}
-                    type="button"
-                  >
-                    Focus {shortLabel(getEdgeEndpointId(selectedEdge.source), 18)}
-                  </button>
-                </div>
-              </div>
-            ) : null}
-
-            {selectedNode ? (
-              <div className="stack">
-                <div className="metric-grid">
-                  <Metric label="Domain" value={selectedNode.id} />
-                  <Metric label="Visible links" value={formatNumber(selectedNode.visibleDegree)} />
-                  <Metric label="Combined strength" value={formatNumber(selectedNode.displayWeight)} />
-                </div>
-                <p className="muted">
-                  In plain English: this domain shares enough infrastructure or tracking clues with the domains below that they are probably worth checking together.
-                </p>
-                <div className="strength-list">
-                  {linkedNeighbors.slice(0, 6).map(({ edge, peer }) => (
-                    <div className="edge-rank" key={edge.key}>
-                      <div className="edge-rank-header">
-                        <strong>{peer}</strong>
-                        <span>Score {edge.score}</span>
-                      </div>
-                      <p className="muted">{edge.kinds.map((kind) => NETWORK_LINK_META[kind].label).join(", ")}</p>
-                    </div>
-                  ))}
-                </div>
-                <div className="button-row">
-                  <button
-                    className="secondary-button"
-                    onClick={() => updateControl("focus", selectedNode.id)}
-                    type="button"
-                  >
-                    Focus this domain
-                  </button>
-                  <button className="secondary-button" onClick={() => setSelection(null)} type="button">
-                    Clear selection
-                  </button>
-                </div>
-              </div>
-            ) : null}
-
-            {!selectedNode && !selectedEdge ? (
-              <div className="stack">
-                <Callout tone="info">
-                  Thick, bright lines mean stronger evidence. A line with TLS or tracking overlap is usually more interesting than a weak shared-hosting IP overlap.
-                </Callout>
-                <div className="strength-list">
-                  {graph.edges.slice(0, 8).map((edge, index) => (
-                    <div className="edge-rank" key={edge.key}>
-                      <div className="edge-rank-header">
-                        <strong>{index + 1}. {getEdgeEndpointId(edge.source)} ↔ {getEdgeEndpointId(edge.target)}</strong>
-                        <span>Score {edge.score}</span>
-                      </div>
-                      <p className="muted">{describeLinkStrength(edge.score)} | {edge.kinds.map((kind) => NETWORK_LINK_META[kind].label).join(", ")}</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-          </SectionCard>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ExplorerPanel({
-  meta,
-  recent,
-  domainTargets,
-  clusters,
-  connections,
-  theme,
-  selectedTarget,
-  setSelectedTarget,
-  onOpenSavedResult
-}) {
-  const [activeTab, setActiveTab] = useState("network");
-  const visibleClusters = getVisibleClusters(clusters);
-
-  return (
-    <SectionCard
-      title="Relationship explorer"
-      subtitle="Pivot across stored domains using the strongest shared signals first."
-    >
-      <div className="tab-row">
-        {EXPLORER_TABS.map((tab) => (
-          <TabButton key={tab.id} active={activeTab === tab.id} label={tab.label} onClick={() => setActiveTab(tab.id)} />
-        ))}
-      </div>
-
-      {activeTab === "recent" ? (
-        <div className="stack">
-          <div className="card-grid">
-            {recent.map((item) => (
-              <LeadCard
-                key={item.id}
-                title={item.target}
-                footer={`${item.type.toUpperCase()} | ${cloudflareLabel(item.cloudflare_fronted)} | ${formatDateTime(item.timestamp)}`}
-              >
-                <button className="inline-action" onClick={() => onOpenSavedResult(item.id)} type="button">
-                  Open saved result
-                </button>
-              </LeadCard>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {activeTab === "network" ? (
-        <NetworkGraphTab clusters={clusters} domainTargets={domainTargets} theme={theme} />
-      ) : null}
-
-      {activeTab === "ip" ? (
-        <div className="stack">
-          <div className="card-grid">
-            {visibleClusters.ip.map((item) => (
-              <LeadCard key={item.ip} title={item.ip} footer={`${item.target_count} linked targets`}>
-                <div className="pill-row">
-                  <TypePill kind={item.label} definitions={meta.server_types || {}} />
-                </div>
-                <p className="break-word">{item.targets}</p>
-                {item.asn_desc ? <p>{item.asn_desc}</p> : null}
-              </LeadCard>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {activeTab === "tracking" ? (
-        <div className="stack">
-          <div className="card-grid">
-            {clusters.tracking.map((item) => (
-              <LeadCard key={`${item.id_type}-${item.id_value}`} title={`${item.id_type}: ${item.id_value}`} footer={`${item.target_count} linked targets`}>
-                <p className="break-word">{item.targets}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {activeTab === "favicon" ? (
-        <div className="stack">
-          <div className="card-grid">
-            {clusters.favicon.map((item) => (
-              <LeadCard key={item.md5} title={item.md5} footer={`${item.target_count} linked targets`}>
-                <p className="break-word">{item.targets}</p>
-              </LeadCard>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {activeTab === "tls" ? (
-        <div className="stack">
-          <div className="card-grid">
-            {clusters.tls.map((item) => (
-              <LeadCard key={item.sha256} title={getTlsOverlapTitle(item)} footer={`${formatNumber(getTlsOverlapTargetCount(item))} linked domains | ${getTlsOverlapStatusLabel(item.relationship_status)}`}>
-                <p>{getTlsOverlapSummary(item)}</p>
-                <p className="break-word"><strong>Domains:</strong> {formatListPreview(parseTargetList(item.targets), 6) || "No linked domains recorded"}</p>
-                <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
-                {item.sha256 ? (
-                  <details className="fold-panel">
-                    <summary>Raw certificate detail</summary>
-                    <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p>
-                  </details>
-                ) : null}
-              </LeadCard>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {activeTab === "connections" ? (
-        <div className="stack">
-          <SearchableDomainField
-            id="connections-target"
-            label="Find a stored domain"
-            value={selectedTarget}
-            onChange={setSelectedTarget}
-            options={domainTargets}
-            placeholder="Search stored domains"
-            helper={`${formatNumber(domainTargets.length)} stored domains available`}
-          />
-
-          {connections ? (
-            <div className="stack">
-              <div className="metric-grid">
-                <Metric label="Cloudflare" value={cloudflareLabel(connections.cloudflare_fronted)} />
-                <Metric label="Registrar" value={(connections.whois || {}).registrar || "Unknown"} />
-                <Metric label="Created" value={formatDate((connections.whois || {}).creation_date)} />
-                <Metric label="Target" value={connections.target} />
-              </div>
-
-              {CONNECTION_SECTIONS.map((section) => {
-                const items = (connections.connections || {})[section.key] || [];
-                if (!items.length) {
-                  return null;
-                }
-                return (
-                  <SectionCard key={section.key} title={section.title}>
-                    <div className="card-grid">
-                      {items.map((item, index) => (
-                        <LeadCard key={`${section.key}-${index}`} title={item.id_value || item.email || item.ip || item.nameserver || item.md5 || item.cn || "Link"}>
-                          {item.shared_with && item.shared_with.length ? (
-                            <p className="break-word"><strong>Shared with:</strong> {item.shared_with.join(", ")}</p>
-                          ) : (
-                            <p>No other stored domains share this attribute yet.</p>
-                          )}
-                          {item.label ? (
-                            <div className="pill-row">
-                              <TypePill kind={item.label} definitions={meta.server_types || {}} />
-                            </div>
-                          ) : null}
-                        </LeadCard>
-                      ))}
-                    </div>
-                  </SectionCard>
-                );
-              })}
-            </div>
-          ) : (
-            <Callout tone="info">Choose a stored domain to see cross-database connections.</Callout>
-          )}
-        </div>
-      ) : null}
-    </SectionCard>
-  );
-}
-
-const GRAPH_VIEW_PADDING = 120;
-const GRAPH_MIN_ZOOM = 0.04;
-const GRAPH_MAX_ZOOM = 2.2;
-const GRAPH_INITIAL_MIN_ZOOM = 0.74;
-const GRAPH_INITIAL_MAX_ZOOM = 1.18;
-const GRAPH_EDGE_HIT_STROKE_WIDTH = 14;
-
-function hashGraphValue(value) {
-  let hash = 2166136261;
-  const text = String(value || "");
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
-function getGraphNodeRadius() {
-  return 20;
-}
-
-function getGraphLinkCoordinates(source, target, index, total) {
-  const dx = (target.x || 0) - (source.x || 0);
-  const dy = (target.y || 0) - (source.y || 0);
-  const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-  const unitX = dx / distance;
-  const unitY = dy / distance;
-  const perpendicularX = -unitY;
-  const perpendicularY = unitX;
-  const offsetIndex = index - (total - 1) / 2;
-  const offset = total > 1 ? offsetIndex * 7 : 0;
-  const sourceRadius = getGraphNodeRadius(source) + 5;
-  const targetRadius = getGraphNodeRadius(target) + 5;
-
-  return {
-    x1: (source.x || 0) + unitX * sourceRadius + perpendicularX * offset,
-    y1: (source.y || 0) + unitY * sourceRadius + perpendicularY * offset,
-    x2: (target.x || 0) - unitX * targetRadius + perpendicularX * offset,
-    y2: (target.y || 0) - unitY * targetRadius + perpendicularY * offset
-  };
-}
-
-function GraphSignalLegendChip({ kind, compact = false }) {
-  const meta = NETWORK_LINK_META[kind];
-  if (!meta) {
-    return null;
+    setSubmitState({ busy: false, error: null });
   }
 
-  return (
-    <span className={compact ? "legend-chip graph-signal-chip compact" : "legend-chip graph-signal-chip"}>
-      <span className="legend-swatch" style={{ background: meta.color }} />
-      <strong>{meta.label}</strong>
-      <InfoPopover title={meta.headline} body={meta.meaning} />
-    </span>
-  );
-}
-
-function computeGraphAnchorPosition(id, index, total) {
-  const angle = (index / Math.max(total, 1)) * Math.PI * 2 - Math.PI / 2;
-  const wobble = (hashGraphValue(id) % 80) - 40;
-  const radius = Math.max(280, total * 36) + wobble;
-  return {
-    x: Math.cos(angle) * radius,
-    y: Math.sin(angle) * radius
-  };
-}
-
-function computeGraphBounds(nodes) {
-  if (!nodes.length) {
-    return {
-      minX: 0,
-      maxX: 0,
-      minY: 0,
-      maxY: 0,
-      width: 1,
-      height: 1,
-      centerX: 0,
-      centerY: 0
-    };
-  }
-
-  const xs = nodes.map((node) => node.x || 0);
-  const ys = nodes.map((node) => node.y || 0);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
-
-  return {
-    minX,
-    maxX,
-    minY,
-    maxY,
-    width: Math.max(maxX - minX, 1),
-    height: Math.max(maxY - minY, 1),
-    centerX: (minX + maxX) / 2,
-    centerY: (minY + maxY) / 2
-  };
-}
-
-function computeGraphNearestDistance(nodes) {
-  if (nodes.length < 2) {
-    return null;
-  }
-
-  let nearest = Number.POSITIVE_INFINITY;
-  for (let leftIndex = 0; leftIndex < nodes.length; leftIndex += 1) {
-    const left = nodes[leftIndex];
-    for (let rightIndex = leftIndex + 1; rightIndex < nodes.length; rightIndex += 1) {
-      const right = nodes[rightIndex];
-      const dx = (right.x || 0) - (left.x || 0);
-      const dy = (right.y || 0) - (left.y || 0);
-      const distance = Math.sqrt(dx * dx + dy * dy);
-      if (distance < nearest) {
-        nearest = distance;
-      }
-    }
-  }
-
-  return Number.isFinite(nearest) ? nearest : null;
-}
-
-function computeGraphInitialViewport(nodes, width, height) {
-  const bounds = computeGraphBounds(nodes);
-  const usableWidth = Math.max(width - GRAPH_VIEW_PADDING * 2, 1);
-  const usableHeight = Math.max(height - GRAPH_VIEW_PADDING * 2, 1);
-  const fitZoom = Math.min(usableWidth / bounds.width, usableHeight / bounds.height);
-  const nearest = computeGraphNearestDistance(nodes);
-  const spacingZoom = nearest ? 132 / Math.max(nearest, 1) : 1;
-  const scale = Math.min(
-    GRAPH_INITIAL_MAX_ZOOM,
-    Math.max(fitZoom, spacingZoom, GRAPH_INITIAL_MIN_ZOOM)
-  );
-
-  return {
-    k: scale,
-    x: width / 2 - bounds.centerX * scale,
-    y: height / 2 - bounds.centerY * scale
-  };
-}
-
-function resolveGraphLinkNodes(link) {
-  if (typeof link.source === "string" || typeof link.target === "string") {
-    return null;
-  }
-  return {
-    source: link.source,
-    target: link.target
-  };
-}
-
-function GraphGuideCard({ kind, dimmed = false }) {
-  const meta = NETWORK_LINK_META[kind];
-  if (!meta) {
-    return null;
-  }
-
-  return (
-    <article className={dimmed ? "graph-guide-card dimmed" : "graph-guide-card"}>
-      <div className="graph-guide-card-header">
-        <div className="graph-guide-card-title">
-          <span className="legend-swatch graph-guide-swatch" style={{ background: meta.color }} />
-          <strong>{meta.headline}</strong>
-        </div>
-        <InfoPopover title={meta.headline} body={meta.meaning} />
-      </div>
-      <p>{meta.summary}</p>
-      <p className="muted">{meta.meaning}</p>
-      <small>{meta.caution}</small>
-    </article>
-  );
-}
-
-function getPrimaryEdgeKind(edge) {
-  const orderedKinds = getOrderedNetworkKinds(edge.kinds);
-  return orderedKinds[0] || edge.primaryKind || "ip";
-}
-
-function CompactDomainCard({ domain, subtitle, actionLabel, onAction }) {
-  return (
-    <div className="graph-sidebar-domain-card">
-      <div>
-        <p className="graph-sidebar-domain-name">{domain}</p>
-        {subtitle ? <p className="graph-sidebar-domain-subtitle">{subtitle}</p> : null}
-      </div>
-      {actionLabel && onAction ? (
-        <button className="graph-link-button" onClick={onAction} type="button">
-          {actionLabel}
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-function EmptyGraphSidebarSelection() {
-  return (
-    <div className="graph-sidebar-empty">
-      <p className="graph-sidebar-empty-title">Select a node or link</p>
-      <p className="graph-sidebar-empty-copy">
-        Click a domain or a connection in the graph to inspect why it is linked and what that clue means in plain English.
-      </p>
-    </div>
-  );
-}
-
-function GraphSidebarHeader({ title, subtitle, onClose }) {
-  return (
-    <div className="graph-sidebar-heading">
-      <div>
-        <h3>{title}</h3>
-        {subtitle ? <p className="muted">{subtitle}</p> : null}
-      </div>
-      {onClose ? (
-        <button className="secondary-button graph-sidebar-close" onClick={onClose} type="button">
-          Clear
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-function DomainGraphSidebar({ graph, selection, onClose, onFocus }) {
-  if (!selection) {
-    return <EmptyGraphSidebarSelection />;
-  }
-
-  if (selection.type === "edge") {
-    const edge = graph.edges.find((item) => item.key === selection.key);
-    if (!edge) {
-      return <EmptyGraphSidebarSelection />;
+  async function parseSubmitPayload(response) {
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      return response.json();
     }
 
-    const details = edge.details.map((detail) => describeGraphDetail(detail));
-
-    return (
-      <div className="graph-sidebar-stack">
-        <GraphSidebarHeader
-          title="Selected connection"
-          subtitle="Why these two domains were linked."
-          onClose={onClose}
-        />
-
-        <div className="graph-sidebar-badge-row">
-          <span className="graph-sidebar-badge solid">{describeLinkStrength(edge.score)}</span>
-          <span className="graph-sidebar-badge">{edge.score} score</span>
-          <span className="graph-sidebar-badge">{edge.kinds.length} signal{edge.kinds.length === 1 ? "" : "s"}</span>
-        </div>
-
-        <div className="graph-sidebar-section">
-          <p className="graph-sidebar-section-title">Domains</p>
-          <div className="graph-sidebar-list">
-            <CompactDomainCard
-              domain={getEdgeEndpointId(edge.source)}
-              subtitle="One side of this connection"
-              actionLabel="Focus"
-              onAction={() => onFocus(getEdgeEndpointId(edge.source))}
-            />
-            <CompactDomainCard
-              domain={getEdgeEndpointId(edge.target)}
-              subtitle="The other side of this connection"
-              actionLabel="Focus"
-              onAction={() => onFocus(getEdgeEndpointId(edge.target))}
-            />
-          </div>
-        </div>
-
-        <div className="graph-sidebar-section">
-          <p className="graph-sidebar-section-title">What this means</p>
-          <div className="graph-sidebar-note">
-            <p>{buildEdgeNarrative(edge)}</p>
-          </div>
-        </div>
-
-        <div className="graph-sidebar-section">
-          <p className="graph-sidebar-section-title">Connection clues</p>
-          <div className="graph-sidebar-list">
-            {details.map((detail, index) => (
-              <div className="graph-sidebar-detail-card" key={`${edge.key}-${detail.label}-${index}`}>
-                <div className="graph-sidebar-detail-top">
-                  <div className="graph-sidebar-detail-title">
-                    <span className="legend-swatch" style={{ background: detail.color }} />
-                    <strong>{detail.headline}</strong>
-                  </div>
-                  <span className="graph-sidebar-badge">{edge.details[index].score}</span>
-                </div>
-                <p>{detail.summary}</p>
-                <p className="muted">{detail.meaning}</p>
-                <div className="graph-sidebar-evidence">
-                  <strong>Observed here</strong>
-                  <span>{detail.evidence || edge.details[index].descriptor}</span>
-                </div>
-                <small>{detail.caution}</small>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const node = graph.nodes.find((item) => item.id === selection.id);
-  if (!node) {
-    return <EmptyGraphSidebarSelection />;
-  }
-
-  const linkedNeighbors = graph.edges
-    .filter((edge) => edgeTouchesNode(edge, node.id))
-    .map((edge) => ({
-      edge,
-      peer: getEdgeEndpointId(edge.source) === node.id ? getEdgeEndpointId(edge.target) : getEdgeEndpointId(edge.source)
-    }))
-    .sort((a, b) => b.edge.score - a.edge.score || a.peer.localeCompare(b.peer))
-    .slice(0, 6);
-  const signalCounts = collectNodeSignalCounts(graph.edges, node.id);
-
-  return (
-    <div className="graph-sidebar-stack">
-      <GraphSidebarHeader
-        title={node.id}
-        subtitle="Selected domain"
-        onClose={onClose}
-      />
-
-      <div className="graph-sidebar-badge-row">
-        <span className="graph-sidebar-badge solid">{formatNumber(node.visibleDegree)} visible links</span>
-        <span className="graph-sidebar-badge">{formatNumber(node.displayWeight)} combined strength</span>
-      </div>
-
-      <div className="graph-sidebar-section">
-        <p className="graph-sidebar-section-title">What this means</p>
-        <div className="graph-sidebar-note">
-          <p>
-            In plain English, this domain shares enough infrastructure or tracking clues with the domains below that they are worth checking together.
-          </p>
-        </div>
-      </div>
-
-      <div className="graph-sidebar-section">
-        <p className="graph-sidebar-section-title">Signal mix</p>
-        <div className="graph-sidebar-badge-row">
-          {Object.entries(signalCounts)
-            .filter(([, count]) => count > 0)
-            .sort((left, right) => right[1] - left[1])
-            .map(([kind, count]) => (
-              <span className="graph-sidebar-badge" key={`${node.id}-${kind}`}>
-                <span className="legend-swatch" style={{ background: NETWORK_LINK_META[kind].color }} />
-                {NETWORK_LINK_META[kind].label}: {count}
-              </span>
-            ))}
-        </div>
-      </div>
-
-      <div className="graph-sidebar-section">
-        <p className="graph-sidebar-section-title">Linked domains</p>
-        {linkedNeighbors.length ? (
-          <div className="graph-sidebar-list">
-            {linkedNeighbors.map(({ edge, peer }) => (
-              <CompactDomainCard
-                key={edge.key}
-                domain={peer}
-                subtitle={buildEdgeNarrative(edge)}
-                actionLabel="Focus"
-                onAction={() => onFocus(peer)}
-              />
-            ))}
-          </div>
-        ) : (
-          <p className="muted">No visible linked domains match the current graph filters.</p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function GraphCanvasD3({ graph, selection, setSelection, theme, graphApiRef, height }) {
-  const containerRef = useRef(null);
-  const svgRef = useRef(null);
-  const viewportGroupRef = useRef(null);
-  const positionsRef = useRef(new Map());
-  const selectionRef = useRef(selection);
-  const selectionChangeRef = useRef(setSelection);
-  const currentTransformRef = useRef(null);
-  const zoomBehaviorRef = useRef(null);
-  const simulationRef = useRef(null);
-  const nodeSelectionRef = useRef(null);
-  const edgeSelectionRef = useRef(null);
-  const [size, setSize] = useState({ width: 0, height });
-
-  useEffect(() => {
-    selectionRef.current = selection;
-  }, [selection]);
-
-  useEffect(() => {
-    selectionChangeRef.current = setSelection;
-  }, [setSelection]);
-
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) {
-      return undefined;
-    }
-
-    const observer = new window.ResizeObserver(() => {
-      setSize({
-        width: container.clientWidth,
-        height: container.clientHeight
-      });
-    });
-
-    observer.observe(container);
-    setSize({
-      width: container.clientWidth,
-      height: container.clientHeight
-    });
-
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    setSize((current) => ({ ...current, height }));
-  }, [height]);
-
-  const applySelectionStyles = () => {
-    const currentSelection = selectionRef.current;
-
-    if (edgeSelectionRef.current) {
-      edgeSelectionRef.current.each(function eachEdge(link) {
-        const group = d3.select(this);
-        const selected = Boolean(currentSelection && currentSelection.type === "edge" && currentSelection.key === link.key);
-        group.select("line.edge-highlight").attr("opacity", selected ? 1 : 0);
-        if (selected) {
-          group.raise();
-        }
-      });
-    }
-
-    if (nodeSelectionRef.current) {
-      nodeSelectionRef.current.each(function eachNode(node) {
-        const group = d3.select(this);
-        const selected = Boolean(currentSelection && currentSelection.type === "node" && currentSelection.id === node.id);
-        group
-          .select("circle.node-shape")
-          .attr("stroke", selected ? "#f8fafc" : "#60a5fa")
-          .attr("stroke-width", selected ? 4 : 2);
-        if (selected) {
-          group.raise();
-        }
-      });
-    }
-  };
-
-  useEffect(() => {
-    const svgElement = svgRef.current;
-    const viewportElement = viewportGroupRef.current;
-    if (!svgElement || !viewportElement || size.width <= 0 || size.height <= 0) {
-      return undefined;
-    }
-
-    simulationRef.current && simulationRef.current.stop();
-
-    const svg = d3.select(svgElement);
-    const viewport = d3.select(viewportElement);
-
-    if (!zoomBehaviorRef.current) {
-      zoomBehaviorRef.current = d3.zoom()
-        .scaleExtent([GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM])
-        .on("zoom", (event) => {
-          currentTransformRef.current = event.transform;
-          viewport.attr("transform", event.transform.toString());
-        });
-    }
-
-    svg.call(zoomBehaviorRef.current);
-    svg.on("dblclick.zoom", null);
-
-    viewport.selectAll("*").remove();
-
-    const sortedNodes = [...graph.nodes].sort((left, right) => right.displayWeight - left.displayWeight || left.id.localeCompare(right.id));
-    const nodes = sortedNodes.map((node, index) => {
-      const previous = positionsRef.current.get(node.id);
-      const anchor = computeGraphAnchorPosition(node.id, index, sortedNodes.length);
-      return {
-        ...node,
-        x: previous ? previous.x : anchor.x,
-        y: previous ? previous.y : anchor.y,
-        anchorX: anchor.x,
-        anchorY: anchor.y,
-        radius: getGraphNodeRadius(),
-        vx: 0,
-        vy: 0
-      };
-    });
-
-    const links = graph.edges.map((edge) => ({
-      ...edge,
-      source: edge.source,
-      target: edge.target
-    }));
-
-    const linkLayer = viewport.append("g").attr("class", "d3-link-layer");
-    const nodeLayer = viewport.append("g").attr("class", "d3-node-layer");
-
-    const edgeSelection = linkLayer
-      .selectAll("g.d3-link-wrap")
-      .data(links)
-      .enter()
-      .append("g")
-      .attr("class", "d3-link-wrap")
-      .attr("data-edge-id", (link) => link.key);
-
-    edgeSelection.each(function buildEdge(link) {
-      const group = d3.select(this);
-      group
-        .append("line")
-        .attr("class", "edge-hit d3-link-hit")
-        .attr("stroke", "transparent")
-        .attr("stroke-width", GRAPH_EDGE_HIT_STROKE_WIDTH)
-        .attr("pointer-events", "stroke")
-        .style("cursor", "pointer")
-        .on("click", (event) => {
-          event.stopPropagation();
-          selectionChangeRef.current && selectionChangeRef.current({ type: "edge", key: link.key });
-        });
-      group
-        .append("line")
-        .attr("class", "edge-base d3-link")
-        .attr("pointer-events", "none");
-      group
-        .append("line")
-        .attr("class", "edge-highlight d3-link-backdrop")
-        .attr("stroke", "#f8fafc")
-        .attr("stroke-width", 7)
-        .attr("opacity", 0)
-        .attr("pointer-events", "none");
-      group.append("title").text(`${link.source} ↔ ${link.target}`);
-    });
-
-    const nodeSelection = nodeLayer
-      .selectAll("g.d3-node")
-      .data(nodes)
-      .enter()
-      .append("g")
-      .attr("class", "d3-node")
-      .attr("data-node-id", (node) => node.id)
-      .style("cursor", "pointer")
-      .on("click", (event, node) => {
-        event.stopPropagation();
-        selectionChangeRef.current && selectionChangeRef.current({ type: "node", id: node.id });
-      });
-
-    nodeSelection.each(function buildNode(node) {
-      const group = d3.select(this);
-      group
-        .append("circle")
-        .attr("class", "node-shape")
-        .attr("r", node.radius)
-        .attr("fill", "#2563eb")
-        .attr("stroke", "#60a5fa")
-        .attr("stroke-width", 2);
-
-      group
-        .append("text")
-        .attr("class", "d3-node-text")
-        .attr("y", node.radius + 18)
-        .attr("text-anchor", "middle")
-        .text(shortLabel(node.id, 32));
-
-      group.append("title").text(node.id);
-    });
-
-    const updateFrame = () => {
-      nodeSelection.attr("transform", (node) => `translate(${node.x || 0}, ${node.y || 0})`);
-
-      edgeSelection.each(function drawEdge(link) {
-        const group = d3.select(this);
-        const resolved = resolveGraphLinkNodes(link);
-        if (!resolved) {
-          return;
-        }
-
-        const drawn = {
-          x1: resolved.source.x || 0,
-          y1: resolved.source.y || 0,
-          x2: resolved.target.x || 0,
-          y2: resolved.target.y || 0
-        };
-        const orderedKinds = getOrderedNetworkKinds(link.kinds);
-        const showOverlap = orderedKinds.length > 1;
-        const primaryKind = orderedKinds[0] || "ip";
-        const baseStroke = showOverlap ? GRAPH_OVERLAP_COLOR : NETWORK_LINK_META[primaryKind].color;
-        const baseWidth = showOverlap ? 5 : 3;
-
-        group.select("line.edge-hit")
-          .attr("x1", drawn.x1)
-          .attr("y1", drawn.y1)
-          .attr("x2", drawn.x2)
-          .attr("y2", drawn.y2);
-
-        group.select("line.edge-base")
-          .attr("x1", drawn.x1)
-          .attr("y1", drawn.y1)
-          .attr("x2", drawn.x2)
-          .attr("y2", drawn.y2)
-          .attr("stroke", baseStroke)
-          .attr("stroke-width", baseWidth);
-
-        group.select("line.edge-highlight")
-          .attr("x1", drawn.x1)
-          .attr("y1", drawn.y1)
-          .attr("x2", drawn.x2)
-          .attr("y2", drawn.y2);
-      });
-
-      nodes.forEach((node) => {
-        positionsRef.current.set(node.id, {
-          x: node.x || 0,
-          y: node.y || 0
-        });
-      });
-
-      applySelectionStyles();
-    };
-
-    const simulation = d3.forceSimulation(nodes)
-      .force("charge", d3.forceManyBody().strength(-1400))
-      .force(
-        "link",
-        d3.forceLink(links)
-          .id((node) => node.id)
-          .distance(210)
-          .strength(0.35)
-      )
-      .force("collide", d3.forceCollide().radius((node) => node.radius + 28).iterations(2))
-      .force(
-        "radial",
-        d3.forceRadial(
-          (node) => Math.max(Math.hypot(node.anchorX, node.anchorY), 260),
-          0,
-          0
-        ).strength(0.22)
-      )
-      .force("anchor-x", d3.forceX((node) => node.anchorX).strength(0.16))
-      .force("anchor-y", d3.forceY((node) => node.anchorY).strength(0.16))
-      .force("center", d3.forceCenter(0, 0))
-      .alpha(0.9)
-      .alphaDecay(0.04)
-      .on("tick", updateFrame);
-
-    simulationRef.current = simulation;
-
-    nodeSelection.call(
-      d3.drag()
-        .on("start", (event, node) => {
-          event.sourceEvent && event.sourceEvent.stopPropagation();
-          if (!event.active) {
-            simulation.alphaTarget(0.25).restart();
-          }
-          node.fx = node.x || 0;
-          node.fy = node.y || 0;
-        })
-        .on("drag", (event, node) => {
-          node.fx = event.x;
-          node.fy = event.y;
-          positionsRef.current.set(node.id, { x: event.x, y: event.y });
-          updateFrame();
-        })
-        .on("end", (event, node) => {
-          if (!event.active) {
-            simulation.alphaTarget(0);
-          }
-          node.fx = node.x || 0;
-          node.fy = node.y || 0;
-          positionsRef.current.set(node.id, {
-            x: node.x || 0,
-            y: node.y || 0
-          });
-          updateFrame();
-        })
-    );
-
-    for (let tick = 0; tick < 60; tick += 1) {
-      simulation.tick();
-    }
-    updateFrame();
-    simulation.alpha(0.35).restart();
-
-    nodeSelectionRef.current = nodeSelection;
-    edgeSelectionRef.current = edgeSelection;
-
-    if (currentTransformRef.current) {
-      viewport.attr("transform", currentTransformRef.current.toString());
-    } else {
-      const initialViewport = computeGraphInitialViewport(nodes, size.width, size.height);
-      const initialTransform = d3.zoomIdentity
-        .translate(initialViewport.x, initialViewport.y)
-        .scale(initialViewport.k);
-      currentTransformRef.current = initialTransform;
-      svg.call(zoomBehaviorRef.current.transform, initialTransform);
-    }
-
-    applySelectionStyles();
-
-    return () => {
-      simulation.stop();
-    };
-  }, [graph, size.height, size.width]);
-
-  useEffect(() => {
-    applySelectionStyles();
-  }, [selection]);
-
-  useEffect(() => {
-    return () => {
-      simulationRef.current && simulationRef.current.stop();
-      if (svgRef.current) {
-        d3.select(svgRef.current).on(".zoom", null);
-      }
-    };
-  }, []);
-
-  return (
-    <div
-      ref={containerRef}
-      className="graph-canvas graph-canvas-large"
-      style={{ height: `${height}px` }}
-    >
-      <svg
-        ref={svgRef}
-        width="100%"
-        height="100%"
-        className="graph-svg"
-      >
-        <rect
-          width="100%"
-          height="100%"
-          fill="#050b16"
-          onClick={() => setSelection(null)}
-        />
-        <g ref={viewportGroupRef} />
-      </svg>
-    </div>
-  );
-}
-
-function AttributionEvidenceRow({ evidence, domainA, domainB, maxFrequency, compact = false }) {
-  const tierMeta = getAttributionTierMeta(evidence?.tier);
-  const categoryMeta = getAttributionCategoryMeta(evidence?.category);
-  const rarity = getEvidenceRarityBadge(evidence, maxFrequency);
-  const leftTimeline = formatFriendlyDateRange(evidence?.first_seen_a, evidence?.last_seen_a);
-  const rightTimeline = formatFriendlyDateRange(evidence?.first_seen_b, evidence?.last_seen_b);
-  const sourcePreview = [
-    ...new Set([...(evidence?.sources_a || []), ...(evidence?.sources_b || [])].filter(Boolean))
-  ];
-
-  return (
-    <article className={compact ? "attribution-evidence-row compact" : "attribution-evidence-row"}>
-      <div className="attribution-evidence-top">
-        <div className="attribution-evidence-copy">
-          <div className="attribution-evidence-title-row">
-            <strong>{evidence?.label || humanizeIdentifierType(evidence?.id_type)}</strong>
-            <span className={`attribution-tier-pill ${tierMeta.tone}`}>{tierMeta.label}</span>
-            <span className="attribution-category-pill" style={{ "--badge-color": categoryMeta.color }}>
-              {categoryMeta.label}
-            </span>
-            <span className={`attribution-rarity-pill ${rarity.tone}`}>{rarity.label}</span>
-          </div>
-          <code className="attribution-code">{evidence?.id_value}</code>
-        </div>
-        <div className="attribution-score-pill">
-          <strong>{formatNumber(evidence?.score || 0)}</strong>
-          <span>strength</span>
-        </div>
-      </div>
-
-      {!compact ? <p className="muted">{evidence?.rationale || rarity.detail}</p> : null}
-
-      <div className="attribution-evidence-meta">
-        <span>
-          <strong>{shortLabel(domainA, 20) || "Left"}:</strong> {leftTimeline}
-        </span>
-        <span>
-          <strong>{shortLabel(domainB, 20) || "Right"}:</strong> {rightTimeline}
-        </span>
-        {sourcePreview.length ? (
-          <span>
-            <strong>Seen via:</strong> {formatListPreview(sourcePreview, compact ? 3 : 5)}
-          </span>
-        ) : null}
-      </div>
-    </article>
-  );
-}
-
-function AttributionFingerprintRow({ identifier, maxFrequency }) {
-  const tierMeta = getAttributionTierMeta(identifier?.tier);
-  const categoryMeta = getAttributionCategoryMeta(identifier?.category);
-  const rarity = getEvidenceRarityBadge(
-    {
-      domain_frequency: identifier?.domain_count,
-      frequency_status: identifier?.frequency_status
-    },
-    maxFrequency
-  );
-
-  return (
-    <article className="attribution-fingerprint-row">
-      <div className="attribution-fingerprint-top">
-        <div className="attribution-evidence-title-row">
-          <strong>{humanizeIdentifierType(identifier?.id_type)}</strong>
-          <span className={`attribution-tier-pill ${tierMeta.tone}`}>{tierMeta.label}</span>
-          <span className="attribution-category-pill" style={{ "--badge-color": categoryMeta.color }}>
-            {categoryMeta.label}
-          </span>
-        </div>
-        <span className={`attribution-rarity-pill ${rarity.tone}`}>{rarity.label}</span>
-      </div>
-      <code className="attribution-code compact">{identifier?.id_value}</code>
-    </article>
-  );
-}
-
-function AttributionDossierPanel({ comparison, domainA, domainB, maxFrequency }) {
-  if (!comparison) {
-    return <Callout tone="info">Select two stored domains to build the pair dossier.</Callout>;
-  }
-
-  const visibleTiers = comparison.visibleTiers || [];
-  const hiddenEvidence = comparison.hiddenEvidence || [];
-
-  return (
-    <div className="stack">
-      {visibleTiers.length ? (
-        visibleTiers.map((tierGroup) => {
-          const tierMeta = getAttributionTierMeta(tierGroup.tier);
-          return (
-            <SectionCard
-              key={tierGroup.tier}
-              title={`${tierMeta.label} evidence`}
-              subtitle={tierMeta.summary}
-              infoTitle={`${tierMeta.label} evidence`}
-              infoBody="Evidence is grouped by strength so the analyst can judge the verdict before worrying about collection source."
-            >
-              <div className="attribution-evidence-list">
-                {tierGroup.evidence.map((evidence) => (
-                  <AttributionEvidenceRow
-                    key={getEvidenceIdentity(evidence)}
-                    evidence={evidence}
-                    domainA={domainA}
-                    domainB={domainB}
-                    maxFrequency={maxFrequency}
-                  />
-                ))}
-              </div>
-            </SectionCard>
-          );
-        })
-      ) : (
-        <Callout tone="warning">No evidence rows survive the current rarity filter. Relax the cutoff or pick a different pair.</Callout>
-      )}
-
-      <SectionCard
-        title="Common evidence check"
-        subtitle="Rows held back because they are too common to drive attribution safely."
-        infoTitle="Common evidence check"
-        infoBody="This is the template-artifact guardrail. If a value links large numbers of unrelated domains, it belongs here rather than in the verdict."
-      >
-        {hiddenEvidence.length ? (
-          <div className="attribution-evidence-list">
-            {hiddenEvidence.map((evidence) => (
-              <AttributionEvidenceRow
-                key={`hidden-${getEvidenceIdentity(evidence)}`}
-                evidence={evidence}
-                domainA={domainA}
-                domainB={domainB}
-                maxFrequency={maxFrequency}
-              />
-            ))}
-          </div>
-        ) : (
-          <p className="muted">No common or template-style evidence was suppressed for this pair.</p>
-        )}
-      </SectionCard>
-    </div>
-  );
-}
-
-function AttributionGraphSidebar({
-  graph,
-  selection,
-  cluster,
-  maxFrequency,
-  onClose,
-  onOpenDossier,
-  onSetFocus
-}) {
-  if (!selection) {
-    return (
-      <div className="attribution-sidebar-empty">
-        <p className="attribution-sidebar-title">Select a node or edge</p>
-        <p className="muted">
-          Click an edge to load the pair dossier above. Click a domain to inspect its identifier fingerprint here.
-        </p>
-      </div>
-    );
-  }
-
-  if (selection.type === "edge") {
-    const edge = graph.edges.find((item) => item.key === selection.key);
-    if (!edge) {
+    const text = await response.text();
+    if (!text) {
       return null;
     }
-    const verdict = buildAttributionVerdict(edge.comparison);
-    const topEvidence = (edge.comparison.visibleEvidence || []).slice(0, 6);
 
-    return (
-      <div className="attribution-sidebar-stack">
-        <div className="attribution-sidebar-header">
-          <div>
-            <p className="attribution-sidebar-kicker">Pair match</p>
-            <h3>{edge.source} ↔ {edge.target}</h3>
-          </div>
-          <button className="secondary-button" onClick={onClose} type="button">
-            Close
-          </button>
-        </div>
-
-        <div className="attribution-sidebar-badges">
-          <span className={`attribution-verdict-pill ${verdict.tone}`}>{verdict.label}</span>
-          <span className="attribution-meta-chip">{formatNumber(edge.comparison.visibleEvidence.length)} trusted rows</span>
-          <span className="attribution-meta-chip">{getAttributionTierMeta(edge.strongestTier).label}</span>
-        </div>
-
-        <p>{verdict.headline}</p>
-        <p className="muted">{verdict.summary}</p>
-
-        <div className="button-row">
-          <button className="primary-button" onClick={() => onOpenDossier(edge.comparison)} type="button">
-            Open dossier
-          </button>
-          <button className="secondary-button" onClick={() => onSetFocus(edge.source)} type="button">
-            Focus {shortLabel(edge.source, 18)}
-          </button>
-        </div>
-
-        <div className="attribution-sidebar-section">
-          <p className="attribution-sidebar-title">Top matching evidence</p>
-          <div className="attribution-evidence-list compact">
-            {topEvidence.map((evidence) => (
-              <AttributionEvidenceRow
-                key={`${edge.key}-${getEvidenceIdentity(evidence)}`}
-                evidence={evidence}
-                domainA={edge.source}
-                domainB={edge.target}
-                maxFrequency={maxFrequency}
-                compact
-              />
-            ))}
-          </div>
-        </div>
-      </div>
-    );
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
   }
+}
 
-  const domain = selection.id;
-  const fingerprint = buildDomainFingerprint(cluster, domain);
-  const relatedEdges = (graph.edges || [])
-    .filter((edge) => edgeTouchesNode(edge, domain))
-    .sort((left, right) => right.score - left.score || left.key.localeCompare(right.key));
+function CaseLayout() {
+  const { caseId } = useParams();
+  const caseRequest = useApi(`/api/cases/${caseId}`);
+  const caseDetail = normalizeCaseDetail(caseRequest.data, caseId);
 
   return (
-    <div className="attribution-sidebar-stack">
-      <div className="attribution-sidebar-header">
-        <div>
-          <p className="attribution-sidebar-kicker">Domain fingerprint</p>
-          <h3>{domain}</h3>
+    <AppShell>
+      <div className="breadcrumb-row">
+        <Link className="text-link" to="/">
+          All cases
+        </Link>
+        <span>/</span>
+        <span>{caseDetail.title}</span>
+      </div>
+
+      <section className="hero-panel compact">
+        <div className="hero-copy">
+          <p className="eyebrow">Case {caseDetail.id || caseId}</p>
+          <h1>{caseDetail.title}</h1>
+          <p>
+            {caseDetail.summaryText ||
+              "This case page is wired to the new API and will surface whatever summary data the backend provides."}
+          </p>
         </div>
-        <button className="secondary-button" onClick={onClose} type="button">
-          Close
-        </button>
+        <div className="hero-side-stack">
+          <StatusBadge status={caseDetail.status} />
+          <div className="inline-metrics">
+            <InlineMetric label="Pairs" value={formatMaybeNumber(caseDetail.pairCount)} />
+            <InlineMetric label="Clusters" value={formatMaybeNumber(caseDetail.clusterCount)} />
+            <InlineMetric label="Job" value={caseDetail.jobId || "None"} />
+          </div>
+        </div>
+      </section>
+
+      <nav className="case-nav" aria-label="Case sections">
+        {CASE_NAV_ITEMS.map((item) => (
+          <NavLink
+            className={({ isActive }) =>
+              isActive ? "case-nav-link active" : "case-nav-link"
+            }
+            key={item.to}
+            to={item.to}
+          >
+            {item.label}
+          </NavLink>
+        ))}
+      </nav>
+
+      {caseRequest.error && !caseRequest.data ? (
+        <ErrorState message={caseRequest.error} />
+      ) : null}
+
+      <Outlet context={{ caseId, caseDetail, caseRequest }} />
+    </AppShell>
+  );
+}
+
+function CaseSummaryPage() {
+  const { caseId, caseDetail, caseRequest } = useCaseContext();
+  const pairsRequest = useApi(`/api/cases/${caseId}/pairs`);
+  const evidenceMetaRequest = useApi("/api/meta/evidence");
+  const pairs = normalizePairs(pairsRequest.data);
+  const withinCasePairs = normalizePairs(pairsRequest.data?.within_case ?? []);
+  const historicalPairs = normalizePairs(pairsRequest.data?.historical ?? []);
+  const evidenceMeta = normalizeEvidenceMeta(evidenceMetaRequest.data);
+  const highlightLines = collectStringList(
+    caseDetail.raw?.highlights ?? caseDetail.raw?.findings ?? caseDetail.raw?.notes,
+  );
+  const metricEntries = buildMetricEntries(caseDetail);
+  const scalarEntries = collectScalarEntries(caseDetail.raw, RAW_CASE_EXCLUDES).slice(0, 8);
+
+  return (
+    <div className="page-stack">
+      {caseRequest.loading && !caseRequest.data ? <LoadingState message="Loading case detail..." /> : null}
+
+      <div className="page-grid two-column">
+        <section className="panel section-stack">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Summary</p>
+              <h2>Case overview</h2>
+            </div>
+            <button className="secondary-button" onClick={caseRequest.refresh} type="button">
+              Refresh
+            </button>
+          </div>
+
+          {metricEntries.length > 0 ? (
+            <div className="metric-grid">
+              {metricEntries.map((metric) => (
+                <MetricCard key={metric.label} label={metric.label} value={metric.value} />
+              ))}
+            </div>
+          ) : null}
+
+          {caseDetail.targets.length > 0 ? (
+            <div className="section-stack tight">
+              <h3>Targets</h3>
+              <div className="chip-row">
+                {caseDetail.targets.map((target) => (
+                  <span className="chip" key={target}>
+                    {target}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {highlightLines.length > 0 ? (
+            <div className="section-stack tight">
+              <h3>Highlights</h3>
+              <ul className="simple-list">
+                {highlightLines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
+          {caseDetail.summaryText ? (
+            <div className="callout">
+              <p>{caseDetail.summaryText}</p>
+            </div>
+          ) : null}
+        </section>
+
+        <aside className="panel section-stack">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Metadata</p>
+              <h2>Case details</h2>
+            </div>
+          </div>
+
+          {scalarEntries.length > 0 ? (
+            <DescriptionGrid entries={scalarEntries} />
+          ) : (
+            <EmptyState message="No scalar summary fields were exposed for this case." />
+          )}
+        </aside>
       </div>
 
-      <div className="attribution-sidebar-badges">
-        <span className="attribution-meta-chip">{formatNumber(relatedEdges.length)} visible links</span>
-        <span className="attribution-meta-chip">{formatNumber(fingerprint.length)} identifiers</span>
-      </div>
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Pairs</p>
+            <h2>Related case pairs</h2>
+            <p className="section-copy">Loaded from `/api/cases/:caseId/pairs`.</p>
+          </div>
+          <button className="secondary-button" onClick={pairsRequest.refresh} type="button">
+            Refresh
+          </button>
+        </div>
 
-      <div className="button-row">
-        <button className="secondary-button" onClick={() => onSetFocus(domain)} type="button">
-          Focus this domain
-        </button>
-      </div>
+        {pairsRequest.loading && !pairsRequest.data ? <LoadingState message="Loading pairs..." /> : null}
+        {pairsRequest.error ? <ErrorState message={pairsRequest.error} /> : null}
+        {!pairsRequest.loading && !pairsRequest.error && pairs.length === 0 ? (
+          <EmptyState message="This case does not have any pairs yet." />
+        ) : null}
+        {withinCasePairs.length > 0 ? (
+          <div className="section-stack tight">
+            <h3>Within this submission</h3>
+            <PairList caseId={caseId} pairs={withinCasePairs} />
+          </div>
+        ) : null}
+        {historicalPairs.length > 0 ? (
+          <div className="section-stack tight">
+            <h3>Against previous history</h3>
+            <PairList caseId={caseId} pairs={historicalPairs} />
+          </div>
+        ) : null}
+      </section>
 
-      <div className="attribution-sidebar-section">
-        <p className="attribution-sidebar-title">Full identifier fingerprint</p>
-        {fingerprint.length ? (
-          <div className="attribution-fingerprint-list">
-            {fingerprint.map((identifier) => (
-              <AttributionFingerprintRow
-                key={`${domain}-${identifier.id_type}-${identifier.id_value}`}
-                identifier={identifier}
-                maxFrequency={maxFrequency}
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Evidence guide</p>
+            <h2>Evidence metadata</h2>
+            <p className="section-copy">Loaded from `/api/meta/evidence`.</p>
+          </div>
+          <button
+            className="secondary-button"
+            onClick={evidenceMetaRequest.refresh}
+            type="button"
+          >
+            Refresh
+          </button>
+        </div>
+
+        {evidenceMetaRequest.loading && !evidenceMetaRequest.data ? (
+          <LoadingState message="Loading evidence metadata..." />
+        ) : null}
+        {evidenceMetaRequest.error ? <ErrorState message={evidenceMetaRequest.error} /> : null}
+        {!evidenceMetaRequest.loading && !evidenceMetaRequest.error && evidenceMeta.length === 0 ? (
+          <EmptyState message="The evidence metadata endpoint returned no definitions." />
+        ) : null}
+        {evidenceMeta.length > 0 ? <EvidenceMetaGrid items={evidenceMeta} /> : null}
+      </section>
+
+      <RawDataDisclosure label="Raw case payload" value={caseDetail.raw} />
+    </div>
+  );
+}
+
+function CaseProgressPage() {
+  const { caseDetail } = useCaseContext();
+  const jobId = caseDetail.jobId;
+  const jobRequest = useApi(jobId ? `/api/jobs/${jobId}` : null, {
+    enabled: Boolean(jobId),
+    pollInterval: jobId ? 3000 : 0,
+  });
+  const job = normalizeJob(jobRequest.data ?? caseDetail.raw?.job ?? caseDetail.raw?.latest_job, jobId);
+  const progressValue =
+    job.percent ?? caseDetail.progress ?? (isTerminalStatus(job.status) ? 100 : null);
+
+  return (
+    <div className="page-stack">
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Job tracking</p>
+            <h2>Progress</h2>
+            <p className="section-copy">Polling `/api/jobs/:jobId` for live status.</p>
+          </div>
+          {jobId ? (
+            <button className="secondary-button" onClick={jobRequest.refresh} type="button">
+              Refresh
+            </button>
+          ) : null}
+        </div>
+
+        {!jobId ? (
+          <EmptyState message="This case does not currently expose a job ID, so there is nothing to poll yet." />
+        ) : null}
+
+        {jobRequest.loading && !jobRequest.data && jobId ? (
+          <LoadingState message="Loading job progress..." />
+        ) : null}
+
+        {jobRequest.error ? <ErrorState message={jobRequest.error} /> : null}
+
+        {jobId ? (
+          <div className="progress-card">
+            <div className="progress-header">
+              <div>
+                <p className="eyebrow">Job {job.id || jobId}</p>
+                <h3>{formatStatusLabel(job.status)}</h3>
+                <p className="card-copy">
+                  {job.summary ||
+                    "The progress page keeps polling the backend so the loading bar stays current while the case is running."}
+                </p>
+              </div>
+              <div className="progress-figure">
+                <strong>{progressValue === null ? "—" : formatPercent(progressValue)}</strong>
+                <span>{job.currentStep || "Waiting for the next backend update"}</span>
+              </div>
+            </div>
+
+            <ProgressBar large value={progressValue ?? 0} />
+
+            <div className="metric-grid">
+              <MetricCard label="Status" value={formatStatusLabel(job.status)} />
+              <MetricCard label="Completed steps" value={formatMaybeNumber(job.completedSteps)} />
+              <MetricCard label="Total steps" value={formatMaybeNumber(job.totalSteps)} />
+              <MetricCard
+                label="Failed targets"
+                value={formatMaybeNumber(job.raw?.failed_targets ?? job.failedTargets)}
               />
+              <MetricCard label="Updated" value={formatMaybeDate(job.updatedAt)} />
+            </div>
+          </div>
+        ) : null}
+
+        {job.steps.length > 0 ? (
+          <div className="section-stack tight">
+            <h3>Milestones</h3>
+            <div className="timeline">
+              {job.steps.map((step) => (
+                <div className="timeline-item" key={step.id}>
+                  <div className={`timeline-dot ${toneClass(step.status)}`} />
+                  <div>
+                    <div className="timeline-title-row">
+                      <strong>{step.label}</strong>
+                      <span>{formatStatusLabel(step.status)}</span>
+                    </div>
+                    {step.detail ? <p className="card-copy">{step.detail}</p> : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Logs</p>
+            <h2>Job output</h2>
+          </div>
+        </div>
+
+        {job.logs.length === 0 ? (
+          <EmptyState message="No job logs were returned yet." />
+        ) : (
+          <div className="log-shell">
+            {job.logs.map((line) => (
+              <div className="log-line" key={line.id}>
+                <span className="log-level">{line.level.toUpperCase()}</span>
+                <span>{line.message}</span>
+              </div>
             ))}
           </div>
-        ) : (
-          <p className="muted">No identifiers from the current component are attached to this domain.</p>
         )}
+      </section>
+
+      <RawDataDisclosure label="Raw job payload" value={job.raw} />
+    </div>
+  );
+}
+
+function CasePairPage() {
+  const { caseId } = useCaseContext();
+  const { pairId } = useParams();
+  const pairRequest = useApi(`/api/cases/${caseId}/pairs/${pairId}`);
+  const evidenceMetaRequest = useApi("/api/meta/evidence");
+  const pair = normalizePairDetail(pairRequest.data, pairId);
+  const evidenceMeta = normalizeEvidenceMeta(evidenceMetaRequest.data);
+  const scalarEntries = collectScalarEntries(pair.raw, RAW_PAIR_EXCLUDES).slice(0, 8);
+
+  return (
+    <div className="page-stack">
+      <div className="breadcrumb-row">
+        <Link className="text-link" to={`/cases/${caseId}/summary`}>
+          Back to summary
+        </Link>
       </div>
 
-      <div className="attribution-sidebar-section">
-        <p className="attribution-sidebar-title">Linked pairs</p>
-        {relatedEdges.length ? (
-          <div className="attribution-link-list">
-            {relatedEdges.map((edge) => {
-              const peer = edge.source === domain ? edge.target : edge.source;
-              const verdict = buildAttributionVerdict(edge.comparison);
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Pair {pair.id || pairId}</p>
+            <h2>{pair.left && pair.right ? `${pair.left} and ${pair.right}` : "Pair detail"}</h2>
+            <p className="section-copy">
+              Loaded from `/api/cases/:caseId/pairs/:pairId`.
+            </p>
+          </div>
+          <button className="secondary-button" onClick={pairRequest.refresh} type="button">
+            Refresh
+          </button>
+        </div>
+
+        {pairRequest.loading && !pairRequest.data ? <LoadingState message="Loading pair detail..." /> : null}
+        {pairRequest.error ? <ErrorState message={pairRequest.error} /> : null}
+
+        <div className="metric-grid">
+          <MetricCard label="Score" value={pair.score === null ? "-" : formatPercent(pair.score)} />
+          <MetricCard label="Status" value={formatStatusLabel(pair.status)} />
+          <MetricCard label="Evidence items" value={pair.evidence.length} />
+          <MetricCard label="Updated" value={formatMaybeDate(pair.updatedAt)} />
+        </div>
+
+        <div className="subject-grid">
+          <SubjectCard label="Left entity" value={pair.left || "Unavailable"} />
+          <SubjectCard label="Right entity" value={pair.right || "Unavailable"} />
+        </div>
+
+        {pair.summary ? (
+          <div className="callout">
+            <p>{pair.summary}</p>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Evidence</p>
+            <h2>Signals behind this pair</h2>
+          </div>
+        </div>
+
+        {pair.evidence.length === 0 ? (
+          <EmptyState message="No evidence items were returned for this pair." />
+        ) : (
+          <div className="evidence-grid">
+            {pair.evidence.map((item) => {
+              const meta = findEvidenceMeta(evidenceMeta, item.type);
+              const values = item.matchedValues?.length ? item.matchedValues : item.value ? [item.value] : [];
               return (
-                <button
-                  className="attribution-link-card"
-                  key={edge.key}
-                  onClick={() => onOpenDossier(edge.comparison)}
-                  type="button"
-                >
-                  <strong>{peer}</strong>
-                  <span>{verdict.label}</span>
-                </button>
+                <article className="evidence-card" key={item.id}>
+                  <div className="evidence-card-top">
+                    <strong>{meta?.label || item.title || formatLabel(item.type)}</strong>
+                    <span>{formatLabel(item.importance || meta?.importance || "supporting")}</span>
+                  </div>
+                  {values.length > 0 ? (
+                    <div className="chip-row">
+                      {values.slice(0, 6).map((value) => (
+                        <span className="chip" key={`${item.id}-${value}`}>
+                          {value}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  <p className="card-copy">
+                    {item.summary || meta?.description || "This signal was returned without an explanation."}
+                  </p>
+                  <div className="evidence-notes">
+                    <p>
+                      <strong>Why it matters:</strong>{" "}
+                      {item.whyItMatters || meta?.whyItMatters || "This overlap adds context to the pair."}
+                    </p>
+                    <p>
+                      <strong>Why it may be weak:</strong>{" "}
+                      {item.caveat || meta?.caveat || "This signal should be weighed with the rest of the evidence."}
+                    </p>
+                  </div>
+                </article>
               );
             })}
           </div>
-        ) : (
-          <p className="muted">No visible links remain after the current filters.</p>
         )}
-      </div>
-    </div>
-  );
-}
-
-function AttributionGraphCanvasD3({ graph, selection, setSelection, theme, graphApiRef, height }) {
-  const containerRef = useRef(null);
-  const svgRef = useRef(null);
-  const viewportGroupRef = useRef(null);
-  const positionsRef = useRef(new Map());
-  const selectionRef = useRef(selection);
-  const selectionChangeRef = useRef(setSelection);
-  const currentTransformRef = useRef(null);
-  const zoomBehaviorRef = useRef(null);
-  const simulationRef = useRef(null);
-  const nodeSelectionRef = useRef(null);
-  const edgeSelectionRef = useRef(null);
-  const [size, setSize] = useState({ width: 0, height });
-  const palette = GRAPH_THEME[theme] || GRAPH_THEME.light;
-
-  useEffect(() => {
-    selectionRef.current = selection;
-  }, [selection]);
-
-  useEffect(() => {
-    selectionChangeRef.current = setSelection;
-  }, [setSelection]);
-
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) {
-      return undefined;
-    }
-
-    const observer = new window.ResizeObserver(() => {
-      setSize({
-        width: container.clientWidth,
-        height: container.clientHeight
-      });
-    });
-
-    observer.observe(container);
-    setSize({
-      width: container.clientWidth,
-      height: container.clientHeight
-    });
-
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    setSize((current) => ({ ...current, height }));
-  }, [height]);
-
-  useEffect(() => {
-    const svgElement = svgRef.current;
-    const viewportElement = viewportGroupRef.current;
-    if (!svgElement || !viewportElement || size.width <= 0 || size.height <= 0) {
-      return undefined;
-    }
-
-    simulationRef.current && simulationRef.current.stop();
-
-    const svg = d3.select(svgElement);
-    const viewport = d3.select(viewportElement);
-
-    if (!zoomBehaviorRef.current) {
-      zoomBehaviorRef.current = d3.zoom()
-        .scaleExtent([GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM])
-        .on("zoom", (event) => {
-          currentTransformRef.current = event.transform;
-          viewport.attr("transform", event.transform.toString());
-        });
-    }
-
-    svg.call(zoomBehaviorRef.current);
-    svg.on("dblclick.zoom", null);
-    viewport.selectAll("*").remove();
-
-    const nodes = [...graph.nodes]
-      .sort((left, right) => right.displayWeight - left.displayWeight || left.id.localeCompare(right.id))
-      .map((node, index, allNodes) => {
-        const previous = positionsRef.current.get(node.id);
-        const anchor = computeGraphAnchorPosition(node.id, index, allNodes.length);
-        return {
-          ...node,
-          x: previous ? previous.x : anchor.x,
-          y: previous ? previous.y : anchor.y,
-          anchorX: anchor.x,
-          anchorY: anchor.y,
-          radius: getGraphNodeRadius(),
-          vx: 0,
-          vy: 0
-        };
-      });
-
-    const links = graph.edges.map((edge) => ({
-      ...edge,
-      source: edge.source,
-      target: edge.target
-    }));
-
-    const linkLayer = viewport.append("g").attr("class", "attribution-link-layer");
-    const nodeLayer = viewport.append("g").attr("class", "attribution-node-layer");
-
-    const edgeSelection = linkLayer
-      .selectAll("g.attribution-link-wrap")
-      .data(links)
-      .enter()
-      .append("g")
-      .attr("class", "attribution-link-wrap")
-      .attr("data-edge-id", (link) => link.key);
-
-    edgeSelection.each(function buildEdge(link) {
-      const group = d3.select(this);
-      group
-        .append("line")
-        .attr("class", "attribution-link-hit")
-        .attr("stroke", "transparent")
-        .attr("stroke-width", GRAPH_EDGE_HIT_STROKE_WIDTH)
-        .attr("pointer-events", "stroke")
-        .style("cursor", "pointer")
-        .on("click", (event) => {
-          event.stopPropagation();
-          selectionChangeRef.current && selectionChangeRef.current({ type: "edge", key: link.key });
-        });
-      group
-        .append("line")
-        .attr("class", "attribution-link-base")
-        .attr("pointer-events", "none");
-      group
-        .append("line")
-        .attr("class", "attribution-link-highlight")
-        .attr("stroke", palette.edgeHighlight)
-        .attr("stroke-width", Number(link.width || 3) + 4)
-        .attr("opacity", 0)
-        .attr("pointer-events", "none");
-      group.append("title").text(`${link.source} ↔ ${link.target}`);
-    });
-
-    const nodeSelection = nodeLayer
-      .selectAll("g.attribution-node")
-      .data(nodes)
-      .enter()
-      .append("g")
-      .attr("class", "attribution-node")
-      .attr("data-node-id", (node) => node.id)
-      .style("cursor", "pointer")
-      .on("click", (event, node) => {
-        event.stopPropagation();
-        selectionChangeRef.current && selectionChangeRef.current({ type: "node", id: node.id });
-      });
-
-    nodeSelection.each(function buildNode(node) {
-      const group = d3.select(this);
-      group
-        .append("circle")
-        .attr("class", "attribution-node-shape")
-        .attr("r", node.radius)
-        .attr("fill", palette.nodeBase)
-        .attr("stroke", palette.nodeStroke)
-        .attr("stroke-width", 2.25);
-
-      group
-        .append("text")
-        .attr("class", "attribution-node-text")
-        .attr("y", node.radius + 18)
-        .attr("text-anchor", "middle")
-        .text(shortLabel(node.id, 28));
-
-      group.append("title").text(node.id);
-    });
-
-    const applySelectionStyles = () => {
-      const currentSelection = selectionRef.current;
-
-      edgeSelection.each(function styleEdge(link) {
-        const group = d3.select(this);
-        const selectedEdge = Boolean(currentSelection && currentSelection.type === "edge" && currentSelection.key === link.key);
-        const relatedToSelectedNode = Boolean(
-          currentSelection
-          && currentSelection.type === "node"
-          && edgeTouchesNode(link, currentSelection.id)
-        );
-        const dimmed = Boolean(currentSelection) && !selectedEdge && !relatedToSelectedNode;
-
-        group.select("line.attribution-link-base")
-          .attr("opacity", selectedEdge || relatedToSelectedNode ? 1 : dimmed ? 0.18 : 0.9);
-        group.select("line.attribution-link-highlight")
-          .attr("opacity", selectedEdge ? 1 : 0);
-      });
-
-      nodeSelection.each(function styleNode(node) {
-        const group = d3.select(this);
-        const selectedNode = Boolean(currentSelection && currentSelection.type === "node" && currentSelection.id === node.id);
-        const relatedToSelectedNode = Boolean(
-          currentSelection
-          && currentSelection.type === "node"
-          && graph.edges.some(
-            (edge) => edgeTouchesNode(edge, currentSelection.id) && edgeTouchesNode(edge, node.id)
-          )
-        );
-        const relatedToSelectedEdge = Boolean(
-          currentSelection
-          && currentSelection.type === "edge"
-          && graph.edges.some(
-            (edge) => edge.key === currentSelection.key && edgeTouchesNode(edge, node.id)
-          )
-        );
-        const active = selectedNode || relatedToSelectedNode || relatedToSelectedEdge;
-        const dimmed = Boolean(currentSelection) && !active;
-
-        group.select("circle.attribution-node-shape")
-          .attr("fill", selectedNode ? palette.labelText : active ? "#67e8f9" : palette.nodeBase)
-          .attr("opacity", dimmed ? 0.24 : 1)
-          .attr("stroke", selectedNode ? "#f8fafc" : palette.nodeStroke)
-          .attr("stroke-width", selectedNode ? 4 : 2.25);
-        group.select("text.attribution-node-text")
-          .attr("opacity", dimmed ? 0.24 : 1);
-        if (selectedNode) {
-          group.raise();
-        }
-      });
-    };
-
-    const updateFrame = () => {
-      nodeSelection.attr("transform", (node) => `translate(${node.x || 0}, ${node.y || 0})`);
-
-      edgeSelection.each(function drawEdge(link) {
-        const group = d3.select(this);
-        const resolved = resolveGraphLinkNodes(link);
-        if (!resolved) {
-          return;
-        }
-
-        const drawn = {
-          x1: resolved.source.x || 0,
-          y1: resolved.source.y || 0,
-          x2: resolved.target.x || 0,
-          y2: resolved.target.y || 0
-        };
-
-        group.select("line.attribution-link-hit")
-          .attr("x1", drawn.x1)
-          .attr("y1", drawn.y1)
-          .attr("x2", drawn.x2)
-          .attr("y2", drawn.y2);
-
-        group.select("line.attribution-link-base")
-          .attr("x1", drawn.x1)
-          .attr("y1", drawn.y1)
-          .attr("x2", drawn.x2)
-          .attr("y2", drawn.y2)
-          .attr("stroke", link.color)
-          .attr("stroke-width", link.width);
-
-        group.select("line.attribution-link-highlight")
-          .attr("x1", drawn.x1)
-          .attr("y1", drawn.y1)
-          .attr("x2", drawn.x2)
-          .attr("y2", drawn.y2);
-      });
-
-      nodes.forEach((node) => {
-        positionsRef.current.set(node.id, {
-          x: node.x || 0,
-          y: node.y || 0
-        });
-      });
-
-      applySelectionStyles();
-    };
-
-    const simulation = d3.forceSimulation(nodes)
-      .force("charge", d3.forceManyBody().strength(-1320))
-      .force(
-        "link",
-        d3.forceLink(links)
-          .id((node) => node.id)
-          .distance(210)
-          .strength(0.32)
-      )
-      .force("collide", d3.forceCollide().radius((node) => node.radius + 26).iterations(2))
-      .force(
-        "radial",
-        d3.forceRadial(
-          (node) => Math.max(Math.hypot(node.anchorX, node.anchorY), 240),
-          0,
-          0
-        ).strength(0.2)
-      )
-      .force("anchor-x", d3.forceX((node) => node.anchorX).strength(0.15))
-      .force("anchor-y", d3.forceY((node) => node.anchorY).strength(0.15))
-      .force("center", d3.forceCenter(0, 0))
-      .alpha(0.92)
-      .alphaDecay(0.04)
-      .on("tick", updateFrame);
-
-    simulationRef.current = simulation;
-
-    nodeSelection.call(
-      d3.drag()
-        .on("start", (event, node) => {
-          event.sourceEvent && event.sourceEvent.stopPropagation();
-          if (!event.active) {
-            simulation.alphaTarget(0.25).restart();
-          }
-          node.fx = node.x || 0;
-          node.fy = node.y || 0;
-        })
-        .on("drag", (event, node) => {
-          node.fx = event.x;
-          node.fy = event.y;
-          positionsRef.current.set(node.id, { x: event.x, y: event.y });
-          updateFrame();
-        })
-        .on("end", (event, node) => {
-          if (!event.active) {
-            simulation.alphaTarget(0);
-          }
-          node.fx = node.x || 0;
-          node.fy = node.y || 0;
-          positionsRef.current.set(node.id, {
-            x: node.x || 0,
-            y: node.y || 0
-          });
-          updateFrame();
-        })
-    );
-
-    for (let tick = 0; tick < 60; tick += 1) {
-      simulation.tick();
-    }
-    updateFrame();
-    simulation.alpha(0.34).restart();
-
-    nodeSelectionRef.current = nodeSelection;
-    edgeSelectionRef.current = edgeSelection;
-
-    const fitGraph = () => {
-      if (!nodes.length) {
-        return;
-      }
-      const initialViewport = computeGraphInitialViewport(nodes, size.width, size.height);
-      const transform = d3.zoomIdentity
-        .translate(initialViewport.x, initialViewport.y)
-        .scale(initialViewport.k);
-      currentTransformRef.current = transform;
-      svg.call(zoomBehaviorRef.current.transform, transform);
-    };
-
-    graphApiRef.current = {
-      fit: fitGraph,
-      reset: () => {
-        currentTransformRef.current = null;
-        fitGraph();
-      }
-    };
-
-    if (currentTransformRef.current) {
-      viewport.attr("transform", currentTransformRef.current.toString());
-    } else {
-      fitGraph();
-    }
-
-    applySelectionStyles();
-
-    return () => {
-      simulation.stop();
-    };
-  }, [graph, palette.edgeHighlight, palette.labelText, palette.nodeBase, palette.nodeStroke, size.height, size.width]);
-
-  useEffect(() => {
-    return () => {
-      simulationRef.current && simulationRef.current.stop();
-      if (svgRef.current) {
-        d3.select(svgRef.current).on(".zoom", null);
-      }
-    };
-  }, []);
-
-  return (
-    <div
-      ref={containerRef}
-      className="attribution-graph-canvas"
-      style={{ height: `${height}px` }}
-    >
-      <svg
-        ref={svgRef}
-        width="100%"
-        height="100%"
-        className="graph-svg"
-      >
-        <rect
-          width="100%"
-          height="100%"
-          fill={palette.surface}
-          onClick={() => setSelection(null)}
-        />
-        <g ref={viewportGroupRef} />
-      </svg>
-    </div>
-  );
-}
-
-function AttributionPage({ domainTargets, preferredSeed, theme }) {
-  const graphApiRef = useRef({
-    fit: () => {},
-    reset: () => {}
-  });
-  const heroRef = useRef(null);
-  const fallbackSeed = preferredSeed || domainTargets[0] || "";
-  const [seedDraft, setSeedDraft] = useState(fallbackSeed);
-  const [activeSeeds, setActiveSeeds] = useState(fallbackSeed);
-  const [activeView, setActiveView] = useState("dossier");
-  const [domainA, setDomainA] = useState(fallbackSeed);
-  const [domainB, setDomainB] = useState("");
-  const [selection, setSelection] = useState(null);
-  const [controls, setControls] = useState({ ...ATTRIBUTION_GRAPH_DEFAULTS });
-  const [clusterState, setClusterState] = useState({
-    data: null,
-    loading: false,
-    error: ""
-  });
-  const [comparisonState, setComparisonState] = useState({
-    data: null,
-    loading: false,
-    error: ""
-  });
-
-  useEffect(() => {
-    if (!activeSeeds && fallbackSeed) {
-      setSeedDraft(fallbackSeed);
-      setActiveSeeds(fallbackSeed);
-    }
-    if (!domainA && fallbackSeed) {
-      setDomainA(fallbackSeed);
-    }
-  }, [activeSeeds, domainA, fallbackSeed]);
-
-  useEffect(() => {
-    if (!activeSeeds.trim()) {
-      setClusterState({
-        data: null,
-        loading: false,
-        error: ""
-      });
-      return;
-    }
-
-    let ignore = false;
-    setClusterState((current) => ({
-      ...current,
-      loading: true,
-      error: ""
-    }));
-
-    apiFetch(`/api/clusters/identifiers?targets=${encodeURIComponent(activeSeeds)}`)
-      .then((response) => {
-        if (!ignore) {
-          setClusterState({
-            data: response,
-            loading: false,
-            error: ""
-          });
-        }
-      })
-      .catch((error) => {
-        if (!ignore) {
-          setClusterState({
-            data: null,
-            loading: false,
-            error: error.message
-          });
-        }
-      });
-
-    return () => {
-      ignore = true;
-    };
-  }, [activeSeeds]);
-
-  useEffect(() => {
-    const cluster = clusterState.data;
-    const clusterDomains = cluster?.component?.domains || [];
-    if (!clusterDomains.length) {
-      return;
-    }
-
-    const topEdge = (cluster.edges || [])[0];
-    const fallbackA = topEdge?.domain_a || clusterDomains[0] || "";
-    const fallbackB = topEdge?.domain_b || clusterDomains.find((item) => item !== fallbackA) || "";
-
-    setDomainA((current) => (current && clusterDomains.includes(current) ? current : fallbackA));
-    setDomainB((current) => (current && clusterDomains.includes(current) && current !== fallbackA ? current : fallbackB));
-  }, [clusterState.data]);
-
-  useEffect(() => {
-    const clusterDomains = clusterState.data?.component?.domains || [];
-    if (domainA && domainB && domainA !== domainB) {
-      return;
-    }
-    const fallback = clusterDomains.find((item) => item !== domainA) || "";
-    if (fallback && domainA === domainB) {
-      setDomainB(fallback);
-    }
-  }, [clusterState.data, domainA, domainB]);
-
-  const pairLookupKey = domainA && domainB && domainA !== domainB ? pairKey(domainA, domainB) : "";
-  const clusterEdge = pairLookupKey
-    ? (clusterState.data?.edges || []).find((item) => pairKey(item.domain_a, item.domain_b) === pairLookupKey) || null
-    : null;
-
-  useEffect(() => {
-    if (!domainA || !domainB || domainA === domainB) {
-      setComparisonState({
-        data: null,
-        loading: false,
-        error: ""
-      });
-      return;
-    }
-
-    if (clusterEdge) {
-      setComparisonState({
-        data: clusterEdge,
-        loading: false,
-        error: ""
-      });
-      return;
-    }
-
-    let ignore = false;
-    setComparisonState((current) => ({
-      ...current,
-      loading: true,
-      error: ""
-    }));
-
-    apiFetch(`/api/compare/domains?domain_a=${encodeURIComponent(domainA)}&domain_b=${encodeURIComponent(domainB)}`)
-      .then((response) => {
-        if (!ignore) {
-          setComparisonState({
-            data: response || null,
-            loading: false,
-            error: ""
-          });
-        }
-      })
-      .catch((error) => {
-        if (!ignore) {
-          setComparisonState({
-            data: null,
-            loading: false,
-            error: error.message
-          });
-        }
-      });
-
-    return () => {
-      ignore = true;
-    };
-  }, [clusterEdge, domainA, domainB]);
-
-  const graph = buildAttributionGraphModel(clusterState.data, controls);
-
-  useEffect(() => {
-    if (!selection) {
-      return;
-    }
-    if (selection.type === "node" && !graph.nodes.some((node) => node.id === selection.id)) {
-      setSelection(null);
-    }
-    if (selection.type === "edge" && !graph.edges.some((edge) => edge.key === selection.key)) {
-      setSelection(null);
-    }
-  }, [graph.edges, graph.nodes, selection]);
-
-  useEffect(() => {
-    if (!selection || selection.type !== "edge") {
-      return;
-    }
-    const edge = graph.edges.find((item) => item.key === selection.key);
-    if (!edge) {
-      return;
-    }
-    setDomainA(edge.comparison.domain_a);
-    setDomainB(edge.comparison.domain_b);
-    heroRef.current && heroRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [graph.edges, selection]);
-
-  const comparison = buildVisibleComparison(comparisonState.data, controls.maxFrequency);
-  const verdict = buildAttributionVerdict(comparison);
-  const matrixRows = buildIdentifierPivotRows(clusterState.data, controls.maxFrequency);
-  const pivotDomains = buildPivotDomains(clusterState.data, graph, domainA, domainB);
-  const pairOptions = clusterState.data?.component?.domains?.length
-    ? clusterState.data.component.domains
-    : domainTargets;
-  const seedTargets = parseDomainTokenInput(activeSeeds);
-  const seedDraftTargets = parseDomainTokenInput(seedDraft);
-
-  const componentDomainCount = clusterState.data?.component?.domains?.length || 0;
-  const componentIdentifierCount = clusterState.data?.component?.identifiers?.length || 0;
-  const matchingEdgeCount = graph.edges.length;
-
-  const openDossierForComparison = (nextComparison) => {
-    if (!nextComparison) {
-      return;
-    }
-    setDomainA(nextComparison.domain_a);
-    setDomainB(nextComparison.domain_b);
-    setComparisonState({
-      data: nextComparison,
-      loading: false,
-      error: ""
-    });
-    setActiveView("dossier");
-    heroRef.current && heroRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
-  };
-
-  const updateControl = (key, value) => {
-    setControls((current) => ({
-      ...current,
-      [key]: value
-    }));
-  };
-
-  return (
-    <PageFrame
-      eyebrow="Explorer"
-      title="Evidence dossier"
-      subtitle="Answer three questions fast: what is the verdict, what matched, and is any of it too common to trust."
-      infoTitle="How to read this workspace"
-      infoBody="The verdict sits above the evidence. Rows are grouped by tier, not by collection source. Every row carries a rarity badge so you can separate silver bullets from template artifacts."
-      metrics={(
-        <>
-          <Metric label="Component domains" value={formatNumber(componentDomainCount)} detail={seedTargets.length ? `${seedTargets.length} seed${seedTargets.length === 1 ? "" : "s"}` : "No seeds"} />
-          <Metric label="Pair matches shown" value={formatNumber(matchingEdgeCount)} detail={`${formatNumber(graph.hiddenEdgeCount || 0)} weaker edges hidden`} />
-          <Metric label="Identifiers in component" value={formatNumber(componentIdentifierCount)} detail={`${formatNumber(matrixRows.length)} below rarity cutoff`} />
-          <Metric label="Verdict" value={verdict.label} detail={comparison ? verdict.summary : "Choose a pair"} />
-        </>
-      )}
-    >
-      <section className="attribution-toolbar">
-        <div className="attribution-toolbar-top">
-          <div className="field-row">
-            <label htmlFor="attribution-seeds">Seed domains</label>
-            <div className="attribution-seed-row">
-              <input
-                id="attribution-seeds"
-                type="text"
-                value={seedDraft}
-                placeholder="example.com second-example.com"
-                onChange={(event) => setSeedDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && seedDraftTargets.length) {
-                    event.preventDefault();
-                    setActiveSeeds(seedDraftTargets.join(", "));
-                  }
-                }}
-              />
-              <button
-                className="secondary-button"
-                onClick={() => setActiveSeeds(seedDraftTargets.join(", "))}
-                type="button"
-                disabled={!seedDraftTargets.length || clusterState.loading}
-              >
-                {clusterState.loading ? "Loading..." : "Load component"}
-              </button>
+      </section>
+
+      {scalarEntries.length > 0 ? (
+        <section className="panel section-stack">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Metadata</p>
+              <h2>Pair details</h2>
             </div>
-            <small>
-              Build a connected component from one or more stored seed domains, then pivot across pairs, nodes, and identifiers.
-            </small>
           </div>
+          <DescriptionGrid entries={scalarEntries} />
+        </section>
+      ) : null}
 
-          <div className="button-row attribution-toolbar-actions">
-            <button className="secondary-button" onClick={() => graphApiRef.current.fit()} type="button">
-              Fit graph
-            </button>
-            <button className="secondary-button" onClick={() => graphApiRef.current.reset()} type="button">
-              Reset graph
-            </button>
+      <RawDataDisclosure label="Raw pair payload" value={pair.raw} />
+    </div>
+  );
+}
+
+function CaseClustersPage() {
+  const { caseId } = useCaseContext();
+  const clustersRequest = useApi(`/api/cases/${caseId}/clusters`);
+  const clusterGroups = normalizeClusterGroups(clustersRequest.data);
+  const graph = clustersRequest.data?.graph ?? clustersRequest.data?.graph_payload ?? null;
+
+  return (
+    <div className="page-stack">
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Clusters</p>
+            <h2>Cluster review</h2>
+            <p className="section-copy">Loaded from `/api/cases/:caseId/clusters`.</p>
           </div>
+          <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
+            Refresh
+          </button>
         </div>
 
-        <div className="attribution-domain-grid">
-          <SearchableDomainField
-            id="attribution-domain-a"
-            label="Pair domain A"
-            value={domainA}
-            onChange={setDomainA}
-            options={pairOptions}
-            placeholder="Pick the left-hand domain"
-            helper={`${formatNumber(pairOptions.length)} domains available in this context`}
-          />
-          <SearchableDomainField
-            id="attribution-domain-b"
-            label="Pair domain B"
-            value={domainB}
-            onChange={setDomainB}
-            options={pairOptions.filter((item) => item !== domainA)}
-            placeholder="Pick the right-hand domain"
-            helper="Choose a second domain to compare."
-          />
-          <SearchableDomainField
-            id="attribution-focus-domain"
-            label="Graph focus"
-            value={controls.focus}
-            onChange={(nextValue) => updateControl("focus", nextValue)}
-            options={clusterState.data?.component?.domains || pairOptions}
-            placeholder="Optional graph focus"
-            emptySelectionLabel="All domains"
-            helper="Hide edges that do not touch this domain."
-          />
-        </div>
+        {clustersRequest.loading && !clustersRequest.data ? (
+          <LoadingState message="Loading clusters..." />
+        ) : null}
+        {clustersRequest.error ? <ErrorState message={clustersRequest.error} /> : null}
+        {!clustersRequest.loading && !clustersRequest.error && clusterGroups.length === 0 ? (
+          <EmptyState message="No clusters were returned for this case." />
+        ) : null}
+        {graph?.nodes?.length > 0 ? <ClusterGraph graph={graph} /> : null}
 
-        <div className="attribution-slider-grid">
-          <label className="attribution-slider" htmlFor="attribution-frequency-filter">
-            <span>False-positive frequency filter</span>
-            <input
-              id="attribution-frequency-filter"
-              min="2"
-              max="60"
-              type="range"
-              value={controls.maxFrequency}
-              onChange={(event) => updateControl("maxFrequency", Number(event.target.value))}
-            />
-            <strong>{controls.maxFrequency}</strong>
-          </label>
-          <label className="attribution-slider" htmlFor="attribution-min-score">
-            <span>Minimum pair strength</span>
-            <input
-              id="attribution-min-score"
-              min="1"
-              max="100"
-              type="range"
-              value={controls.minScore}
-              onChange={(event) => updateControl("minScore", Number(event.target.value))}
-            />
-            <strong>{controls.minScore}</strong>
-          </label>
-          <label className="attribution-slider" htmlFor="attribution-max-edges">
-            <span>Graph edges shown</span>
-            <input
-              id="attribution-max-edges"
-              min="10"
-              max="120"
-              step="2"
-              type="range"
-              value={controls.maxEdges}
-              onChange={(event) => updateControl("maxEdges", Number(event.target.value))}
-            />
-            <strong>{controls.maxEdges}</strong>
-          </label>
-        </div>
+        {clusterGroups.length > 0 ? (
+          <div className="section-stack">
+            {clusterGroups.map((group) => (
+              <section className="section-stack tight" key={group.key}>
+                <div className="group-heading">
+                  <h3>{group.label}</h3>
+                  <span>{group.clusters.length} clusters</span>
+                </div>
 
-        {clusterState.error ? <Callout tone="danger">{clusterState.error}</Callout> : null}
-        {clusterState.data?.missing?.length ? (
-          <Callout tone="warning">Missing seeds: {clusterState.data.missing.join(", ")}</Callout>
+                <div className="cluster-grid">
+                  {group.clusters.map((cluster) => (
+                    <article className="cluster-card" key={cluster.id}>
+                      <div className="cluster-card-top">
+                        <div>
+                          <p className="eyebrow">{cluster.type ? formatLabel(cluster.type) : "Cluster"}</p>
+                          <h4>{cluster.label}</h4>
+                        </div>
+                        {cluster.score !== null ? <strong>{formatPercent(cluster.score)}</strong> : null}
+                      </div>
+
+                      <div className="inline-metrics">
+                        <InlineMetric
+                          label="Members"
+                          value={formatMaybeNumber(cluster.memberCount || cluster.members.length)}
+                        />
+                        <InlineMetric label="Cluster ID" value={cluster.id} />
+                      </div>
+
+                      {cluster.summary ? <p className="card-copy">{cluster.summary}</p> : null}
+
+                      {cluster.members.length > 0 ? (
+                        <div className="chip-row">
+                          {cluster.members.slice(0, 6).map((member) => (
+                            <span className="chip" key={`${cluster.id}-${member}`}>
+                              {member}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </article>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
         ) : null}
       </section>
 
-      <section className={`attribution-hero ${verdict.tone}`} ref={heroRef}>
-        <div className="attribution-hero-header">
-          <div>
-            <span className="eyebrow">Verdict</span>
-            <h3>{domainA && domainB ? `${domainA} ↔ ${domainB}` : "Choose a pair"}</h3>
-            <p>{comparison ? verdict.headline : "Pick a pair or click a graph edge to populate the dossier."}</p>
-          </div>
-          <div className={`attribution-verdict-pill ${verdict.tone}`}>{verdict.label}</div>
-        </div>
-
-        {comparisonState.error ? <Callout tone="danger">{comparisonState.error}</Callout> : null}
-        {comparisonState.loading ? <Callout tone="info">Loading the pair dossier…</Callout> : null}
-
-        {comparison ? (
-          <>
-            <div className="metric-grid attribution-hero-metrics">
-              <Metric label="Trusted rows" value={formatNumber(comparison.visibleEvidence.length)} detail={`${formatNumber(comparison.hiddenEvidence.length)} hidden as common`} />
-              <Metric label="Tier 1" value={formatNumber(verdict.tierCounts.tier_1)} detail={`${formatNumber(verdict.tierCounts.tier_2)} Tier 2 corroborators`} />
-              <Metric label="Unique or pair-specific" value={formatNumber(verdict.uniqueCount)} detail={`${formatNumber(verdict.rareCount)} rare total`} />
-              <Metric label="Pair strength" value={formatNumber(comparison.visibleScore)} detail="Narrative verdict, not a fake precision percentage" />
-            </div>
-            <p className="attribution-hero-summary">{verdict.summary}</p>
-          </>
-        ) : (
-          <p className="muted">The dossier will appear here once a valid pair is selected.</p>
-        )}
-      </section>
-
-      <div className="tab-row">
-        {ATTRIBUTION_VIEW_TABS.map((tab) => (
-          <TabButton key={tab.id} active={activeView === tab.id} label={tab.label} onClick={() => setActiveView(tab.id)} />
-        ))}
-      </div>
-
-      {activeView === "dossier" ? (
-        <AttributionDossierPanel
-          comparison={comparison}
-          domainA={domainA}
-          domainB={domainB}
-          maxFrequency={controls.maxFrequency}
-        />
-      ) : null}
-
-      {activeView === "cluster" ? (
-        graph.edges.length ? (
-          <div className="attribution-graph-layout">
-            <section className="attribution-graph-card">
-              <div className="attribution-graph-header">
-                <div>
-                  <h3>Force-directed cluster graph</h3>
-                  <p className="muted">
-                    Nodes are domains. Edges are shared identifiers. Thickness tracks the strongest tier on the link, and color tracks the strongest surviving category.
-                  </p>
-                </div>
-                <div className="attribution-sidebar-badges">
-                  <span className="attribution-meta-chip">{formatNumber(graph.nodes.length)} domains</span>
-                  <span className="attribution-meta-chip">{formatNumber(graph.edges.length)} edges</span>
-                  <span className="attribution-meta-chip">Top score {formatNumber(graph.maxScore || 0)}</span>
-                </div>
-              </div>
-              <AttributionGraphCanvasD3
-                graph={graph}
-                selection={selection}
-                setSelection={setSelection}
-                theme={theme}
-                graphApiRef={graphApiRef}
-                height={ATTRIBUTION_GRAPH_HEIGHT}
-              />
-            </section>
-
-            <aside className="attribution-graph-sidebar">
-              <AttributionGraphSidebar
-                graph={graph}
-                selection={selection}
-                cluster={clusterState.data}
-                maxFrequency={controls.maxFrequency}
-                onClose={() => setSelection(null)}
-                onOpenDossier={openDossierForComparison}
-                onSetFocus={(domain) => updateControl("focus", domain)}
-              />
-            </aside>
-          </div>
-        ) : (
-          <Callout tone="info">
-            No links survive the current graph filters. Lower the minimum strength, loosen the rarity cutoff, or load a wider component.
-          </Callout>
-        )
-      ) : null}
-
-      {activeView === "matrix" ? (
-        matrixRows.length ? (
-          <SectionCard
-            title="Identifier pivot table"
-            subtitle="Rows are identifiers, columns are domains, and the table is sorted so the smallest shared sets rise to the top."
-            infoTitle="Identifier pivot table"
-            infoBody="This is the smoking-gun view. Identifiers shared by exactly a few domains surface first, while common template artifacts stay lower or disappear behind the rarity filter."
-          >
-            <div className="attribution-matrix-shell">
-              <table className="attribution-matrix-table">
-                <thead>
-                  <tr>
-                    <th className="sticky">Identifier</th>
-                    {pivotDomains.map((domain) => (
-                      <th key={domain}>{shortLabel(domain, 24)}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {matrixRows.map((identifier) => {
-                    const tierMeta = getAttributionTierMeta(identifier.tier);
-                    const categoryMeta = getAttributionCategoryMeta(identifier.category);
-                    const rarity = getEvidenceRarityBadge(
-                      {
-                        domain_frequency: identifier.domain_count,
-                        frequency_status: identifier.frequency_status
-                      },
-                      controls.maxFrequency
-                    );
-                    return (
-                      <tr key={`${identifier.id_type}-${identifier.id_value}`}>
-                        <td className="sticky">
-                          <div className="attribution-matrix-id">
-                            <div className="attribution-evidence-title-row">
-                              <strong>{humanizeIdentifierType(identifier.id_type)}</strong>
-                              <span className={`attribution-tier-pill ${tierMeta.tone}`}>{tierMeta.label}</span>
-                              <span className="attribution-category-pill" style={{ "--badge-color": categoryMeta.color }}>
-                                {categoryMeta.label}
-                              </span>
-                            </div>
-                            <code className="attribution-code compact">{identifier.id_value}</code>
-                            <span className={`attribution-rarity-pill ${rarity.tone}`}>{rarity.label}</span>
-                          </div>
-                        </td>
-                        {pivotDomains.map((domain) => {
-                          const present = Array.isArray(identifier.domains) && identifier.domains.includes(domain);
-                          return (
-                            <td
-                              key={`${identifier.id_type}-${identifier.id_value}-${domain}`}
-                              className={present ? "present" : "absent"}
-                              title={present ? `${domain} carries this identifier.` : `${domain} does not carry this identifier.`}
-                            >
-                              {present ? <span className="attribution-matrix-mark" /> : null}
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </SectionCard>
-        ) : (
-          <Callout tone="info">
-            No identifiers remain below the current rarity cutoff. Raise the filter if you want to inspect more common values.
-          </Callout>
-        )
-      ) : null}
-    </PageFrame>
+      <RawDataDisclosure label="Raw cluster payload" value={clustersRequest.data} />
+    </div>
   );
 }
 
-function GraphPage({ clusters, domainTargets, theme }) {
-  const graphApiRef = useRef({
-    fit: () => {},
-    reset: () => {}
-  });
-  const resizeStateRef = useRef(null);
-  const [controls, setControls] = useState({ ...GRAPH_DEFAULT_CONTROLS });
-  const [selection, setSelection] = useState(null);
-  const [graphHeight, setGraphHeight] = useState(GRAPH_DEFAULT_HEIGHT);
-  const [sidebarWidth, setSidebarWidth] = useState(GRAPH_DEFAULT_SIDEBAR_WIDTH);
-
-  const visibleClusters = getVisibleClusters(clusters);
-  const graph = buildNetworkModel(visibleClusters, controls);
-  const focusOptions = domainTargets || [];
-  const activeNodeId = selection && selection.type === "node" ? selection.id : "";
-  const activeEdgeKey = selection && selection.type === "edge" ? selection.key : "";
-  const selectedNode = activeNodeId
-    ? graph.nodes.find((node) => node.id === activeNodeId) || null
-    : null;
-  const selectedEdge = activeEdgeKey
-    ? graph.edges.find((edge) => edge.key === activeEdgeKey) || null
-    : null;
-  const linkedNeighbors = selectedNode
-    ? graph.edges
-      .filter((edge) => edgeTouchesNode(edge, selectedNode.id))
-      .map((edge) => ({
-        edge,
-        peer: getEdgeEndpointId(edge.source) === selectedNode.id ? getEdgeEndpointId(edge.target) : getEdgeEndpointId(edge.source)
-      }))
-      .sort((a, b) => b.edge.score - a.edge.score || a.peer.localeCompare(b.peer))
-    : [];
-  const nodeSignalCounts = selectedNode ? collectNodeSignalCounts(graph.edges, selectedNode.id) : null;
-  const selectedEdgeDetails = selectedEdge ? selectedEdge.details.map((detail) => describeGraphDetail(detail)) : [];
-  const strongestLinks = graph.edges.slice(0, 6);
-
-  useEffect(() => {
-    if (!selection) {
-      return;
-    }
-    if (selection.type === "node" && !graph.nodes.some((node) => node.id === selection.id)) {
-      setSelection(null);
-    }
-    if (selection.type === "edge" && !graph.edges.some((edge) => edge.key === selection.key)) {
-      setSelection(null);
-    }
-  }, [graph.edges, graph.nodes, selection]);
-
-  useEffect(() => {
-    const handlePointerMove = (event) => {
-      const activeResize = resizeStateRef.current;
-      if (!activeResize) {
-        return;
-      }
-
-      if (activeResize.mode === "height" || activeResize.mode === "both") {
-        const nextHeight = Math.min(
-          GRAPH_MAX_HEIGHT,
-          Math.max(
-            GRAPH_MIN_HEIGHT,
-            activeResize.startHeight + (event.clientY - activeResize.startClientY)
-          )
-        );
-        setGraphHeight(nextHeight);
-      }
-
-      if (activeResize.mode === "width" || activeResize.mode === "both") {
-        const nextSidebarWidth = Math.min(
-          GRAPH_MAX_SIDEBAR_WIDTH,
-          Math.max(
-            GRAPH_MIN_SIDEBAR_WIDTH,
-            activeResize.startSidebarWidth - (event.clientX - activeResize.startClientX)
-          )
-        );
-        setSidebarWidth(nextSidebarWidth);
-      }
-    };
-
-    const clearResizeState = () => {
-      resizeStateRef.current = null;
-      document.body.style.removeProperty("cursor");
-      document.body.style.removeProperty("user-select");
-    };
-
-    const handlePointerUp = (event) => {
-      if (resizeStateRef.current && resizeStateRef.current.pointerId !== event.pointerId) {
-        return;
-      }
-      clearResizeState();
-    };
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-    window.addEventListener("pointercancel", clearResizeState);
-
-    return () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      window.removeEventListener("pointercancel", clearResizeState);
-      clearResizeState();
-    };
-  }, []);
-
-  const updateControl = (key, value) => {
-    setControls((current) => ({
-      ...current,
-      [key]: value
-    }));
-  };
-
-  const resetGraphFilters = () => {
-    setSelection(null);
-    setControls({ ...GRAPH_DEFAULT_CONTROLS });
-  };
-
-  const handleSelectionChange = (nextSelection) => {
-    setSelection((current) => {
-      if (!nextSelection) {
-        return null;
-      }
-      if (!current || current.type !== nextSelection.type) {
-        return nextSelection;
-      }
-      if (current.type === "node") {
-        return current.id === nextSelection.id ? null : nextSelection;
-      }
-      return current.key === nextSelection.key ? null : nextSelection;
-    });
-  };
-
-  const handleResizePointerDown = (mode, event) => {
-    resizeStateRef.current = {
-      mode,
-      pointerId: event.pointerId,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startHeight: graphHeight,
-      startSidebarWidth: sidebarWidth
-    };
-    document.body.style.setProperty(
-      "cursor",
-      mode === "width" ? "ew-resize" : mode === "height" ? "ns-resize" : "nwse-resize"
-    );
-    document.body.style.setProperty("user-select", "none");
-    event.preventDefault();
-    event.stopPropagation();
-  };
-
-  const relatedEdgeCount = graph.edges.length;
+function ClusterGraph({ graph }) {
+  const layout = buildClusterLayout(graph);
 
   return (
-    <PageFrame
-      eyebrow="Explorer"
-      title="Relationship graph"
-      subtitle="Filter stored domain links by strength, signal type, and focus domain."
-      metrics={
-        <>
-          <Metric label="Domains in view" value={formatNumber(graph.nodes.length)} />
-          <Metric label="Links shown" value={formatNumber(graph.edges.length)} detail="Strongest links first" />
-          <Metric label="Top score" value={formatNumber(graph.maxScore || 0)} />
-          <Metric label="Hidden weaker links" value={formatNumber(graph.hiddenEdgeCount || 0)} />
-        </>
-      }
-    >
-      {graph.edges.length ? (
-        <div className="tt-graph-layout" style={{ "--graph-sidebar-width": `${sidebarWidth}px` }}>
-          <section className="tt-graph-card">
-            <div className="tt-graph-card-header">
-              <div className="tt-graph-title-block">
-                <h3>Link graph for stored domains</h3>
-                <p className="tt-graph-subtitle">
-                  Shared TLS, tracking, favicon, direct-IP, and network evidence, ranked so the strongest technical links surface first.
-                </p>
-              </div>
-              <div className="tt-graph-badge-group">
-                <span className="tt-graph-badge tt-graph-badge-solid">{formatNumber(graph.nodes.length)} domains</span>
-                <span className="tt-graph-badge">{relatedEdgeCount} inferred links</span>
-                <span className="tt-graph-badge">Top score {graph.maxScore || 0}</span>
-              </div>
-            </div>
-
-            <div className="tt-graph-control-row">
-              <button className="tt-graph-button" onClick={() => graphApiRef.current.fit()} type="button">
-                Fit graph
-              </button>
-              <button className="tt-graph-button" onClick={() => graphApiRef.current.reset()} type="button">
-                Reset zoom
-              </button>
-              <button className="tt-graph-button" onClick={resetGraphFilters} type="button">
-                Reset filters
-              </button>
-
-              <label className="tt-graph-toggle">
-                <input checked={controls.includeTls} onChange={() => updateControl("includeTls", !controls.includeTls)} type="checkbox" />
-                <span>TLS certs</span>
-              </label>
-              <label className="tt-graph-toggle">
-                <input checked={controls.includeTracking} onChange={() => updateControl("includeTracking", !controls.includeTracking)} type="checkbox" />
-                <span>Tracking IDs</span>
-              </label>
-              <label className="tt-graph-toggle">
-                <input checked={controls.includeFavicon} onChange={() => updateControl("includeFavicon", !controls.includeFavicon)} type="checkbox" />
-                <span>Favicons</span>
-              </label>
-              <label className="tt-graph-toggle">
-                <input checked={controls.includeIp} onChange={() => updateControl("includeIp", !controls.includeIp)} type="checkbox" />
-                <span>Shared IPs</span>
-              </label>
-              <label className="tt-graph-toggle">
-                <input checked={controls.includeAsn} onChange={() => updateControl("includeAsn", !controls.includeAsn)} type="checkbox" />
-                <span>ASNs</span>
-              </label>
-            </div>
-
-            <div className="tt-graph-control-row secondary">
-              <label className="tt-graph-inline-control" htmlFor="graph-page-min-score">
-                <span>Minimum strength</span>
-                <input id="graph-page-min-score" min="1" max="30" type="range" value={controls.minScore} onChange={(event) => updateControl("minScore", Number(event.target.value))} />
-                <strong>{controls.minScore}</strong>
-              </label>
-
-              <label className="tt-graph-inline-control" htmlFor="graph-page-max-links">
-                <span>Links shown</span>
-                <input id="graph-page-max-links" min="10" max="80" step="2" type="range" value={controls.maxLinks} onChange={(event) => updateControl("maxLinks", Number(event.target.value))} />
-                <strong>{controls.maxLinks}</strong>
-              </label>
-
-              <SearchableDomainField
-                className="tt-graph-inline-select domain-search-inline"
-                id="graph-page-focus"
-                label="Focus domain"
-                value={controls.focus}
-                onChange={(nextValue) => updateControl("focus", nextValue)}
-                options={focusOptions}
-                placeholder="Search stored domains"
-                emptySelectionLabel="All domains"
-                helper={`${formatNumber(focusOptions.length)} stored domains available`}
-              />
-            </div>
-
-            <div className="tt-graph-legend">
-              <span className="tt-graph-legend-item">
-                <span className="tt-graph-legend-line overlap" />
-                Multiple indicators
-              </span>
-              {NETWORK_LINK_ORDER.map((kind) => (
-                <span className="tt-graph-legend-item" key={kind}>
-                  <span className="tt-graph-legend-line" style={{ backgroundColor: NETWORK_LINK_META[kind].color }} />
-                  {NETWORK_LINK_META[kind].label}
-                </span>
-              ))}
-            </div>
-
-            <div className="tt-graph-canvas-shell">
-              <GraphCanvasD3
-                graph={graph}
-                selection={selection}
-                setSelection={handleSelectionChange}
-                theme={theme}
-                graphApiRef={graphApiRef}
-                height={graphHeight}
-              />
-
-              <button
-                className="graph-resize-handle horizontal"
-                onPointerDown={(event) => handleResizePointerDown("height", event)}
-                type="button"
-                aria-label="Resize graph height"
-                title="Drag to resize graph height"
-              >
-                Resize height
-              </button>
-              <button
-                className="graph-resize-handle vertical"
-                onPointerDown={(event) => handleResizePointerDown("width", event)}
-                type="button"
-                aria-label="Resize sidebar width"
-                title="Drag to resize sidebar width"
-              >
-                Resize sidebar
-              </button>
-              <button
-                className="graph-resize-handle corner"
-                onPointerDown={(event) => handleResizePointerDown("both", event)}
-                type="button"
-                aria-label="Resize graph workspace"
-                title="Drag to resize graph workspace"
-              >
-                Resize
-              </button>
-            </div>
-          </section>
-
-          <aside className="tt-graph-sidebar-card">
-            <DomainGraphSidebar
-              graph={graph}
-              selection={selection}
-              onClose={() => setSelection(null)}
-              onFocus={(domain) => updateControl("focus", domain)}
-            />
-          </aside>
-        </div>
-      ) : (
-        <Callout tone="info">
-          No links match the current graph filters. Lower the minimum strength, raise the link limit, or clear the domain focus.
-        </Callout>
-      )}
-    </PageFrame>
-  );
-}
-
-function ConnectionsPage({ connections, meta, selectedTarget, setSelectedTarget, domainTargets, onOpenSavedResult }) {
-  return (
-    <PageFrame
-      eyebrow="Explorer"
-      title="Domain connections"
-      subtitle="Search a stored domain to inspect the strongest overlaps already in the database."
-    >
-      <SearchableDomainField
-        id="connections-page-target"
-        label="Find a stored domain"
-        value={selectedTarget}
-        onChange={setSelectedTarget}
-        options={domainTargets}
-        placeholder="Search stored domains"
-        helper={`${formatNumber(domainTargets.length)} stored domains available`}
-      />
-
-      {connections ? (
-        <div className="stack">
-          <div className="metric-grid">
-            <Metric label="Target" value={connections.target} />
-            <Metric label="Cloudflare" value={cloudflareLabel(connections.cloudflare_fronted)} />
-            <Metric label="Registrar" value={(connections.whois || {}).registrar || "Unknown"} />
-            <Metric label="Created" value={formatDate((connections.whois || {}).creation_date)} />
-          </div>
-
-          {connections.history && connections.history.length ? (
-            <SectionCard
-              title="Run history"
-              infoTitle="Run history"
-              infoBody="This is the append-only timeline for the selected target. Open an older run to compare how the domain’s IPs, certificates, and provider hits changed over time."
-            >
-              <div className="card-grid">
-                {connections.history.map((item) => (
-                  <LeadCard
-                    key={item.id}
-                    title={formatDateTime(item.timestamp)}
-                    footer={item.is_latest ? "Latest run" : "Historical run"}
-                  >
-                    <p><strong>Cloudflare:</strong> {cloudflareLabel(item.cloudflare_fronted)}</p>
-                    <p><strong>Type:</strong> {String(item.type || "").toUpperCase()}</p>
-                    <button className="inline-action" onClick={() => onOpenSavedResult(item.id)} type="button">
-                      Open run
-                    </button>
-                  </LeadCard>
-                ))}
-              </div>
-            </SectionCard>
-          ) : null}
-
-          {CONNECTION_SECTIONS.map((section) => {
-            const items = (connections.connections || {})[section.key] || [];
-            if (!items.length) {
-              return null;
-            }
-            return (
-              <SectionCard key={section.key} title={section.title} infoTitle={section.title} infoBody={section.infoBody}>
-                <div className="card-grid">
-                  {items.map((item, index) => (
-                    <LeadCard key={`${section.key}-${index}`} title={getConnectionItemTitle(section.key, item)}>
-                      {item.shared_with && item.shared_with.length ? (
-                        <p className="break-word"><strong>Shared with:</strong> {item.shared_with.join(", ")}</p>
-                      ) : (
-                        <p>No other stored domains share this attribute yet.</p>
-                      )}
-                      <ConnectionItemDetails sectionKey={section.key} item={item} meta={meta} />
-                    </LeadCard>
-                  ))}
-                </div>
-              </SectionCard>
-            );
-          })}
-        </div>
-      ) : (
-        <Callout tone="info">Choose a stored domain to see its cross-domain overlaps.</Callout>
-      )}
-    </PageFrame>
-  );
-}
-
-function SharedSignalPage({ eyebrow, title, subtitle, infoTitle, infoBody, items, renderItem, emptyMessage }) {
-  return (
-    <PageFrame eyebrow={eyebrow} title={title} subtitle={subtitle} infoTitle={infoTitle} infoBody={infoBody}>
-      {items.length ? (
-        <div className="card-grid">
-          {items.map(renderItem)}
-        </div>
-      ) : (
-        <Callout tone="info">{emptyMessage}</Callout>
-      )}
-    </PageFrame>
-  );
-}
-
-function InvestigatePage({ form, setForm, busy, scanHelp, openctiState, onAnalyze, onProvidersOnly, onOpenCtiAction, job }) {
-  const openctiJob = buildOpenctiJob(openctiState);
-
-  return (
-    <PageFrame
-      eyebrow="Workflow"
-      title="Analyse"
-      subtitle="Start from a domain or IP, then watch the workflow spread outward only where the evidence supports it."
-      infoTitle="How this page works"
-      infoBody="Use this page to launch a seed-first analysis run. The app profiles the supplied domain or IP first, then fans outward into pivots, providers, Google ranges, ASNs, and TLS checks as the run develops."
-    >
-      <div className="full-page-grid">
-        <ControlPanel
-          form={form}
-          setForm={setForm}
-          busy={busy}
-          scanHelp={scanHelp}
-          openctiState={openctiState}
-          onAnalyze={onAnalyze}
-          onProvidersOnly={onProvidersOnly}
-          onOpenCtiAction={onOpenCtiAction}
-        />
-        <div className="stack">
-          {!job ? (
-            <SectionCard
-              title="Seed-first workflow"
-              subtitle="What the run will do once you press Analyse target."
-              infoTitle="Seed-first workflow"
-              infoBody="The flow starts with the supplied target, then branches outward into pivots and deeper infrastructure checks only when the earlier evidence gives it somewhere useful to go."
-            >
-              <AnalysisFlowPanel targetHint={form.target} />
-            </SectionCard>
-          ) : <JobProgress job={job} />}
-          {openctiJob ? <JobProgress job={openctiJob} /> : null}
-          {!job && !openctiJob ? (
-            <SectionCard title="Ready" subtitle="No job is running right now.">
-              <p className="muted">Add a seed on the left, start the run, and this column will switch from the planned flow to the live analysis state.</p>
-            </SectionCard>
-          ) : null}
+    <section className="cluster-graph-card">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Diagram</p>
+          <h3>Cluster map</h3>
         </div>
       </div>
-    </PageFrame>
-  );
-}
-
-function ResultContentPage({ pageId, result, meta, onRunRecommendation, onOpenSavedResult, busy }) {
-  const pageMeta = RESULT_PAGES.find((page) => page.id === pageId) || RESULT_PAGES[0];
-  const pageMetrics = (
-    <>
-      <Metric label="Target" value={result.input} />
-      <Metric label="Cloudflare" value={cloudflareLabel(result.cloudflare_fronted ?? result.cloudflare)} />
-      <Metric label="Origin leads" value={collectOriginLeadCount(result)} />
-      <Metric label="Saved" value={formatDateTime(result.timestamp)} />
-    </>
-  );
-
-  return (
-    <PageFrame
-      eyebrow="Result"
-      title={pageMeta.label}
-      subtitle={pageMeta.subtitle}
-      infoTitle={pageMeta.label}
-      infoBody="These result pages use the full width of the app so each analysis section has room to breathe. Switch pages from the navigation strip above."
-      actions={
-        <button className="secondary-button" onClick={() => downloadResult(result)} type="button">
-          Download JSON
-        </button>
-      }
-      metrics={pageMetrics}
-    >
-      {pageId === "overview" ? (
-        <OverviewTab
-          result={result}
-          meta={meta}
-          onRunRecommendation={onRunRecommendation}
-          onOpenSavedResult={onOpenSavedResult}
-          busy={busy}
-        />
-      ) : null}
-      {pageId === "dns" ? <DnsTab result={result} /> : null}
-      {pageId === "certs" ? <CertificatesTab result={result} meta={meta} /> : null}
-      {pageId === "origin" ? <OriginTab result={result} meta={meta} /> : null}
-      {pageId === "ips" ? <IpDetailsTab result={result} meta={meta} /> : null}
-    </PageFrame>
-  );
-}
-
-function ControlPanel({ form, setForm, busy, scanHelp, openctiState, onAnalyze, onProvidersOnly, onOpenCtiAction }) {
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [showOpencti, setShowOpencti] = useState(false);
-
-  const updateField = (key, value) => {
-    setForm((current) => ({
-      ...current,
-      [key]: value
-    }));
-  };
-
-  const toggle = (key) => updateField(key, !form[key]);
-
-  const scanFields = [
-    ["scan", "Eastern-EU GCP"],
-    ["scan_europe", "All-EU GCP + Turkey"],
-    ["scan_providers", "Known RU/EU hosters"],
-    ["scan_eu_countries", "All EU member states"],
-    ["scan_full", "Full scan"],
-    ["scan_all", "Global GCP"]
-  ];
-
-  return (
-    <SectionCard
-      title="Analyse a seed"
-      subtitle="Start with a domain or IP. Keep the default view tight, then widen the fan-out only if you need it."
-      infoTitle="How this run starts"
-      infoBody="The app profiles the supplied seed first. Google, provider, and country sweeps are available, but they stay tucked away until you explicitly open them."
-    >
-      <div className="stack">
-        <div className="field-row">
-          <label htmlFor="target">Target domain or IP</label>
-          <input
-            id="target"
-            type="text"
-            value={form.target}
-            placeholder="news-pravda.com"
-            onChange={(event) => updateField("target", event.target.value)}
-            disabled={busy}
+      <svg className="cluster-graph" viewBox={`0 0 ${layout.width} ${layout.height}`}>
+        {layout.edges.map((edge) => (
+          <line
+            key={`${edge.from}-${edge.to}`}
+            stroke={edge.color || "#94a3b8"}
+            strokeWidth={edge.width || 1}
+            x1={edge.x1}
+            x2={edge.x2}
+            y1={edge.y1}
+            y2={edge.y2}
           />
-        </div>
-
-        <div className="button-row">
-          <button className="primary-button" onClick={onAnalyze} type="button" disabled={busy || !form.target.trim()}>
-            {busy ? "Running..." : "Analyse target"}
-          </button>
-          <button className="secondary-button" onClick={onProvidersOnly} type="button" disabled={busy || !form.target.trim()}>
-            Providers only
-          </button>
-        </div>
-
-        <div className="fold-panel control-fold">
-          <button className="fold-toggle" onClick={() => setShowAdvanced(!showAdvanced)} type="button">
-            {showAdvanced ? "Hide expansion settings" : "Show expansion settings"}
-          </button>
-          {showAdvanced ? (
-            <div className="stack">
-              <div className="field-group">
-                <h3>Expansion modes</h3>
-                {scanFields.map(([key, label]) => (
-                  <label className="checkbox-row" key={key}>
-                    <input checked={form[key]} disabled={busy} onChange={() => toggle(key)} type="checkbox" />
-                    <span>
-                      <strong>{label}</strong>
-                      <small>{scanHelp[key]}</small>
-                    </span>
-                  </label>
-                ))}
-              </div>
-
-              <div className="field-row">
-                <label htmlFor="countries">Custom countries</label>
-                <input
-                  id="countries"
-                  type="text"
-                  value={form.countriesText}
-                  placeholder="RU UA BY"
-                  onChange={(event) => updateField("countriesText", event.target.value.toUpperCase())}
-                  disabled={busy}
-                />
-              </div>
-
-              <div className="split-fields">
-                <div className="field-row">
-                  <label htmlFor="concurrency">Async concurrency</label>
-                  <input
-                    id="concurrency"
-                    min="100"
-                    max="50000"
-                    step="500"
-                    type="number"
-                    value={form.concurrency}
-                    onChange={(event) => updateField("concurrency", Number(event.target.value))}
-                    disabled={busy}
-                  />
-                </div>
-                <div className="field-row">
-                  <label htmlFor="rate">masscan rate (pps)</label>
-                  <input
-                    id="rate"
-                    min="100"
-                    max="500000"
-                    step="1000"
-                    type="number"
-                    value={form.rate}
-                    onChange={(event) => updateField("rate", Number(event.target.value))}
-                    disabled={busy}
-                  />
-                </div>
-              </div>
-            </div>
-          ) : null}
-        </div>
-
-        <div className="fold-panel control-fold">
-          <button className="fold-toggle" onClick={() => setShowOpencti(!showOpencti)} type="button">
-            {showOpencti ? "Hide OpenCTI controls" : "Show OpenCTI controls"}
-          </button>
-          {showOpencti ? (
-            <div className="field-group">
-              <h3>OpenCTI ingestion</h3>
-              {openctiState.available === false ? (
-                <p className="muted">OpenCTI ingestion is not available in this environment.</p>
-              ) : (
-                <>
-                  <p className="muted">
-                    {openctiState.running
-                      ? `Running ${openctiState.done || 0}/${openctiState.total || 0} | ${openctiState.current || "Preparing"}`
-                      : openctiState.completed_at
-                        ? `Last run ${openctiState.completed_at}`
-                        : "Idle. Nothing runs automatically now; press Run when you want to ingest OpenCTI domains."}
-                  </p>
-                  <div className="button-row">
-                    <button className="secondary-button" onClick={() => onOpenCtiAction(false)} type="button" disabled={openctiState.running}>
-                      Run
-                    </button>
-                    <button className="secondary-button" onClick={() => onOpenCtiAction(true)} type="button" disabled={openctiState.running}>
-                      Re-run all
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </SectionCard>
+        ))}
+        {layout.nodes.map((node) => (
+          <g key={node.id} transform={`translate(${node.x}, ${node.y})`}>
+            <circle fill={node.color || "#2752d6"} r="18" />
+            <text className="graph-node-label" textAnchor="middle" y="34">
+              {node.label}
+            </text>
+          </g>
+        ))}
+      </svg>
+    </section>
   );
 }
 
-export default function App() {
-  const initialHashPage = typeof window === "undefined" ? "" : window.location.hash.replace(/^#/, "");
-  const [theme, setTheme] = useState(() => {
-    if (typeof window === "undefined") {
-      return "light";
-    }
-    const savedTheme = window.localStorage.getItem("ip-intel-theme");
-    if (savedTheme === "light" || savedTheme === "dark") {
-      return savedTheme;
-    }
-    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  });
-  const [meta, setMeta] = useState({
-    cert_types: {},
-    server_types: {},
-    scan_options: {}
-  });
-  const [job, setJob] = useState(null);
-  const [recent, setRecent] = useState([]);
-  const [domainTargets, setDomainTargets] = useState([]);
-  const [clusters, setClusters] = useState({
-    ip: [],
-    asn: [],
-    tracking: [],
-    favicon: [],
-    tls: []
-  });
-  const [connections, setConnections] = useState(null);
-  const [selectedTarget, setSelectedTarget] = useState("");
-  const [tlsScope, setTlsScope] = useState("current");
-  const [asnScope, setAsnScope] = useState("current");
-  const [openctiState, setOpenctiState] = useState({ available: false });
-  const [statusMessage, setStatusMessage] = useState("");
-  const [errorMessage, setErrorMessage] = useState("");
-  const [form, setForm] = useState({
-    target: "",
-    scan: false,
-    scan_europe: false,
-    scan_all: false,
-    scan_providers: false,
-    scan_eu_countries: false,
-    scan_full: false,
-    countriesText: "",
-    concurrency: 5000,
-    rate: 100000
-  });
-  const [activePage, setActivePage] = useState(initialHashPage || "investigate");
-
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    document.documentElement.style.colorScheme = theme;
-    window.localStorage.setItem("ip-intel-theme", theme);
-  }, [theme]);
-
-  async function loadExplorerData() {
-    const [recentResponse, domainsResponse, ipResponse, asnResponse, trackingResponse, faviconResponse, tlsResponse] = await Promise.allSettled([
-      apiFetch("/api/history/recent?limit=100"),
-      apiFetch("/api/history/domains"),
-      apiFetch("/api/clusters/ip"),
-      apiFetch(`/api/clusters/asn?scope=${encodeURIComponent(asnScope)}`),
-      apiFetch("/api/clusters/tracking"),
-      apiFetch("/api/clusters/favicon"),
-      apiFetch(`/api/clusters/tls?scope=${encodeURIComponent(tlsScope)}`)
-    ]);
-
-    setRecent(recentResponse.status === "fulfilled" ? recentResponse.value.items || [] : []);
-    setDomainTargets(domainsResponse.status === "fulfilled" ? domainsResponse.value.items || [] : []);
-    setClusters({
-      ip: ipResponse.status === "fulfilled" ? ipResponse.value.items || [] : [],
-      asn: asnResponse.status === "fulfilled" ? asnResponse.value.items || [] : [],
-      tracking: trackingResponse.status === "fulfilled" ? trackingResponse.value.items || [] : [],
-      favicon: faviconResponse.status === "fulfilled" ? faviconResponse.value.items || [] : [],
-      tls: tlsResponse.status === "fulfilled" ? tlsResponse.value.items || [] : []
-    });
-
-    const labeledResponses = [
-      ["Recent searches", recentResponse],
-      ["Stored domains", domainsResponse],
-      ["Shared IPs", ipResponse],
-      ["Shared ASNs", asnResponse],
-      ["Tracking IDs", trackingResponse],
-      ["Favicons", faviconResponse],
-      ["TLS overlaps", tlsResponse]
-    ];
-    const failures = labeledResponses.filter(([, response]) => response.status === "rejected");
-    if (failures.length) {
-      const dbFailure = failures.find(([, response]) => isDatabaseCorruptionMessage(response.reason?.message));
-      if (dbFailure) {
-        setErrorMessage("The SQLite database is corrupted or unreadable. Explorer pages can look empty until the database is repaired, restored, or replaced.");
-      } else {
-        setErrorMessage(failures.map(([label, response]) => `${label}: ${response.reason?.message || "Request failed"}`).join(" | "));
-      }
-    } else {
-      setErrorMessage("");
-    }
-  }
-
-  async function loadOpencti() {
-    try {
-      const response = await apiFetch("/api/opencti/status");
-      setOpenctiState(response);
-    } catch (_error) {
-      setOpenctiState({ available: false });
-    }
-  }
-
-  useEffect(() => {
-    async function bootstrap() {
-      try {
-        const metaResponse = await apiFetch("/api/meta");
-        setMeta(metaResponse);
-        await loadOpencti();
-      } catch (error) {
-        setErrorMessage(error.message);
-      }
-    }
-
-    bootstrap();
-  }, []);
-
-  useEffect(() => {
-    loadExplorerData().catch((error) => {
-      setErrorMessage(error.message);
-    });
-  }, [asnScope, tlsScope]);
-
-  useEffect(() => {
-    if (!selectedTarget) {
-      const firstDomain = (domainTargets.length ? domainTargets : getDomainTargets(recent))[0];
-      if (firstDomain) {
-        setSelectedTarget(firstDomain);
-      }
-    }
-  }, [domainTargets, recent, selectedTarget]);
-
-  useEffect(() => {
-    if (!selectedTarget) {
-      setConnections(null);
-      return;
-    }
-
-    let ignore = false;
-    async function loadConnections() {
-      try {
-        const response = await apiFetch(`/api/connections/${encodeURIComponent(selectedTarget)}`);
-        if (!ignore) {
-          setConnections(response);
-        }
-      } catch (error) {
-        if (!ignore) {
-          setConnections(null);
-          if (isDatabaseCorruptionMessage(error.message)) {
-            setErrorMessage("The SQLite database is corrupted or unreadable. Domain connections cannot be loaded until the database is repaired, restored, or replaced.");
-          }
-        }
-      }
-    }
-
-    loadConnections();
-    return () => {
-      ignore = true;
-    };
-  }, [selectedTarget]);
-
-  useEffect(() => {
-    if (!job || (job.status !== "queued" && job.status !== "running")) {
-      return undefined;
-    }
-
-    const timer = window.setInterval(async () => {
-      try {
-        const response = await apiFetch(`/api/jobs/${job.id}`);
-        setJob(response);
-        if (response.status === "completed" || response.status === "failed") {
-          window.clearInterval(timer);
-          await loadExplorerData();
-        }
-      } catch (error) {
-        setErrorMessage(error.message);
-        window.clearInterval(timer);
-      }
-    }, 1000);
-
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [job]);
-
-  useEffect(() => {
-    loadOpencti();
-  }, []);
-
-  useEffect(() => {
-    if (!openctiState.running) return undefined;
-    const timer = window.setInterval(() => {
-      loadOpencti();
-    }, 1500);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [openctiState.running]);
-
-  async function submitAnalysis(overrides = {}) {
-    setErrorMessage("");
-    setStatusMessage("");
-
-    try {
-      const payload = {
-        target: form.target,
-        scan: form.scan,
-        scan_europe: form.scan_europe,
-        scan_all: form.scan_all,
-        scan_providers: form.scan_providers,
-        scan_eu_countries: form.scan_eu_countries,
-        scan_full: form.scan_full,
-        scan_countries: form.countriesText.split(/\s+/).filter(Boolean),
-        concurrency: form.concurrency,
-        rate: form.rate,
-        ...overrides
-      };
-
-      const response = await apiFetch("/api/analyze", {
-        method: "POST",
-        body: JSON.stringify(payload)
-      });
-
-      setJob(response);
-      setStatusMessage(`Started analysis for ${response.target}.`);
-      setActivePage("investigate");
-    } catch (error) {
-      setErrorMessage(error.message);
-    }
-  }
-
-  async function openSavedResult(searchId) {
-    try {
-      const response = await apiFetch(`/api/history/${searchId}`);
-      setJob({
-        id: `saved-${searchId}`,
-        target: response.result.input,
-        status: "completed",
-        logs: [],
-        partial_result: response.result,
-        result: response.result,
-        updated_at: response.search.timestamp,
-        progress: {
-          fraction: 1,
-          completed: [],
-          completed_count: 0,
-          total: 0
-        }
-      });
-      if (response.result.type === "domain") {
-        setSelectedTarget(response.result.input);
-      }
-      setStatusMessage(`Loaded saved result for ${response.result.input}.`);
-      setActivePage("overview");
-    } catch (error) {
-      setErrorMessage(error.message);
-    }
-  }
-
-  async function triggerOpenCti(forceReanalyse) {
-    try {
-      const response = await apiFetch(`/api/opencti/run?force_reanalyse=${forceReanalyse}`, {
-        method: "POST"
-      });
-      setStatusMessage(response.started ? "OpenCTI ingestion started." : "OpenCTI ingestion is already running.");
-      await loadOpencti();
-    } catch (error) {
-      setErrorMessage(error.message);
-    }
-  }
-
-  async function runRecommendedScan(recommendation) {
-    if (!result || !recommendation) {
-      return;
-    }
-
-    const options = recommendation.options || {};
-    const countries = Array.isArray(options.scan_countries) ? options.scan_countries : [];
-
-    setForm((current) => ({
-      ...current,
-      target: result.input,
-      scan: Boolean(options.scan),
-      scan_europe: Boolean(options.scan_europe),
-      scan_all: Boolean(options.scan_all),
-      scan_providers: Boolean(options.scan_providers),
-      scan_eu_countries: Boolean(options.scan_eu_countries),
-      scan_full: Boolean(options.scan_full),
-      countriesText: countries.join(" ")
-    }));
-
-    await submitAnalysis({
-      target: result.input,
-      scan: false,
-      scan_europe: false,
-      scan_all: false,
-      scan_providers: false,
-      scan_eu_countries: false,
-      scan_full: false,
-      scan_countries: countries,
-      ...options
-    });
-  }
-
-  const result = job && job.result ? job.result : null;
-  const busy = job && (job.status === "queued" || job.status === "running");
-  const availableDomainTargets = domainTargets.length ? domainTargets : getDomainTargets(recent);
-  const storedDomains = availableDomainTargets.length;
-  const visibleClusters = getVisibleClusters(clusters);
-  const sharedSignalCount = visibleClusters.ip.length + visibleClusters.asn.length + clusters.tracking.length + clusters.favicon.length + clusters.tls.length;
-  const openctiLabel = openctiState.available === false
-    ? "Unavailable"
-    : openctiState.running
-      ? "Running"
-      : "Manual";
-  const topbarChips = result
-    ? [
-        { label: "Current target", value: shortLabel(result.input, 28), title: result.input },
-        { label: "Origin leads", value: formatNumber(collectOriginLeadCount(result)) },
-        { label: "Expandable pivots", value: formatNumber(getRelatedTargetsSummary(result).expandable || 0) }
-      ]
-    : [
-        { label: "Stored domains", value: formatNumber(storedDomains) },
-        { label: "Shared signals", value: formatNumber(sharedSignalCount) },
-        { label: "OpenCTI", value: openctiLabel }
-      ];
-  const workflowPages = [
-    { id: "investigate", label: "Analyse", subtitle: "Launch and monitor seed-first collection runs." }
-  ];
-  const resultPages = result ? RESULT_PAGES : [];
-  const explorerPages = EXPLORER_PAGES;
-  const availablePageIdList = [
-    ...workflowPages.map((page) => page.id),
-    ...resultPages.map((page) => page.id),
-    ...explorerPages.map((page) => page.id)
-  ];
-  const availablePageIds = new Set(availablePageIdList);
-  const availablePageKey = availablePageIdList.join("|");
-
-  useEffect(() => {
-    const onHashChange = () => {
-      const nextPage = window.location.hash.replace(/^#/, "");
-      if (nextPage && availablePageIds.has(nextPage)) {
-        setActivePage(nextPage);
-      }
-    };
-
-    window.addEventListener("hashchange", onHashChange);
-    return () => {
-      window.removeEventListener("hashchange", onHashChange);
-    };
-  }, [availablePageKey]);
-
-  useEffect(() => {
-    if (availablePageIds.has(activePage)) {
-      return;
-    }
-    setActivePage(result ? "overview" : "investigate");
-  }, [activePage, availablePageKey, result]);
-
-  useEffect(() => {
-    if (result && !window.location.hash) {
-      setActivePage("overview");
-    }
-  }, [result]);
-
-  function navigateToPage(pageId) {
-    setActivePage(pageId);
-    if (typeof window !== "undefined") {
-      window.history.replaceState(null, "", `#${pageId}`);
-    }
-  }
-
-  let pageContent = (
-    <PageFrame
-      eyebrow="Workflow"
-      title="Ready to analyse"
-      subtitle="Run a collection job or move through the explorer pages above."
-      infoTitle="Where to start"
-      infoBody="If you already have stored data, start on the graph page. If not, run a new job from the Analyse page first."
-    >
-      <p className="muted">Start with a target, then move across the result and explorer pages once the data lands.</p>
-    </PageFrame>
-  );
-
-  if (activePage === "investigate") {
-    pageContent = (
-      <InvestigatePage
-        form={form}
-        setForm={setForm}
-        busy={busy}
-        scanHelp={meta.scan_options || {}}
-        openctiState={openctiState}
-        onAnalyze={() => submitAnalysis()}
-        onProvidersOnly={() =>
-          submitAnalysis({
-            scan: false,
-            scan_europe: false,
-            scan_all: false,
-            scan_providers: true,
-            scan_eu_countries: false,
-            scan_full: false,
-            scan_countries: []
-          })
-        }
-        onOpenCtiAction={triggerOpenCti}
-        job={job}
-      />
-    );
-  }
-
-  if (result && RESULT_PAGES.some((page) => page.id === activePage)) {
-    pageContent = (
-      <ResultContentPage
-        pageId={activePage}
-        result={result}
-        meta={meta}
-        onRunRecommendation={runRecommendedScan}
-        onOpenSavedResult={openSavedResult}
-        busy={busy}
-      />
-    );
-  }
-
-  if (activePage === "graph") {
-    pageContent = (
-      <AttributionPage
-        domainTargets={availableDomainTargets}
-        preferredSeed={selectedTarget || (result && result.type === "domain" ? result.input : "")}
-        theme={theme}
-      />
-    );
-  }
-
-  if (activePage === "connections") {
-    pageContent = (
-      <ConnectionsPage
-        connections={connections}
-        meta={meta}
-        selectedTarget={selectedTarget}
-        setSelectedTarget={setSelectedTarget}
-        domainTargets={availableDomainTargets}
-        onOpenSavedResult={openSavedResult}
-      />
-    );
-  }
-
-  if (activePage === "recent") {
-    pageContent = (
-      <PageFrame
-        eyebrow="Explorer"
-        title="Recent searches"
-        subtitle="Saved investigations you can reopen without running the pipeline again."
-        infoTitle="Recent searches"
-        infoBody="Think of this page as case history, not live traffic. Search any stored domain below to open older runs, not just the most recent ones."
-      >
-        <div className="stack">
-          <SectionCard
-            title="Run browser"
-            subtitle="Pick any stored domain to see every saved run we have for it."
-          >
-            <SearchableDomainField
-              id="recent-page-target"
-              label="Find a stored domain"
-              value={selectedTarget}
-              onChange={setSelectedTarget}
-              options={availableDomainTargets}
-              placeholder="Search stored domains"
-              helper={`${formatNumber(availableDomainTargets.length)} stored domains available`}
-            />
-
-            {connections && connections.history && connections.history.length ? (
-              <div className="card-grid">
-                {connections.history.map((item) => (
-                  <LeadCard
-                    key={item.id}
-                    title={formatDateTime(item.timestamp)}
-                    footer={item.is_latest ? "Latest run" : "Historical run"}
-                  >
-                    <p><strong>Target:</strong> {item.target}</p>
-                    <p><strong>Cloudflare:</strong> {cloudflareLabel(item.cloudflare_fronted)}</p>
-                    <p><strong>Type:</strong> {String(item.type || "").toUpperCase()}</p>
-                    <button className="inline-action" onClick={() => openSavedResult(item.id)} type="button">
-                      Open run
-                    </button>
-                  </LeadCard>
-                ))}
-              </div>
-            ) : (
-              <Callout tone="info">Select a stored domain to load its full run history.</Callout>
-            )}
-          </SectionCard>
-
-          <SectionCard
-            title="Latest saved runs"
-            subtitle="The newest saved results across every target."
-          >
-            {recent.length ? (
-              <div className="card-grid">
-                {recent.map((item) => (
-                  <LeadCard
-                    key={item.id}
-                    title={item.target}
-                    footer={`${item.type.toUpperCase()} | ${cloudflareLabel(item.cloudflare_fronted)} | ${formatDateTime(item.timestamp)}`}
-                  >
-                    <button className="inline-action" onClick={() => openSavedResult(item.id)} type="button">
-                      Open saved result
-                    </button>
-                  </LeadCard>
-                ))}
-              </div>
-            ) : (
-              <Callout tone="info">No saved searches are available yet.</Callout>
-            )}
-          </SectionCard>
-        </div>
-      </PageFrame>
-    );
-  }
-
-  if (activePage === "ip") {
-    pageContent = (
-      <SharedSignalPage
-        eyebrow="Explorer"
-        title="Shared IPs"
-        subtitle="Domains that touched the same server address or hosting network."
-        infoTitle="Shared IPs"
-        infoBody="Broad CDN, managed WordPress, mail, and shared-hosting overlaps are filtered out here so the remaining shared IPs stay closer to dedicated-server leads."
-        items={visibleClusters.ip}
-        emptyMessage="No shared IP clusters are stored yet."
-        renderItem={(item) => (
-          <LeadCard key={item.ip} title={item.ip} footer={`${item.target_count} linked targets`}>
-            <div className="pill-row">
-              <TypePill kind={item.label} definitions={meta.server_types || {}} />
-            </div>
-            <p className="break-word">{item.targets}</p>
-            {item.asn_desc ? <p>{item.asn_desc}</p> : null}
-            {item.network_cidr ? <p><strong>Network:</strong> {item.network_cidr}</p> : null}
-            {item.proxy_family ? <p><strong>Reverse proxy:</strong> {item.proxy_family}</p> : null}
-          </LeadCard>
-        )}
-      />
-    );
-  }
-
-  if (activePage === "asn") {
-    pageContent = (
-      <PageFrame
-        eyebrow="Explorer"
-        title="Shared ASNs"
-        subtitle="Domains clustering around the same provider network or autonomous system."
-        infoTitle="How to read ASN overlap"
-        infoBody="Broad CDN, managed WordPress, mail, and shared-hosting networks are filtered out here as low-signal noise. Treat the remaining ASN overlaps as supporting context, not final proof."
-      >
-        <div className="field-row">
-          <label htmlFor="asn-scope">Scope</label>
-          <select id="asn-scope" value={asnScope} onChange={(event) => setAsnScope(event.target.value)}>
-            <option value="current">Current overlaps</option>
-            <option value="historical">Historical only</option>
-            <option value="all">All history</option>
-          </select>
-        </div>
-        {visibleClusters.asn.length ? (
-          <div className="card-grid">
-            {visibleClusters.asn.map((item) => (
-              <LeadCard
-                key={item.asn}
-                title={`AS${item.asn}`}
-                footer={`${item.target_count} linked targets | ${item.relationship_status === "current" ? "shared now" : "historical only"}`}
-              >
-                <div className="pill-row">
-                  <TypePill kind={item.label} definitions={meta.server_types || {}} />
-                </div>
-                {item.asn_desc ? <p><strong>Owner:</strong> {item.asn_desc}</p> : null}
-                {item.network_cidrs && item.network_cidrs.length ? (
-                  <p className="break-word"><strong>Networks:</strong> {formatListPreview(item.network_cidrs)}</p>
-                ) : null}
-                {item.proxy_families && item.proxy_families.length ? (
-                  <p><strong>Proxy families:</strong> {item.proxy_families.join(", ")}</p>
-                ) : null}
-                <p className="break-word">{item.targets}</p>
-              </LeadCard>
-            ))}
-          </div>
-        ) : (
-          <Callout tone="info">No ASN overlaps are stored for this scope yet.</Callout>
-        )}
-      </PageFrame>
-    );
-  }
-
-  if (activePage === "tracking") {
-    pageContent = (
-      <SharedSignalPage
-        eyebrow="Explorer"
-        title="Tracking IDs"
-        subtitle="Analytics and advertising identifiers reused across stored domains."
-        infoTitle="Tracking IDs"
-        infoBody="If two domains share the same tracking or advertising code, it often means the same operator, agency, or page template is behind both."
-        items={clusters.tracking}
-        emptyMessage="No tracking overlaps are stored yet."
-        renderItem={(item) => (
-          <LeadCard key={`${item.id_type}-${item.id_value}`} title={`${item.id_type}: ${item.id_value}`} footer={`${item.target_count} linked targets`}>
-            <p className="break-word">{item.targets}</p>
-          </LeadCard>
-        )}
-      />
-    );
-  }
-
-  if (activePage === "favicon") {
-    pageContent = (
-      <SharedSignalPage
-        eyebrow="Explorer"
-        title="Favicons"
-        subtitle="Domains sharing the same browser-tab icon hash."
-        infoTitle="Favicons"
-        infoBody="Matching favicons are not proof by themselves, but they are a useful sign that sites may share a template, builder, or operator."
-        items={clusters.favicon}
-        emptyMessage="No favicon overlaps are stored yet."
-        renderItem={(item) => (
-          <LeadCard key={item.md5} title={item.md5} footer={`${item.target_count} linked targets`}>
-            <p className="break-word">{item.targets}</p>
-          </LeadCard>
-        )}
-      />
-    );
-  }
-
-  if (activePage === "tls") {
-    pageContent = (
-      <PageFrame
-        eyebrow="Explorer"
-        title="Shared certificates"
-        subtitle="Domains that reused the same HTTPS certificate, with the overlap explained in plain English."
-        infoTitle="Shared certificates"
-        infoBody="When domains present the same HTTPS certificate, they were configured together at some point. Current sharing is usually stronger than historical sharing."
-      >
-        <div className="field-row">
-          <label htmlFor="tls-scope">Scope</label>
-          <select id="tls-scope" value={tlsScope} onChange={(event) => setTlsScope(event.target.value)}>
-            <option value="current">Still shared now</option>
-            <option value="historical">Past sharing only</option>
-            <option value="all">Now and past</option>
-          </select>
-        </div>
-        {clusters.tls.length ? (
-          <div className="card-grid">
-            {clusters.tls.map((item) => (
-              <LeadCard
-                key={item.sha256}
-                title={getTlsOverlapTitle(item)}
-                footer={`${formatNumber(getTlsOverlapTargetCount(item))} linked domains | ${getTlsOverlapStatusLabel(item.relationship_status)}`}
-              >
-                <p>{getTlsOverlapSummary(item)}</p>
-                <p className="break-word"><strong>Domains:</strong> {formatListPreview(parseTargetList(item.targets), 6) || "No linked domains recorded"}</p>
-                <p><strong>Issued by:</strong> {getTlsOverlapIssuer(item)}</p>
-                {(item.overlap_start || item.overlap_end) ? (
-                  <p><strong>Shared during:</strong> {formatFriendlyDateRange(item.overlap_start, item.overlap_end)}</p>
-                ) : null}
-                {(item.first_observed || item.last_observed) ? (
-                  <p><strong>Seen in our data:</strong> {formatFriendlyDateRange(item.first_observed, item.last_observed)}</p>
-                ) : null}
-                <details className="fold-panel">
-                  <summary>Raw certificate detail</summary>
-                  <div className="stack">
-                    {item.sha256 ? <p className="break-word"><strong>Fingerprint:</strong> {item.sha256}</p> : null}
-                    <p><strong>Current linked domains:</strong> {formatNumber(item.current_target_count || 0)}</p>
-                    <p><strong>Historical linked domains:</strong> {formatNumber(item.historical_target_count || 0)}</p>
-                  </div>
-                </details>
-              </LeadCard>
-            ))}
-          </div>
-        ) : (
-          <Callout tone="info">No shared certificates are stored for this scope yet.</Callout>
-        )}
-      </PageFrame>
-    );
-  }
-
+function NotFoundPage() {
   return (
-    <main className="app-shell">
-      <header className="app-topbar">
-        <div className="app-topbar-main">
-          <div className="brand-block">
-            <span className="brand-kicker">IP Intel</span>
-            <h1 className="brand-title">Seed-first investigation</h1>
-            <p className="brand-subtitle">
-              Profile the supplied domain or IP first, then fan outward only where the evidence creates a useful lead.
+    <AppShell>
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">404</p>
+            <h1>Page not found</h1>
+          </div>
+        </div>
+        <p className="section-copy">
+          The requested route is not part of this small routed frontend rewrite.
+        </p>
+        <div className="action-row">
+          <Link className="primary-button" to="/">
+            Return to cases
+          </Link>
+        </div>
+      </section>
+    </AppShell>
+  );
+}
+
+function AppShell({ children }) {
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <Link className="brand-mark" to="/">
+          <span>IP</span>
+          <strong>Intel</strong>
+        </Link>
+        <p className="header-copy">Frontend routes for cases, jobs, pairs, and clusters.</p>
+      </header>
+      <main className="app-main">{children}</main>
+    </div>
+  );
+}
+
+function PairList({ caseId, pairs }) {
+  return (
+    <div className="pair-list">
+      {pairs.map((pair) => (
+        <article className="pair-row" key={pair.id}>
+          <div className="pair-row-copy">
+            <h3>{pair.left && pair.right ? `${pair.left} vs ${pair.right}` : `Pair ${pair.id}`}</h3>
+            <p className="card-copy">
+              {pair.summary ||
+                `${pair.evidence.length} evidence item${pair.evidence.length === 1 ? "" : "s"} returned.`}
             </p>
           </div>
-          <div className="topbar-actions">
-            <div className="status-chip-row">
-              {topbarChips.map((chip) => (
-                <span className="status-chip" key={chip.label} title={chip.title || chip.value}>
-                  <strong>{chip.value}</strong>
-                  {chip.label}
-                </span>
-              ))}
-            </div>
-            <button className="theme-toggle" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} type="button">
-              {theme === "dark" ? "Light mode" : "Dark mode"}
-            </button>
+          <div className="pair-row-meta">
+            {pair.score !== null ? <strong>{formatPercent(pair.score)}</strong> : null}
+            <StatusBadge compact status={pair.status} />
+            <Link className="text-link" to={`/cases/${caseId}/pairs/${pair.id}`}>
+              Open pair
+            </Link>
           </div>
-        </div>
-
-        <div className="page-nav">
-          <div className="page-nav-group">
-            <span className="page-nav-label">Workflow</span>
-            <div className="page-nav-strip">
-              {workflowPages.map((page) => (
-                <PageNavButton
-                  key={page.id}
-                  active={activePage === page.id}
-                  label={page.label}
-                  subtitle={page.subtitle}
-                  onClick={() => navigateToPage(page.id)}
-                />
-              ))}
-            </div>
-          </div>
-
-          {resultPages.length ? (
-            <div className="page-nav-group">
-              <span className="page-nav-label">Case</span>
-              <div className="page-nav-strip">
-                {resultPages.map((page) => (
-                  <PageNavButton
-                    key={page.id}
-                    active={activePage === page.id}
-                    label={page.label}
-                    subtitle={page.subtitle}
-                    onClick={() => navigateToPage(page.id)}
-                  />
-                ))}
-              </div>
-            </div>
-          ) : null}
-
-          <div className="page-nav-group">
-            <span className="page-nav-label">Explorer</span>
-            <div className="page-nav-strip">
-              {explorerPages.map((page) => (
-                <PageNavButton
-                  key={page.id}
-                  active={activePage === page.id}
-                  label={page.label}
-                  subtitle={page.subtitle}
-                  onClick={() => navigateToPage(page.id)}
-                />
-              ))}
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {statusMessage ? <Callout tone="success">{statusMessage}</Callout> : null}
-      {errorMessage ? <Callout tone="danger">{errorMessage}</Callout> : null}
-
-      <section className="page-stage">
-        {pageContent}
-      </section>
-    </main>
+        </article>
+      ))}
+    </div>
   );
+}
+
+function EvidenceMetaGrid({ items }) {
+  return (
+    <div className="evidence-grid">
+      {items.map((item) => (
+        <article className="evidence-card" key={item.type}>
+          <div className="evidence-card-top">
+            <strong>{item.label}</strong>
+            <span>{item.type}</span>
+          </div>
+          <p className="card-copy">
+            {item.description || "This evidence type did not include a description."}
+          </p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function DescriptionGrid({ entries }) {
+  return (
+    <dl className="description-grid">
+      {entries.map((entry) => (
+        <div className="description-item" key={entry.label}>
+          <dt>{entry.label}</dt>
+          <dd>{entry.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function MetricCard({ label, value }) {
+  return (
+    <article className="metric-card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </article>
+  );
+}
+
+function SubjectCard({ label, value }) {
+  return (
+    <article className="subject-card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </article>
+  );
+}
+
+function InlineMetric({ label, value }) {
+  return (
+    <div className="inline-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ProgressBar({ large = false, value }) {
+  const safeValue = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+  return (
+    <div className={`progress-track ${large ? "large" : ""}`}>
+      <div className="progress-fill" style={{ width: `${safeValue}%` }} />
+    </div>
+  );
+}
+
+function StatusBadge({ compact = false, status }) {
+  return (
+    <span className={`status-badge ${toneClass(status)} ${compact ? "compact" : ""}`}>
+      {formatStatusLabel(status)}
+    </span>
+  );
+}
+
+function LoadingState({ message }) {
+  return <div className="state-card">{message}</div>;
+}
+
+function ErrorState({ message }) {
+  return <div className="state-card error">{message}</div>;
+}
+
+function EmptyState({ message }) {
+  return <div className="state-card muted">{message}</div>;
+}
+
+function RawDataDisclosure({ label, value }) {
+  if (!value) {
+    return null;
+  }
+
+  return (
+    <details className="raw-disclosure">
+      <summary>{label}</summary>
+      <pre>{JSON.stringify(value, null, 2)}</pre>
+    </details>
+  );
+}
+
+function useCaseContext() {
+  return useOutletContext();
+}
+
+function buildClusterLayout(graph) {
+  const width = 1080;
+  const height = 540;
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph?.edges) ? graph.edges : [];
+  const grouped = new Map();
+
+  nodes.forEach((node) => {
+    const key = node.cluster ?? node.group ?? "isolate";
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push(node);
+  });
+
+  const groups = Array.from(grouped.values());
+  const centerX = width / 2;
+  const centerY = height / 2 - 10;
+  const outerRadius = Math.max(120, Math.min(240, 56 * groups.length));
+  const layoutNodes = [];
+  const byId = new Map();
+
+  groups.forEach((groupNodes, groupIndex) => {
+    const groupAngle = (Math.PI * 2 * groupIndex) / Math.max(groups.length, 1);
+    const groupCenterX =
+      groups.length === 1 ? centerX : centerX + Math.cos(groupAngle) * outerRadius;
+    const groupCenterY =
+      groups.length === 1 ? centerY : centerY + Math.sin(groupAngle) * Math.min(outerRadius * 0.55, 150);
+    const innerRadius = Math.max(24, 18 * groupNodes.length);
+
+    groupNodes.forEach((node, nodeIndex) => {
+      const nodeAngle = (Math.PI * 2 * nodeIndex) / Math.max(groupNodes.length, 1);
+      const x = groupCenterX + Math.cos(nodeAngle) * (groupNodes.length === 1 ? 0 : innerRadius);
+      const y = groupCenterY + Math.sin(nodeAngle) * (groupNodes.length === 1 ? 0 : innerRadius);
+      const laidOutNode = { ...node, x, y };
+      layoutNodes.push(laidOutNode);
+      byId.set(node.id, laidOutNode);
+    });
+  });
+
+  const layoutEdges = edges
+    .map((edge) => {
+      const fromNode = byId.get(edge.from);
+      const toNode = byId.get(edge.to);
+      if (!fromNode || !toNode) {
+        return null;
+      }
+      return {
+        ...edge,
+        x1: fromNode.x,
+        y1: fromNode.y,
+        x2: toNode.x,
+        y2: toNode.y,
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    width,
+    height,
+    nodes: layoutNodes,
+    edges: layoutEdges,
+  };
+}
+
+function collectScalarEntries(source, excludes) {
+  if (!source || typeof source !== "object") {
+    return [];
+  }
+
+  return Object.entries(source)
+    .filter(([key, value]) => {
+      if (excludes.has(key)) {
+        return false;
+      }
+
+      if (value === null || value === undefined || value === "") {
+        return false;
+      }
+
+      if (Array.isArray(value)) {
+        return false;
+      }
+
+      return typeof value !== "object";
+    })
+    .map(([key, value]) => ({
+      label: formatLabel(key),
+      value: formatDisplayValue(value, key),
+    }));
+}
+
+function collectStringList(value) {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === "string") {
+          return item;
+        }
+
+        if (item && typeof item === "object") {
+          return item.label ?? item.title ?? item.summary ?? item.description ?? null;
+        }
+
+        return null;
+      })
+      .filter(Boolean);
+  }
+
+  if (typeof value === "string") {
+    return [value];
+  }
+
+  return [];
+}
+
+function buildMetricEntries(caseDetail) {
+  const metrics = [];
+  const pushMetric = (label, value) => {
+    if (value === null || value === undefined || value === "") {
+      return;
+    }
+
+    metrics.push({ label, value });
+  };
+
+  pushMetric("Status", formatStatusLabel(caseDetail.status));
+  pushMetric("Pairs", formatMaybeNumber(caseDetail.pairCount));
+  pushMetric("Clusters", formatMaybeNumber(caseDetail.clusterCount));
+  pushMetric("Progress", caseDetail.progress === null ? null : formatPercent(caseDetail.progress));
+
+  Object.entries(caseDetail.metrics || {})
+    .slice(0, 4)
+    .forEach(([key, value]) => {
+      pushMetric(formatLabel(key), formatDisplayValue(value, key));
+    });
+
+  return metrics.slice(0, 6);
+}
+
+function sortCases(left, right) {
+  const leftDate = left.updatedAt ? Date.parse(left.updatedAt) : 0;
+  const rightDate = right.updatedAt ? Date.parse(right.updatedAt) : 0;
+
+  if (leftDate !== rightDate) {
+    return rightDate - leftDate;
+  }
+
+  return String(left.title).localeCompare(String(right.title));
+}
+
+function formatDisplayValue(value, key = "") {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+
+  if (typeof value === "boolean") {
+    return value ? "Yes" : "No";
+  }
+
+  if (typeof value === "number") {
+    return formatNumber(value);
+  }
+
+  if (typeof value === "string") {
+    if (/(_at|_on|date|time)$/i.test(key)) {
+      return formatDate(value);
+    }
+
+    return value;
+  }
+
+  return String(value);
+}
+
+function formatMaybeDate(value) {
+  return value ? formatDate(value) : "—";
+}
+
+function formatMaybeNumber(value) {
+  return value === null || value === undefined || value === "" ? "—" : formatNumber(value);
+}
+
+function toneClass(status) {
+  const normalized = String(status || "unknown").toLowerCase();
+
+  if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("cancel")) {
+    return "danger";
+  }
+
+  if (
+    normalized.includes("done") ||
+    normalized.includes("complete") ||
+    normalized.includes("success") ||
+    normalized.includes("ready")
+  ) {
+    return "success";
+  }
+
+  if (normalized.includes("warn") || normalized.includes("review") || normalized.includes("hold")) {
+    return "warning";
+  }
+
+  return "info";
+}
+
+function formatStatusLabel(status) {
+  if (!status) {
+    return "Unknown";
+  }
+
+  return formatLabel(status);
+}
+
+function findEvidenceMeta(items, type) {
+  return items.find((item) => item.type === type) ?? null;
 }

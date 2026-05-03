@@ -1,0 +1,346 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class EvidenceDefinition:
+    path: str
+    label: str
+    category: str
+    description: str
+    why_it_matters: str
+    caveat: str
+    base_importance: str
+
+
+EVIDENCE_DEFINITIONS: dict[str, EvidenceDefinition] = {
+    "tls_certs.probes[*].fingerprint_sha256": EvidenceDefinition(
+        path="tls_certs.probes[*].fingerprint_sha256",
+        label="Shared TLS fingerprint",
+        category="Transport",
+        description="Both targets served the same TLS certificate fingerprint.",
+        why_it_matters="A matching certificate fingerprint is one of the strongest shared-backend indicators.",
+        caveat="It weakens if the certificate is an abandoned default vhost or belongs to a broad shared platform.",
+        base_importance="decisive",
+    ),
+    "ssh_host_keys.probes[*].fingerprint_sha256": EvidenceDefinition(
+        path="ssh_host_keys.probes[*].fingerprint_sha256",
+        label="Shared SSH host key",
+        category="Transport",
+        description="Both targets exposed the same SSH host key fingerprint.",
+        why_it_matters="A shared SSH key usually points to the same managed host or image lineage.",
+        caveat="It is less definitive on managed hosting where providers reuse images or proxy access.",
+        base_importance="decisive",
+    ),
+    "non_cf_ips": EvidenceDefinition(
+        path="non_cf_ips",
+        label="Shared non-proxied IP",
+        category="Infrastructure",
+        description="Both targets exposed the same non-Cloudflare IP.",
+        why_it_matters="Shared live origin IPs often indicate the same server or hosting footprint.",
+        caveat="Historical or shared-hosting IPs are weaker than current dedicated infrastructure.",
+        base_importance="strong",
+    ),
+    "dns.A": EvidenceDefinition(
+        path="dns.A",
+        label="Shared A record",
+        category="Infrastructure",
+        description="Both targets resolved to the same IPv4 address.",
+        why_it_matters="Current DNS overlap can show the same live hosting or routing destination.",
+        caveat="Popular hosting providers can place unrelated sites on the same address pool.",
+        base_importance="strong",
+    ),
+    "hackertarget.hits[*].ip": EvidenceDefinition(
+        path="hackertarget.hits[*].ip",
+        label="Shared reverse lookup IP",
+        category="Infrastructure",
+        description="Both targets appeared on the same reverse-IP or hostsearch result.",
+        why_it_matters="Reverse-IP overlap adds support for shared hosting history.",
+        caveat="It is often historical or provider-wide rather than operator-specific.",
+        base_importance="supporting",
+    ),
+    "urlscan.hits[*].ip": EvidenceDefinition(
+        path="urlscan.hits[*].ip",
+        label="Shared urlscan IP",
+        category="Infrastructure",
+        description="Both targets were observed on the same IP in urlscan data.",
+        why_it_matters="It can connect hosting history or shared rendered infrastructure.",
+        caveat="urlscan observations can be old or reflect edge/proxy infrastructure.",
+        base_importance="supporting",
+    ),
+    "circl_pdns.records[*].rdata": EvidenceDefinition(
+        path="circl_pdns.records[*].rdata",
+        label="Shared passive DNS record",
+        category="Infrastructure",
+        description="Both targets shared the same passive DNS answer.",
+        why_it_matters="Passive DNS overlap captures infrastructure that may no longer be live.",
+        caveat="Historical reuse is useful context, but weaker than current resolution.",
+        base_importance="supporting",
+    ),
+    "page_metadata.google_analytics": EvidenceDefinition(
+        path="page_metadata.google_analytics",
+        label="Shared Google Analytics ID",
+        category="Web identity",
+        description="Both targets used the same Google Analytics property.",
+        why_it_matters="Analytics identifiers are often directly controlled by the same operator or team.",
+        caveat="Agencies and templates can reuse IDs, so this needs other corroboration.",
+        base_importance="strong",
+    ),
+    "page_metadata.gtm_ids": EvidenceDefinition(
+        path="page_metadata.gtm_ids",
+        label="Shared Google Tag Manager container",
+        category="Web identity",
+        description="Both targets referenced the same GTM container.",
+        why_it_matters="A shared tag container often reflects shared ownership or the same deployment pipeline.",
+        caveat="Third-party implementers can reuse containers across clients.",
+        base_importance="strong",
+    ),
+    "page_metadata.facebook_pixel": EvidenceDefinition(
+        path="page_metadata.facebook_pixel",
+        label="Shared Facebook pixel",
+        category="Web identity",
+        description="Both targets shared the same Facebook tracking pixel.",
+        why_it_matters="Ad-tech IDs are often tied to the same marketing or operator account.",
+        caveat="Marketing vendors can reuse pixels across a portfolio.",
+        base_importance="strong",
+    ),
+    "page_metadata.yandex_metrika": EvidenceDefinition(
+        path="page_metadata.yandex_metrika",
+        label="Shared Yandex Metrika ID",
+        category="Web identity",
+        description="Both targets shared the same Yandex Metrika identifier.",
+        why_it_matters="Shared analytics IDs can be a direct operator signal.",
+        caveat="Analytics alone should not outrank transport or origin evidence.",
+        base_importance="strong",
+    ),
+    "page_metadata.tiktok_pixel": EvidenceDefinition(
+        path="page_metadata.tiktok_pixel",
+        label="Shared TikTok pixel",
+        category="Web identity",
+        description="Both targets used the same TikTok advertising identifier.",
+        why_it_matters="This can connect properties that share the same ad operations.",
+        caveat="Advertisers or agencies can reuse pixels for multiple campaigns.",
+        base_importance="supporting",
+    ),
+    "page_metadata.adsense_publisher_ids": EvidenceDefinition(
+        path="page_metadata.adsense_publisher_ids",
+        label="Shared AdSense publisher ID",
+        category="Web identity",
+        description="Both targets exposed the same AdSense publisher identifier.",
+        why_it_matters="Publisher IDs often tie back to the same monetization account.",
+        caveat="Shared templates or publisher resellers can reduce the signal.",
+        base_importance="strong",
+    ),
+    "page_metadata.favicon_md5": EvidenceDefinition(
+        path="page_metadata.favicon_md5",
+        label="Shared favicon hash",
+        category="Web content",
+        description="Both targets served a favicon with the same hash.",
+        why_it_matters="Favicons often survive domain churn and can connect cloned or related sites.",
+        caveat="Common CMS or hosting defaults can produce the same favicon across unrelated sites.",
+        base_importance="supporting",
+    ),
+    "page_metadata.favicon_murmurhash3": EvidenceDefinition(
+        path="page_metadata.favicon_murmurhash3",
+        label="Shared favicon MurmurHash3",
+        category="Web content",
+        description="Both targets served the same favicon fingerprint used in icon matching workflows.",
+        why_it_matters="It is helpful for clustering visually or operationally related sites.",
+        caveat="Common defaults reduce specificity.",
+        base_importance="supporting",
+    ),
+    "page_metadata.source_map_urls": EvidenceDefinition(
+        path="page_metadata.source_map_urls",
+        label="Shared source-map disclosure",
+        category="Web content",
+        description="Both targets exposed the same source-map reference.",
+        why_it_matters="Shared build artifacts often point to the same frontend pipeline or codebase.",
+        caveat="CDN-hosted shared bundles can create false positives.",
+        base_importance="supporting",
+    ),
+    "page_metadata.social_handle_values": EvidenceDefinition(
+        path="page_metadata.social_handle_values",
+        label="Shared social handle",
+        category="Identity",
+        description="Both targets exposed the same social handle or linked profile.",
+        why_it_matters="Operator-controlled social identities can be a strong attribution clue.",
+        caveat="Aggregator or mirrored social links can reduce confidence.",
+        base_importance="supporting",
+    ),
+    "whois.emails": EvidenceDefinition(
+        path="whois.emails",
+        label="Shared WHOIS email",
+        category="Registration",
+        description="Both targets shared a WHOIS contact email.",
+        why_it_matters="Registration contacts can directly link ownership or administrative control.",
+        caveat="Privacy proxies and registrar aliases make this less common and sometimes noisy.",
+        base_importance="strong",
+    ),
+    "whois.registrar": EvidenceDefinition(
+        path="whois.registrar",
+        label="Shared registrar",
+        category="Registration",
+        description="Both targets used the same registrar.",
+        why_it_matters="It can support other evidence when the rest of the pattern lines up.",
+        caveat="Registrars are widely shared and are weak by themselves.",
+        base_importance="low-signal",
+    ),
+    "dns.NS": EvidenceDefinition(
+        path="dns.NS",
+        label="Shared nameserver",
+        category="DNS",
+        description="Both targets delegated to the same nameserver hostname.",
+        why_it_matters="Custom or vanity nameserver overlap can reflect the same operator.",
+        caveat="Commodity provider nameservers are weak and often shared across many customers.",
+        base_importance="supporting",
+    ),
+    "nameserver_analysis.vanity_apexes": EvidenceDefinition(
+        path="nameserver_analysis.vanity_apexes",
+        label="Shared vanity nameserver apex",
+        category="DNS",
+        description="Both targets used the same non-generic nameserver apex.",
+        why_it_matters="Vanity nameservers are often more distinctive than commodity DNS hosting.",
+        caveat="Some resellers or white-label platforms still share these values.",
+        base_importance="supporting",
+    ),
+    "txt_verification_tokens": EvidenceDefinition(
+        path="txt_verification_tokens",
+        label="Shared TXT verification token",
+        category="Identity",
+        description="Both targets exposed the same TXT verification token.",
+        why_it_matters="Verification tokens often point to the same SaaS or account ownership.",
+        caveat="Some provisioning workflows can accidentally reuse them across related properties.",
+        base_importance="strong",
+    ),
+    "email_security.dmarc_report_uris": EvidenceDefinition(
+        path="email_security.dmarc_report_uris",
+        label="Shared DMARC report recipient",
+        category="Email policy",
+        description="Both targets sent DMARC reports to the same mailbox.",
+        why_it_matters="Shared reporting inboxes often indicate the same mail administration team.",
+        caveat="Managed providers or MSSPs can centralize reports for multiple clients.",
+        base_importance="supporting",
+    ),
+    "email_security.spf_includes": EvidenceDefinition(
+        path="email_security.spf_includes",
+        label="Shared SPF include",
+        category="Email policy",
+        description="Both targets referenced the same SPF include.",
+        why_it_matters="It can connect the same mail provider stack or sending setup.",
+        caveat="Large mail providers are widely shared, so this is usually supporting only.",
+        base_importance="supporting",
+    ),
+    "email_security.dkim_selectors": EvidenceDefinition(
+        path="email_security.dkim_selectors",
+        label="Shared DKIM selector",
+        category="Email policy",
+        description="Both targets exposed the same DKIM selector name.",
+        why_it_matters="Matching selectors can tie domains to the same mail tooling or operator habits.",
+        caveat="Common default selectors are not unique.",
+        base_importance="supporting",
+    ),
+    "microsoft_tenant.tenant_guid": EvidenceDefinition(
+        path="microsoft_tenant.tenant_guid",
+        label="Shared Microsoft tenant GUID",
+        category="SaaS identity",
+        description="Both targets pointed to the same Microsoft Entra tenant.",
+        why_it_matters="A shared tenant GUID is a very strong common-administration signal.",
+        caveat="It mainly speaks to administrative linkage, not necessarily the same infrastructure.",
+        base_importance="decisive",
+    ),
+    "mail_client_config.servers": EvidenceDefinition(
+        path="mail_client_config.servers",
+        label="Shared mail client server",
+        category="Email operations",
+        description="Both targets published the same mail client configuration server hostname.",
+        why_it_matters="Shared autodiscover or autoconfig endpoints can reveal common backend operations.",
+        caveat="Hosted mail providers can make this common across unrelated tenants.",
+        base_importance="supporting",
+    ),
+    "mail_client_config.domains": EvidenceDefinition(
+        path="mail_client_config.domains",
+        label="Shared mail config domain",
+        category="Email operations",
+        description="Both targets referenced the same mail configuration domain.",
+        why_it_matters="This can connect the same mail deployment or control plane.",
+        caveat="Mail providers can reuse domains widely.",
+        base_importance="supporting",
+    ),
+    "legal_pages.entity_names": EvidenceDefinition(
+        path="legal_pages.entity_names",
+        label="Shared legal entity",
+        category="Identity",
+        description="Both targets exposed the same legal entity name in a legal or contact page.",
+        why_it_matters="Entity names can be a direct ownership or operating-company signal.",
+        caveat="Parsing can be noisy and some names are generic or partner-related.",
+        base_importance="strong",
+    ),
+    "legal_pages.registration_ids": EvidenceDefinition(
+        path="legal_pages.registration_ids",
+        label="Shared registration ID",
+        category="Identity",
+        description="Both targets exposed the same company or registration identifier.",
+        why_it_matters="Registration IDs are usually high-confidence ownership indicators.",
+        caveat="Poor extraction or copied policies can introduce errors.",
+        base_importance="decisive",
+    ),
+    "well_known.security_contacts": EvidenceDefinition(
+        path="well_known.security_contacts",
+        label="Shared security.txt contact",
+        category="Well-known files",
+        description="Both targets published the same `security.txt` contact.",
+        why_it_matters="Security contact reuse can reflect the same organization or response team.",
+        caveat="Bug bounty vendors or managed service providers can centralize these contacts.",
+        base_importance="supporting",
+    ),
+    "well_known.assetlinks_packages": EvidenceDefinition(
+        path="well_known.assetlinks_packages",
+        label="Shared Android asset links package",
+        category="Well-known files",
+        description="Both targets referenced the same Android application package.",
+        why_it_matters="Shared mobile app linkage is often a direct brand or operator signal.",
+        caveat="White-label app bundles can weaken uniqueness.",
+        base_importance="strong",
+    ),
+    "well_known.ads_txt_publishers": EvidenceDefinition(
+        path="well_known.ads_txt_publishers",
+        label="Shared ads.txt publisher",
+        category="Well-known files",
+        description="Both targets exposed the same ads.txt publisher ID.",
+        why_it_matters="Monetization identifiers can connect related properties.",
+        caveat="Resellers and shared ad operations can introduce noise.",
+        base_importance="supporting",
+    ),
+}
+
+
+DEFAULT_EVIDENCE = EvidenceDefinition(
+    path="",
+    label="Shared signal",
+    category="Other",
+    description="The pair shared the same value at this path.",
+    why_it_matters="Any overlap can add context when it aligns with stronger evidence.",
+    caveat="Unknown paths should be treated as supporting context until reviewed.",
+    base_importance="supporting",
+)
+
+
+def evidence_definition(path: str) -> EvidenceDefinition:
+    return EVIDENCE_DEFINITIONS.get(path, DEFAULT_EVIDENCE)
+
+
+def evidence_catalog() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": definition.path,
+            "label": definition.label,
+            "category": definition.category,
+            "description": definition.description,
+            "why_it_matters": definition.why_it_matters,
+            "caveat": definition.caveat,
+            "importance": definition.base_importance,
+        }
+        for definition in EVIDENCE_DEFINITIONS.values()
+    ]

@@ -2052,6 +2052,15 @@ async def _analyze_domain_async(
         },
     }
 
+    _search_id: int | None = None
+    if persist:
+        try:
+            from intel_db import create_search, save_search_fields, finalize_search
+            _search_id = create_search(domain, "domain", result["timestamp"])
+            result["search_id"] = _search_id
+        except Exception as _exc:
+            log(f"DB create_search failed: {_exc}")
+
     RESULTS_DIR.mkdir(exist_ok=True)
     _safe     = re.sub(r"[^a-zA-Z0-9._-]", "_", domain)
     _ts       = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -2122,6 +2131,17 @@ async def _analyze_domain_async(
         email_security["spf_includes"] = spf_details.get("includes", [])
         email_security["spf_records"] = spf_details.get("records", [])
         _cb("email_security", email_security)
+
+        if _search_id:
+            try:
+                save_search_fields(_search_id, {k: result[k] for k in (
+                    "whois", "dns", "cert_transparency", "historical_dns", "page_metadata",
+                    "email_security", "spf_origins", "well_known", "legal_pages",
+                    "mail_client_config", "microsoft_tenant", "nameserver_analysis",
+                    "dns_txt_tokens", "subdomains", "input", "type", "timestamp",
+                ) if k in result})
+            except Exception as _exc:
+                log(f"DB incremental save (group1) failed: {_exc}")
 
         # ── Group 2: origin discovery + zone transfer — all concurrent ────────
         # Zone transfer is included here (not before) so its per-nameserver
@@ -2194,6 +2214,14 @@ async def _analyze_domain_async(
     if source_errors:
         result["source_errors"] = source_errors
 
+    if _search_id:
+        try:
+            save_search_fields(_search_id, {k: result[k] for k in (
+                "zone_transfer", "origin_candidates", "page_metadata", "source_errors",
+            ) if k in result})
+        except Exception as _exc:
+            log(f"DB incremental save (group2) failed: {_exc}")
+
     # ── Scan phases — sequential, long-running, each uses its own event loop ──
     do_gcp_europe_scan   = scan_europe   or scan_full
     do_provider_scan     = scan_providers or scan_full
@@ -2234,6 +2262,12 @@ async def _analyze_domain_async(
         _cb("origin_candidates.country_scan", country_scan_result)
     else:
         _cb("origin_candidates.country_scan", {"skipped": True, "reason": "Pass --scan-country CC or --scan-full (EU) to scan country IP space"})
+
+    if _search_id:
+        try:
+            save_search_fields(_search_id, {"origin_candidates": result.get("origin_candidates", {})})
+        except Exception as _exc:
+            log(f"DB incremental save (scans) failed: {_exc}")
 
     # ── IP enrichment ──────────────────────────────────────────────────────────
     # Collect every IP seen from any source: direct DNS + all origin discovery.
@@ -2370,6 +2404,14 @@ async def _analyze_domain_async(
         _cb("ip_details", result["ip_details"])
     _cb("non_cf_tls_certs", non_cloudflare_tls_certs)
 
+    if _search_id:
+        try:
+            save_search_fields(_search_id, {k: result[k] for k in (
+                "ip_details", "non_cf_tls_certs", "ssh_host_keys", "non_cf_ips",
+            ) if k in result})
+        except Exception as _exc:
+            log(f"DB incremental save (ip/tls) failed: {_exc}")
+
     if enable_wordlist_followups and wordlist_followup_targets:
         log(
             f"Subdomain follow-up scans: {len(wordlist_followup_targets)} "
@@ -2436,6 +2478,14 @@ async def _analyze_domain_async(
         followup_summary["status"] = "completed"
         _cb("subdomain_followup_summary", followup_summary)
 
+        if _search_id:
+            try:
+                save_search_fields(_search_id, {k: result[k] for k in (
+                    "subdomain_followups", "subdomain_followup_summary",
+                ) if k in result})
+            except Exception as _exc:
+                log(f"DB incremental save (followups) failed: {_exc}")
+
     # Cloudflare-fronted flag
     current_a_records = dns_records.get("A") or []
     result["cloudflare_fronted"] = bool(current_a_records) and all(
@@ -2445,8 +2495,11 @@ async def _analyze_domain_async(
     # ── Persist everything to SQLite ──────────────────────────────────────────
     if persist:
         try:
-            from intel_db import DB_PATH, save_search
-            save_search(result)
+            from intel_db import DB_PATH, finalize_search, save_search
+            if _search_id:
+                finalize_search(_search_id, result, timestamp=result["timestamp"])
+            else:
+                save_search(result)
             log(f"Search saved to {DB_PATH}")
         except Exception as _exc:
             log(f"DB save failed: {_exc}")
@@ -2537,8 +2590,9 @@ def analyze_ip(ip: str) -> dict:
     result["proxy_confidence"] = proxy_details.get("proxy_confidence")
 
     try:
-        from intel_db import DB_PATH, save_search
-        save_search(result)
+        from intel_db import DB_PATH, create_search, finalize_search
+        sid = create_search(ip, "ip", result["timestamp"])
+        finalize_search(sid, result, timestamp=result["timestamp"])
         log(f"Search saved to {DB_PATH}")
     except Exception as _exc:
         log(f"DB save failed: {_exc}")

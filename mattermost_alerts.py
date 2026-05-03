@@ -448,6 +448,97 @@ def send_analysis_notification(job: Mapping[str, Any]) -> bool:
     )
 
 
+def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
+    webhook_url = _webhook_url()
+    if not webhook_url:
+        LOGGER.warning("Mattermost alert skipped because MATTERMOST_WEBHOOK_URL is not set")
+        return False
+
+    case_id = str(case.get("id") or "")
+    status = str(case.get("status") or job.get("status") or "unknown")
+    summary = _safe_dict(case.get("summary"))
+    top_findings = _safe_list(summary.get("top_findings"))[:3]
+    target_count = case.get("total_targets") or summary.get("target_count")
+    successful = case.get("successful_targets")
+    failed = case.get("failed_targets")
+    overlap_count = int(summary.get("within_case_pair_count", 0)) + int(summary.get("historical_pair_count", 0))
+    duration = _duration_label(case.get("started_at") or job.get("started_at"), case.get("finished_at") or job.get("finished_at"))
+
+    base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
+    summary_url = f"{base_url}/cases/{case_id}/summary" if base_url and case_id else None
+
+    highlights = []
+    for item in top_findings:
+        left = str(item.get("left_target") or "").strip()
+        right = str(item.get("right_target") or "").strip()
+        score = item.get("score")
+        line = f"{left} vs {right}".strip()
+        if score is not None:
+            line = f"{line} ({score})"
+        if line:
+            highlights.append(line)
+
+    text_lines = [
+        f"**IP Intel case {case_id or 'unknown'}**",
+        f"Status: `{status}`",
+    ]
+    if duration:
+        text_lines.append(f"Duration: `{duration}`")
+    text_lines.append(f"Submitted: `{target_count or 0}`")
+    text_lines.append(f"Succeeded: `{successful or 0}`")
+    text_lines.append(f"Failed: `{failed or 0}`")
+    text_lines.append(f"Overlaps: `{overlap_count}`")
+    if highlights:
+        text_lines.append("Top findings:")
+        text_lines.extend(f"- {item}" for item in highlights)
+    if summary_url:
+        text_lines.append(f"[Open summary]({summary_url})")
+
+    card_lines = [
+        "<h2>IP Intel Case Complete</h2>",
+        f"<p><strong>Case:</strong> {case_id or 'unknown'}</p>",
+        f"<p><strong>Status:</strong> {status}</p>",
+        f"<p><strong>Duration:</strong> {duration or 'n/a'}</p>",
+        f"<p><strong>Targets:</strong> submitted {target_count or 0}, succeeded {successful or 0}, failed {failed or 0}</p>",
+        f"<p><strong>Overlaps:</strong> {overlap_count}</p>",
+    ]
+    if highlights:
+        card_lines.append("<ul>")
+        card_lines.extend(f"<li>{item}</li>" for item in highlights)
+        card_lines.append("</ul>")
+    if summary_url:
+        card_lines.append(f'<p><a href="{summary_url}">Open case summary</a></p>')
+
+    payload = {
+        "text": "\n".join(text_lines),
+        "props": {"card": "".join(card_lines)},
+        "attachments": [
+            {
+                "color": "#1c8a5d" if status == "completed" else "#ba4a3d",
+                "title": f"Case {case_id or 'unknown'}",
+                "title_link": summary_url,
+                "fields": [
+                    {"short": True, "title": "Submitted", "value": str(target_count or 0)},
+                    {"short": True, "title": "Duration", "value": duration or "n/a"},
+                    {"short": True, "title": "Succeeded", "value": str(successful or 0)},
+                    {"short": True, "title": "Failed", "value": str(failed or 0)},
+                    {"short": True, "title": "Overlaps", "value": str(overlap_count)},
+                    {"short": True, "title": "Status", "value": status},
+                ],
+            }
+        ],
+    }
+    LOGGER.info("Queueing Mattermost case alert for case=%r status=%r", case_id, status)
+    thread = threading.Thread(
+        target=_deliver_message,
+        args=(webhook_url, payload),
+        name="mattermost-case-alert",
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
 def send_opencti_notification(status: str, details: Mapping[str, Any] | None = None) -> bool:
     values = dict(details or {})
     total = values.get("total")

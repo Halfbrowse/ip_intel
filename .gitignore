@@ -16,7 +16,7 @@ build/
 .venv/
 venv/
 env/
-
+.env
 # uv
 .uv/
 

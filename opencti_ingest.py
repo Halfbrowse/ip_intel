@@ -50,7 +50,7 @@ _status_handler = _StatusLogHandler()
 _status_handler.setFormatter(_LOG_FMT)
 log.addHandler(_status_handler)
 
-_INGEST_WORKERS = max(1, int(os.getenv("OPENCTI_INGEST_WORKERS", "6")))
+_INGEST_WORKERS = max(1, int(os.getenv("OPENCTI_INGEST_WORKERS", "3")))
 
 _started = False
 _start_lock = threading.Lock()

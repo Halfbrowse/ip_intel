@@ -17,11 +17,14 @@ dependencies = [
     "colorama>=0.4.6",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    "psycopg[binary]>=3.2",
+    "python-multipart>=0.0.9",
     "pycti>=6.0",
     "libmagic>=1.0",
     "tqdm>=4.66",
     "mmh3>=5.1",
     "paramiko>=3.5",
+    "pytest>=8.3",
 ]
 
 [project.scripts]
