@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from analysis_service import AnalysisRun, _merge_page_metadata
-from case_runtime import CaseRuntime, build_case_response, build_job_response, parse_submission
+from core.analysis_service import AnalysisRun, _merge_page_metadata
+from cases.case_runtime import (
+    CaseRuntime,
+    build_case_response,
+    build_job_response,
+    build_pairs_response,
+    parse_submission,
+)
 
 
 def test_parse_submission_single_target() -> None:
@@ -69,6 +75,87 @@ def test_build_case_response_surfaces_progress_and_counts() -> None:
     assert payload["counts"]["submitted"] == 1
 
 
+def test_build_pairs_response_returns_slim_summaries(monkeypatch) -> None:
+    evidence_items = [
+        {"id": "e-dns", "category": "DNS", "importance": "low-signal", "matched_values": ["ns1"]},
+        {
+            "id": "e-tls",
+            "category": "Transport",
+            "importance": "decisive",
+            "matched_values": ["a", "b", "c", "d", "e"],
+        },
+        {"id": "e-ssh", "category": "Transport", "importance": "strong", "matched_values": ["x"]},
+        {"id": "e-ip", "category": "Infrastructure", "importance": "supporting", "matched_values": ["y"]},
+        {"id": "e-ip2", "category": "Infrastructure", "importance": "supporting", "matched_values": ["z"]},
+    ]
+    monkeypatch.setattr(
+        "cases.case_runtime.list_pairings",
+        lambda case_id: [
+            {
+                "id": "pair-1",
+                "scope": "within_case",
+                "left_target": "alpha.example",
+                "right_target": "beta.example",
+                "score": 72,
+                "match_count": 5,
+                "payload": {
+                    "summary": "Overlap driven by shared TLS certificates.",
+                    "top_paths": ["tls_certs.probes[*].fingerprint_sha256"],
+                    "evidence_items": evidence_items,
+                },
+            },
+            {
+                "id": "pair-2",
+                "scope": "historical",
+                "left_target": "alpha.example",
+                "right_target": "gamma.example",
+                "score": 31,
+                "match_count": 1,
+                "payload": {"evidence_items": []},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "cases.case_runtime.load_case_inputs",
+        lambda case_id: [
+            {"normalized_target": "beta.example"},
+            {"normalized_target": "alpha.example"},
+        ],
+    )
+
+    response = build_pairs_response("case-1")
+
+    # The duplicated within_case/historical arrays are gone; the frontend
+    # filters the single pairs list by scope.
+    assert set(response.keys()) == {"pairs", "seed_targets"}
+    assert response["seed_targets"] == ["alpha.example", "beta.example"]
+
+    first = response["pairs"][0]
+    assert first["id"] == "pair-1"
+    assert first["scope"] == "within_case"
+    assert first["left"] == "alpha.example"
+    assert first["right"] == "beta.example"
+    assert first["score"] == 72
+    assert first["match_count"] == 5
+    assert first["is_seed_pair"] is True
+    assert first["summary"] == "Overlap driven by shared TLS certificates."
+    assert first["top_paths"] == ["tls_certs.probes[*].fingerprint_sha256"]
+    # Only the strongest evidence ships inline, ordered by importance.
+    assert [item["id"] for item in first["evidence"]] == ["e-tls", "e-ssh", "e-ip"]
+    assert first["evidence_count"] == 5
+    assert first["evidence_counts"] == {"Transport": 2, "Infrastructure": 2, "DNS": 1}
+    # Inline matched values are capped, with the original count preserved.
+    assert first["evidence"][0]["matched_values"] == ["a", "b", "c"]
+    assert first["evidence"][0]["matched_value_count"] == 5
+    assert "evidence_items" not in first
+
+    second = response["pairs"][1]
+    assert second["is_seed_pair"] is False
+    assert second["evidence"] == []
+    assert second["evidence_count"] == 0
+    assert second["evidence_counts"] == {}
+
+
 def test_merge_page_metadata_handles_list_entries_with_dicts() -> None:
     merged = _merge_page_metadata(
         {
@@ -93,7 +180,7 @@ def test_merge_page_metadata_handles_list_entries_with_dicts() -> None:
 
 def test_build_clusters_include_observed_ips_from_current_and_historical_runs(monkeypatch) -> None:
     monkeypatch.setattr(
-        "case_runtime.list_search_runs_by_ids",
+        "cases.case_runtime.list_search_runs_by_ids",
         lambda run_ids: [
             {
                 "id": "run-b",

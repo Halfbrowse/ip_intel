@@ -4,8 +4,8 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-import signal_dns
-from signal_dns import (
+import sources.signal_dns as signal_dns
+from sources.signal_dns import (
     extract_mailto_addresses,
     extract_txt_tenancy_tokens,
     lookup_txt_records,

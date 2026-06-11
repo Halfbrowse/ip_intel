@@ -1,4 +1,13 @@
-import { useDeferredValue, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import {
   Link,
   NavLink,
@@ -11,26 +20,40 @@ import {
 } from "./router.jsx";
 
 import {
-  formatDate,
+  fetchJson,
   formatLabel,
-  formatNumber,
   formatPercent,
   isTerminalStatus,
   normalizeCaseDetail,
   normalizeCases,
   normalizeClusterGroups,
-  normalizeEvidenceMeta,
   normalizeJob,
   normalizePairDetail,
   normalizePairs,
   useApi,
 } from "./api.js";
+import {
+  DescriptionGrid,
+  EmptyState,
+  ErrorState,
+  InlineMetric,
+  LoadingState,
+  MetricCard,
+  ProgressBar,
+  RawDataDisclosure,
+  StatusBadge,
+  SubjectCard,
+  formatDisplayValue,
+  formatMaybeDate,
+  formatMaybeNumber,
+  formatStatusLabel,
+} from "./components/primitives.jsx";
 
-const CASE_NAV_ITEMS = [
-  { to: "summary", label: "Summary" },
-  { to: "progress", label: "Progress" },
-  { to: "clusters", label: "Clusters" },
-];
+// Heavy views load on demand so the initial route ships less JavaScript:
+// the cluster graph pulls in the d3 modules, and the progress/log view is
+// only needed while a job is running.
+const ClusterGraph = lazy(() => import("./components/ClusterGraph.jsx"));
+const CaseProgressPage = lazy(() => import("./components/CaseProgressPage.jsx"));
 
 const RAW_CASE_EXCLUDES = new Set([
   "id",
@@ -101,7 +124,14 @@ export default function App() {
       <Route path="/" element={<HomePage />} />
       <Route path="/cases/:caseId" element={<CaseLayout />}>
         <Route index element={<Navigate replace to="summary" />} />
-        <Route path="progress" element={<CaseProgressPage />} />
+        <Route
+          path="progress"
+          element={
+            <Suspense fallback={<LoadingState message="Loading the progress view..." />}>
+              <CaseProgressPage />
+            </Suspense>
+          }
+        />
         <Route path="summary" element={<CaseSummaryPage />} />
         <Route path="pairs/:pairId" element={<CasePairPage />} />
         <Route path="clusters" element={<CaseClustersPage />} />
@@ -121,27 +151,43 @@ function HomePage() {
     error: null,
   });
   const deferredSearch = useDeferredValue(search);
-  const cases = normalizeCases(casesRequest.data).sort(sortCases);
+  const cases = useMemo(
+    () => normalizeCases(casesRequest.data).sort(sortCases),
+    [casesRequest.data],
+  );
   const query = deferredSearch.trim().toLowerCase();
-  const filteredCases = query
-    ? cases.filter((caseItem) => {
-        const haystack = [
-          caseItem.id,
-          caseItem.title,
-          caseItem.summaryText,
-          caseItem.status,
-          caseItem.jobId,
-          caseItem.targets.join(" "),
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase();
-        return haystack.includes(query);
-      })
-    : cases;
+  const filteredCases = useMemo(
+    () =>
+      query
+        ? cases.filter((caseItem) => {
+            const haystack = [
+              caseItem.id,
+              caseItem.title,
+              caseItem.summaryText,
+              caseItem.status,
+              caseItem.jobId,
+              caseItem.targets.join(" "),
+            ]
+              .filter(Boolean)
+              .join(" ")
+              .toLowerCase();
+            return haystack.includes(query);
+          })
+        : cases,
+    [cases, query],
+  );
 
-  const runningCases = cases.filter((caseItem) => !isTerminalStatus(caseItem.status)).length;
-  const readySummaries = cases.filter((caseItem) => caseItem.summaryText).length;
+  const runningCases = useMemo(
+    () => cases.filter((caseItem) => !isTerminalStatus(caseItem.status)).length,
+    [cases],
+  );
+  const readySummaries = useMemo(
+    () => cases.filter((caseItem) => caseItem.summaryText).length,
+    [cases],
+  );
+
+  const LIST_CAP = 200;
+  const visibleCases = filteredCases.slice(0, LIST_CAP);
 
   return (
     <AppShell>
@@ -150,8 +196,8 @@ function HomePage() {
           <p className="eyebrow">Submission workspace</p>
           <h1>Submit domains or IPs and follow the overlap case as it runs.</h1>
           <p>
-            Start with one target or a CSV, then move through progress, overlap summary,
-            pair evidence, and cluster review without the old monolithic explorer.
+            Start with one target or a CSV, then explore which domains are linked, how
+            strongly, and why — in plain English.
           </p>
         </div>
         <div className="hero-stats">
@@ -264,59 +310,16 @@ function HomePage() {
           />
         ) : null}
 
+        {filteredCases.length > LIST_CAP ? (
+          <p className="section-copy">
+            Showing {LIST_CAP} of {filteredCases.length} cases. Refine the search to see more.
+          </p>
+        ) : null}
+
         {filteredCases.length > 0 ? (
           <div className="case-grid">
-            {filteredCases.map((caseItem) => (
-              <article className="case-card" key={caseItem.id}>
-                <div className="case-card-header">
-                  <div>
-                    <p className="eyebrow">Case {caseItem.id}</p>
-                    <h3>{caseItem.title}</h3>
-                    <p className="card-copy">
-                      {caseItem.summaryText || "Open the summary page to inspect the case detail."}
-                    </p>
-                  </div>
-                  <StatusBadge status={caseItem.status} />
-                </div>
-
-                {caseItem.targets.length > 0 ? (
-                  <div className="chip-row">
-                    {caseItem.targets.slice(0, 4).map((target) => (
-                      <span className="chip" key={target}>
-                        {target}
-                      </span>
-                    ))}
-                  </div>
-                ) : null}
-
-                <div className="inline-metrics">
-                  <InlineMetric label="Pairs" value={formatMaybeNumber(caseItem.pairCount)} />
-                  <InlineMetric label="Clusters" value={formatMaybeNumber(caseItem.clusterCount)} />
-                  <InlineMetric label="Updated" value={formatMaybeDate(caseItem.updatedAt)} />
-                </div>
-
-                {caseItem.progress !== null ? (
-                  <div className="mini-progress">
-                    <div className="mini-progress-top">
-                      <span>Progress</span>
-                      <strong>{formatPercent(caseItem.progress)}</strong>
-                    </div>
-                    <ProgressBar value={caseItem.progress} />
-                  </div>
-                ) : null}
-
-                <div className="action-row">
-                  <Link className="primary-button" to={`/cases/${caseItem.id}/summary`}>
-                    Open summary
-                  </Link>
-                  <Link className="text-link" to={`/cases/${caseItem.id}/progress`}>
-                    Progress
-                  </Link>
-                  <Link className="text-link" to={`/cases/${caseItem.id}/clusters`}>
-                    Clusters
-                  </Link>
-                </div>
-              </article>
+            {visibleCases.map((caseItem) => (
+              <CaseCard caseItem={caseItem} key={caseItem.id} />
             ))}
           </div>
         ) : null}
@@ -392,10 +395,93 @@ function HomePage() {
   }
 }
 
+const CaseCard = memo(function CaseCard({ caseItem }) {
+  const caseRunning = !isTerminalStatus(caseItem.status);
+  return (
+    <article className="case-card">
+      <div className="case-card-header">
+        <div>
+          <p className="eyebrow">Case {caseItem.id}</p>
+          <h3>{caseItem.title}</h3>
+          <p className="card-copy">
+            {caseItem.summaryText || "Open the summary page to inspect the case detail."}
+          </p>
+        </div>
+        <StatusBadge status={caseItem.status} />
+      </div>
+
+      {caseItem.targets.length > 0 ? (
+        <div className="chip-row">
+          {caseItem.targets.slice(0, 4).map((target) => (
+            <span className="chip" key={target}>
+              {target}
+            </span>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="inline-metrics">
+        <InlineMetric label="Pairs" value={formatMaybeNumber(caseItem.pairCount)} />
+        <InlineMetric label="Clusters" value={formatMaybeNumber(caseItem.clusterCount)} />
+        <InlineMetric label="Updated" value={formatMaybeDate(caseItem.updatedAt)} />
+      </div>
+
+      {caseRunning && caseItem.progress !== null ? (
+        <div className="mini-progress">
+          <div className="mini-progress-top">
+            <span>Progress</span>
+            <strong>{formatPercent(caseItem.progress)}</strong>
+          </div>
+          <ProgressBar value={caseItem.progress} />
+        </div>
+      ) : null}
+
+      <div className="action-row">
+        <Link className="primary-button" to={`/cases/${caseItem.id}/summary`}>
+          Open summary
+        </Link>
+        {caseRunning ? (
+          <Link className="text-link" to={`/cases/${caseItem.id}/progress`}>
+            Progress
+          </Link>
+        ) : null}
+        <Link className="text-link" to={`/cases/${caseItem.id}/clusters`}>
+          Clusters
+        </Link>
+      </div>
+    </article>
+  );
+});
+
+function isCaseActive(caseDetail) {
+  const status = String(caseDetail?.status || "").toLowerCase();
+  return status === "running" || status === "queued" || status === "pending";
+}
+
 function CaseLayout() {
   const { caseId } = useParams();
-  const caseRequest = useApi(`/api/cases/${caseId}`);
-  const caseDetail = normalizeCaseDetail(caseRequest.data, caseId);
+  const [livePolling, setLivePolling] = useState(false);
+  const caseRequest = useApi(`/api/cases/${caseId}`, {
+    pollInterval: livePolling ? 4000 : 0,
+  });
+  const caseDetail = useMemo(
+    () => normalizeCaseDetail(caseRequest.data, caseId),
+    [caseRequest.data, caseId],
+  );
+  const caseActive = Boolean(caseRequest.data) && isCaseActive(caseDetail);
+
+  useEffect(() => {
+    setLivePolling(caseActive);
+  }, [caseActive]);
+
+  const navItems = useMemo(() => {
+    const items = [{ to: "summary", label: "Summary" }];
+    if (caseActive) {
+      items.push({ to: "progress", label: "Progress" });
+    }
+    items.push({ to: "clusters", label: "Clusters" });
+    return items;
+  }, [caseActive]);
 
   return (
     <AppShell>
@@ -413,7 +499,7 @@ function CaseLayout() {
           <h1>{caseDetail.title}</h1>
           <p>
             {caseDetail.summaryText ||
-              "This case page is wired to the new API and will surface whatever summary data the backend provides."}
+              "This case answers one question: are these domains controlled by the same entity, and with what confidence?"}
           </p>
         </div>
         <div className="hero-side-stack">
@@ -421,13 +507,13 @@ function CaseLayout() {
           <div className="inline-metrics">
             <InlineMetric label="Pairs" value={formatMaybeNumber(caseDetail.pairCount)} />
             <InlineMetric label="Clusters" value={formatMaybeNumber(caseDetail.clusterCount)} />
-            <InlineMetric label="Job" value={caseDetail.jobId || "None"} />
+            <InlineMetric label="Targets" value={caseDetail.targets.length || "—"} />
           </div>
         </div>
       </section>
 
       <nav className="case-nav" aria-label="Case sections">
-        {CASE_NAV_ITEMS.map((item) => (
+        {navItems.map((item) => (
           <NavLink
             className={({ isActive }) =>
               isActive ? "case-nav-link active" : "case-nav-link"
@@ -444,40 +530,730 @@ function CaseLayout() {
         <ErrorState message={caseRequest.error} />
       ) : null}
 
-      <Outlet context={{ caseId, caseDetail, caseRequest }} />
+      <Outlet context={{ caseId, caseDetail, caseRequest, caseActive }} />
     </AppShell>
   );
 }
 
-function CaseSummaryPage() {
-  const { caseId, caseDetail, caseRequest } = useCaseContext();
-  const pairsRequest = useApi(`/api/cases/${caseId}/pairs`);
-  const evidenceMetaRequest = useApi("/api/meta/evidence");
-  const pairs = normalizePairs(pairsRequest.data);
-  const withinCasePairs = normalizePairs(pairsRequest.data?.within_case ?? []);
-  const historicalPairs = normalizePairs(pairsRequest.data?.historical ?? []);
-  const evidenceMeta = normalizeEvidenceMeta(evidenceMetaRequest.data);
-  const highlightLines = collectStringList(
-    caseDetail.raw?.highlights ?? caseDetail.raw?.findings ?? caseDetail.raw?.notes,
+/* ------------------------------------------------------------------ */
+/* Evidence vocabulary: plain-English framing for the backend signals. */
+/* ------------------------------------------------------------------ */
+
+const IMPORTANCE_RANK = {
+  decisive: 0,
+  key: 0,
+  anchoring: 0,
+  strong: 1,
+  supporting: 2,
+  "low-signal": 3,
+  low_signal: 3,
+};
+
+function importanceRank(importance) {
+  const rank = IMPORTANCE_RANK[String(importance || "").toLowerCase()];
+  return rank === undefined ? 2 : rank;
+}
+
+function importanceTone(importance) {
+  switch (importanceRank(importance)) {
+    case 0:
+      return "success";
+    case 1:
+      return "warning";
+    case 3:
+      return "neutral";
+    default:
+      return "info";
+  }
+}
+
+const CATEGORY_INFO = {
+  Transport: {
+    title: "TLS certificates & SSH keys",
+    blurb: "Cryptographic fingerprints served by the live servers.",
+  },
+  Infrastructure: {
+    title: "Shared IP addresses",
+    blurb: "Current and historical hosting overlap.",
+  },
+  "Web identity": {
+    title: "Tracking & analytics IDs",
+    blurb: "Analytics, tag-manager, and advertising accounts embedded in the pages.",
+  },
+  "Web content": {
+    title: "Page content & favicons",
+    blurb: "Visual and build artifacts served by the sites.",
+  },
+  Identity: {
+    title: "Ownership identity",
+    blurb: "Legal entities, social handles, and verification tokens.",
+  },
+  Registration: {
+    title: "Domain registration",
+    blurb: "WHOIS contacts and registrar records.",
+  },
+  DNS: {
+    title: "DNS & nameservers",
+    blurb: "Delegation and resolution overlap.",
+  },
+  "Email policy": {
+    title: "Email configuration",
+    blurb: "SPF, DKIM, and DMARC policy overlap.",
+  },
+  "Email operations": {
+    title: "Mail infrastructure",
+    blurb: "Mail servers and autodiscover endpoints.",
+  },
+  "SaaS identity": {
+    title: "SaaS tenants",
+    blurb: "Shared cloud-service accounts such as Microsoft 365.",
+  },
+  "Well-known files": {
+    title: "Site metadata files",
+    blurb: "security.txt, ads.txt, and app-link files.",
+  },
+  Other: {
+    title: "Other shared signals",
+    blurb: "Additional overlap captured during the scan.",
+  },
+};
+
+const CATEGORY_PHRASES = {
+  Transport: "shared TLS certificates or SSH keys",
+  Infrastructure: "shared hosting IPs",
+  "Web identity": "shared tracking and analytics IDs",
+  "Web content": "matching page content",
+  Identity: "shared ownership identity details",
+  Registration: "shared registration records",
+  DNS: "shared DNS infrastructure",
+  "Email policy": "shared email configuration",
+  "Email operations": "shared mail infrastructure",
+  "SaaS identity": "a shared SaaS tenant",
+  "Well-known files": "shared site metadata files",
+  Other: "shared low-level signals",
+};
+
+function sortEvidence(evidence) {
+  return [...(evidence || [])].sort(
+    (a, b) => importanceRank(a.importance) - importanceRank(b.importance),
   );
-  const metricEntries = buildMetricEntries(caseDetail);
-  const scalarEntries = collectScalarEntries(caseDetail.raw, RAW_CASE_EXCLUDES).slice(0, 8);
+}
+
+function lowerFirst(text) {
+  if (!text) {
+    return text;
+  }
+  return text.charAt(0).toLowerCase() + text.slice(1);
+}
+
+function evidenceNoun(item) {
+  const label = item.title || formatLabel(item.type);
+  if (/^shared\s+/i.test(label)) {
+    return `the same ${label.replace(/^shared\s+/i, "")}`;
+  }
+  return lowerFirst(label);
+}
+
+function linkStrength(score) {
+  const value = score === null || score === undefined ? 0 : score;
+  if (value >= 70) {
+    return { tier: "strong", label: "Strong link", tone: "success" };
+  }
+  if (value >= 30) {
+    return { tier: "moderate", label: "Moderate link", tone: "warning" };
+  }
+  return { tier: "weak", label: "Weak link", tone: "neutral" };
+}
+
+function connectionReason(pair) {
+  const sorted = sortEvidence(pair.evidence);
+  if (sorted.length === 0) {
+    return "No shared evidence was recorded for this pair, so the connection is unsupported.";
+  }
+  const best = sorted[0];
+  const noun = evidenceNoun(best);
+  const { tier } = linkStrength(pair.score);
+
+  if (tier === "strong") {
+    return `These domains share ${noun} — ${
+      lowerFirst(best.whyItMatters) || "a strong sign that they are run by the same entity."
+    }`;
+  }
+  if (tier === "moderate") {
+    const why = best.whyItMatters ? `${best.whyItMatters} ` : "";
+    return `These domains overlap on ${noun}. ${why}Treat this as a moderate signal that needs corroboration.`;
+  }
+  const nouns = [...new Set(sorted.slice(0, 2).map((item) => evidenceNoun(item)))];
+  return `The only overlap is ${nouns.join(" and ")} — ${
+    lowerFirst(best.caveat) ||
+    "signals that many unrelated sites share, so this is weak evidence of common control."
+  }`;
+}
+
+function categorySummaryLine(items) {
+  const best = items[0];
+  const noun = evidenceNoun(best);
+  const extraCount = items.length - 1;
+  const extra =
+    extraCount > 0 ? ` plus ${extraCount} related signal${extraCount === 1 ? "" : "s"}` : "";
+  switch (importanceRank(best.importance)) {
+    case 0:
+      return `Both sites present ${noun}${extra}. ${best.whyItMatters || ""}`.trim();
+    case 1:
+      return `Both sites share ${noun}${extra}. ${best.whyItMatters || ""}`.trim();
+    case 3:
+      return `They match on ${noun}${extra}, but ${
+        lowerFirst(best.caveat) || "this is common across unrelated sites, so it counts for little."
+      }`;
+    default:
+      return `They also share ${noun}${extra} — supporting context rather than proof on its own.`;
+  }
+}
+
+function groupEvidence(evidence) {
+  const sorted = sortEvidence(evidence);
+  const byCategory = new Map();
+  sorted.forEach((item) => {
+    const category = item.category || "Other";
+    if (!byCategory.has(category)) {
+      byCategory.set(category, []);
+    }
+    byCategory.get(category).push(item);
+  });
+
+  return [...byCategory.entries()]
+    .map(([category, items]) => {
+      const info = CATEGORY_INFO[category] || { title: category, blurb: "" };
+      return {
+        category,
+        title: info.title,
+        blurb: info.blurb,
+        items,
+        bestImportance: items[0].importance,
+        bestRank: importanceRank(items[0].importance),
+        summary: categorySummaryLine(items),
+      };
+    })
+    .sort((a, b) => a.bestRank - b.bestRank || b.items.length - a.items.length);
+}
+
+function dominantCategoryPhrase(pairs) {
+  const counts = new Map();
+  pairs.forEach((pair) => {
+    const best = sortEvidence(pair.evidence)[0];
+    if (!best) {
+      return;
+    }
+    const category = best.category || "Other";
+    counts.set(category, (counts.get(category) || 0) + 1);
+  });
+  let topCategory = null;
+  let topCount = 0;
+  counts.forEach((count, category) => {
+    if (count > topCount) {
+      topCount = count;
+      topCategory = category;
+    }
+  });
+  return topCategory ? CATEGORY_PHRASES[topCategory] || CATEGORY_PHRASES.Other : null;
+}
+
+function buildCaseExplanation(seedTargets, pairs) {
+  const seeds = [...new Set(seedTargets)].filter(Boolean);
+  const seedPairs = pairs.filter((pair) => pair.isSeedPair);
+  const historicalPairs = pairs.filter((pair) => pair.scope === "historical");
+  const sentences = [];
+
+  if (seeds.length >= 2) {
+    const bestByDomain = new Map(seeds.map((domain) => [domain, 0]));
+    seedPairs.forEach((pair) => {
+      const score = pair.score ?? 0;
+      [pair.left, pair.right].forEach((domain) => {
+        if (bestByDomain.has(domain) && score > bestByDomain.get(domain)) {
+          bestByDomain.set(domain, score);
+        }
+      });
+    });
+
+    let strong = 0;
+    let moderate = 0;
+    let weak = 0;
+    bestByDomain.forEach((score) => {
+      if (score >= 70) {
+        strong += 1;
+      } else if (score >= 30) {
+        moderate += 1;
+      } else {
+        weak += 1;
+      }
+    });
+
+    if (strong >= 2) {
+      const phrase = dominantCategoryPhrase(
+        seedPairs.filter((pair) => (pair.score ?? 0) >= 70),
+      );
+      sentences.push(
+        `${strong} of the ${seeds.length} submitted domains appear tightly linked${
+          phrase ? `, mainly through ${phrase}` : ""
+        }.`,
+      );
+      if (moderate > 0) {
+        sentences.push(
+          `${moderate} more show${moderate === 1 ? "s" : ""} only a moderate connection.`,
+        );
+      }
+    } else if (moderate >= 2) {
+      const phrase = dominantCategoryPhrase(
+        seedPairs.filter((pair) => (pair.score ?? 0) >= 30),
+      );
+      sentences.push(
+        `${moderate} of the ${seeds.length} submitted domains show a moderate connection${
+          phrase ? ` through ${phrase}` : ""
+        } — suggestive, but not conclusive on its own.`,
+      );
+    } else {
+      sentences.push(
+        `No strong connections were found between the ${seeds.length} submitted domains.`,
+      );
+    }
+
+    if (weak > 0 && (strong >= 2 || moderate >= 2)) {
+      sentences.push(
+        `${weak} show${weak === 1 ? "s" : ""} only weak or no overlap with the rest.`,
+      );
+    }
+  } else if (seeds.length === 1) {
+    sentences.push(
+      `One domain was submitted, so it is compared against its discovered subdomains and against domains from earlier cases.`,
+    );
+  }
+
+  if (historicalPairs.length > 0) {
+    const top = historicalPairs.reduce((bestSoFar, pair) =>
+      (pair.score ?? 0) > (bestSoFar.score ?? 0) ? pair : bestSoFar,
+    );
+    sentences.push(
+      `Earlier cases surfaced ${historicalPairs.length} historical match${
+        historicalPairs.length === 1 ? "" : "es"
+      }; the strongest is ${top.left} and ${top.right} at ${formatPercent(top.score)}.`,
+    );
+  }
+
+  if (sentences.length === 0) {
+    return pairs.length === 0
+      ? "No overlap between the analyzed domains has been recorded yet."
+      : null;
+  }
+  return sentences.join(" ");
+}
+
+/* ----------------------------------------------------- */
+/* Domain-centric linkage explorer and the pair digest.   */
+/* ----------------------------------------------------- */
+
+function DomainLinkageExplorer({ caseId, pairs, seedTargets, request }) {
+  const domainLists = useMemo(() => {
+    const seeds = [...new Set(seedTargets)].filter(Boolean);
+    const seedSet = new Set(seeds);
+    const others = new Set();
+    pairs.forEach((pair) => {
+      [pair.left, pair.right].forEach((domain) => {
+        if (domain && !seedSet.has(domain)) {
+          others.add(domain);
+        }
+      });
+    });
+    return { seeds, others: [...others].sort() };
+  }, [pairs, seedTargets]);
+
+  const allDomains = useMemo(
+    () => [...domainLists.seeds, ...domainLists.others],
+    [domainLists],
+  );
+
+  const [selected, setSelected] = useState(null);
+  const [expandedPairId, setExpandedPairId] = useState(null);
+  const togglePair = useCallback((pairId) => {
+    setExpandedPairId((current) => (current === pairId ? null : pairId));
+  }, []);
+  const activeDomain =
+    selected && allDomains.includes(selected) ? selected : allDomains[0] ?? null;
+
+  const rows = useMemo(() => {
+    if (!activeDomain) {
+      return [];
+    }
+    return pairs
+      .filter((pair) => pair.left === activeDomain || pair.right === activeDomain)
+      .map((pair) => ({
+        pair,
+        other: pair.left === activeDomain ? pair.right : pair.left,
+      }))
+      .sort((a, b) => (b.pair.score ?? 0) - (a.pair.score ?? 0));
+  }, [pairs, activeDomain]);
+
+  const selectDomain = (domain) => {
+    setSelected(domain);
+    setExpandedPairId(null);
+  };
+
+  return (
+    <section className="panel section-stack">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Domain linkage</p>
+          <h2>Who is linked to whom?</h2>
+          <p className="section-copy">
+            Pick a domain to see every other domain ranked by linkage confidence, strongest
+            first. Click a connection to see what the two sites have in common.
+          </p>
+        </div>
+        {request ? (
+          <button className="secondary-button" onClick={request.refresh} type="button">
+            Refresh
+          </button>
+        ) : null}
+      </div>
+
+      {request?.loading && !request?.data ? (
+        <LoadingState message="Loading connections..." />
+      ) : null}
+      {request?.error ? <ErrorState message={request.error} /> : null}
+
+      {allDomains.length === 0 && !request?.loading ? (
+        <EmptyState message="No comparison results are available for this case yet." />
+      ) : null}
+
+      {domainLists.seeds.length > 0 ? (
+        <div className="domain-selector" role="group" aria-label="Select a domain">
+          {domainLists.seeds.map((domain) => (
+            <button
+              className={`domain-chip ${domain === activeDomain ? "active" : ""}`}
+              key={domain}
+              onClick={() => selectDomain(domain)}
+              type="button"
+            >
+              {domain}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {domainLists.others.length > 0 ? (
+        <details
+          className="domain-extra"
+          open={domainLists.others.includes(activeDomain) || undefined}
+        >
+          <summary>
+            Discovered and historical domains ({domainLists.others.length})
+          </summary>
+          <div className="domain-selector">
+            {domainLists.others.map((domain) => (
+              <button
+                className={`domain-chip secondary ${domain === activeDomain ? "active" : ""}`}
+                key={domain}
+                onClick={() => selectDomain(domain)}
+                type="button"
+              >
+                {domain}
+              </button>
+            ))}
+          </div>
+        </details>
+      ) : null}
+
+      {activeDomain && rows.length === 0 && !request?.loading ? (
+        <EmptyState
+          message={`No recorded overlap between ${activeDomain} and any other domain in this case.`}
+        />
+      ) : null}
+
+      {rows.length > 0 ? (
+        <div className="linkage-list">
+          {rows.map(({ pair, other }) => (
+            <LinkageCard
+              caseId={caseId}
+              expanded={expandedPairId === pair.id}
+              key={pair.id}
+              onToggle={togglePair}
+              other={other}
+              pair={pair}
+            />
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+const LinkageCard = memo(function LinkageCard({ caseId, expanded, onToggle, other, pair }) {
+  const strength = linkStrength(pair.score);
+  const reason = connectionReason(pair);
+  const barWidth = Math.max(4, Math.min(100, pair.score ?? 0));
+  const signalCount = pair.evidenceCount ?? pair.evidence.length;
+
+  return (
+    <article className={`linkage-card ${expanded ? "expanded" : ""}`}>
+      <button
+        aria-expanded={expanded}
+        className="linkage-card-main"
+        onClick={() => onToggle(pair.id)}
+        type="button"
+      >
+        <span className="linkage-percent">
+          <strong>{pair.score === null ? "—" : formatPercent(pair.score)}</strong>
+          <span className={`status-badge compact ${strength.tone}`}>{strength.label}</span>
+        </span>
+        <span className="linkage-body">
+          <span className="linkage-domains">
+            <strong>{other || "Unknown domain"}</strong>
+            {pair.scope === "historical" ? (
+              <span className="chip linkage-scope-chip">From an earlier case</span>
+            ) : null}
+            <span className="linkage-signal-count">
+              {signalCount} signal{signalCount === 1 ? "" : "s"}
+            </span>
+          </span>
+          <span className="card-copy linkage-reason">{reason}</span>
+          <span className="strength-track" aria-hidden="true">
+            <span
+              className={`strength-fill ${strength.tier}`}
+              style={{ width: `${barWidth}%` }}
+            />
+          </span>
+        </span>
+        <span aria-hidden="true" className="linkage-caret">
+          {expanded ? "▴" : "▾"}
+        </span>
+      </button>
+      {expanded ? <PairDigest caseId={caseId} pair={pair} /> : null}
+    </article>
+  );
+});
+
+// The pairs list ships only the top few evidence items per pair, so the
+// digest fetches the full evidence lazily on first expand. Resolved details
+// are cached in memory so re-expanding a card is instant.
+const pairEvidenceCache = new Map();
+
+function usePairEvidence(caseId, pairId) {
+  const cacheKey = caseId && pairId ? `${caseId}/${pairId}` : null;
+  const [state, setState] = useState(() => {
+    if (!cacheKey) {
+      return { evidence: null, loading: false, error: null };
+    }
+    const cached = pairEvidenceCache.get(cacheKey);
+    return cached
+      ? { evidence: cached, loading: false, error: null }
+      : { evidence: null, loading: true, error: null };
+  });
+
+  useEffect(() => {
+    if (!cacheKey) {
+      return undefined;
+    }
+    const cached = pairEvidenceCache.get(cacheKey);
+    if (cached) {
+      setState({ evidence: cached, loading: false, error: null });
+      return undefined;
+    }
+
+    let active = true;
+    setState({ evidence: null, loading: true, error: null });
+    fetchJson(`/api/cases/${caseId}/pairs/${pairId}`)
+      .then((payload) => {
+        const detail = normalizePairDetail(payload, pairId);
+        pairEvidenceCache.set(cacheKey, detail.evidence);
+        if (active) {
+          setState({ evidence: detail.evidence, loading: false, error: null });
+        }
+      })
+      .catch((error) => {
+        if (active) {
+          setState({
+            evidence: null,
+            loading: false,
+            error: error.message || "Failed to load the shared evidence.",
+          });
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [cacheKey, caseId, pairId]);
+
+  return state;
+}
+
+const PairDigest = memo(function PairDigest({ caseId = null, pair }) {
+  const lazyDetail = usePairEvidence(caseId, caseId ? pair.id : null);
+  const evidence = caseId ? lazyDetail.evidence : pair.evidence;
+  const groups = useMemo(() => groupEvidence(evidence || []), [evidence]);
+
+  if (caseId && lazyDetail.loading) {
+    return (
+      <div className="pair-digest">
+        <DigestShimmer />
+      </div>
+    );
+  }
+
+  return (
+    <div className="pair-digest">
+      {caseId && lazyDetail.error ? <ErrorState message={lazyDetail.error} /> : null}
+      {!(caseId && lazyDetail.error) && groups.length === 0 ? (
+        <EmptyState message="No shared evidence was recorded for this pair." />
+      ) : null}
+      {groups.map((group) => (
+        <EvidenceCategoryGroup group={group} key={group.category} />
+      ))}
+      {caseId && pair.id ? (
+        <div className="action-row">
+          <Link className="text-link" to={`/cases/${caseId}/pairs/${pair.id}`}>
+            Open full pair detail
+          </Link>
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
+function DigestShimmer() {
+  return (
+    <div aria-label="Loading shared evidence" className="digest-shimmer" role="status">
+      <span className="shimmer-line wide" />
+      <span className="shimmer-line" />
+      <span className="shimmer-line narrow" />
+    </div>
+  );
+}
+
+const DIGEST_PREVIEW_COUNT = 3;
+
+const EvidenceCategoryGroup = memo(function EvidenceCategoryGroup({ group }) {
+  const [showAll, setShowAll] = useState(false);
+  const visibleItems = showAll ? group.items : group.items.slice(0, DIGEST_PREVIEW_COUNT);
+  const hiddenCount = group.items.length - DIGEST_PREVIEW_COUNT;
+
+  return (
+    <section className="digest-group">
+      <div className="digest-group-head">
+        <div className="digest-group-title">
+          <strong>{group.title}</strong>
+          <span className="digest-count">
+            {group.items.length} signal{group.items.length === 1 ? "" : "s"}
+          </span>
+        </div>
+        <span className={`status-badge compact ${importanceTone(group.bestImportance)}`}>
+          {formatLabel(group.bestImportance || "supporting")}
+        </span>
+      </div>
+      <p className="card-copy digest-summary">{group.summary}</p>
+      <ul className="digest-items">
+        {visibleItems.map((item) => (
+          <li className="digest-item" key={item.id}>
+            <span className="digest-item-label">{item.title || formatLabel(item.type)}</span>
+            <span className="chip-row digest-item-values">
+              {evidenceValues(item)
+                .slice(0, 2)
+                .map((value) => (
+                  <span className="chip evidence-chip" key={`${item.id}-${value}`} title={value}>
+                    {value}
+                  </span>
+                ))}
+              {evidenceValues(item).length > 2 ? (
+                <span className="chip digest-more-chip">
+                  +{evidenceValues(item).length - 2} more
+                </span>
+              ) : null}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {hiddenCount > 0 ? (
+        <button
+          className="show-all-button"
+          onClick={() => setShowAll((current) => !current)}
+          type="button"
+        >
+          {showAll
+            ? `Show top ${DIGEST_PREVIEW_COUNT}`
+            : `Show all ${group.items.length} signals`}
+        </button>
+      ) : null}
+    </section>
+  );
+});
+
+function evidenceValues(item) {
+  if (item.matchedValues?.length) {
+    return item.matchedValues;
+  }
+  return item.value ? [item.value] : [];
+}
+
+/* ----------------- */
+/* Case detail pages */
+/* ----------------- */
+
+function CaseSummaryPage() {
+  const { caseId, caseDetail, caseRequest, caseActive } = useCaseContext();
+  const pairsRequest = useApi(`/api/cases/${caseId}/pairs`, {
+    pollInterval: caseActive ? 6000 : 0,
+  });
+  const pairs = useMemo(() => normalizePairs(pairsRequest.data), [pairsRequest.data]);
+  const seedTargets = useMemo(() => {
+    const fromPairs = pairsRequest.data?.seed_targets;
+    if (Array.isArray(fromPairs) && fromPairs.length > 0) {
+      return fromPairs;
+    }
+    return caseDetail.targets;
+  }, [pairsRequest.data, caseDetail.targets]);
+  const explanation = useMemo(
+    () => buildCaseExplanation(seedTargets, pairs),
+    [seedTargets, pairs],
+  );
+  const highlightLines = useMemo(
+    () =>
+      collectStringList(
+        caseDetail.raw?.highlights ?? caseDetail.raw?.findings ?? caseDetail.raw?.notes,
+      ),
+    [caseDetail.raw],
+  );
+  const metricEntries = useMemo(() => buildMetricEntries(caseDetail), [caseDetail]);
+  const scalarEntries = useMemo(
+    () => collectScalarEntries(caseDetail.raw, RAW_CASE_EXCLUDES).slice(0, 8),
+    [caseDetail.raw],
+  );
 
   return (
     <div className="page-stack">
-      {caseRequest.loading && !caseRequest.data ? <LoadingState message="Loading case detail..." /> : null}
+      {caseRequest.loading && !caseRequest.data ? (
+        <LoadingState message="Loading case detail..." />
+      ) : null}
+
+      {caseActive ? <ActiveJobNotice caseDetail={caseDetail} caseId={caseId} /> : null}
 
       <div className="page-grid two-column">
         <section className="panel section-stack">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Summary</p>
-              <h2>Case overview</h2>
+              <p className="eyebrow">Overview</p>
+              <h2>What this case found</h2>
+              {caseDetail.summaryText ? (
+                <p className="section-copy">{caseDetail.summaryText}</p>
+              ) : null}
             </div>
             <button className="secondary-button" onClick={caseRequest.refresh} type="button">
               Refresh
             </button>
           </div>
+
+          {explanation ? (
+            <div className="callout">
+              <p>{explanation}</p>
+            </div>
+          ) : null}
 
           {metricEntries.length > 0 ? (
             <div className="metric-grid">
@@ -510,12 +1286,6 @@ function CaseSummaryPage() {
               </ul>
             </div>
           ) : null}
-
-          {caseDetail.summaryText ? (
-            <div className="callout">
-              <p>{caseDetail.summaryText}</p>
-            </div>
-          ) : null}
         </section>
 
         <aside className="panel section-stack">
@@ -534,182 +1304,44 @@ function CaseSummaryPage() {
         </aside>
       </div>
 
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Pairs</p>
-            <h2>Related case pairs</h2>
-            <p className="section-copy">Loaded from `/api/cases/:caseId/pairs`.</p>
-          </div>
-          <button className="secondary-button" onClick={pairsRequest.refresh} type="button">
-            Refresh
-          </button>
-        </div>
-
-        {pairsRequest.loading && !pairsRequest.data ? <LoadingState message="Loading pairs..." /> : null}
-        {pairsRequest.error ? <ErrorState message={pairsRequest.error} /> : null}
-        {!pairsRequest.loading && !pairsRequest.error && pairs.length === 0 ? (
-          <EmptyState message="This case does not have any pairs yet." />
-        ) : null}
-        {withinCasePairs.length > 0 ? (
-          <div className="section-stack tight">
-            <h3>Within this submission</h3>
-            <PairList caseId={caseId} pairs={withinCasePairs} />
-          </div>
-        ) : null}
-        {historicalPairs.length > 0 ? (
-          <div className="section-stack tight">
-            <h3>Against previous history</h3>
-            <PairList caseId={caseId} pairs={historicalPairs} />
-          </div>
-        ) : null}
-      </section>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Evidence guide</p>
-            <h2>Evidence metadata</h2>
-            <p className="section-copy">Loaded from `/api/meta/evidence`.</p>
-          </div>
-          <button
-            className="secondary-button"
-            onClick={evidenceMetaRequest.refresh}
-            type="button"
-          >
-            Refresh
-          </button>
-        </div>
-
-        {evidenceMetaRequest.loading && !evidenceMetaRequest.data ? (
-          <LoadingState message="Loading evidence metadata..." />
-        ) : null}
-        {evidenceMetaRequest.error ? <ErrorState message={evidenceMetaRequest.error} /> : null}
-        {!evidenceMetaRequest.loading && !evidenceMetaRequest.error && evidenceMeta.length === 0 ? (
-          <EmptyState message="The evidence metadata endpoint returned no definitions." />
-        ) : null}
-        {evidenceMeta.length > 0 ? <EvidenceMetaGrid items={evidenceMeta} /> : null}
-      </section>
+      <DomainLinkageExplorer
+        caseId={caseId}
+        pairs={pairs}
+        request={pairsRequest}
+        seedTargets={seedTargets}
+      />
 
       <RawDataDisclosure label="Raw case payload" value={caseDetail.raw} />
     </div>
   );
 }
 
-function CaseProgressPage() {
-  const { caseDetail } = useCaseContext();
-  const jobId = caseDetail.jobId;
-  const jobRequest = useApi(jobId ? `/api/jobs/${jobId}` : null, {
-    enabled: Boolean(jobId),
-    pollInterval: jobId ? 3000 : 0,
-  });
-  const job = normalizeJob(jobRequest.data ?? caseDetail.raw?.job ?? caseDetail.raw?.latest_job, jobId);
-  const progressValue =
-    job.percent ?? caseDetail.progress ?? (isTerminalStatus(job.status) ? 100 : null);
+function ActiveJobNotice({ caseDetail, caseId }) {
+  const job = normalizeJob(caseDetail.raw?.job ?? caseDetail.raw?.latest_job, caseDetail.jobId);
+  const percent = job.percent ?? caseDetail.progress ?? 0;
 
   return (
-    <div className="page-stack">
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Job tracking</p>
-            <h2>Progress</h2>
-            <p className="section-copy">Polling `/api/jobs/:jobId` for live status.</p>
-          </div>
-          {jobId ? (
-            <button className="secondary-button" onClick={jobRequest.refresh} type="button">
-              Refresh
-            </button>
-          ) : null}
+    <section className="panel section-stack active-job-strip">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Job running</p>
+          <h2>{formatStatusLabel(caseDetail.status)}</h2>
+          <p className="section-copy">
+            {job.summary || "The case is still being processed. Results update automatically."}
+          </p>
         </div>
-
-        {!jobId ? (
-          <EmptyState message="This case does not currently expose a job ID, so there is nothing to poll yet." />
-        ) : null}
-
-        {jobRequest.loading && !jobRequest.data && jobId ? (
-          <LoadingState message="Loading job progress..." />
-        ) : null}
-
-        {jobRequest.error ? <ErrorState message={jobRequest.error} /> : null}
-
-        {jobId ? (
-          <div className="progress-card">
-            <div className="progress-header">
-              <div>
-                <p className="eyebrow">Job {job.id || jobId}</p>
-                <h3>{formatStatusLabel(job.status)}</h3>
-                <p className="card-copy">
-                  {job.summary ||
-                    "The progress page keeps polling the backend so the loading bar stays current while the case is running."}
-                </p>
-              </div>
-              <div className="progress-figure">
-                <strong>{progressValue === null ? "—" : formatPercent(progressValue)}</strong>
-                <span>{job.currentStep || "Waiting for the next backend update"}</span>
-              </div>
-            </div>
-
-            <ProgressBar large value={progressValue ?? 0} />
-
-            <div className="metric-grid">
-              <MetricCard label="Status" value={formatStatusLabel(job.status)} />
-              <MetricCard label="Completed steps" value={formatMaybeNumber(job.completedSteps)} />
-              <MetricCard label="Total steps" value={formatMaybeNumber(job.totalSteps)} />
-              <MetricCard
-                label="Failed targets"
-                value={formatMaybeNumber(job.raw?.failed_targets ?? job.failedTargets)}
-              />
-              <MetricCard label="Updated" value={formatMaybeDate(job.updatedAt)} />
-            </div>
-          </div>
-        ) : null}
-
-        {job.steps.length > 0 ? (
-          <div className="section-stack tight">
-            <h3>Milestones</h3>
-            <div className="timeline">
-              {job.steps.map((step) => (
-                <div className="timeline-item" key={step.id}>
-                  <div className={`timeline-dot ${toneClass(step.status)}`} />
-                  <div>
-                    <div className="timeline-title-row">
-                      <strong>{step.label}</strong>
-                      <span>{formatStatusLabel(step.status)}</span>
-                    </div>
-                    {step.detail ? <p className="card-copy">{step.detail}</p> : null}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : null}
-      </section>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Logs</p>
-            <h2>Job output</h2>
-          </div>
+        <div className="progress-figure">
+          <strong>{formatPercent(percent)}</strong>
+          <span>{job.currentStep || "Working..."}</span>
         </div>
-
-        {job.logs.length === 0 ? (
-          <EmptyState message="No job logs were returned yet." />
-        ) : (
-          <div className="log-shell">
-            {job.logs.map((line) => (
-              <div className="log-line" key={line.id}>
-                <span className="log-level">{line.level.toUpperCase()}</span>
-                <span>{line.message}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <RawDataDisclosure label="Raw job payload" value={job.raw} />
-    </div>
+      </div>
+      <ProgressBar value={percent} />
+      <div className="action-row">
+        <Link className="text-link" to={`/cases/${caseId}/progress`}>
+          View detailed progress and logs
+        </Link>
+      </div>
+    </section>
   );
 }
 
@@ -717,10 +1349,17 @@ function CasePairPage() {
   const { caseId } = useCaseContext();
   const { pairId } = useParams();
   const pairRequest = useApi(`/api/cases/${caseId}/pairs/${pairId}`);
-  const evidenceMetaRequest = useApi("/api/meta/evidence");
-  const pair = normalizePairDetail(pairRequest.data, pairId);
-  const evidenceMeta = normalizeEvidenceMeta(evidenceMetaRequest.data);
-  const scalarEntries = collectScalarEntries(pair.raw, RAW_PAIR_EXCLUDES).slice(0, 8);
+  const pair = useMemo(
+    () => normalizePairDetail(pairRequest.data, pairId),
+    [pairRequest.data, pairId],
+  );
+  const strength = linkStrength(pair.score);
+  const reason = connectionReason(pair);
+  const barWidth = Math.max(4, Math.min(100, pair.score ?? 0));
+  const scalarEntries = useMemo(
+    () => collectScalarEntries(pair.raw, RAW_PAIR_EXCLUDES).slice(0, 8),
+    [pair.raw],
+  );
 
   return (
     <div className="page-stack">
@@ -735,23 +1374,31 @@ function CasePairPage() {
           <div>
             <p className="eyebrow">Pair {pair.id || pairId}</p>
             <h2>{pair.left && pair.right ? `${pair.left} and ${pair.right}` : "Pair detail"}</h2>
-            <p className="section-copy">
-              Loaded from `/api/cases/:caseId/pairs/:pairId`.
-            </p>
           </div>
           <button className="secondary-button" onClick={pairRequest.refresh} type="button">
             Refresh
           </button>
         </div>
 
-        {pairRequest.loading && !pairRequest.data ? <LoadingState message="Loading pair detail..." /> : null}
+        {pairRequest.loading && !pairRequest.data ? (
+          <LoadingState message="Loading pair detail..." />
+        ) : null}
         {pairRequest.error ? <ErrorState message={pairRequest.error} /> : null}
 
-        <div className="metric-grid">
-          <MetricCard label="Score" value={pair.score === null ? "-" : formatPercent(pair.score)} />
-          <MetricCard label="Status" value={formatStatusLabel(pair.status)} />
-          <MetricCard label="Evidence items" value={pair.evidence.length} />
-          <MetricCard label="Updated" value={formatMaybeDate(pair.updatedAt)} />
+        <div className="linkage-headline">
+          <div className="linkage-percent">
+            <strong>{pair.score === null ? "—" : formatPercent(pair.score)}</strong>
+            <span className={`status-badge compact ${strength.tone}`}>{strength.label}</span>
+          </div>
+          <div className="linkage-body">
+            <p className="card-copy linkage-reason">{reason}</p>
+            <div className="strength-track" aria-hidden="true">
+              <div
+                className={`strength-fill ${strength.tier}`}
+                style={{ width: `${barWidth}%` }}
+              />
+            </div>
+          </div>
         </div>
 
         <div className="subject-grid">
@@ -769,51 +1416,16 @@ function CasePairPage() {
       <section className="panel section-stack">
         <div className="panel-header">
           <div>
-            <p className="eyebrow">Evidence</p>
-            <h2>Signals behind this pair</h2>
+            <p className="eyebrow">Evidence digest</p>
+            <h2>What these domains have in common</h2>
+            <p className="section-copy">
+              Grouped by what the overlap means, strongest first. Expand a group to see every
+              matched value.
+            </p>
           </div>
         </div>
 
-        {pair.evidence.length === 0 ? (
-          <EmptyState message="No evidence items were returned for this pair." />
-        ) : (
-          <div className="evidence-grid">
-            {pair.evidence.map((item) => {
-              const meta = findEvidenceMeta(evidenceMeta, item.type);
-              const values = item.matchedValues?.length ? item.matchedValues : item.value ? [item.value] : [];
-              return (
-                <article className="evidence-card" key={item.id}>
-                  <div className="evidence-card-top">
-                    <strong>{meta?.label || item.title || formatLabel(item.type)}</strong>
-                    <span>{formatLabel(item.importance || meta?.importance || "supporting")}</span>
-                  </div>
-                  {values.length > 0 ? (
-                    <div className="chip-row">
-                      {values.slice(0, 6).map((value) => (
-                        <span className="chip" key={`${item.id}-${value}`}>
-                          {value}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                  <p className="card-copy">
-                    {item.summary || meta?.description || "This signal was returned without an explanation."}
-                  </p>
-                  <div className="evidence-notes">
-                    <p>
-                      <strong>Why it matters:</strong>{" "}
-                      {item.whyItMatters || meta?.whyItMatters || "This overlap adds context to the pair."}
-                    </p>
-                    <p>
-                      <strong>Why it may be weak:</strong>{" "}
-                      {item.caveat || meta?.caveat || "This signal should be weighed with the rest of the evidence."}
-                    </p>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
-        )}
+        <PairDigest pair={pair} />
       </section>
 
       {scalarEntries.length > 0 ? (
@@ -836,8 +1448,15 @@ function CasePairPage() {
 function CaseClustersPage() {
   const { caseId } = useCaseContext();
   const clustersRequest = useApi(`/api/cases/${caseId}/clusters`);
-  const clusterGroups = normalizeClusterGroups(clustersRequest.data);
+  const clusterGroups = useMemo(
+    () => normalizeClusterGroups(clustersRequest.data),
+    [clustersRequest.data],
+  );
   const graph = clustersRequest.data?.graph ?? clustersRequest.data?.graph_payload ?? null;
+  const seedTargets = useMemo(
+    () => new Set(clustersRequest.data?.seed_targets ?? []),
+    [clustersRequest.data],
+  );
 
   return (
     <div className="page-stack">
@@ -860,7 +1479,11 @@ function CaseClustersPage() {
         {!clustersRequest.loading && !clustersRequest.error && clusterGroups.length === 0 ? (
           <EmptyState message="No clusters were returned for this case." />
         ) : null}
-        {graph?.nodes?.length > 0 ? <ClusterGraph graph={graph} /> : null}
+        {graph?.nodes?.length > 0 ? (
+          <Suspense fallback={<LoadingState message="Loading the cluster map..." />}>
+            <ClusterGraph graph={graph} seedTargets={seedTargets} />
+          </Suspense>
+        ) : null}
 
         {clusterGroups.length > 0 ? (
           <div className="section-stack">
@@ -915,42 +1538,6 @@ function CaseClustersPage() {
   );
 }
 
-function ClusterGraph({ graph }) {
-  const layout = buildClusterLayout(graph);
-
-  return (
-    <section className="cluster-graph-card">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">Diagram</p>
-          <h3>Cluster map</h3>
-        </div>
-      </div>
-      <svg className="cluster-graph" viewBox={`0 0 ${layout.width} ${layout.height}`}>
-        {layout.edges.map((edge) => (
-          <line
-            key={`${edge.from}-${edge.to}`}
-            stroke={edge.color || "#94a3b8"}
-            strokeWidth={edge.width || 1}
-            x1={edge.x1}
-            x2={edge.x2}
-            y1={edge.y1}
-            y2={edge.y2}
-          />
-        ))}
-        {layout.nodes.map((node) => (
-          <g key={node.id} transform={`translate(${node.x}, ${node.y})`}>
-            <circle fill={node.color || "#2752d6"} r="18" />
-            <text className="graph-node-label" textAnchor="middle" y="34">
-              {node.label}
-            </text>
-          </g>
-        ))}
-      </svg>
-    </section>
-  );
-}
-
 function NotFoundPage() {
   return (
     <AppShell>
@@ -974,7 +1561,44 @@ function NotFoundPage() {
   );
 }
 
+const THEME_STORAGE_KEY = "theme";
+
+export function getInitialTheme() {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === "light" || stored === "dark") {
+      return stored;
+    }
+  } catch {
+    // Ignore storage access errors and fall back to the system preference.
+  }
+
+  return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+}
+
+function useTheme() {
+  const [theme, setTheme] = useState(getInitialTheme);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, next);
+    } catch {
+      // Persisting the preference is best-effort.
+    }
+    setTheme(next);
+  };
+
+  return { theme, toggleTheme };
+}
+
 function AppShell({ children }) {
+  const { theme, toggleTheme } = useTheme();
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -982,205 +1606,27 @@ function AppShell({ children }) {
           <span>IP</span>
           <strong>Intel</strong>
         </Link>
-        <p className="header-copy">Frontend routes for cases, jobs, pairs, and clusters.</p>
+        <div className="header-side">
+          <p className="header-copy">Frontend routes for cases, jobs, pairs, and clusters.</p>
+          <button
+            aria-pressed={theme === "dark"}
+            className="secondary-button theme-toggle"
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Switch to the light theme" : "Switch to the dark theme"}
+            type="button"
+          >
+            <span aria-hidden="true" className="theme-toggle-indicator" />
+            {theme === "dark" ? "Light mode" : "Dark mode"}
+          </button>
+        </div>
       </header>
       <main className="app-main">{children}</main>
     </div>
   );
 }
 
-function PairList({ caseId, pairs }) {
-  return (
-    <div className="pair-list">
-      {pairs.map((pair) => (
-        <article className="pair-row" key={pair.id}>
-          <div className="pair-row-copy">
-            <h3>{pair.left && pair.right ? `${pair.left} vs ${pair.right}` : `Pair ${pair.id}`}</h3>
-            <p className="card-copy">
-              {pair.summary ||
-                `${pair.evidence.length} evidence item${pair.evidence.length === 1 ? "" : "s"} returned.`}
-            </p>
-          </div>
-          <div className="pair-row-meta">
-            {pair.score !== null ? <strong>{formatPercent(pair.score)}</strong> : null}
-            <StatusBadge compact status={pair.status} />
-            <Link className="text-link" to={`/cases/${caseId}/pairs/${pair.id}`}>
-              Open pair
-            </Link>
-          </div>
-        </article>
-      ))}
-    </div>
-  );
-}
-
-function EvidenceMetaGrid({ items }) {
-  return (
-    <div className="evidence-grid">
-      {items.map((item) => (
-        <article className="evidence-card" key={item.type}>
-          <div className="evidence-card-top">
-            <strong>{item.label}</strong>
-            <span>{item.type}</span>
-          </div>
-          <p className="card-copy">
-            {item.description || "This evidence type did not include a description."}
-          </p>
-        </article>
-      ))}
-    </div>
-  );
-}
-
-function DescriptionGrid({ entries }) {
-  return (
-    <dl className="description-grid">
-      {entries.map((entry) => (
-        <div className="description-item" key={entry.label}>
-          <dt>{entry.label}</dt>
-          <dd>{entry.value}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
-function MetricCard({ label, value }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </article>
-  );
-}
-
-function SubjectCard({ label, value }) {
-  return (
-    <article className="subject-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </article>
-  );
-}
-
-function InlineMetric({ label, value }) {
-  return (
-    <div className="inline-metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function ProgressBar({ large = false, value }) {
-  const safeValue = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
-  return (
-    <div className={`progress-track ${large ? "large" : ""}`}>
-      <div className="progress-fill" style={{ width: `${safeValue}%` }} />
-    </div>
-  );
-}
-
-function StatusBadge({ compact = false, status }) {
-  return (
-    <span className={`status-badge ${toneClass(status)} ${compact ? "compact" : ""}`}>
-      {formatStatusLabel(status)}
-    </span>
-  );
-}
-
-function LoadingState({ message }) {
-  return <div className="state-card">{message}</div>;
-}
-
-function ErrorState({ message }) {
-  return <div className="state-card error">{message}</div>;
-}
-
-function EmptyState({ message }) {
-  return <div className="state-card muted">{message}</div>;
-}
-
-function RawDataDisclosure({ label, value }) {
-  if (!value) {
-    return null;
-  }
-
-  return (
-    <details className="raw-disclosure">
-      <summary>{label}</summary>
-      <pre>{JSON.stringify(value, null, 2)}</pre>
-    </details>
-  );
-}
-
 function useCaseContext() {
   return useOutletContext();
-}
-
-function buildClusterLayout(graph) {
-  const width = 1080;
-  const height = 540;
-  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
-  const edges = Array.isArray(graph?.edges) ? graph.edges : [];
-  const grouped = new Map();
-
-  nodes.forEach((node) => {
-    const key = node.cluster ?? node.group ?? "isolate";
-    if (!grouped.has(key)) {
-      grouped.set(key, []);
-    }
-    grouped.get(key).push(node);
-  });
-
-  const groups = Array.from(grouped.values());
-  const centerX = width / 2;
-  const centerY = height / 2 - 10;
-  const outerRadius = Math.max(120, Math.min(240, 56 * groups.length));
-  const layoutNodes = [];
-  const byId = new Map();
-
-  groups.forEach((groupNodes, groupIndex) => {
-    const groupAngle = (Math.PI * 2 * groupIndex) / Math.max(groups.length, 1);
-    const groupCenterX =
-      groups.length === 1 ? centerX : centerX + Math.cos(groupAngle) * outerRadius;
-    const groupCenterY =
-      groups.length === 1 ? centerY : centerY + Math.sin(groupAngle) * Math.min(outerRadius * 0.55, 150);
-    const innerRadius = Math.max(24, 18 * groupNodes.length);
-
-    groupNodes.forEach((node, nodeIndex) => {
-      const nodeAngle = (Math.PI * 2 * nodeIndex) / Math.max(groupNodes.length, 1);
-      const x = groupCenterX + Math.cos(nodeAngle) * (groupNodes.length === 1 ? 0 : innerRadius);
-      const y = groupCenterY + Math.sin(nodeAngle) * (groupNodes.length === 1 ? 0 : innerRadius);
-      const laidOutNode = { ...node, x, y };
-      layoutNodes.push(laidOutNode);
-      byId.set(node.id, laidOutNode);
-    });
-  });
-
-  const layoutEdges = edges
-    .map((edge) => {
-      const fromNode = byId.get(edge.from);
-      const toNode = byId.get(edge.to);
-      if (!fromNode || !toNode) {
-        return null;
-      }
-      return {
-        ...edge,
-        x1: fromNode.x,
-        y1: fromNode.y,
-        x2: toNode.x,
-        y2: toNode.y,
-      };
-    })
-    .filter(Boolean);
-
-  return {
-    width,
-    height,
-    nodes: layoutNodes,
-    edges: layoutEdges,
-  };
 }
 
 function collectScalarEntries(source, excludes) {
@@ -1251,7 +1697,6 @@ function buildMetricEntries(caseDetail) {
   pushMetric("Status", formatStatusLabel(caseDetail.status));
   pushMetric("Pairs", formatMaybeNumber(caseDetail.pairCount));
   pushMetric("Clusters", formatMaybeNumber(caseDetail.clusterCount));
-  pushMetric("Progress", caseDetail.progress === null ? null : formatPercent(caseDetail.progress));
 
   Object.entries(caseDetail.metrics || {})
     .slice(0, 4)
@@ -1271,71 +1716,4 @@ function sortCases(left, right) {
   }
 
   return String(left.title).localeCompare(String(right.title));
-}
-
-function formatDisplayValue(value, key = "") {
-  if (value === null || value === undefined || value === "") {
-    return "—";
-  }
-
-  if (typeof value === "boolean") {
-    return value ? "Yes" : "No";
-  }
-
-  if (typeof value === "number") {
-    return formatNumber(value);
-  }
-
-  if (typeof value === "string") {
-    if (/(_at|_on|date|time)$/i.test(key)) {
-      return formatDate(value);
-    }
-
-    return value;
-  }
-
-  return String(value);
-}
-
-function formatMaybeDate(value) {
-  return value ? formatDate(value) : "—";
-}
-
-function formatMaybeNumber(value) {
-  return value === null || value === undefined || value === "" ? "—" : formatNumber(value);
-}
-
-function toneClass(status) {
-  const normalized = String(status || "unknown").toLowerCase();
-
-  if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("cancel")) {
-    return "danger";
-  }
-
-  if (
-    normalized.includes("done") ||
-    normalized.includes("complete") ||
-    normalized.includes("success") ||
-    normalized.includes("ready")
-  ) {
-    return "success";
-  }
-
-  if (normalized.includes("warn") || normalized.includes("review") || normalized.includes("hold")) {
-    return "warning";
-  }
-
-  return "info";
-}
-
-function formatStatusLabel(status) {
-  if (!status) {
-    return "Unknown";
-  }
-
-  return formatLabel(status);
-}
-
-function findEvidenceMeta(items, type) {
-  return items.find((item) => item.type === type) ?? null;
 }

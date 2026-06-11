@@ -10,6 +10,8 @@ Sources (all free, no API keys required by default):
     - python-whois: Domain and IP WHOIS
     - ipwhois     : IP ASN / network info via RDAP
     - crt.sh      : Subdomain discovery + full cert transparency data (SANs, issuers)
+                    (falls back to Cert Spotter's free API on outage/rate-limit;
+                    optional CERTSPOTTER_API_KEY raises the Cert Spotter limit)
     - hackertarget: Reverse IP lookup — skipped automatically for Cloudflare IPs
     - CIRCL pDNS  : Passive / historical DNS records (pdns.circl.lu)
     - Origin probe: Resolves crt.sh subdomains and flags any that bypass Cloudflare
@@ -58,7 +60,7 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from tqdm import tqdm
 
-from signal_dns import (
+from sources.signal_dns import (
     acollect_spf_details,
     aget_email_security_records,
     aprobe_microsoft_tenant,
@@ -68,8 +70,9 @@ from signal_dns import (
     parse_caa_records,
     probe_microsoft_tenant_sync,
 )
-from signal_transport import fetch_ssh_host_key, fetch_tls_certificate, parse_certificate_der
-from signal_web import (
+from sources.signal_transport import fetch_ssh_host_key, fetch_tls_certificate, parse_certificate_der
+from utils.outbound import httpx_kwargs, requests_kwargs
+from sources.signal_web import (
     extract_page_enrichment,
     afetch_homepage_profile,
     afetch_mail_client_config,
@@ -78,8 +81,8 @@ from signal_web import (
 )
 
 
-RESULTS_DIR = Path(__file__).parent / "results"
-CONFIG_DIR = Path(__file__).parent / "config"
+RESULTS_DIR = Path(__file__).parent.parent / "results"
+CONFIG_DIR = Path(__file__).parent.parent / "config"
 _LOG_CONTEXT = threading.local()
 _URLSCAN_GATE = threading.Semaphore(max(1, int(os.getenv("URLSCAN_MAX_PARALLEL", "1"))))
 _DNS_RECORD_TYPES = ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")
@@ -507,6 +510,104 @@ def _parse_crt_sh_entries(entries: list, domain: str) -> dict:
 _CRT_SH_EMPTY = {"subdomains": [], "total_certs": 0, "issuers": [], "cross_domain_sans": [], "certs": []}
 
 
+# ── Certificate Transparency fallback via Cert Spotter ───────────────────────
+# crt.sh rate-limits aggressively and falls over often. When it fails we fall
+# back to Cert Spotter's free issuances API (no key required; an optional
+# CERTSPOTTER_API_KEY Bearer token raises the rate limit). Issuances are
+# converted into crt.sh-shaped entries and fed through _parse_crt_sh_entries
+# so everything downstream (ct_certs storage, clustering, sibling picks)
+# behaves exactly as with crt.sh data.
+
+CERTSPOTTER_API_URL = "https://api.certspotter.com/v1/issuances"
+CERTSPOTTER_MAX_PAGES = 20  # pagination safety cap (free tier ≈ 100 queries/hour)
+
+
+def _certspotter_headers() -> dict:
+    headers = {"Accept": "application/json"}
+    api_key = os.environ.get("CERTSPOTTER_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _certspotter_params(domain: str, after: str | None = None) -> dict:
+    params: dict = {
+        "domain": domain,
+        "include_subdomains": "true",
+        "expand": ["dns_names", "issuer", "cert"],
+    }
+    if after is not None:
+        params["after"] = after
+    return params
+
+
+def _certspotter_to_crt_sh_entries(issuances: list) -> list[dict]:
+    """Convert Cert Spotter issuance objects into crt.sh-shaped entries so they
+    can be normalized by _parse_crt_sh_entries (no I/O)."""
+    entries: list[dict] = []
+    for issuance in _iter_mapping_items(issuances):
+        cert_id = issuance.get("id")
+        try:
+            cert_id = int(cert_id)
+        except (TypeError, ValueError):
+            pass
+        issuer = issuance.get("issuer")
+        if isinstance(issuer, Mapping):
+            issuer_name = issuer.get("name") or issuer.get("friendly_name") or ""
+        else:
+            issuer_name = str(issuer or "")
+        dns_names = [n for n in (issuance.get("dns_names") or []) if isinstance(n, str)]
+        entries.append({
+            "id":              cert_id,
+            "issuer_name":     issuer_name,
+            "name_value":      "\n".join(dns_names),
+            "not_before":      issuance.get("not_before"),
+            "not_after":       issuance.get("not_after"),
+            "entry_timestamp": None,  # Cert Spotter does not expose CT log timestamps
+        })
+    return entries
+
+
+def certspotter_data(domain: str) -> dict:
+    """
+    Query Cert Spotter for certificate transparency data — the fallback used
+    when crt.sh fails, times out, or rate-limits. Paginates via the `after`
+    parameter until an empty page is returned. Same return shape as
+    crt_sh_data().
+    """
+    issuances: list = []
+    after: str | None = None
+    try:
+        for _ in range(CERTSPOTTER_MAX_PAGES):
+            resp = requests.get(
+                CERTSPOTTER_API_URL,
+                params=_certspotter_params(domain, after),
+                headers=_certspotter_headers(),
+                timeout=20,
+                **requests_kwargs(),
+            )
+            if resp.status_code != 200:
+                if issuances:
+                    break  # keep the pages we already collected
+                log(f"Cert Spotter HTTP {resp.status_code}")
+                return dict(_CRT_SH_EMPTY)
+            page = resp.json()
+            if not isinstance(page, list) or not page:
+                break
+            issuances.extend(page)
+            last_id = page[-1].get("id") if isinstance(page[-1], Mapping) else None
+            if not last_id:
+                break
+            after = str(last_id)
+    except Exception as exc:
+        if not issuances:
+            log(f"Cert Spotter failed: {exc}")
+            return dict(_CRT_SH_EMPTY)
+    result = _parse_crt_sh_entries(_certspotter_to_crt_sh_entries(issuances), domain)
+    result["ct_source"] = "certspotter"
+    return result
+
+
 def crt_sh_data(domain: str) -> dict:
     """
     Query crt.sh for full certificate transparency data.
@@ -515,6 +616,9 @@ def crt_sh_data(domain: str) -> dict:
     in the same certificate as the target domain but belong to a different domain.
     Cross-domain SANs are a strong signal for shared hosting / origin server
     infrastructure that may not be visible via reverse-IP lookups.
+
+    Falls back to Cert Spotter when crt.sh errors, times out, or rate-limits.
+    A legitimate empty (zero-cert) crt.sh response does NOT trigger the fallback.
     """
     try:
         resp = requests.get(
@@ -522,12 +626,17 @@ def crt_sh_data(domain: str) -> dict:
             params={"q": domain, "output": "json"},
             timeout=20,
             headers={"Accept": "application/json"},
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
-            return dict(_CRT_SH_EMPTY)
-        return _parse_crt_sh_entries(resp.json(), domain)
-    except Exception:
-        return dict(_CRT_SH_EMPTY)
+            log(f"crt.sh HTTP {resp.status_code} — falling back to Cert Spotter")
+            return certspotter_data(domain)
+        result = _parse_crt_sh_entries(resp.json(), domain)
+        result["ct_source"] = "crt.sh"
+        return result
+    except Exception as exc:
+        log(f"crt.sh failed ({exc}) — falling back to Cert Spotter")
+        return certspotter_data(domain)
 
 
 # ── Historical / Passive DNS via CIRCL ────────────────────────────────────────
@@ -546,6 +655,7 @@ def circl_passive_dns(domain: str) -> dict:
             f"https://www.circl.lu/pdns/query/{domain}",
             timeout=15,
             headers={"Accept": "application/json"},
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             return result
@@ -725,6 +835,7 @@ def hackertarget_host_search(domain: str) -> list[dict]:
             "https://api.hackertarget.com/hostsearch/",
             params={"q": domain},
             timeout=15,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             return []
@@ -762,6 +873,7 @@ def urlscan_historical_ips(domain: str) -> list[dict]:
             params={"q": f"domain:{domain}", "size": "100"},
             timeout=15,
             headers={"User-Agent": "ip-intel/1.0 (OSINT research)"},
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             return []
@@ -1019,6 +1131,7 @@ def fetch_country_ip_ranges(country_code: str) -> list[str]:
             params={"resource": country_code.upper(), "v4_format": "prefix"},
             timeout=30,
             headers={"Accept": "application/json"},
+            **requests_kwargs(),
         )
         resp.raise_for_status()
         resources = resp.json().get("data", {}).get("resources", {})
@@ -1045,6 +1158,7 @@ def fetch_asn_ip_ranges(asns: list[str]) -> dict[str, list[str]]:
                 params={"resource": asn},
                 timeout=15,
                 headers={"Accept": "application/json"},
+                **requests_kwargs(),
             )
             response.raise_for_status()
             announced_prefixes = response.json().get("data", {}).get("prefixes", [])
@@ -1069,7 +1183,7 @@ def fetch_asn_ip_ranges(asns: list[str]) -> dict[str, list[str]]:
 def fetch_gcp_ip_ranges(region_prefixes: list[str] | None = None) -> list[str]:
     """Download GCP's published IPv4 ranges, filtered to the given region prefixes."""
     try:
-        resp = requests.get(GCP_IP_RANGES_URL, timeout=15)
+        resp = requests.get(GCP_IP_RANGES_URL, timeout=15, **requests_kwargs())
         resp.raise_for_status()
         cidrs = []
         for entry in resp.json().get("prefixes", []):
@@ -1516,6 +1630,7 @@ def hackertarget_reverse_ip(ip: str) -> list[str]:
             "https://api.hackertarget.com/reverseiplookup/",
             params={"q": ip},
             timeout=15,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             return []
@@ -1714,7 +1829,7 @@ def fetch_page_metadata(domain: str, save_favicon_as: Path | None = None) -> dic
     HTML lang attribute, CMS generator, social links + handles, and favicon MD5.
     """
     async def _run() -> dict:
-        async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True, **httpx_kwargs()) as client:
             return await _afetch_page_metadata(domain, client, save_favicon_as)
 
     return asyncio.run(_run())
@@ -1768,14 +1883,57 @@ async def _aget_dmarc_dkim(domain: str) -> dict:
     return await aget_email_security_records(domain)
 
 
+_CRT_SH_FAILED = {**_CRT_SH_EMPTY, "_failed": True}
+
+
+async def _acertspotter_data(domain: str, client: httpx.AsyncClient) -> dict:
+    """Async Cert Spotter fallback — same normalization as certspotter_data().
+    Returns _CRT_SH_FAILED (so the crt.sh retry sweep still kicks in) only when
+    Cert Spotter yields nothing either."""
+    issuances: list = []
+    after: str | None = None
+    try:
+        for _ in range(CERTSPOTTER_MAX_PAGES):
+            resp = await client.get(
+                CERTSPOTTER_API_URL,
+                params=_certspotter_params(domain, after),
+                headers=_certspotter_headers(),
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                if issuances:
+                    break  # keep the pages we already collected
+                log(f"Cert Spotter HTTP {resp.status_code}")
+                return dict(_CRT_SH_FAILED)
+            page = resp.json()
+            if not isinstance(page, list) or not page:
+                break
+            issuances.extend(page)
+            last_id = page[-1].get("id") if isinstance(page[-1], Mapping) else None
+            if not last_id:
+                break
+            after = str(last_id)
+    except Exception as exc:
+        if not issuances:
+            log(f"Cert Spotter failed: {exc}")
+            return dict(_CRT_SH_FAILED)
+    result = _parse_crt_sh_entries(_certspotter_to_crt_sh_entries(issuances), domain)
+    result["ct_source"] = "certspotter"
+    return result
+
+
 async def _acrt_sh_data(domain: str, client: httpx.AsyncClient) -> dict:
     try:
         resp = await client.get("https://crt.sh/", params={"q": domain, "output": "json"}, headers={"Accept": "application/json"}, timeout=30.0)
         if resp.status_code != 200:
-            return dict(_CRT_SH_EMPTY)
-        return _parse_crt_sh_entries(resp.json(), domain)
-    except Exception:
-        return dict(_CRT_SH_EMPTY)
+            log(f"crt.sh HTTP {resp.status_code} — falling back to Cert Spotter")
+            return await _acertspotter_data(domain, client)
+        result = _parse_crt_sh_entries(resp.json(), domain)
+        result["ct_source"] = "crt.sh"
+        return result
+    except Exception as exc:
+        log(f"crt.sh failed ({exc}) — falling back to Cert Spotter")
+        return await _acertspotter_data(domain, client)
 
 
 async def _acircl_passive_dns(domain: str, client: httpx.AsyncClient) -> dict:
@@ -2055,7 +2213,7 @@ async def _analyze_domain_async(
     _search_id: int | None = None
     if persist:
         try:
-            from intel_db import create_search, save_search_fields, finalize_search
+            from db.intel_db import create_search, save_search_fields, finalize_search
             _search_id = create_search(domain, "domain", result["timestamp"])
             result["search_id"] = _search_id
         except Exception as _exc:
@@ -2094,25 +2252,27 @@ async def _analyze_domain_async(
 
     # ── Group 1: all concurrent via shared httpx client ───────────────────────
     log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata / well-known / legal / tenant probe (async)...")
-    async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True) as client:
-        (_, dns_records, cert_transparency_raw, _, _, _, _, _, _) = await asyncio.gather(
-            _task("whois",          asyncio.to_thread(get_domain_whois, domain)),
-            _task("dns",            _aget_dns_records(domain)),
-            _task("_ct_tmp",        _acrt_sh_data(domain, client)),
-            _task("historical_dns", _acircl_passive_dns(domain, client)),
-            _task("page_metadata",  _afetch_page_metadata(domain, client, _fav_path)),
-            _task("email_security", _aget_dmarc_dkim(domain)),
-            _task("well_known",     afetch_well_known_artifacts(domain, client)),
-            _task("legal_pages",    ascrape_legal_pages(domain, client)),
+    async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True, **httpx_kwargs()) as client:
+        (_, dns_records, cert_transparency_raw, _, _, _, _, _, _, _) = await asyncio.gather(
+            _task("whois",             asyncio.to_thread(get_domain_whois, domain)),
+            _task("dns",               _aget_dns_records(domain)),
+            _task("_ct_tmp",           _acrt_sh_data(domain, client)),
+            _task("historical_dns",    _acircl_passive_dns(domain, client)),
+            _task("page_metadata",     _afetch_page_metadata(domain, client, _fav_path)),
+            _task("email_security",    _aget_dmarc_dkim(domain)),
+            _task("well_known",        afetch_well_known_artifacts(domain, client)),
+            _task("legal_pages",       ascrape_legal_pages(domain, client)),
             _task("mail_client_config", afetch_mail_client_config(domain, client)),
+            _task("microsoft_tenant",  aprobe_microsoft_tenant(domain, client)),
         )
-        _cb("microsoft_tenant", await aprobe_microsoft_tenant(domain, client))
 
         # Post-process CT — split subdomains out and notify each separately
         del result["_ct_tmp"]
+        crt_sh_failed = cert_transparency_raw.pop("_failed", False)
         discovered_subdomains = cert_transparency_raw.pop("subdomains", [])
         result["subdomains"]        = discovered_subdomains
         result["cert_transparency"] = cert_transparency_raw
+        result["crt_sh_status"]     = "pending_retry" if crt_sh_failed else "ok"
         _cb("cert_transparency", cert_transparency_raw)
         _cb("subdomains", discovered_subdomains)
 
@@ -2120,17 +2280,10 @@ async def _analyze_domain_async(
         _cb("dns", dns_records)
         _cb("dns_txt_tokens", extract_txt_tenancy_tokens(dns_records.get("TXT", [])))
 
-        spf_details = await acollect_spf_details(domain, dns_records.get("TXT", []))
-        _cb("spf_origins", spf_details.get("origins", []))
-
         nameservers  = dns_records.get("NS", [])
         _mx_raw      = dns_records.get("MX") or []
         mx_records   = _mx_raw if isinstance(_mx_raw, list) else []
         _cb("nameserver_analysis", _classify_nameservers(nameservers))
-        email_security = result.get("email_security") or {}
-        email_security["spf_includes"] = spf_details.get("includes", [])
-        email_security["spf_records"] = spf_details.get("records", [])
-        _cb("email_security", email_security)
 
         if _search_id:
             try:
@@ -2148,11 +2301,12 @@ async def _analyze_domain_async(
         # 5 s timeout does not delay the rest of origin discovery.
         if nameservers:
             log(f"Zone transfer attempt on {len(nameservers)} nameserver(s) (concurrent with origin discovery)")
-        group_two_sources = "Zone transfer / subdomain probe / MX / wordlist / HackerTarget"
+        group_two_sources = "Zone transfer / subdomain probe / MX / wordlist / HackerTarget / SPF"
         if enable_urlscan:
             group_two_sources += " / urlscan"
         group_two_sources += " (async)..."
         log(group_two_sources)
+        _spf_txt = dns_records.get("TXT", [])
         await asyncio.gather(
             _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
             _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
@@ -2161,10 +2315,18 @@ async def _analyze_domain_async(
             _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
             _oc_task("urlscan",         _run_serial_urlscan(_aurlscan_historical_ips(domain, client)) if enable_urlscan else _empty_list()),
             _task("urlscan_analytics",  _run_serial_urlscan(_aurlscan_fetch_analytics(domain, client)) if enable_urlscan else _empty_dict()),
+            _task("spf_details_tmp",    acollect_spf_details(domain, _spf_txt)),
             # _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
             # _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
             # _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
         )
+
+    _spf_details = result.pop("spf_details_tmp", {}) or {}
+    _cb("spf_origins", _spf_details.get("origins", []))
+    _email_sec = result.get("email_security") or {}
+    _email_sec["spf_includes"] = _spf_details.get("includes", [])
+    _email_sec["spf_records"]  = _spf_details.get("records", [])
+    _cb("email_security", _email_sec)
 
     wordlist_hits = (result.get("origin_candidates", {}) or {}).get("wordlist_leaks", [])
     all_wordlist_followup_targets = _select_wordlist_followup_targets(
@@ -2492,15 +2654,15 @@ async def _analyze_domain_async(
         is_cloudflare_ip(ip_address) for ip_address in current_a_records if isinstance(ip_address, str)
     )
 
-    # ── Persist everything to SQLite ──────────────────────────────────────────
+    # ── Persist everything to PostgreSQL ──────────────────────────────────────
     if persist:
         try:
-            from intel_db import DB_PATH, finalize_search, save_search
+            from db.intel_db import finalize_search, save_search
             if _search_id:
                 finalize_search(_search_id, result, timestamp=result["timestamp"])
             else:
                 save_search(result)
-            log(f"Search saved to {DB_PATH}")
+            log("Search saved to intel database")
         except Exception as _exc:
             log(f"DB save failed: {_exc}")
 
@@ -2584,16 +2746,16 @@ def analyze_ip(ip: str) -> dict:
         if ssh_host_key:
             result["ssh_host_keys"] = [ssh_host_key]
 
-    # ── Persist to SQLite ─────────────────────────────────────────────────────
+    # ── Persist to PostgreSQL ─────────────────────────────────────────────────
     proxy_details = detect_proxy_details(ip, result.get("ptr"), result.get("asn_info"), result.get("tls_cert"))
     result["proxy_family"] = proxy_details.get("proxy_family")
     result["proxy_confidence"] = proxy_details.get("proxy_confidence")
 
     try:
-        from intel_db import DB_PATH, create_search, finalize_search
+        from db.intel_db import create_search, finalize_search
         sid = create_search(ip, "ip", result["timestamp"])
         finalize_search(sid, result, timestamp=result["timestamp"])
-        log(f"Search saved to {DB_PATH}")
+        log("Search saved to intel database")
     except Exception as _exc:
         log(f"DB save failed: {_exc}")
 

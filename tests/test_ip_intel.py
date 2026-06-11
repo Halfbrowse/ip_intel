@@ -78,8 +78,8 @@ sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric.ed25519", cryp
 sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric.ed448", cryptography_ed448)
 sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric.rsa", cryptography_rsa)
 
-import ip_intel
-from ip_intel import _select_wordlist_followup_targets
+import core.ip_intel as ip_intel
+from core.ip_intel import _select_wordlist_followup_targets
 
 
 class IpIntelTests(unittest.TestCase):

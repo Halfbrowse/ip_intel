@@ -1,9 +1,14 @@
 """
-db.py — SQLite persistence for ip-intel.
+intel_db.py — PostgreSQL persistence for raw ip-intel runs.
 
 This module stores every analysis run append-only, then builds "latest run"
 views in query code so the UI can default to current relationships while still
 preserving enough history to answer "was this shared in the past?"
+
+Connection conventions mirror cases/case_store.py: psycopg3, short-lived
+connections opened per operation so multiple workers can hit the database
+concurrently. The connection string comes from INTEL_DATABASE_URL when set,
+otherwise DATABASE_URL (the same database used for case storage).
 """
 
 from __future__ import annotations
@@ -13,51 +18,52 @@ import json
 import os
 import ipaddress
 import re
-import sqlite3
+import threading
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = BASE_DIR / "data" / "ip_intel.db"
-DB_PATH = Path(os.getenv("IP_INTEL_DB_PATH", str(DEFAULT_DB_PATH))).expanduser()
-if not DB_PATH.is_absolute():
-    DB_PATH = (BASE_DIR / DB_PATH).resolve()
-else:
-    DB_PATH = DB_PATH.resolve()
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+DEFAULT_DATABASE_URL = "postgresql://ip_intel:ip_intel@postgres:5432/ip_intel"
+
+
+def database_url() -> str:
+    return (
+        os.getenv("INTEL_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or DEFAULT_DATABASE_URL
+    ).strip()
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
-def _conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(str(DB_PATH))
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
+def _conn() -> psycopg.Connection[Any]:
+    return psycopg.connect(database_url(), row_factory=dict_row)
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS searches (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     target              TEXT    NOT NULL,
     type                TEXT    NOT NULL,
     timestamp           TEXT    NOT NULL,
     cloudflare_fronted  INTEGER,
-    raw_json            TEXT    NOT NULL
+    raw_json            TEXT    NOT NULL DEFAULT '',
+    source_errors       JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_searches_target     ON searches(target);
 CREATE INDEX IF NOT EXISTS idx_searches_ts         ON searches(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_searches_target_ts  ON searches(target, timestamp DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS ips (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id           INTEGER NOT NULL REFERENCES searches(id),
+    id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id           BIGINT  NOT NULL REFERENCES searches(id),
     ip                  TEXT    NOT NULL,
     source              TEXT,
     cloudflare          INTEGER,
@@ -69,7 +75,7 @@ CREATE TABLE IF NOT EXISTS ips (
     network_name        TEXT,
     network_cidr        TEXT,
     proxy_family        TEXT,
-    proxy_confidence    REAL,
+    proxy_confidence    DOUBLE PRECISION,
     observed_at         TEXT,
     port                INTEGER
 );
@@ -81,18 +87,19 @@ CREATE INDEX IF NOT EXISTS idx_ips_cidr           ON ips(network_cidr);
 CREATE INDEX IF NOT EXISTS idx_ips_proxy_family   ON ips(proxy_family);
 
 CREATE TABLE IF NOT EXISTS tls_certs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     ip          TEXT    NOT NULL,
     port        INTEGER NOT NULL,
     sni_used    TEXT,
     cn          TEXT,
-    sans        TEXT,
+    sans        JSONB,
     issuer_cn   TEXT,
     issuer_org  TEXT,
     not_before  TEXT,
     not_after   TEXT,
     sha256      TEXT,
+    spki_sha256 TEXT,
     observed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tls_search_id         ON tls_certs(search_id);
@@ -102,13 +109,13 @@ CREATE INDEX IF NOT EXISTS idx_tls_ip                ON tls_certs(ip);
 CREATE INDEX IF NOT EXISTS idx_tls_sha256_observed   ON tls_certs(sha256, observed_at DESC);
 
 CREATE TABLE IF NOT EXISTS ct_certs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
-    cert_id     INTEGER,
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
+    cert_id     BIGINT,
     issuer      TEXT,
     not_before  TEXT,
     not_after   TEXT,
-    sans        TEXT,
+    sans        JSONB,
     observed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ct_search_id       ON ct_certs(search_id);
@@ -116,8 +123,8 @@ CREATE INDEX IF NOT EXISTS idx_ct_issuer          ON ct_certs(issuer);
 CREATE INDEX IF NOT EXISTS idx_ct_cert_id         ON ct_certs(cert_id);
 
 CREATE TABLE IF NOT EXISTS subdomains (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     subdomain   TEXT    NOT NULL,
     source      TEXT
 );
@@ -125,8 +132,8 @@ CREATE INDEX IF NOT EXISTS idx_sub_search_id ON subdomains(search_id);
 CREATE INDEX IF NOT EXISTS idx_sub_subdomain ON subdomains(subdomain);
 
 CREATE TABLE IF NOT EXISTS dns_records (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     rtype       TEXT    NOT NULL,
     value       TEXT    NOT NULL
 );
@@ -134,8 +141,8 @@ CREATE INDEX IF NOT EXISTS idx_dns_search_id ON dns_records(search_id);
 CREATE INDEX IF NOT EXISTS idx_dns_value     ON dns_records(value);
 
 CREATE TABLE IF NOT EXISTS historical_dns (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     rrtype      TEXT,
     rdata       TEXT,
     first_seen  TEXT,
@@ -145,8 +152,8 @@ CREATE INDEX IF NOT EXISTS idx_hist_search_id ON historical_dns(search_id);
 CREATE INDEX IF NOT EXISTS idx_hist_rdata     ON historical_dns(rdata);
 
 CREATE TABLE IF NOT EXISTS tracking_ids (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     id_type     TEXT    NOT NULL,
     id_value    TEXT    NOT NULL
 );
@@ -154,8 +161,8 @@ CREATE INDEX IF NOT EXISTS idx_track_search_id ON tracking_ids(search_id);
 CREATE INDEX IF NOT EXISTS idx_track_value     ON tracking_ids(id_type, id_value);
 
 CREATE TABLE IF NOT EXISTS social_accounts (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     platform    TEXT    NOT NULL,
     handle      TEXT    NOT NULL,
     url         TEXT
@@ -164,16 +171,16 @@ CREATE INDEX IF NOT EXISTS idx_social_search_id ON social_accounts(search_id);
 CREATE INDEX IF NOT EXISTS idx_social_handle    ON social_accounts(platform, handle);
 
 CREATE TABLE IF NOT EXISTS favicons (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     md5         TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fav_search_id ON favicons(search_id);
 CREATE INDEX IF NOT EXISTS idx_fav_md5       ON favicons(md5);
 
 CREATE TABLE IF NOT EXISTS identifiers (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id       INTEGER NOT NULL REFERENCES searches(id),
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id       BIGINT  NOT NULL REFERENCES searches(id),
     id_type         TEXT    NOT NULL,
     id_value        TEXT    NOT NULL,
     tier            TEXT    NOT NULL,
@@ -182,44 +189,44 @@ CREATE TABLE IF NOT EXISTS identifiers (
     observed_at     TEXT,
     first_seen      TEXT,
     last_seen       TEXT,
-    raw_json        TEXT
+    raw_json        JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_identifiers_search_id     ON identifiers(search_id);
 CREATE INDEX IF NOT EXISTS idx_identifiers_type_value    ON identifiers(id_type, id_value);
 
 CREATE TABLE IF NOT EXISTS whois_data (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id       INTEGER NOT NULL REFERENCES searches(id),
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id       BIGINT  NOT NULL REFERENCES searches(id),
     registrar       TEXT,
     creation_date   TEXT,
     expiry_date     TEXT,
     org             TEXT,
     country         TEXT,
-    emails          TEXT,
-    nameservers     TEXT
+    emails          JSONB,
+    nameservers     JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_whois_search_id ON whois_data(search_id);
 CREATE INDEX IF NOT EXISTS idx_whois_registrar ON whois_data(registrar);
 
 CREATE TABLE IF NOT EXISTS registrant_emails (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     email       TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_email_search_id ON registrant_emails(search_id);
 CREATE INDEX IF NOT EXISTS idx_email_value     ON registrant_emails(email);
 
 CREATE TABLE IF NOT EXISTS nameservers (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     nameserver  TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ns_search_id ON nameservers(search_id);
 CREATE INDEX IF NOT EXISTS idx_ns_value     ON nameservers(nameserver);
 
 CREATE TABLE IF NOT EXISTS spf_origins (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     ip          TEXT    NOT NULL,
     cidr        TEXT
 );
@@ -227,25 +234,26 @@ CREATE INDEX IF NOT EXISTS idx_spf_search_id ON spf_origins(search_id);
 CREATE INDEX IF NOT EXISTS idx_spf_ip        ON spf_origins(ip);
 
 CREATE TABLE IF NOT EXISTS cross_sans (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     san         TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_csan_search_id ON cross_sans(search_id);
 CREATE INDEX IF NOT EXISTS idx_csan_san       ON cross_sans(san);
 
 CREATE TABLE IF NOT EXISTS scan_hits (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     scan_type   TEXT    NOT NULL,
     ip          TEXT    NOT NULL,
     port        INTEGER,
     cn          TEXT,
-    sans        TEXT,
+    sans        JSONB,
     issuer      TEXT,
     not_before  TEXT,
     not_after   TEXT,
     sha256      TEXT,
+    spki_sha256 TEXT,
     cloudflare  INTEGER,
     observed_at TEXT
 );
@@ -256,8 +264,8 @@ CREATE INDEX IF NOT EXISTS idx_scan_sha256          ON scan_hits(sha256);
 CREATE INDEX IF NOT EXISTS idx_scan_sha256_observed ON scan_hits(sha256, observed_at DESC);
 
 CREATE TABLE IF NOT EXISTS provider_hits (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     provider    TEXT    NOT NULL,
     ip          TEXT,
     port        INTEGER,
@@ -267,14 +275,14 @@ CREATE TABLE IF NOT EXISTS provider_hits (
     org         TEXT,
     country     TEXT,
     cloudflare  INTEGER,
-    services    TEXT,
-    hostnames   TEXT,
+    services    JSONB,
+    hostnames   JSONB,
     mode        TEXT,
     status      TEXT,
     query_type  TEXT,
     total       INTEGER,
     observed_at TEXT,
-    raw_json    TEXT
+    raw_json    JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_provider_search_id    ON provider_hits(search_id);
 CREATE INDEX IF NOT EXISTS idx_provider_name         ON provider_hits(provider);
@@ -282,8 +290,8 @@ CREATE INDEX IF NOT EXISTS idx_provider_ip_observed  ON provider_hits(ip, observ
 CREATE INDEX IF NOT EXISTS idx_provider_status       ON provider_hits(status);
 
 CREATE TABLE IF NOT EXISTS page_metadata (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id       INTEGER NOT NULL REFERENCES searches(id),
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id       BIGINT  NOT NULL REFERENCES searches(id),
     html_lang       TEXT,
     cms_generator   TEXT,
     favicon_md5     TEXT,
@@ -294,15 +302,15 @@ CREATE INDEX IF NOT EXISTS idx_meta_lang      ON page_metadata(html_lang);
 CREATE INDEX IF NOT EXISTS idx_meta_cms       ON page_metadata(cms_generator);
 
 CREATE TABLE IF NOT EXISTS discovered_targets (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id       INTEGER NOT NULL REFERENCES searches(id),
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id       BIGINT  NOT NULL REFERENCES searches(id),
     target          TEXT    NOT NULL,
     target_type     TEXT    NOT NULL,
     relation        TEXT    NOT NULL,
     source          TEXT    NOT NULL,
     score           INTEGER NOT NULL DEFAULT 0,
     observed_at     TEXT,
-    raw_json        TEXT
+    raw_json        JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_discovered_search_id      ON discovered_targets(search_id);
 CREATE INDEX IF NOT EXISTS idx_discovered_target         ON discovered_targets(target);
@@ -310,10 +318,10 @@ CREATE INDEX IF NOT EXISTS idx_discovered_target_type    ON discovered_targets(t
 CREATE INDEX IF NOT EXISTS idx_discovered_target_source  ON discovered_targets(target, source);
 
 CREATE TABLE IF NOT EXISTS search_fields (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    search_id   BIGINT  NOT NULL REFERENCES searches(id),
     key         TEXT    NOT NULL,
-    json_value  TEXT    NOT NULL,
+    json_value  JSONB   NOT NULL,
     UNIQUE(search_id, key)
 );
 CREATE INDEX IF NOT EXISTS idx_sf_search_id ON search_fields(search_id);
@@ -577,101 +585,51 @@ _IDENTIFIER_HANDLE_TYPES = {
 }
 
 
-def _table_columns(c: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+_ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields"]
+
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY = False
+
+# Arbitrary constant used as a Postgres advisory lock key so concurrent workers
+# do not race each other while creating the schema.
+_SCHEMA_ADVISORY_LOCK_KEY = 882_417_309
 
 
-def _add_column_if_missing(c: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    if column not in _table_columns(c, table):
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def _recreate_identifiers_table(c: sqlite3.Connection) -> None:
-    c.execute("DROP TABLE IF EXISTS identifiers")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS identifiers (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            search_id       INTEGER NOT NULL REFERENCES searches(id),
-            id_type         TEXT    NOT NULL,
-            id_value        TEXT    NOT NULL,
-            tier            TEXT    NOT NULL,
-            category        TEXT    NOT NULL,
-            source          TEXT    NOT NULL,
-            observed_at     TEXT,
-            first_seen      TEXT,
-            last_seen       TEXT,
-            raw_json        TEXT
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_identifiers_search_id  ON identifiers(search_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_identifiers_type_value ON identifiers(id_type, id_value)")
-
-
-def _migrate_schema(c: sqlite3.Connection) -> None:
-    c.execute("DROP INDEX IF EXISTS idx_searches_target_unique")
-
-    for column, definition in [
-        ("asn_registry", "TEXT"),
-        ("network_name", "TEXT"),
-        ("network_cidr", "TEXT"),
-        ("proxy_family", "TEXT"),
-        ("proxy_confidence", "REAL"),
-        ("observed_at", "TEXT"),
-        ("port", "INTEGER"),
-    ]:
-        _add_column_if_missing(c, "ips", column, definition)
-
-    _add_column_if_missing(c, "tls_certs", "sha256", "TEXT")
-    _add_column_if_missing(c, "tls_certs", "spki_sha256", "TEXT")
-    _add_column_if_missing(c, "tls_certs", "observed_at", "TEXT")
-    _add_column_if_missing(c, "ct_certs", "observed_at", "TEXT")
-    _add_column_if_missing(c, "scan_hits", "sha256", "TEXT")
-    _add_column_if_missing(c, "scan_hits", "spki_sha256", "TEXT")
-    _add_column_if_missing(c, "scan_hits", "observed_at", "TEXT")
-
-    _add_column_if_missing(c, "searches", "source_errors", "TEXT")
-
-    identifier_columns = _table_columns(c, "identifiers")
-    required_identifier_columns = {
-        "id",
-        "search_id",
-        "id_type",
-        "id_value",
-        "tier",
-        "category",
-        "source",
-        "observed_at",
-        "first_seen",
-        "last_seen",
-        "raw_json",
-    }
-    if identifier_columns and not required_identifier_columns.issubset(identifier_columns):
-        # Older local versions stored domain-scoped identifiers with a different shape.
-        # Rebuild the table and repopulate it from stored search payloads.
-        _recreate_identifiers_table(c)
+def schema_statements() -> list[str]:
+    return [stmt.strip() for stmt in _SCHEMA.strip().split(";") if stmt.strip()]
 
 
 def init_db() -> None:
-    with _conn() as c:
-        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        schema_statements = [stmt.strip() for stmt in _SCHEMA.strip().split(";") if stmt.strip()]
-        table_statements = [stmt for stmt in schema_statements if not stmt.upper().startswith("CREATE INDEX")]
-        index_statements = [stmt for stmt in schema_statements if stmt.upper().startswith("CREATE INDEX")]
+    """Create the schema once per process (idempotent and concurrency-safe)."""
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY:
+            return
+        with _conn() as c:
+            c.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_ADVISORY_LOCK_KEY,))
+            for stmt in schema_statements():
+                c.execute(stmt)
+        _SCHEMA_READY = True
 
-        for stmt in table_statements:
-            stmt = stmt.strip()
-            c.execute(stmt)
-        _migrate_schema(c)
-        for stmt in index_statements:
-            c.execute(stmt)
+
+def reset_schema_cache() -> None:
+    """Forget that the schema was initialized (used by tests)."""
+    global _SCHEMA_READY
+    with _SCHEMA_LOCK:
+        _SCHEMA_READY = False
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _json(value: Any) -> str:
+def _json_dumps(value: Any) -> str:
     return json.dumps(value, default=str)
+
+
+def _json(value: Any) -> Jsonb:
+    """Wrap a value for insertion into a JSONB column."""
+    return Jsonb(value, dumps=_json_dumps)
 
 
 def _normalize_asn(value: Any) -> str | None:
@@ -1190,22 +1148,22 @@ def _is_low_signal_tls_identity(value: Any) -> bool:
     return _text_contains_any(text, _LOW_SIGNAL_TLS_PATTERNS)
 
 
-def _latest_search_rows(c: sqlite3.Connection) -> list[sqlite3.Row]:
+def _latest_search_rows(c: psycopg.Connection[Any]) -> list[dict[str, Any]]:
     rows = c.execute(
         "SELECT id, target, type, timestamp, cloudflare_fronted FROM searches ORDER BY target, timestamp DESC, id DESC"
     ).fetchall()
-    latest: dict[str, sqlite3.Row] = {}
+    latest: dict[str, dict[str, Any]] = {}
     for row in rows:
         norm = _normalize_target(row["target"])
         latest.setdefault(norm, row)
     return list(latest.values())
 
 
-def _latest_search_id_map(c: sqlite3.Connection) -> dict[str, int]:
+def _latest_search_id_map(c: psycopg.Connection[Any]) -> dict[str, int]:
     return {_normalize_target(row["target"]): int(row["id"]) for row in _latest_search_rows(c)}
 
 
-def _search_rows_for_target(c: sqlite3.Connection, target: str) -> list[sqlite3.Row]:
+def _search_rows_for_target(c: psycopg.Connection[Any], target: str) -> list[dict[str, Any]]:
     norm = _normalize_target(target)
     rows = c.execute(
         "SELECT id, target, type, timestamp, cloudflare_fronted FROM searches ORDER BY timestamp DESC, id DESC"
@@ -1213,15 +1171,15 @@ def _search_rows_for_target(c: sqlite3.Connection, target: str) -> list[sqlite3.
     return [row for row in rows if _normalize_target(row["target"]) == norm]
 
 
-def _latest_row_for_target(c: sqlite3.Connection, target: str) -> sqlite3.Row | None:
+def _latest_row_for_target(c: psycopg.Connection[Any], target: str) -> dict[str, Any] | None:
     rows = _search_rows_for_target(c, target)
     return rows[0] if rows else None
 
 
-def _query_rows_for_ids(c: sqlite3.Connection, query: str, ids: list[int], params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+def _query_rows_for_ids(c: psycopg.Connection[Any], query: str, ids: list[int], params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     if not ids:
         return []
-    placeholders = ",".join("?" for _ in ids)
+    placeholders = ",".join("%s" for _ in ids)
     return c.execute(query.format(placeholders=placeholders), (*ids, *params)).fetchall()
 
 
@@ -1289,7 +1247,7 @@ def _extract_ip_port_map(result: dict[str, Any]) -> dict[tuple[str, str], int | 
     return mapping
 
 
-def _row_target_list(rows: list[sqlite3.Row], exclude_norm: str | None = None) -> list[str]:
+def _row_target_list(rows: list[dict[str, Any]], exclude_norm: str | None = None) -> list[str]:
     targets = []
     for row in rows:
         target = row["target"]
@@ -2104,14 +2062,14 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
-def _refresh_search_identifiers(c: sqlite3.Connection, search_id: int, payload: dict[str, Any]) -> None:
+def _refresh_search_identifiers(c: psycopg.Connection[Any], search_id: int, payload: dict[str, Any]) -> None:
     observed_at = str(payload.get("timestamp") or datetime.now(timezone.utc).isoformat())
-    c.execute("DELETE FROM identifiers WHERE search_id = ?", (search_id,))
+    c.execute("DELETE FROM identifiers WHERE search_id = %s", (search_id,))
     for item in extract_search_identifiers(payload):
         c.execute(
             """INSERT INTO identifiers
                (search_id, id_type, id_value, tier, category, source, observed_at, first_seen, last_seen, raw_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
                 search_id,
                 item["id_type"],
@@ -2130,44 +2088,39 @@ def _refresh_search_identifiers(c: sqlite3.Connection, search_id: int, payload: 
 
 # ── Incremental persistence helpers ──────────────────────────────────────────
 
-def _load_result_from_fields(c: sqlite3.Connection, search_id: int) -> dict | None:
+def _load_result_from_fields(c: psycopg.Connection[Any], search_id: int) -> dict | None:
     rows = c.execute(
-        "SELECT key, json_value FROM search_fields WHERE search_id = ?", (search_id,)
+        "SELECT key, json_value FROM search_fields WHERE search_id = %s", (search_id,)
     ).fetchall()
     if not rows:
         return None
-    result = {}
-    for row in rows:
-        try:
-            result[row["key"]] = json.loads(row["json_value"])
-        except (json.JSONDecodeError, TypeError):
-            result[row["key"]] = row["json_value"]
-    return result
+    # json_value is JSONB, so psycopg already returns parsed Python values.
+    return {row["key"]: row["json_value"] for row in rows}
 
 
 def create_search(target: str, typ: str, timestamp: str) -> int:
     """Insert the searches row upfront and return search_id; fields written later."""
     init_db()
     with _conn() as c:
-        c.execute(
-            "INSERT INTO searches (target, type, timestamp, raw_json) VALUES (?,?,?,'')",
+        row = c.execute(
+            "INSERT INTO searches (target, type, timestamp, raw_json) VALUES (%s,%s,%s,'') RETURNING id",
             (target, typ, timestamp),
-        )
-        return int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+        ).fetchone()
+        return int(row["id"])
 
 
 def save_search_fields(search_id: int, fields: dict[str, Any]) -> None:
     """Upsert a batch of result fields into search_fields."""
     with _conn() as c:
-        c.execute("BEGIN IMMEDIATE")
         for key, value in fields.items():
             c.execute(
-                "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
-                (search_id, key, json.dumps(value, default=str)),
+                "INSERT INTO search_fields (search_id, key, json_value) VALUES (%s,%s,%s) "
+                "ON CONFLICT (search_id, key) DO UPDATE SET json_value = EXCLUDED.json_value",
+                (search_id, key, _json(value)),
             )
 
 
-def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp: str) -> None:
+def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, timestamp: str) -> None:
     """Write all structured child table rows from a result dict."""
     typ = result.get("type", "unknown")
     ip_details = result.get("ip_details", {})
@@ -2184,7 +2137,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
                     """INSERT INTO ips
                        (search_id, ip, source, cloudflare, ptr, asn, asn_desc, asn_registry, country,
                         network_name, network_cidr, proxy_family, proxy_confidence, observed_at, port)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         sid, ip, source, cf_value,
                         info.get("ptr"),
@@ -2206,7 +2159,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
             """INSERT INTO ips
                (search_id, ip, source, cloudflare, ptr, asn, asn_desc, asn_registry, country,
                 network_name, network_cidr, proxy_family, proxy_confidence, observed_at, port)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
                 sid, result.get("input", ""), "direct",
                 1 if result.get("cloudflare") else 0,
@@ -2231,7 +2184,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
         c.execute(
             """INSERT INTO tls_certs
                (search_id, ip, port, sni_used, cn, sans, issuer_cn, issuer_org, not_before, not_after, sha256, spki_sha256, observed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
                 sid,
                 cert.get("ip"), cert.get("port", 443), cert.get("sni_used"),
@@ -2253,7 +2206,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
             c.execute(
                 """INSERT INTO scan_hits
                    (search_id, scan_type, ip, port, cn, sans, issuer, not_before, not_after, sha256, spki_sha256, cloudflare, observed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (
                     sid, scan_label, hit.get("ip"), hit.get("port", 443),
                     hit.get("cn"), _json(hit.get("sans", [])),
@@ -2273,7 +2226,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
                 """INSERT INTO provider_hits
                    (search_id, provider, ip, port, protocol, asn, asn_desc, org, country, cloudflare,
                     services, hostnames, mode, status, query_type, total, observed_at, raw_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (
                     sid, provider, hit.get("ip"), hit.get("port"), hit.get("protocol"),
                     _normalize_asn(hit.get("asn")),
@@ -2290,16 +2243,16 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
     ct = result.get("cert_transparency", {})
     for cert in ct.get("certs", []):
         c.execute(
-            "INSERT INTO ct_certs (search_id, cert_id, issuer, not_before, not_after, sans, observed_at) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO ct_certs (search_id, cert_id, issuer, not_before, not_after, sans, observed_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
             (sid, cert.get("id"), cert.get("issuer"), cert.get("not_before"), cert.get("not_after"), _json(cert.get("sans", [])), timestamp),
         )
     for san in ct.get("cross_domain_sans", []):
-        c.execute("INSERT INTO cross_sans (search_id, san) VALUES (?,?)", (sid, san))
+        c.execute("INSERT INTO cross_sans (search_id, san) VALUES (%s,%s)", (sid, san))
 
     for sub in result.get("subdomains", []):
-        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (?,?,?)", (sid, sub, "crt.sh"))
+        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (%s,%s,%s)", (sid, sub, "crt.sh"))
     for sub in result.get("zone_transfer", []):
-        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (?,?,?)", (sid, sub, "zone_transfer"))
+        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (%s,%s,%s)", (sid, sub, "zone_transfer"))
 
     dns = result.get("dns", {})
     for rtype, values in dns.items():
@@ -2308,20 +2261,20 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
         if isinstance(values, list):
             for value in values:
                 c.execute(
-                    "INSERT INTO dns_records (search_id, rtype, value) VALUES (?,?,?)",
+                    "INSERT INTO dns_records (search_id, rtype, value) VALUES (%s,%s,%s)",
                     (sid, rtype, _json(value) if isinstance(value, dict) else str(value)),
                 )
         elif isinstance(values, dict):
-            c.execute("INSERT INTO dns_records (search_id, rtype, value) VALUES (?,?,?)", (sid, rtype, _json(values)))
+            c.execute("INSERT INTO dns_records (search_id, rtype, value) VALUES (%s,%s,%s)", (sid, rtype, _json(values)))
 
     for rec in result.get("historical_dns", {}).get("records", []):
         c.execute(
-            "INSERT INTO historical_dns (search_id, rrtype, rdata, first_seen, last_seen) VALUES (?,?,?,?,?)",
+            "INSERT INTO historical_dns (search_id, rrtype, rdata, first_seen, last_seen) VALUES (%s,%s,%s,%s,%s)",
             (sid, rec.get("rrtype"), rec.get("rdata"), rec.get("first_seen"), rec.get("last_seen")),
         )
 
     for entry in result.get("spf_origins", []):
-        c.execute("INSERT INTO spf_origins (search_id, ip, cidr) VALUES (?,?,?)", (sid, entry.get("ip"), entry.get("cidr")))
+        c.execute("INSERT INTO spf_origins (search_id, ip, cidr) VALUES (%s,%s,%s)", (sid, entry.get("ip"), entry.get("cidr")))
 
     whois_row = result.get("whois", {})
     if whois_row and not whois_row.get("error"):
@@ -2332,7 +2285,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
         c.execute(
             """INSERT INTO whois_data
                (search_id, registrar, creation_date, expiry_date, org, country, emails, nameservers)
-               VALUES (?,?,?,?,?,?,?,?)""",
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
                 sid,
                 str(whois_row.get("registrar") or ""),
@@ -2345,9 +2298,9 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
         )
         for email in emails_raw:
             if email and isinstance(email, str):
-                c.execute("INSERT INTO registrant_emails (search_id, email) VALUES (?,?)", (sid, email.lower().strip()))
+                c.execute("INSERT INTO registrant_emails (search_id, email) VALUES (%s,%s)", (sid, email.lower().strip()))
         for nameserver in ns_raw:
-            c.execute("INSERT INTO nameservers (search_id, nameserver) VALUES (?,?)", (sid, nameserver))
+            c.execute("INSERT INTO nameservers (search_id, nameserver) VALUES (%s,%s)", (sid, nameserver))
 
     meta = result.get("page_metadata", {})
     for id_type, key in [
@@ -2355,7 +2308,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
         ("tiktok_pixel", "tiktok_pixel"), ("yandex_metrika", "yandex_metrika"), ("adsense", "adsense_publisher_ids"),
     ]:
         for value in (meta.get(key) or []):
-            c.execute("INSERT INTO tracking_ids (search_id, id_type, id_value) VALUES (?,?,?)", (sid, id_type, str(value)))
+            c.execute("INSERT INTO tracking_ids (search_id, id_type, id_value) VALUES (%s,%s,%s)", (sid, id_type, str(value)))
 
     handles = meta.get("social_handles", {})
     links = meta.get("social_links", {})
@@ -2363,17 +2316,17 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
         urls = links.get(platform) or []
         for handle in (handles.get(platform) or []):
             c.execute(
-                "INSERT INTO social_accounts (search_id, platform, handle, url) VALUES (?,?,?,?)",
+                "INSERT INTO social_accounts (search_id, platform, handle, url) VALUES (%s,%s,%s,%s)",
                 (sid, platform, handle, urls[0] if urls else None),
             )
 
     favicon_md5 = meta.get("favicon_md5")
     if favicon_md5:
-        c.execute("INSERT INTO favicons (search_id, md5) VALUES (?,?)", (sid, favicon_md5))
+        c.execute("INSERT INTO favicons (search_id, md5) VALUES (%s,%s)", (sid, favicon_md5))
 
     email_security = result.get("email_security", {})
     c.execute(
-        "INSERT INTO page_metadata (search_id, html_lang, cms_generator, favicon_md5, dmarc) VALUES (?,?,?,?,?)",
+        "INSERT INTO page_metadata (search_id, html_lang, cms_generator, favicon_md5, dmarc) VALUES (%s,%s,%s,%s,%s)",
         (sid, meta.get("html_lang"), meta.get("cms_generator"), favicon_md5, email_security.get("dmarc")),
     )
 
@@ -2381,7 +2334,7 @@ def _save_child_tables(c: sqlite3.Connection, sid: int, result: dict, timestamp:
         c.execute(
             """INSERT INTO discovered_targets
                (search_id, target, target_type, relation, source, score, observed_at, raw_json)
-               VALUES (?,?,?,?,?,?,?,?)""",
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
                 sid, item["target"], item["target_type"], item["relation"],
                 item["source"], int(item.get("score") or 0), timestamp, _json(item.get("raw_json")),
@@ -2402,20 +2355,21 @@ def finalize_search(search_id: int, result: dict, *, timestamp: str) -> None:
     result["related_targets_summary"] = related_summary
 
     with _conn() as c:
-        c.execute("BEGIN IMMEDIATE")
         c.execute(
-            "UPDATE searches SET cloudflare_fronted = ?, source_errors = ? WHERE id = ?",
-            (cf_val, json.dumps(source_errors, default=str) if source_errors else None, search_id),
+            "UPDATE searches SET cloudflare_fronted = %s, source_errors = %s WHERE id = %s",
+            (cf_val, _json(source_errors) if source_errors else None, search_id),
         )
         _save_child_tables(c, search_id, result, timestamp)
         for key, value in result.items():
             c.execute(
-                "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
-                (search_id, key, json.dumps(value, default=str)),
+                "INSERT INTO search_fields (search_id, key, json_value) VALUES (%s,%s,%s) "
+                "ON CONFLICT (search_id, key) DO UPDATE SET json_value = EXCLUDED.json_value",
+                (search_id, key, _json(value)),
             )
         c.execute(
-            "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
-            (search_id, "related_targets_summary", json.dumps(related_summary, default=str)),
+            "INSERT INTO search_fields (search_id, key, json_value) VALUES (%s,%s,%s) "
+                "ON CONFLICT (search_id, key) DO UPDATE SET json_value = EXCLUDED.json_value",
+            (search_id, "related_targets_summary", _json(related_summary)),
         )
 
 
@@ -2423,7 +2377,7 @@ def get_result(search_id: int) -> dict | None:
     init_db()
     with _conn() as c:
         meta = c.execute(
-            "SELECT target, type, timestamp, cloudflare_fronted FROM searches WHERE id = ?",
+            "SELECT target, type, timestamp, cloudflare_fronted FROM searches WHERE id = %s",
             (search_id,),
         ).fetchone()
         if not meta:
@@ -2459,7 +2413,7 @@ def get_recent(limit: int = 100) -> list[dict]:
     init_db()
     with _conn() as c:
         rows = c.execute(
-            "SELECT id, target, type, timestamp, cloudflare_fronted FROM searches ORDER BY timestamp DESC, id DESC LIMIT ?",
+            "SELECT id, target, type, timestamp, cloudflare_fronted FROM searches ORDER BY timestamp DESC, id DESC LIMIT %s",
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -2487,10 +2441,14 @@ def get_domains_with_source_errors(source: str | None = None) -> list[dict]:
 
     results = []
     for row in rows:
-        try:
-            errors = json.loads(row["source_errors"]) if row["source_errors"] else []
-        except (json.JSONDecodeError, TypeError):
-            errors = []
+        # source_errors is JSONB, so psycopg returns parsed values; older callers
+        # may still hand us JSON text, so stay tolerant.
+        errors = row["source_errors"] or []
+        if isinstance(errors, (str, bytes)):
+            try:
+                errors = json.loads(errors)
+            except (json.JSONDecodeError, TypeError):
+                errors = []
         if not isinstance(errors, list):
             errors = [errors] if errors else []
         if source is None or source in errors:
@@ -2502,7 +2460,7 @@ def get_by_id(sid: int) -> dict | None:
     init_db()
     with _conn() as c:
         row = c.execute(
-            "SELECT id, target, type, timestamp, cloudflare_fronted, source_errors FROM searches WHERE id = ?",
+            "SELECT id, target, type, timestamp, cloudflare_fronted, source_errors FROM searches WHERE id = %s",
             (sid,),
         ).fetchone()
     return dict(row) if row else None
@@ -2519,12 +2477,12 @@ def update_search_payload(search_id: int, payload: dict[str, Any]) -> None:
     init_db()
     timestamp = str(payload.get("timestamp") or datetime.now(timezone.utc).isoformat())
     with _conn() as c:
-        c.execute("BEGIN IMMEDIATE")
-        c.execute("UPDATE searches SET timestamp = ? WHERE id = ?", (timestamp, search_id))
+        c.execute("UPDATE searches SET timestamp = %s WHERE id = %s", (timestamp, search_id))
         for key, value in payload.items():
             c.execute(
-                "INSERT OR REPLACE INTO search_fields (search_id, key, json_value) VALUES (?,?,?)",
-                (search_id, key, json.dumps(value, default=str)),
+                "INSERT INTO search_fields (search_id, key, json_value) VALUES (%s,%s,%s) "
+                "ON CONFLICT (search_id, key) DO UPDATE SET json_value = EXCLUDED.json_value",
+                (search_id, key, _json(value)),
             )
         _refresh_search_identifiers(c, search_id, payload)
 
@@ -2555,7 +2513,7 @@ def find_by_ip(ip: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp, i.source
                FROM searches s JOIN ips i ON s.id = i.search_id
-               WHERE i.ip = ?
+               WHERE i.ip = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (ip,),
         ).fetchall()
@@ -2568,7 +2526,7 @@ def find_by_tls_sha256(sha256: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp, t.cn, t.issuer_cn
                FROM searches s JOIN tls_certs t ON s.id = t.search_id
-               WHERE t.sha256 = ?
+               WHERE t.sha256 = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (sha256,),
         ).fetchall()
@@ -2581,7 +2539,7 @@ def find_by_tracking_id(id_type: str, id_value: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp
                FROM searches s JOIN tracking_ids t ON s.id = t.search_id
-               WHERE t.id_type = ? AND t.id_value = ?
+               WHERE t.id_type = %s AND t.id_value = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (id_type, id_value),
         ).fetchall()
@@ -2594,7 +2552,7 @@ def find_by_favicon(md5: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp
                FROM searches s JOIN favicons f ON s.id = f.search_id
-               WHERE f.md5 = ?
+               WHERE f.md5 = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (md5,),
         ).fetchall()
@@ -2607,7 +2565,7 @@ def find_by_registrant_email(email: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp
                FROM searches s JOIN registrant_emails e ON s.id = e.search_id
-               WHERE e.email = ?
+               WHERE e.email = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (email.lower().strip(),),
         ).fetchall()
@@ -2620,7 +2578,7 @@ def find_by_social_handle(platform: str, handle: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp
                FROM searches s JOIN social_accounts a ON s.id = a.search_id
-               WHERE a.platform = ? AND a.handle = ?
+               WHERE a.platform = %s AND a.handle = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (platform, handle),
         ).fetchall()
@@ -2634,7 +2592,7 @@ def find_by_nameserver(ns: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp
                FROM searches s JOIN nameservers n ON s.id = n.search_id
-               WHERE n.nameserver = ?
+               WHERE n.nameserver = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (nameserver,),
         ).fetchall()
@@ -2647,7 +2605,7 @@ def find_by_cross_san(san: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp
                FROM searches s JOIN cross_sans cs ON s.id = cs.search_id
-               WHERE cs.san = ?
+               WHERE cs.san = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (san,),
         ).fetchall()
@@ -2664,7 +2622,7 @@ def find_by_identifier(id_type: str, id_value: str) -> list[dict]:
         rows = c.execute(
             """SELECT DISTINCT s.id, s.target, s.type, s.timestamp, i.tier, i.category
                FROM searches s JOIN identifiers i ON s.id = i.search_id
-               WHERE i.id_type = ? AND i.id_value = ?
+               WHERE i.id_type = %s AND i.id_value = %s
                ORDER BY s.timestamp DESC, s.id DESC""",
             (id_type, normalized_value),
         ).fetchall()
@@ -2853,7 +2811,7 @@ def summarize_result_db_matches(
     }
 
 
-def _latest_domain_rows(c: sqlite3.Connection) -> list[sqlite3.Row]:
+def _latest_domain_rows(c: psycopg.Connection[Any]) -> list[dict[str, Any]]:
     return [
         row
         for row in _latest_search_rows(c)
@@ -2890,7 +2848,7 @@ def _identifier_rationale(category: str, tier: str, frequency_status: str, domai
     return f"{tier_label} {category_label} evidence derived from pairwise timing."
 
 
-def _load_latest_domain_identifier_state(c: sqlite3.Connection) -> dict[str, Any]:
+def _load_latest_domain_identifier_state(c: psycopg.Connection[Any]) -> dict[str, Any]:
     latest_rows = _latest_domain_rows(c)
     latest_ids = [int(row["id"]) for row in latest_rows]
 
@@ -2955,11 +2913,15 @@ def _load_latest_domain_identifier_state(c: sqlite3.Connection) -> dict[str, Any
             payload["last_seen"] = row["last_seen"]
         if row["observed_at"] and (not payload["observed_at"] or str(row["observed_at"]) < str(payload["observed_at"])):
             payload["observed_at"] = row["observed_at"]
-        if row["raw_json"] and len(payload["raw_examples"]) < 3:
-            try:
-                payload["raw_examples"].append(json.loads(row["raw_json"]))
-            except json.JSONDecodeError:
-                payload["raw_examples"].append(row["raw_json"])
+        raw_example = row["raw_json"]
+        if raw_example is not None and len(payload["raw_examples"]) < 3:
+            # raw_json is JSONB, so psycopg returns parsed values already.
+            if isinstance(raw_example, (str, bytes)):
+                try:
+                    raw_example = json.loads(raw_example)
+                except json.JSONDecodeError:
+                    pass
+            payload["raw_examples"].append(raw_example)
 
         identifier_domains[key].add(norm_target)
         identifier_meta.setdefault(
@@ -3479,7 +3441,7 @@ def _is_noise_label(label: str | None) -> bool:
     return label in {"mail", "cdn_proxy", "shared_hosting"}
 
 
-def _build_ip_label_index(c: sqlite3.Connection) -> dict[tuple[int, str], str]:
+def _build_ip_label_index(c: psycopg.Connection[Any]) -> dict[tuple[int, str], str]:
     rows = c.execute(
         """SELECT search_id, ip, ptr, asn, source, proxy_family
            FROM ips"""
@@ -3512,11 +3474,11 @@ def _is_low_signal_tls_observation(row: Mapping[str, Any], ip_label_index: Mappi
 
 # ── Cluster helpers ───────────────────────────────────────────────────────────
 
-def _latest_ids(c: sqlite3.Connection) -> list[int]:
+def _latest_ids(c: psycopg.Connection[Any]) -> list[int]:
     return [int(row["id"]) for row in _latest_search_rows(c)]
 
 
-def _aggregate_targets(rows: list[sqlite3.Row], key_fn) -> dict[Any, dict[str, Any]]:
+def _aggregate_targets(rows: list[dict[str, Any]], key_fn) -> dict[Any, dict[str, Any]]:
     grouped: dict[Any, dict[str, Any]] = {}
     for row in rows:
         key = key_fn(row)
@@ -3607,7 +3569,7 @@ def cluster_by_favicon() -> list[dict]:
     return sorted(_finalize_cluster_items(items), key=lambda item: (-item["target_count"], item["md5"]))
 
 
-def _load_tls_observations(c: sqlite3.Connection) -> list[dict[str, Any]]:
+def _load_tls_observations(c: psycopg.Connection[Any]) -> list[dict[str, Any]]:
     rows = c.execute(
         """SELECT s.id AS search_id, s.target, t.ip, t.sha256, t.cn, t.issuer_cn AS issuer, t.not_before, t.not_after,
                   t.observed_at, 'tls_probe' AS source
@@ -3813,26 +3775,26 @@ def get_connections_for_target(target: str) -> dict | None:
                 c,
                 f"""SELECT DISTINCT s.target
                     FROM {table} x JOIN searches s ON s.id = x.search_id
-                    WHERE x.search_id IN ({{placeholders}}) AND x.{column} = ?""",
+                    WHERE x.search_id IN ({{placeholders}}) AND x.{column} = %s""",
                 latest_ids,
                 (value,),
             )
             return _row_target_list(rows, exclude_norm=norm_target)
 
         whois = c.execute(
-            "SELECT registrar, creation_date, expiry_date, org, country FROM whois_data WHERE search_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT registrar, creation_date, expiry_date, org, country FROM whois_data WHERE search_id = %s ORDER BY id DESC LIMIT 1",
             (current_sid,),
         ).fetchone()
 
         tracking = []
-        for row in c.execute("SELECT id_type, id_value FROM tracking_ids WHERE search_id = ?", (current_sid,)).fetchall():
+        for row in c.execute("SELECT id_type, id_value FROM tracking_ids WHERE search_id = %s", (current_sid,)).fetchall():
             tracking.append({"id_type": row["id_type"], "id_value": row["id_value"], "shared_with": _others_by("tracking_ids", "id_value", row["id_value"])})
 
         ips = []
         seen_ips: set[str] = set()
         for row in c.execute(
             """SELECT ip, source, ptr, asn, asn_desc, country, cloudflare, network_cidr, proxy_family
-               FROM ips WHERE search_id = ?""",
+               FROM ips WHERE search_id = %s""",
             (current_sid,),
         ).fetchall():
             ip = row["ip"]
@@ -3865,7 +3827,7 @@ def get_connections_for_target(target: str) -> dict | None:
         seen_asns: set[str] = set()
         for row in c.execute(
             """SELECT asn, asn_desc, network_cidr, ptr, source, proxy_family
-               FROM ips WHERE search_id = ? AND asn IS NOT NULL AND asn != ''""",
+               FROM ips WHERE search_id = %s AND asn IS NOT NULL AND asn != ''""",
             (current_sid,),
         ).fetchall():
             asn = _normalize_asn(row["asn"])
@@ -3894,7 +3856,7 @@ def get_connections_for_target(target: str) -> dict | None:
         ip_label_index = _build_ip_label_index(c)
         for row in c.execute(
             """SELECT sha256, cn, sans, issuer_cn, ip, not_before, not_after
-               FROM tls_certs WHERE search_id = ?""",
+               FROM tls_certs WHERE search_id = %s""",
             (current_sid,),
         ).fetchall():
             fingerprint = row["sha256"]
@@ -3926,7 +3888,7 @@ def get_connections_for_target(target: str) -> dict | None:
         seen_provider_hits: set[tuple[str, str | None]] = set()
         for row in c.execute(
             """SELECT provider, ip, port, protocol, asn, asn_desc, org, country, mode, status, query_type
-               FROM provider_hits WHERE search_id = ?""",
+               FROM provider_hits WHERE search_id = %s""",
             (current_sid,),
         ).fetchall():
             key = (row["provider"], row["ip"])
@@ -3951,7 +3913,7 @@ def get_connections_for_target(target: str) -> dict | None:
                             c,
                             """SELECT DISTINCT s.target
                                FROM provider_hits p JOIN searches s ON s.id = p.search_id
-                               WHERE p.search_id IN ({placeholders}) AND p.provider = ? AND p.ip = ?""",
+                               WHERE p.search_id IN ({placeholders}) AND p.provider = %s AND p.ip = %s""",
                             latest_ids,
                             (row["provider"], row["ip"]),
                         ),
@@ -4023,18 +3985,18 @@ def get_connections_for_target(target: str) -> dict | None:
             )
 
         favicons = []
-        for row in c.execute("SELECT md5 FROM favicons WHERE search_id = ?", (current_sid,)).fetchall():
+        for row in c.execute("SELECT md5 FROM favicons WHERE search_id = %s", (current_sid,)).fetchall():
             favicons.append({"md5": row["md5"], "shared_with": _others_by("favicons", "md5", row["md5"])})
 
         emails = []
-        for row in c.execute("SELECT email FROM registrant_emails WHERE search_id = ?", (current_sid,)).fetchall():
+        for row in c.execute("SELECT email FROM registrant_emails WHERE search_id = %s", (current_sid,)).fetchall():
             email = row["email"]
             if email in _GENERIC_EMAILS:
                 continue
             emails.append({"email": email, "shared_with": _others_by("registrant_emails", "email", email)})
 
         nameservers = []
-        for row in c.execute("SELECT nameserver FROM nameservers WHERE search_id = ?", (current_sid,)).fetchall():
+        for row in c.execute("SELECT nameserver FROM nameservers WHERE search_id = %s", (current_sid,)).fetchall():
             nameservers.append({"nameserver": row["nameserver"], "shared_with": _others_by("nameservers", "nameserver", row["nameserver"])})
 
         identifiers = []
@@ -4087,7 +4049,7 @@ def get_connections_for_target(target: str) -> dict | None:
         for row in c.execute(
             """SELECT target, target_type, relation, source, score
                FROM discovered_targets
-               WHERE search_id = ?
+               WHERE search_id = %s
                ORDER BY score DESC, target ASC""",
             (current_sid,),
         ).fetchall():
@@ -4122,7 +4084,7 @@ def get_connections_for_target(target: str) -> dict | None:
             else:
                 discovered_ips.append(payload)
 
-        social = [dict(row) for row in c.execute("SELECT platform, handle, url FROM social_accounts WHERE search_id = ?", (current_sid,)).fetchall()]
+        social = [dict(row) for row in c.execute("SELECT platform, handle, url FROM social_accounts WHERE search_id = %s", (current_sid,)).fetchall()]
         history = [
             {
                 "id": row["id"],

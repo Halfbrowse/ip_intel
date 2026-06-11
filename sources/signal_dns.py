@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from utils.outbound import httpx_kwargs
+
 try:
     import dns.asyncresolver
     import dns.exception
@@ -1002,6 +1004,7 @@ async def probe_microsoft_tenant_guid(
             timeout=httpx.Timeout(10.0, read=15.0),
             follow_redirects=True,
             headers={"User-Agent": "ip-intel/signal-dns"},
+            **httpx_kwargs(),
         )
 
     async def _probe(url: str) -> dict[str, Any]:
@@ -1084,6 +1087,7 @@ def probe_microsoft_tenant_guid_sync(
             timeout=httpx.Timeout(10.0, read=15.0),
             follow_redirects=True,
             headers={"User-Agent": "ip-intel/signal-dns"},
+            **httpx_kwargs(),
         )
 
     probes: list[dict[str, Any]] = []

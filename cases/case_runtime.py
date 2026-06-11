@@ -6,12 +6,12 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
-import cluster
-import check
-import ip_intel
-import basic
-from analysis_service import AnalysisRun, analyze_target, clean_target, normalize_inputs, pairing_label, parse_csv_targets
-from case_store import (
+from utils import cluster
+from utils import check
+from core import ip_intel
+from core import basic
+from core.analysis_service import AnalysisRun, analyze_target, clean_target, normalize_inputs, pairing_label, parse_csv_targets
+from cases.case_store import (
     JOB_STAGES,
     append_job_log,
     complete_case,
@@ -19,19 +19,22 @@ from case_store import (
     find_historical_candidates,
     get_case,
     get_job,
+    get_pending_crt_sh_retries,
     list_search_runs_by_ids,
     list_pairings,
     list_search_runs,
     load_case_inputs,
     mark_case_started,
+    patch_search_run_payload,
     recoverable_jobs,
     replace_cluster,
     replace_pairings,
     save_search_run,
     update_job_progress,
 )
-from evidence_meta import evidence_definition
-from mattermost_alerts import send_case_notification
+from utils.evidence_meta import evidence_definition
+from integrations.mattermost_alerts import send_case_notification
+from integrations.email_alerts import send_case_email
 
 
 DEFAULT_CLUSTER_THRESHOLD = 30
@@ -58,6 +61,43 @@ class CaseRuntime:
     def recover(self) -> None:
         for job in recoverable_jobs():
             self.submit_existing(job["case_id"], job["id"])
+
+    def retry_crt_sh_pending(self) -> int:
+        """
+        Re-query crt.sh for any search runs that previously failed.
+        Returns the number of runs successfully updated.
+        """
+        import asyncio
+        import httpx
+
+        pending = get_pending_crt_sh_retries()
+        if not pending:
+            return 0
+
+        updated = 0
+        for row in pending:
+            run_id = row["id"]
+            domain = row["normalized_target"]
+            try:
+                async def _fetch(d: str) -> dict:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0), follow_redirects=True) as client:
+                        return await ip_intel._acrt_sh_data(d, client)
+
+                result = asyncio.run(_fetch(domain))
+                if result.get("_failed"):
+                    continue
+
+                subdomains = result.pop("subdomains", [])
+                patch_search_run_payload(run_id, {
+                    "cert_transparency": result,
+                    "subdomains": subdomains,
+                    "crt_sh_status": "ok",
+                })
+                updated += 1
+            except Exception:
+                pass
+
+        return updated
 
     def _run_case(self, case_id: str, job_id: str) -> None:
         basic._SCANNED_DOMAINS.clear()
@@ -230,6 +270,7 @@ class CaseRuntime:
             job_row = get_job(job_id)
             if case_row and job_row:
                 send_case_notification(case_row, job_row)
+                send_case_email(case_row, job_row)
         except Exception as exc:  # noqa: BLE001
             self._log(job_id, "warning", f"Case failed: {exc}", stage="notification")
             complete_case(
@@ -685,34 +726,78 @@ def build_job_response(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Mirrors the importance ranking used by the frontend so the "top" evidence
+# shipped with the slim pairs list matches what the UI treats as strongest.
+_EVIDENCE_IMPORTANCE_RANK = {
+    "decisive": 0,
+    "key": 0,
+    "anchoring": 0,
+    "strong": 1,
+    "supporting": 2,
+    "low-signal": 3,
+    "low_signal": 3,
+}
+
+# How many of the strongest evidence items ship inline with the pairs list,
+# and how many matched values each of those items keeps. The full evidence
+# set stays available via GET /api/cases/{case_id}/pairs/{pair_id}.
+TOP_EVIDENCE_LIMIT = 3
+_TOP_EVIDENCE_VALUE_LIMIT = 3
+
+
+def _evidence_rank(item: dict[str, Any]) -> int:
+    importance = str(item.get("importance") or "").lower()
+    return _EVIDENCE_IMPORTANCE_RANK.get(importance, 2)
+
+
+def _slim_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
+    slim = dict(item)
+    matched_values = slim.get("matched_values")
+    if isinstance(matched_values, list) and len(matched_values) > _TOP_EVIDENCE_VALUE_LIMIT:
+        slim["matched_values"] = matched_values[:_TOP_EVIDENCE_VALUE_LIMIT]
+        slim["matched_value_count"] = len(matched_values)
+    return slim
+
+
 def build_pairs_response(case_id: str) -> dict[str, Any]:
     rows = list_pairings(case_id)
+    case_inputs = load_case_inputs(case_id)
+    seed_set = {inp["normalized_target"] for inp in case_inputs if inp.get("normalized_target")}
     items = []
-    within_case = []
-    historical = []
     for row in rows:
         payload = row.get("payload") or {}
-        item = {
-            "id": row["id"],
-            "scope": row["scope"],
-            "status": "completed",
-            "left": row["left_target"],
-            "right": row["right_target"],
-            "score": row["score"],
-            "summary": payload.get("summary"),
-            "evidence": payload.get("evidence_items", []),
-            "top_paths": payload.get("top_paths", []),
-            "match_count": row["match_count"],
-        }
-        items.append(item)
-        if row["scope"] == "within_case":
-            within_case.append(item)
-        else:
-            historical.append(item)
+        left = row["left_target"]
+        right = row["right_target"]
+        is_seed_pair = (left in seed_set and right in seed_set)
+        evidence_items = payload.get("evidence_items") or []
+        evidence_counts: dict[str, int] = {}
+        for evidence in evidence_items:
+            category = str(evidence.get("category") or "Other")
+            evidence_counts[category] = evidence_counts.get(category, 0) + 1
+        top_evidence = [
+            _slim_evidence_item(evidence)
+            for evidence in sorted(evidence_items, key=_evidence_rank)[:TOP_EVIDENCE_LIMIT]
+        ]
+        items.append(
+            {
+                "id": row["id"],
+                "scope": row["scope"],
+                "status": "completed",
+                "left": left,
+                "right": right,
+                "score": row["score"],
+                "summary": payload.get("summary"),
+                "evidence": top_evidence,
+                "evidence_count": len(evidence_items),
+                "evidence_counts": evidence_counts,
+                "top_paths": payload.get("top_paths", []),
+                "match_count": row["match_count"],
+                "is_seed_pair": is_seed_pair,
+            }
+        )
     return {
         "pairs": items,
-        "within_case": within_case,
-        "historical": historical,
+        "seed_targets": sorted(seed_set),
     }
 
 

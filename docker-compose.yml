@@ -1,4 +1,27 @@
 services:
+  # Optional VPN egress for outbound provider traffic (rate-limit bypass).
+  # Only started with: docker compose --profile vpn up
+  # Then set OUTBOUND_PROXY_URL=http://vpn:8888 (e.g. in .env) so ip-intel
+  # routes provider HTTP calls through gluetun's built-in HTTP proxy.
+  vpn:
+    image: qmcgaw/gluetun
+    profiles: ["vpn"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      # VPN credentials/config come from .env — see gluetun docs for your provider.
+      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER:-}
+      VPN_TYPE: ${VPN_TYPE:-wireguard}
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:-}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES:-}
+      # Built-in HTTP proxy, reachable on the compose network as vpn:8888.
+      HTTPPROXY: "on"
+      HTTPPROXY_LISTENING_ADDRESS: ":8888"
+    restart: unless-stopped
+
   postgres:
     image: postgres:16
     environment:
@@ -23,6 +46,9 @@ services:
     environment:
       DATABASE_URL: postgresql://ip_intel:ip_intel@postgres:5432/ip_intel
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:9000}
+      # With the `vpn` profile active, set OUTBOUND_PROXY_URL=http://vpn:8888
+      # to route outbound provider HTTP calls through the VPN. Empty = direct.
+      OUTBOUND_PROXY_URL: ${OUTBOUND_PROXY_URL:-}
     volumes:
       - ./data:/app/data
     depends_on:

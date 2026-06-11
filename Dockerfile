@@ -34,8 +34,14 @@ COPY pyproject.toml uv.lock ./
 RUN uv pip install --system --no-cache -r pyproject.toml
 
 # Copy application code
-COPY app.py case_app.py case_runtime.py case_store.py analysis_service.py evidence_meta.py ./
-COPY basic.py check.py cluster.py ip_intel.py intel_db.py opencti_ingest.py mattermost_alerts.py signal_dns.py signal_transport.py signal_web.py ./
+COPY app.py ./
+COPY sources ./sources
+COPY core ./core
+COPY cases ./cases
+COPY utils ./utils
+COPY db ./db
+COPY integrations ./integrations
+COPY scripts ./scripts
 COPY config ./config
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 

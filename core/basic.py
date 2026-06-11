@@ -33,6 +33,8 @@ from cryptography.x509.oid import NameOID
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from utils.outbound import requests_kwargs
+
 load_dotenv()
 
 # Paramiko's background threads love to dump full tracebacks to stderr when
@@ -106,35 +108,40 @@ def resolve_ips(hostname: str) -> list[str]:
 # ── Services ──────────────────────────────────────────────────────────────────
 
 def get_dns(domain: str) -> dict:
-    """Resolve A, AAAA, MX, NS, TXT, SOA, CNAME, CAA records."""
-    resolver = dns.resolver.Resolver()
-    resolver.timeout  = 5
-    resolver.lifetime = 10
-    out: dict = {}
-    for rtype in ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA"):
+    """Resolve A, AAAA, MX, NS, TXT, SOA, CNAME, CAA records (parallel lookups)."""
+
+    def _resolve_one(rtype: str) -> tuple[str, object]:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout  = 5
+        resolver.lifetime = 10
         try:
             answers = resolver.resolve(domain, rtype)
             if rtype == "MX":
-                out[rtype] = [
+                return rtype, [
                     {"preference": r.preference, "exchange": str(r.exchange).rstrip(".")}
                     for r in answers
                 ]
-            elif rtype == "SOA":
+            if rtype == "SOA":
                 r = answers[0]
-                out[rtype] = {
+                return rtype, {
                     "mname":  str(r.mname).rstrip("."),
                     "rname":  str(r.rname).rstrip("."),
                     "serial": int(r.serial),
                 }
-            elif rtype == "TXT":
-                out[rtype] = [
+            if rtype == "TXT":
+                return rtype, [
                     b"".join(r.strings).decode("utf-8", errors="replace")
                     for r in answers
                 ]
-            else:
-                out[rtype] = [str(r).rstrip(".") for r in answers]
+            return rtype, [str(r).rstrip(".") for r in answers]
         except Exception:
-            out[rtype] = []
+            return rtype, []
+
+    rtypes = ("A", "AAAA", "CAA", "CNAME", "MX", "NS", "TXT", "SOA")
+    out: dict = {}
+    with ThreadPoolExecutor(max_workers=len(rtypes)) as ex:
+        for rtype, value in ex.map(_resolve_one, rtypes):
+            out[rtype] = value
     log_ok(f"DNS: A={len(out.get('A', []))} AAAA={len(out.get('AAAA', []))} "
            f"MX={len(out.get('MX', []))} NS={len(out.get('NS', []))}")
     return out
@@ -171,17 +178,23 @@ def get_whois(domain: str) -> dict:
 
 
 def get_crt_sh(domain: str) -> dict:
-    """Subdomains + issuers + cert metadata from crt.sh."""
+    """Subdomains + issuers + cert metadata from crt.sh.
+
+    Falls back to Cert Spotter (get_certspotter) when crt.sh errors, times
+    out, or rate-limits. A legitimate zero-cert crt.sh response does NOT
+    trigger the fallback.
+    """
     try:
         resp = requests.get(
             "https://crt.sh/",
             params={"q": domain, "output": "json"},
             headers={"Accept": "application/json"},
             timeout=20,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
-            log_warn(f"crt.sh HTTP {resp.status_code}")
-            return {"error": f"HTTP {resp.status_code}"}
+            log_warn(f"crt.sh HTTP {resp.status_code} — falling back to Cert Spotter")
+            return get_certspotter(domain)
 
         entries = resp.json()
         subdomains: set[str] = set()
@@ -225,10 +238,118 @@ def get_crt_sh(domain: str) -> dict:
             "subdomains":  sorted(subdomains),
             "issuers":     sorted(issuers),
             "certs":       certs,
+            "source":      "crt.sh",
         }
     except Exception as exc:
-        log_warn(f"crt.sh failed: {exc}")
-        return {"error": str(exc)}
+        log_warn(f"crt.sh failed ({exc}) — falling back to Cert Spotter")
+        return get_certspotter(domain)
+
+
+CERTSPOTTER_API_URL   = "https://api.certspotter.com/v1/issuances"
+CERTSPOTTER_MAX_PAGES = 20  # pagination safety cap (free tier ≈ 100 queries/hour)
+
+
+def get_certspotter(domain: str) -> dict:
+    """Subdomains + issuers + cert metadata from Cert Spotter — the free CT
+    fallback used when crt.sh is down or rate-limiting.
+
+    No API key needed; set CERTSPOTTER_API_KEY (sent as a Bearer token) to
+    raise the rate limit. Paginates via the ``after`` parameter and normalizes
+    into the exact get_crt_sh() result shape.
+    """
+    try:
+        headers = {"Accept": "application/json"}
+        api_key = os.environ.get("CERTSPOTTER_API_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        issuances: list[dict] = []
+        after: str | None = None
+        for _ in range(CERTSPOTTER_MAX_PAGES):
+            params: dict = {
+                "domain":             domain,
+                "include_subdomains": "true",
+                "expand":             ["dns_names", "issuer", "cert"],
+            }
+            if after is not None:
+                params["after"] = after
+            resp = requests.get(
+                CERTSPOTTER_API_URL,
+                params=params,
+                headers=headers,
+                timeout=20,
+                **requests_kwargs(),
+            )
+            if resp.status_code != 200:
+                if issuances:
+                    break  # keep the pages we already collected
+                log_warn(f"Cert Spotter HTTP {resp.status_code}")
+                return {"error": f"HTTP {resp.status_code}", "source": "certspotter"}
+            page = resp.json()
+            if not isinstance(page, list) or not page:
+                break
+            issuances.extend(e for e in page if isinstance(e, dict))
+            last_id = page[-1].get("id") if isinstance(page[-1], dict) else None
+            if not last_id:
+                break
+            after = str(last_id)
+
+        subdomains: set[str] = set()
+        issuers:    set[str] = set()
+        certs = []
+        seen_ids: set = set()
+
+        for entry in issuances:
+            cid = entry.get("id")
+            try:
+                cid = int(cid)
+            except (TypeError, ValueError):
+                pass
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+
+            issuer = entry.get("issuer")
+            if isinstance(issuer, dict):
+                issuer_name = issuer.get("name") or issuer.get("friendly_name") or ""
+            else:
+                issuer_name = str(issuer or "")
+            m = re.search(r"CN=([^,]+)", issuer_name)
+            issuer_cn = m.group(1).strip() if m else issuer_name
+            if issuer_cn:
+                issuers.add(issuer_cn)
+
+            sans = []
+            for name in entry.get("dns_names") or []:
+                if not isinstance(name, str):
+                    continue
+                name = name.strip().lstrip("*.").lower()
+                if not name:
+                    continue
+                sans.append(name)
+                if name.endswith(f".{domain}") and name != domain:
+                    subdomains.add(name)
+
+            certs.append({
+                "id":         cid,
+                "issuer":     issuer_cn,
+                "not_before": entry.get("not_before"),
+                "not_after":  entry.get("not_after"),
+                "sans":       sorted(set(sans)),
+            })
+
+        log_ok(f"Cert Spotter: {len(certs)} certs, {len(subdomains)} subdomains, "
+               f"{len(issuers)} issuers")
+        return {
+            "total_certs": len(certs),
+            "subdomains":  sorted(subdomains),
+            "issuers":     sorted(issuers),
+            "certs":       certs,
+            "source":      "certspotter",
+        }
+    except Exception as exc:
+        log_warn(f"Cert Spotter failed: {exc}")
+        return {"error": str(exc), "source": "certspotter"}
 
 
 def get_circl_pdns(domain: str) -> dict:
@@ -238,6 +359,7 @@ def get_circl_pdns(domain: str) -> dict:
             f"https://www.circl.lu/pdns/query/{domain}",
             headers={"Accept": "application/json"},
             timeout=15,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             log_warn(f"CIRCL pDNS HTTP {resp.status_code}")
@@ -276,6 +398,7 @@ def get_hackertarget(domain: str) -> dict:
             "https://api.hackertarget.com/hostsearch/",
             params={"q": domain},
             timeout=15,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             return {"hits": [], "error": f"HTTP {resp.status_code}"}
@@ -314,6 +437,7 @@ def _fetch_urlscan_referrers(uuid: str, domain: str, timeout: float = 15.0) -> d
             f"https://urlscan.io/api/v1/result/{uuid}/",
             headers={"User-Agent": "ip-intel/1.0"},
             timeout=timeout,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             out["error"] = f"HTTP {resp.status_code}"
@@ -353,6 +477,7 @@ def get_urlscan(domain: str) -> dict:
             params={"q": f"domain:{domain}", "size": "100"},
             headers={"User-Agent": "ip-intel/1.0"},
             timeout=15,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             return {"hits": [], "error": f"HTTP {resp.status_code}"}
@@ -511,7 +636,8 @@ def get_page_metadata(domain: str) -> dict:
     # Try HTTPS with normal verification first.
     try:
         resp = requests.get(f"https://{domain}", headers=headers,
-                            timeout=15, allow_redirects=True)
+                            timeout=15, allow_redirects=True,
+                            **requests_kwargs())
         html = resp.text
     except Exception as exc:
         last_err = str(exc)
@@ -527,7 +653,8 @@ def get_page_metadata(domain: str) -> dict:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             resp = requests.get(f"https://{domain}", headers=headers,
-                                timeout=15, allow_redirects=True, verify=False)
+                                timeout=15, allow_redirects=True, verify=False,
+                                **requests_kwargs())
             html = resp.text
             out["fetched_insecure"] = True
             log_warn(f"page_metadata: {domain} has broken TLS — fetched anyway")
@@ -538,7 +665,8 @@ def get_page_metadata(domain: str) -> dict:
     if html is None:
         try:
             resp = requests.get(f"http://{domain}", headers=headers,
-                                timeout=15, allow_redirects=True)
+                                timeout=15, allow_redirects=True,
+                                **requests_kwargs())
             html = resp.text
             out["fetched_http"] = True
             log_warn(f"page_metadata: {domain} fell back to plain HTTP")
@@ -756,18 +884,24 @@ def pick_followup_subdomains(results: dict, limit: int = FOLLOWUP_LIMIT) -> list
         low = name.lower()
         return -sum(1 for p in priority if p in low)  # lower score = higher priority
 
-    candidates: list[str] = []
     ordered = sorted(subs, key=score)
     if not ordered:
         return []
-    log_info(f"screening {min(len(ordered), 30)} subdomain(s) for origin leaks")
-    for sub in ordered[:30]:  # cap DNS lookups
-        if len(candidates) >= limit:
-            break
-        ips = resolve_ips(sub)
-        if any(not is_cloudflare_ip(ip) for ip in ips):
-            candidates.append(sub)
-    return candidates
+    to_probe = ordered[:30]
+    log_info(f"screening {len(to_probe)} subdomain(s) for origin leaks")
+    hits: set[str] = set()
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(resolve_ips, sub): sub for sub in to_probe}
+        for fut in as_completed(futures):
+            sub = futures[fut]
+            try:
+                ips = fut.result()
+            except Exception:
+                ips = []
+            if any(not is_cloudflare_ip(ip) for ip in ips):
+                hits.add(sub)
+    candidates = [s for s in to_probe if s in hits]
+    return candidates[:limit]
 
 
 def _apex(hostname: str) -> str:
@@ -993,6 +1127,7 @@ def get_live_probe(domain: str) -> dict:
             headers=headers_req,
             timeout=10,
             allow_redirects=True,
+            **requests_kwargs(),
         )
         # Some servers lie about HEAD — accept but treat 405/501 as "retry GET".
         if resp.status_code in (405, 501):
@@ -1005,6 +1140,7 @@ def get_live_probe(domain: str) -> dict:
                 timeout=15,
                 allow_redirects=True,
                 stream=True,  # don't pull the body — headers are enough
+                **requests_kwargs(),
             )
         except Exception as exc:
             # One more try on plain HTTP.
@@ -1015,6 +1151,7 @@ def get_live_probe(domain: str) -> dict:
                     timeout=15,
                     allow_redirects=True,
                     stream=True,
+                    **requests_kwargs(),
                 )
             except Exception as exc2:
                 out["fetch_error"] = str(exc2)
@@ -1515,7 +1652,7 @@ def run_batch(csv_path: Path, out_dir: Path, *,
     print()
     log_info("running pairwise comparison across all scans...")
     try:
-        from check import compare_directory
+        from utils.check import compare_directory
         compare_directory(scans_dir, out_dir / "overlaps")
     except ImportError:
         log_warn("check.py not importable — run it manually with:")
@@ -1723,7 +1860,7 @@ def run_dive_round(scans_dir: Path, out_dir: Path, *,
     print()
     log_info("dive done — re-running pairwise comparison with dive results included...")
     try:
-        from check import compare_directory
+        from utils.check import compare_directory
         compare_directory(scans_dir, overlap_dir)
     except ImportError:
         log_warn("check.py not importable — run it manually")
@@ -1784,6 +1921,7 @@ def hackertarget_reverse_ip(ip: str) -> list[str]:
             "https://api.hackertarget.com/reverseiplookup/",
             params={"q": ip},
             timeout=15,
+            **requests_kwargs(),
         )
         if resp.status_code != 200:
             return []

@@ -7,10 +7,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-import basic
-import ip_intel
-import signal_dns
-import signal_web
+from core import basic
+from core import ip_intel
+from sources import signal_dns
+from sources import signal_web
 
 
 StageLogger = Callable[[str, str], None]

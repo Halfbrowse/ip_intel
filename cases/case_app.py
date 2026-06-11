@@ -1,32 +1,52 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from case_runtime import CaseRuntime, build_case_response, build_job_response, build_pairs_response, parse_submission
-from case_store import get_case, get_cluster, get_job, get_pairing, healthcheck, init_db, list_cases
-from evidence_meta import evidence_catalog
+from cases.case_runtime import CaseRuntime, build_case_response, build_job_response, build_pairs_response, parse_submission
+from cases.case_store import get_case, get_cluster, get_job, get_pairing, healthcheck, init_db, list_cases, load_case_inputs
+from utils.evidence_meta import evidence_catalog
 
 
 BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
+FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 runtime = CaseRuntime()
 LOGGER = logging.getLogger("ip_intel.case_app")
+
+
+_CRT_SH_RETRY_INTERVAL = 300  # seconds between retry sweeps
+
+
+async def _crt_sh_retry_loop() -> None:
+    while True:
+        await asyncio.sleep(_CRT_SH_RETRY_INTERVAL)
+        try:
+            updated = await asyncio.to_thread(runtime.retry_crt_sh_pending)
+            if updated:
+                LOGGER.info("crt.sh retry: updated %d run(s)", updated)
+        except Exception as exc:
+            LOGGER.warning("crt.sh retry sweep failed: %s", exc)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
     runtime.recover()
+    retry_task = asyncio.create_task(_crt_sh_retry_loop())
     yield
+    retry_task.cancel()
 
 
 app = FastAPI(title="IP Intel", lifespan=lifespan)
@@ -37,6 +57,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+def _etag_json_response(request: Request, content: Any) -> Response:
+    """
+    Serialize `content` to JSON, attach a strong ETag (hash of the body), and
+    answer with 304 Not Modified when the client already holds this version.
+    """
+    body = json.dumps(jsonable_encoder(content), separators=(",", ":")).encode("utf-8")
+    etag = f'"{hashlib.sha256(body).hexdigest()}"'
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match:
+        client_tags = {tag.strip() for tag in if_none_match.split(",")}
+        if etag in client_tags or f"W/{etag}" in client_tags or "*" in client_tags:
+            return Response(status_code=304, headers={"ETag": etag})
+    return Response(content=body, media_type="application/json", headers={"ETag": etag})
+
 
 @app.get("/api/health")
 def api_health() -> dict[str, Any]:
@@ -49,8 +86,11 @@ def api_evidence_meta() -> dict[str, Any]:
 
 
 @app.get("/api/cases")
-def api_list_cases() -> dict[str, Any]:
-    return {"cases": [build_case_response(row) for row in list_cases()]}
+def api_list_cases(request: Request) -> Response:
+    return _etag_json_response(
+        request,
+        {"cases": [build_case_response(row) for row in list_cases()]},
+    )
 
 
 @app.post("/api/cases")
@@ -93,11 +133,11 @@ async def api_create_case(request: Request) -> JSONResponse:
 
 
 @app.get("/api/cases/{case_id}")
-def api_get_case(case_id: str) -> dict[str, Any]:
+def api_get_case(case_id: str, request: Request) -> Response:
     case_row = get_case(case_id)
     if case_row is None:
         raise HTTPException(status_code=404, detail="Case not found.")
-    return {"case": build_case_response(case_row)}
+    return _etag_json_response(request, {"case": build_case_response(case_row)})
 
 
 @app.get("/api/jobs/{job_id}")
@@ -109,11 +149,11 @@ def api_get_job(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/cases/{case_id}/pairs")
-def api_get_case_pairs(case_id: str) -> dict[str, Any]:
+def api_get_case_pairs(case_id: str, request: Request) -> Response:
     case_row = get_case(case_id)
     if case_row is None:
         raise HTTPException(status_code=404, detail="Case not found.")
-    return build_pairs_response(case_id)
+    return _etag_json_response(request, build_pairs_response(case_id))
 
 
 @app.get("/api/cases/{case_id}/pairs/{pair_id}")
@@ -153,6 +193,12 @@ def api_get_clusters(case_id: str) -> dict[str, Any]:
     payload = dict(cluster_row.get("payload") or {})
     payload["graph"] = cluster_row.get("graph_payload") or {}
     payload["threshold"] = cluster_row.get("threshold")
+    case_inputs = load_case_inputs(case_id)
+    payload["seed_targets"] = [
+        inp["normalized_target"]
+        for inp in case_inputs
+        if inp.get("normalized_target") and inp.get("is_seed")
+    ]
     return payload
 
 

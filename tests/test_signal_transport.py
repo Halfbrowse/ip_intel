@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from signal_transport import parse_certificate_der
+from sources.signal_transport import parse_certificate_der
 
 
 def _make_cert() -> bytes:

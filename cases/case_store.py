@@ -499,6 +499,33 @@ def _replace_helper_rows(cur: psycopg.Cursor[Any], run_id: str, helpers: dict[st
         )
 
 
+def patch_search_run_payload(run_id: str, fields: dict[str, Any]) -> None:
+    """Merge fields into an existing search run's payload."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE search_runs SET payload = payload || %s WHERE id = %s",
+                (Jsonb(fields), run_id),
+            )
+        conn.commit()
+
+
+def get_pending_crt_sh_retries() -> list[dict[str, Any]]:
+    """Return search runs where crt.sh failed and has not yet been retried."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, normalized_target
+                FROM search_runs
+                WHERE payload->>'crt_sh_status' = 'pending_retry'
+                  AND status = 'completed'
+                ORDER BY created_at
+                """
+            )
+            return cur.fetchall()
+
+
 def list_search_runs(case_id: str, *, only_success: bool = False) -> list[dict[str, Any]]:
     query = """
         SELECT *

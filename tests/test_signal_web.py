@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from signal_web import (
+from sources.signal_web import (
     compute_favicon_hashes,
     extract_page_enrichment,
     find_favicon_urls,

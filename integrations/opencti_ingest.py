@@ -1,24 +1,28 @@
 """
-opencti_ingest.py - Pull Domain-Name observables from OpenCTI and run
-basic ip-intel analysis on each.
+opencti_ingest.py - Pull Domain-Name observables and Channel SDOs from
+OpenCTI and run basic ip-intel analysis on each derived domain.
 
 This worker is triggered manually through the API/UI. Configuration via env vars:
-  OPENCTI_URL    - e.g. https://opencti.example.com
-  OPENCTI_TOKEN  - API token with read access to observables
+  OPENCTI_URL              - e.g. https://opencti.example.com
+  OPENCTI_TOKEN            - API token with read access to observables
+  OPENCTI_INGEST_CHANNELS  - set to false/0/no/off to skip Channel SDOs (default: true)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit
 
-import ip_intel
-from intel_db import get_domains_with_source_errors
-from mattermost_alerts import send_opencti_notification, send_retry_notification
+from core import ip_intel
+from db.intel_db import get_domains_with_source_errors
+from integrations.email_alerts import send_opencti_email, send_retry_email
+from integrations.mattermost_alerts import send_opencti_notification, send_retry_notification
 from pycti import OpenCTIApiClient
 
 log = logging.getLogger("opencti_ingest")
@@ -52,6 +56,41 @@ log.addHandler(_status_handler)
 
 _INGEST_WORKERS = max(1, int(os.getenv("OPENCTI_INGEST_WORKERS", "3")))
 
+# Provenance labels for queue entries
+SOURCE_DOMAIN_OBSERVABLE = "domain-observable"
+SOURCE_CHANNEL = "channel"
+
+# Social-media platform domains - channels hosted on these are not
+# "non-social media channels" (per the project end goal), so they are skipped.
+_SOCIAL_MEDIA_DOMAINS = frozenset(
+    {
+        "discord.com",
+        "discord.gg",
+        "facebook.com",
+        "fb.com",
+        "instagram.com",
+        "linkedin.com",
+        "ok.ru",
+        "odnoklassniki.ru",
+        "reddit.com",
+        "rumble.com",
+        "t.me",
+        "telegram.me",
+        "telegram.org",
+        "threads.net",
+        "tiktok.com",
+        "twitch.tv",
+        "twitter.com",
+        "vk.com",
+        "whatsapp.com",
+        "x.com",
+        "youtu.be",
+        "youtube.com",
+    }
+)
+
+_DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}$")
+
 _started = False
 _start_lock = threading.Lock()
 _retry_lock = threading.Lock()
@@ -69,6 +108,7 @@ _status: dict = {
     "skipped": 0,
     "current": None,
     "last_error": None,
+    "sources": {},
     "logs": [],
 }
 
@@ -133,6 +173,7 @@ def retry_source_errors(source: str | None = None) -> int:
         if not domains:
             log.info("No domains with source errors to retry")
             send_retry_notification("completed", {"source": source, "retried": 0})
+            send_retry_email("completed", {"source": source, "retried": 0})
             return 0
 
         label = source or "any"
@@ -148,10 +189,12 @@ def retry_source_errors(source: str | None = None) -> int:
 
         log.info("Retry complete - %d domains reanalysed", len(domains))
         send_retry_notification("completed", {"source": source, "retried": len(domains), "last_error": last_error})
+        send_retry_email("completed", {"source": source, "retried": len(domains), "last_error": last_error})
         return len(domains)
     except Exception as exc:
         last_error = str(exc)
         send_retry_notification("failed", {"source": source, "retried": 0, "last_error": last_error})
+        send_retry_email("failed", {"source": source, "retried": 0, "last_error": last_error})
         raise
     finally:
         with _retry_lock:
@@ -198,6 +241,145 @@ def _get_domains() -> list[str]:
         return []
 
 
+def _channels_enabled() -> bool:
+    """Channel SDO ingestion toggle - OPENCTI_INGEST_CHANNELS, default true."""
+    return os.getenv("OPENCTI_INGEST_CHANNELS", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _normalize_domain(text: object) -> str | None:
+    """
+    Normalize a free-text candidate (bare domain, host/path, or full URL) to a
+    bare registrable domain: strip scheme, path, port, and a leading "www.".
+    Returns None when the text does not parse as a domain.
+    """
+    value = str(text or "").strip().lower()
+    if not value:
+        return None
+    try:
+        if "://" in value:
+            host = urlsplit(value).hostname or ""
+        elif "/" in value:
+            host = urlsplit(f"//{value}").hostname or ""
+        else:
+            host = value
+    except ValueError:
+        return None
+    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host  # bare "host:port"
+    host = host.strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    if not _DOMAIN_RE.match(host):
+        return None
+    return host
+
+
+def _is_social_media_domain(domain: str) -> bool:
+    return any(domain == skip or domain.endswith(f".{skip}") for skip in _SOCIAL_MEDIA_DOMAINS)
+
+
+def _channel_candidate_domains(channel: dict) -> list[str]:
+    """
+    Extract candidate domains from one OpenCTI Channel SDO: from its name
+    and aliases (when they parse as a domain/URL) and from external
+    reference URLs. Social-media filtering happens in the caller.
+    """
+    texts: list[object] = [channel.get("name")]
+    for alias_key in ("aliases", "x_opencti_aliases"):
+        aliases = channel.get(alias_key)
+        if isinstance(aliases, (list, tuple)):
+            texts.extend(aliases)
+
+    refs = channel.get("externalReferences") or channel.get("external_references") or []
+    if isinstance(refs, dict):  # raw GraphQL edges shape
+        refs = [edge.get("node", edge) for edge in refs.get("edges") or [] if isinstance(edge, dict)]
+    for ref in refs:
+        if isinstance(ref, dict):
+            texts.append(ref.get("url"))
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        domain = _normalize_domain(text)
+        if domain and domain not in seen:
+            seen.add(domain)
+            candidates.append(domain)
+    return candidates
+
+
+def _get_channel_domains(exclude: set[str]) -> list[str]:
+    """
+    Fetch Channel SDOs (STIX 2.1 extension) from OpenCTI and return the
+    bare domains they resolve to, skipping social-media platform domains
+    and anything already present in `exclude` (the Domain-Name set).
+    """
+    url = os.getenv("OPENCTI_URL", "").strip()
+    token = os.getenv("OPENCTI_TOKEN", "").strip()
+    if not url or not token:
+        log.info("OPENCTI_URL or OPENCTI_TOKEN not set - skipping channel ingestion")
+        return []
+
+    try:
+        api = OpenCTIApiClient(url, token, log_level="error")
+        channel_api = getattr(api, "channel", None)
+        list_channels = getattr(channel_api, "list", None)
+        if not callable(list_channels):
+            log.warning("pycti channel API not available - continuing with domain observables only")
+            return []
+
+        log.info("Fetching Channel objects...")
+        channels = list_channels(getAll=True) or []
+
+        domains: list[str] = []
+        seen: set[str] = set(exclude)
+        skipped_social = 0
+        deduped = 0
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            name = channel.get("name")
+            for domain in _channel_candidate_domains(channel):
+                if _is_social_media_domain(domain):
+                    skipped_social += 1
+                    log.info("Skipping social-media domain %s (channel %r)", domain, name)
+                    continue
+                if domain in seen:
+                    deduped += 1
+                    log.info("Skipping duplicate domain %s (channel %r)", domain, name)
+                    continue
+                seen.add(domain)
+                domains.append(domain)
+        log.info(
+            "Fetched %d Channel objects from OpenCTI -> %d new domains (%d social-media skipped, %d duplicates)",
+            len(channels),
+            len(domains),
+            skipped_social,
+            deduped,
+        )
+        return domains
+    except Exception as exc:  # noqa: BLE001
+        log.error("OpenCTI channel fetch error: %s - continuing with domain observables only", exc)
+        return []
+
+
+def _build_queue() -> list[tuple[str, str]]:
+    """Build the analysis queue as (domain, source) pairs, deduped across sources."""
+    queue: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for domain in _get_domains():
+        if domain in seen:
+            continue
+        seen.add(domain)
+        queue.append((domain, SOURCE_DOMAIN_OBSERVABLE))
+
+    if _channels_enabled():
+        for domain in _get_channel_domains(seen):
+            seen.add(domain)
+            queue.append((domain, SOURCE_CHANNEL))
+    else:
+        log.info("Channel ingestion disabled via OPENCTI_INGEST_CHANNELS")
+    return queue
+
+
 def _run(force_reanalyse: bool = False) -> None:
     """Worker: fetch domains from OpenCTI and analyse each one."""
     global _ingest_running
@@ -221,13 +403,14 @@ def _run(force_reanalyse: bool = False) -> None:
             "current": None,
             "last_error": None,
             "mode": mode,
+            "sources": {},
             "logs": [],
         }
     )
 
     try:
         log.info("OpenCTI ingestion starting (force_reanalyse=%s)", force_reanalyse)
-        queue = _get_domains()
+        queue = _build_queue()
         if not queue:
             log.info("OpenCTI ingestion: nothing to do")
             return
@@ -237,24 +420,31 @@ def _run(force_reanalyse: bool = False) -> None:
         future_to_domain: dict = {}
         queue_index = 0
 
+        source_counts = {
+            SOURCE_DOMAIN_OBSERVABLE: sum(1 for _, source in queue if source == SOURCE_DOMAIN_OBSERVABLE),
+            SOURCE_CHANNEL: sum(1 for _, source in queue if source == SOURCE_CHANNEL),
+        }
         log.info(
-            "Queueing %d OpenCTI domains with %d worker(s) (DB skip filter disabled)",
+            "Queueing %d OpenCTI domains (%d from domain observables, %d from channels) "
+            "with %d worker(s) (DB skip filter disabled)",
             len(queue),
+            source_counts[SOURCE_DOMAIN_OBSERVABLE],
+            source_counts[SOURCE_CHANNEL],
             worker_count,
         )
-        _status.update({"total": len(queue), "skipped": 0})
+        _status.update({"total": len(queue), "skipped": 0, "sources": dict(source_counts)})
 
         def submit_next(executor: ThreadPoolExecutor) -> bool:
             nonlocal queue_index
             if queue_index >= len(queue):
                 return False
-            domain = queue[queue_index]
+            domain, source = queue[queue_index]
             queue_index += 1
             future = executor.submit(_analyze_opencti_domain, domain)
-            future_to_domain[future] = domain
+            future_to_domain[future] = (domain, source)
             active_domains.add(domain)
             _status["current"] = _format_current_domains(active_domains)
-            log.info("[queued %d/%d] %s", queue_index, len(queue), domain)
+            log.info("[queued %d/%d] %s (source=%s)", queue_index, len(queue), domain, source)
             return True
 
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="opencti-domain") as executor:
@@ -264,7 +454,7 @@ def _run(force_reanalyse: bool = False) -> None:
 
             while future_to_domain:
                 completed = next(as_completed(tuple(future_to_domain)))
-                domain = future_to_domain.pop(completed)
+                domain, source = future_to_domain.pop(completed)
                 active_domains.discard(domain)
                 _status["done"] += 1
 
@@ -275,7 +465,7 @@ def _run(force_reanalyse: bool = False) -> None:
                     error = str(exc)
 
                 if error:
-                    log.error("Error on %s - %s", completed_domain, error)
+                    log.error("Error on %s (source=%s) - %s", completed_domain, source, error)
                     _status["last_error"] = f"{completed_domain}: {error}"
 
                 submit_next(executor)
@@ -290,19 +480,29 @@ def _run(force_reanalyse: bool = False) -> None:
         log.exception("OpenCTI ingestion failed")
     finally:
         _status.update({"running": False, "completed_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-        send_opencti_notification(
-            "failed" if fatal_error else ("completed_with_errors" if _status.get("last_error") else "completed"),
-            {
-                "mode": _status.get("mode"),
-                "done": _status.get("done", 0),
-                "total": _status.get("total", 0),
-                "skipped": _status.get("skipped", 0),
-                "started_at": _status.get("started_at"),
-                "completed_at": _status.get("completed_at"),
-                "last_error": _status.get("last_error"),
-                "note": "No domains to ingest." if _status.get("total", 0) == 0 and not fatal_error else None,
-            },
-        )
+        notification_status = "failed" if fatal_error else ("completed_with_errors" if _status.get("last_error") else "completed")
+        source_counts = _status.get("sources") or {}
+        note_parts = []
+        if _status.get("total", 0) == 0 and not fatal_error:
+            note_parts.append("No domains to ingest.")
+        if any(source_counts.values()):
+            note_parts.append(
+                f"Sources: {source_counts.get(SOURCE_DOMAIN_OBSERVABLE, 0)} {SOURCE_DOMAIN_OBSERVABLE}, "
+                f"{source_counts.get(SOURCE_CHANNEL, 0)} {SOURCE_CHANNEL}."
+            )
+        notification_details = {
+            "mode": _status.get("mode"),
+            "done": _status.get("done", 0),
+            "total": _status.get("total", 0),
+            "skipped": _status.get("skipped", 0),
+            "sources": dict(source_counts),
+            "started_at": _status.get("started_at"),
+            "completed_at": _status.get("completed_at"),
+            "last_error": _status.get("last_error"),
+            "note": " ".join(note_parts) if note_parts else None,
+        }
+        send_opencti_notification(notification_status, notification_details)
+        send_opencti_email(notification_status, notification_details)
         with _ingest_lock:
             _ingest_running = False
 

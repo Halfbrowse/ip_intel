@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export function useApi(path, options = {}) {
   const { enabled = true, pollInterval = 0 } = options;
@@ -8,20 +8,43 @@ export function useApi(path, options = {}) {
     loading: Boolean(path && enabled),
   });
   const [requestVersion, setRequestVersion] = useState(0);
+  const loadRef = useRef(null);
 
   useEffect(() => {
     if (!path || !enabled) {
       setState({ data: null, error: null, loading: false });
+      loadRef.current = null;
       return undefined;
     }
 
     let active = true;
-    let timerId = null;
     let requestSequence = 0;
+    let inFlight = false;
+    // Cheap change detection: keep the raw response text and the ETag from
+    // the last successful fetch. Polls send If-None-Match (a 304 costs almost
+    // nothing on the wire) and the body is only parsed when it changed.
+    let lastBodyText = null;
+    let lastEtag = null;
+
+    const keepCurrent = (previous) => {
+      if (previous.error === null && previous.loading === false) {
+        return previous;
+      }
+      return { data: previous.data, error: null, loading: false };
+    };
 
     const load = async (reset = false) => {
-      const currentRequest = requestSequence + 1;
-      requestSequence = currentRequest;
+      if (inFlight && !reset) {
+        // A previous poll is still running; skip this tick instead of piling
+        // up overlapping requests.
+        return;
+      }
+      const currentRequest = ++requestSequence;
+      inFlight = true;
+      if (reset) {
+        lastBodyText = null;
+        lastEtag = null;
+      }
 
       setState((previous) => ({
         data: reset ? null : previous.data,
@@ -30,12 +53,47 @@ export function useApi(path, options = {}) {
       }));
 
       try {
-        const data = await fetchJson(path);
+        const headers = { Accept: "application/json" };
+        if (lastEtag) {
+          headers["If-None-Match"] = lastEtag;
+        }
+        const response = await fetch(path, { headers });
 
         if (!active || currentRequest !== requestSequence) {
           return;
         }
 
+        if (response.status === 304) {
+          // Unchanged since the last poll; keep the data we already have.
+          setState(keepCurrent);
+          return;
+        }
+
+        const text = response.status === 204 ? "" : await response.text();
+
+        if (!active || currentRequest !== requestSequence) {
+          return;
+        }
+
+        if (!response.ok) {
+          const payload = parseTextPayload(text);
+          const message =
+            (payload &&
+              typeof payload === "object" &&
+              (payload.detail || payload.message || payload.error)) ||
+            `Request failed with status ${response.status}`;
+          throw new Error(String(message));
+        }
+
+        lastEtag = response.headers.get("etag");
+
+        if (lastBodyText !== null && text === lastBodyText) {
+          setState(keepCurrent);
+          return;
+        }
+
+        lastBodyText = text;
+        const data = parseTextPayload(text);
         setState({ data, error: null, loading: false });
       } catch (error) {
         if (!active || currentRequest !== requestSequence) {
@@ -47,22 +105,50 @@ export function useApi(path, options = {}) {
           error: error.message || "Request failed.",
           loading: false,
         }));
+      } finally {
+        if (currentRequest === requestSequence) {
+          inFlight = false;
+        }
       }
     };
 
+    loadRef.current = load;
     load(true);
-
-    if (pollInterval > 0) {
-      timerId = window.setInterval(() => {
-        load(false);
-      }, pollInterval);
-    }
 
     return () => {
       active = false;
-      if (timerId) {
-        window.clearInterval(timerId);
+      if (loadRef.current === load) {
+        loadRef.current = null;
       }
+    };
+  }, [enabled, path, requestVersion]);
+
+  // Polling lives in its own effect so that turning it on or off (for example
+  // when a job finishes) does not reset the data that is already loaded.
+  useEffect(() => {
+    if (!path || !enabled || !(pollInterval > 0)) {
+      return undefined;
+    }
+
+    const timerId = window.setInterval(() => {
+      // Skip background work while the tab is hidden.
+      if (document.hidden) {
+        return;
+      }
+      loadRef.current?.(false);
+    }, pollInterval);
+
+    const handleVisibility = () => {
+      // Refresh immediately when the tab becomes visible again.
+      if (!document.hidden) {
+        loadRef.current?.(false);
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      window.clearInterval(timerId);
+      document.removeEventListener("visibilitychange", handleVisibility);
     };
   }, [enabled, path, pollInterval, requestVersion]);
 
@@ -72,6 +158,18 @@ export function useApi(path, options = {}) {
       setRequestVersion((version) => version + 1);
     },
   };
+}
+
+function parseTextPayload(text) {
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 export async function fetchJson(path) {
@@ -354,6 +452,10 @@ function normalizePairItem(item, index) {
     ),
     updatedAt: pickFirst(raw, ["updated_at", "updatedAt", "modified_at", "modifiedAt"]),
     evidence,
+    evidenceCount:
+      pickFirst(raw, ["evidence_count", "evidenceCount"], null) ?? evidence.length,
+    evidenceCounts: raw.evidence_counts || raw.evidenceCounts || null,
+    isSeedPair: Boolean(raw.is_seed_pair),
   };
 }
 
@@ -520,7 +622,7 @@ function readableValue(value) {
 
   if (typeof value === "object") {
     return (
-      pickFirst(value, ["label", "name", "title", "target", "domain", "value", "id"]) ||
+      pickFirst(value, ["label", "name", "title", "target", "domain", "ip", "value", "id"]) ||
       JSON.stringify(value)
     );
   }
