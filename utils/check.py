@@ -362,7 +362,12 @@ MATCH_WEIGHTS: dict[str, int] = {
     "tls_certs.probes[*].fingerprint_sha256":     100,
     "ssh_host_keys.probes[*].fingerprint_sha256":  90,
     "tls_certs.probes[*].cn":                      40,
-    "non_cf_ips":                                  30,
+    # A shared *non-proxied* IP is a shared origin box — both domains terminate
+    # on the same physical server, not just the same CDN edge. That's far
+    # stronger than a shared Cloudflare/anycast address (which we filter out
+    # entirely) or a plain dns.A record that may itself be a proxy front, so it
+    # sits just below the crypto-fingerprint tier.
+    "non_cf_ips":                                  50,
     "dns.A":                                       25,
     "dns.AAAA":                                    25,
     "hackertarget.hits[*].ip":                     20,
@@ -407,6 +412,104 @@ MATCH_WEIGHTS: dict[str, int] = {
     "well_known.ads_txt_publishers":               18,
     "nameserver_analysis.vanity_apexes":           12,
 }
+
+
+# Subdomain labels that virtually every domain has. Two unrelated sites both
+# having `www`, `mail`, or `cpanel` says nothing — those are mandated by
+# protocols, mail clients, or hosting panels. The forensic signal is in the
+# *non-default* labels two domains share (e.g. both run `grafana`, `gitlab-ci`,
+# `vault`, `staging-old`): a reused private naming convention points at one
+# operator standing up the same internal services behind both apexes.
+_COMMON_SUBDOMAIN_LABELS = {
+    "www", "www2", "m", "mobile", "web",
+    "mail", "mail2", "webmail", "smtp", "smtps", "imap", "imaps", "pop",
+    "pop3", "mx", "mx1", "mx2", "email", "relay", "mailrelay",
+    "ns", "ns1", "ns2", "ns3", "ns4", "dns", "dns1", "dns2",
+    "ftp", "sftp", "ftps",
+    "cpanel", "whm", "webdisk", "webmail", "cpcalendars", "cpcontacts",
+    "autodiscover", "autoconfig", "_domainkey", "_dmarc", "_acme-challenge",
+    "cdn", "static", "assets", "img", "images", "media", "files",
+    "localhost", "default", "vpn", "remote",
+}
+
+
+def _apex_of(domain: str) -> str:
+    """Best-effort registrable apex — last two labels. Good enough for stripping
+    a known scan domain off its own subdomains."""
+    domain = (domain or "").strip().lower().lstrip(".")
+    parts = domain.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+
+def _subdomain_labels(scan: dict) -> set[str]:
+    """
+    Collect the distinctive sub-labels a scan exposed for its own apex.
+
+    For a scan of `example.com` with subdomains `grafana.example.com` and
+    `ci.internal.example.com`, this yields {"grafana", "ci.internal"} — the
+    label prefix below the apex, with universal/boilerplate labels dropped.
+    Full FQDNs can never literally match across two different apexes, so we
+    compare the prefixes instead.
+    """
+    if not isinstance(scan, dict):
+        return set()
+    apex = _apex_of(scan.get("domain") or scan.get("input") or "")
+    if not apex:
+        return set()
+
+    hosts: set[str] = set()
+    hosts.update((scan.get("crt_sh") or {}).get("subdomains") or [])
+    for hit in ((scan.get("hackertarget") or {}).get("hits") or []):
+        if isinstance(hit, dict) and hit.get("subdomain"):
+            hosts.add(hit["subdomain"])
+
+    labels: set[str] = set()
+    suffix = "." + apex
+    for host in hosts:
+        if not isinstance(host, str):
+            continue
+        h = host.strip().lower().lstrip("*.").lstrip(".")
+        if not h.endswith(suffix):
+            continue
+        label = h[: -len(suffix)]
+        if not label or label in _COMMON_SUBDOMAIN_LABELS:
+            continue
+        # The leftmost label is what defines the service; ignore a bare wildcard.
+        if label.split(".")[0] in _COMMON_SUBDOMAIN_LABELS:
+            continue
+        labels.add(label)
+    return labels
+
+
+# Each distinctive shared label is worth this much, capped so a pair of domains
+# with huge CT histories can't run the score away on coincidental overlap.
+_SUBDOMAIN_LABEL_WEIGHT = 8
+_SUBDOMAIN_OVERLAP_CAP  = 40
+
+
+def analyze_subdomain_overlap(a: dict, b: dict) -> dict:
+    """
+    Two unrelated apexes that nonetheless expose the same set of non-default
+    subdomain labels are likely stood up by the same operator off one template
+    of internal services. Returns the shared labels and a capped weight.
+
+    {
+      "shared_labels": [...],     # sorted, distinctive labels common to both
+      "a_label_count": int,
+      "b_label_count": int,
+      "weight": int,              # contribution to the pair score
+    }
+    """
+    a_labels = _subdomain_labels(a)
+    b_labels = _subdomain_labels(b)
+    shared = sorted(a_labels & b_labels)
+    weight = min(len(shared) * _SUBDOMAIN_LABEL_WEIGHT, _SUBDOMAIN_OVERLAP_CAP)
+    return {
+        "shared_labels": shared,
+        "a_label_count": len(a_labels),
+        "b_label_count": len(b_labels),
+        "weight":        weight,
+    }
 
 
 def _cert_is_relevant(cert: dict, domain: str) -> bool:
@@ -605,7 +708,8 @@ def assess_freshness_context(a: dict, b: dict, matches: dict) -> dict:
 
 def score_matches(matches: dict, cross_refs: list[dict],
                   cert_quality: dict | None = None,
-                  freshness: dict | None = None) -> int:
+                  freshness: dict | None = None,
+                  subdomain_overlap: dict | None = None) -> int:
     """Sum weights for every matched path. Used to rank pairs."""
     total = 0
     cert_mult = (cert_quality or {}).get("weight_mult", 1.0)
@@ -645,6 +749,7 @@ def score_matches(matches: dict, cross_refs: list[dict],
             total += 50
         elif finding.get("relationship") == "both_third_party":
             total += 20
+    total += (subdomain_overlap or {}).get("weight", 0)
     return total
 
 
@@ -697,7 +802,8 @@ def compare_pair(a: dict, b: dict) -> dict:
     cross_refs   = analyze_urlscan_cross_referrers(a, b)
     cert_quality = assess_cert_match_quality(a, b)
     freshness    = assess_freshness_context(a, b, matches)
-    score        = score_matches(matches, cross_refs, cert_quality, freshness)
+    sub_overlap  = analyze_subdomain_overlap(a, b)
+    score        = score_matches(matches, cross_refs, cert_quality, freshness, sub_overlap)
     confidence   = confidence_from_score(score)
     return {
         "a_domain":           a.get("domain") or a.get("input"),
@@ -708,6 +814,7 @@ def compare_pair(a: dict, b: dict) -> dict:
         "match_count":        len(matches),
         "cert_quality":       cert_quality,
         "freshness":          freshness,
+        "subdomain_overlap":  sub_overlap,
         "matches":            matches,
         "urlscan_cross_refs": cross_refs,
     }
@@ -745,7 +852,9 @@ def compare_directory(scans_dir: Path, out_dir: Path) -> None:
 
     for a_domain, b_domain in itertools.combinations(sorted(scans), 2):
         pair = compare_pair(scans[a_domain], scans[b_domain])
-        if pair["match_count"] == 0 and not pair["urlscan_cross_refs"]:
+        if (pair["match_count"] == 0
+                and not pair["urlscan_cross_refs"]
+                and not pair["subdomain_overlap"]["shared_labels"]):
             continue  # no point writing an empty file
 
         pair_file = out_dir / f"{_safe(a_domain)}__vs__{_safe(b_domain)}.json"

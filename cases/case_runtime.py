@@ -644,7 +644,9 @@ def _pair_record(
     right: AnalysisRun,
 ) -> dict[str, Any] | None:
     pair = check.compare_pair(left.payload, right.payload)
-    if pair["match_count"] == 0 and not pair["urlscan_cross_refs"]:
+    if (pair["match_count"] == 0
+            and not pair["urlscan_cross_refs"]
+            and not (pair.get("subdomain_overlap") or {}).get("shared_labels")):
         return None
 
     left_target = pairing_label(left.payload)
@@ -724,6 +726,22 @@ def _pair_evidence(pair: dict[str, Any]) -> list[dict[str, Any]]:
                 "why_it_matters": "It can show embedding, shared referrers, or adjacent hosting history.",
                 "caveat": "Rendered-scan data needs manual review because edges and third-party content can add noise.",
                 "matched_values": [item],
+            }
+        )
+
+    shared_labels = (pair.get("subdomain_overlap") or {}).get("shared_labels") or []
+    if shared_labels:
+        evidence_items.append(
+            {
+                "id": "subdomain_overlap",
+                "type": "subdomain_overlap",
+                "label": "Shared subdomain naming",
+                "category": "Infrastructure",
+                "importance": "strong" if len(shared_labels) >= 4 else "supporting",
+                "description": "Both targets expose the same non-default subdomain labels under different apexes.",
+                "why_it_matters": "A reused private naming convention points at one operator standing up the same internal services behind each domain.",
+                "caveat": "Generic labels are filtered, but a small overlap can still be coincidental — weigh it alongside other signals.",
+                "matched_values": shared_labels,
             }
         )
     return evidence_items
