@@ -339,19 +339,26 @@ def fetch_website_channel_domains(limit: int = 100) -> list[str]:
     if not callable(list_channels):
         raise RuntimeError("pycti channel API is not available in this client version")
 
-    # Channels of type "website" only — `types=["website"]` filters server-side.
-    # Newest first and capped at `limit` gives "the last 100 created".
+    # Filter to channel_type == "website" SERVER-SIDE via a FilterGroup. NB:
+    # pycti's channel.list() ignores a `types=` kwarg (it only reads filters/
+    # first/orderBy/...), so the only way `first=limit` returns `limit`
+    # *website* channels — rather than `limit` channels of any type that we'd
+    # then whittle down — is to push the type filter into the query.
+    website_filter = {
+        "mode": "and",
+        "filters": [{"key": "channel_types", "values": ["website"], "operator": "eq", "mode": "or"}],
+        "filterGroups": [],
+    }
     try:
         channels = list_channels(
-            types=["website"],
+            filters=website_filter,
             first=limit,
             orderBy="created_at",
             orderMode="desc",
         ) or []
-    except Exception as exc:  # noqa: BLE001 - pycti order/first args drift between versions
-        log.warning("Ordered channel list failed (%s); fetching all website channels", exc)
-        channels = list_channels(types=["website"]) or []
-        # Order/cap locally when the server wouldn't.
+    except Exception as exc:  # noqa: BLE001 - guard against schema/arg drift
+        log.warning("Ordered website-channel list failed (%s); fetching all and capping locally", exc)
+        channels = list_channels(filters=website_filter, getAll=True) or []
         channels = sorted(
             (c for c in channels if isinstance(c, dict)),
             key=lambda c: str(c.get("created_at") or c.get("created") or ""),
@@ -364,9 +371,8 @@ def fetch_website_channel_domains(limit: int = 100) -> list[str]:
     for channel in channels:
         if not isinstance(channel, dict):
             continue
-        # Backstop if a server ignores the type filter: drop only channels that
-        # *explicitly* declare a non-website type. When the field is absent we
-        # trust the server-side `types=["website"]` filter rather than drop it.
+        # Backstop only: drop a channel that *explicitly* declares a non-website
+        # type (the server filter above should already guarantee this).
         has_type = channel.get("channel_types") is not None or channel.get("channel_type") is not None
         if has_type and not _channel_is_website(channel):
             continue
