@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 import hashlib
 import json
 import logging
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,39 @@ BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 runtime = CaseRuntime()
 LOGGER = logging.getLogger("ip_intel.case_app")
+
+
+def _configure_logging() -> None:
+    """Surface our own ``ip_intel.*`` loggers on stdout.
+
+    Uvicorn only configures its own loggers, so by default the container logs
+    show nothing but HTTP access lines (which endpoints got hit). We want the
+    actual analysis progress — the same messages streamed to the user in the
+    frontend — to appear in ``docker compose logs``, so we attach a stdout
+    handler to the shared ``ip_intel`` parent logger and let children
+    propagate to it. Level is controlled by IP_INTEL_LOG_LEVEL (default INFO).
+
+    The chatty uvicorn.access logger (one line per UI poll of the case/job
+    endpoints) is bumped to WARNING so the analysis log isn't drowned out.
+    """
+    level_name = os.environ.get("IP_INTEL_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    root = logging.getLogger("ip_intel")
+    root.setLevel(level)
+    if not any(getattr(h, "_ip_intel", False) for h in root.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler._ip_intel = True  # type: ignore[attr-defined]
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+        )
+        root.addHandler(handler)
+    root.propagate = False
+
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+_configure_logging()
 
 
 _CRT_SH_RETRY_INTERVAL = 300  # seconds between retry sweeps

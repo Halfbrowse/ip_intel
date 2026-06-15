@@ -1019,13 +1019,19 @@ def censys_cert_search(domain: str, *, include_history: bool = True) -> dict:
 
     Requires a Censys Starter tier or higher for the search API; cert history
     additionally needs the Enterprise Adversary Investigation entitlement.
+    The Censys Platform API requires the request to be associated with an
+    organization — calls without it are rejected — so we pass CENSYS_ORG_ID.
     Add to .env:
         CENSYS_API_KEY=<personal-access-token>
+        CENSYS_ORG_ID=<organization-id>
     """
     api_key = os.environ.get("CENSYS_API_KEY")
+    org_id  = os.environ.get("CENSYS_ORG_ID")
 
     if not api_key:
         return {"skipped": True, "reason": "CENSYS_API_KEY not set in .env"}
+    if not org_id:
+        return {"skipped": True, "reason": "CENSYS_ORG_ID not set in .env"}
 
     from censys_platform import SDK
 
@@ -1033,7 +1039,7 @@ def censys_cert_search(domain: str, *, include_history: bool = True) -> dict:
     fingerprints: list[str] = []
     seen_ips: set[str] = set()
     try:
-        with SDK(personal_access_token=api_key) as sdk:
+        with SDK(personal_access_token=api_key, organization_id=org_id) as sdk:
             query = f'host.services.tls.leaf_certificate.subject.common_name = "{domain}"'
             page_token: str | None = None
             for _ in range(_CENSYS_SEARCH_MAX_PAGES):

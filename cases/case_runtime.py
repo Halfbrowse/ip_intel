@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -44,6 +45,19 @@ from cases.case_store import (
 from utils.evidence_meta import evidence_definition
 from integrations.mattermost_alerts import send_case_notification
 from integrations.email_alerts import send_case_email
+
+
+LOGGER = logging.getLogger("ip_intel.case_runtime")
+
+# Map the job-log levels we stream to the frontend onto Python logging levels.
+# "success" is a frontend-only notion, so it lands on INFO in the server logs.
+_JOB_LOG_LEVELS = {
+    "debug":   logging.DEBUG,
+    "info":    logging.INFO,
+    "success": logging.INFO,
+    "warning": logging.WARNING,
+    "error":   logging.ERROR,
+}
 
 
 DEFAULT_CLUSTER_THRESHOLD = 30
@@ -507,7 +521,16 @@ class CaseRuntime:
         }
 
     def _log(self, job_id: str, level: str, message: str, *, stage: str | None = None) -> None:
+        # Persist for the frontend's live progress feed...
         append_job_log(job_id, level=level, message=message, stage=stage)
+        # ...and mirror the same human-readable line to the server logs so
+        # `docker compose logs` shows the actual analysis progress (what the
+        # user sees streamed in the UI), not just the HTTP endpoint hits.
+        stage_tag = f"/{stage}" if stage else ""
+        LOGGER.log(
+            _JOB_LOG_LEVELS.get(level, logging.INFO),
+            "[job %s%s] %s", job_id, stage_tag, message,
+        )
 
 
 def _same_site(left: str, right: str) -> bool:

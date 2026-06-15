@@ -532,15 +532,18 @@ def get_urlscan(domain: str) -> dict:
 def get_censys(domain: str) -> dict:
     """Hosts serving a TLS cert matching the domain (needs CENSYS_API_KEY)."""
     api_key = os.environ.get("CENSYS_API_KEY")
+    org_id  = os.environ.get("CENSYS_ORG_ID")
     if not api_key:
         return {"skipped": True, "reason": "CENSYS_API_KEY not set"}
+    if not org_id:
+        return {"skipped": True, "reason": "CENSYS_ORG_ID not set"}
     try:
         from censys_platform import SDK
     except ImportError:
         return {"skipped": True, "reason": "censys_platform not installed"}
 
     try:
-        with SDK(personal_access_token=api_key) as sdk:
+        with SDK(personal_access_token=api_key, organization_id=org_id) as sdk:
             query = f'host.services.tls.leaf_certificate.subject.common_name = "{domain}"'
             resp = sdk.global_data.search(search_query_input_body={
                 "query":     query,
