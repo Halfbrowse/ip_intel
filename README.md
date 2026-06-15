@@ -240,9 +240,11 @@ SANs are preserved in stored certificate records. The graph does not currently t
 
 ### Censys
 
-- Uses a free-safe/basic host search path.
-- Does not assume certificate-history or advanced paid-only pivots are available.
-- Paid-only or entitlement failures are surfaced explicitly in results.
+- **Tier requirement:** the cert→host search uses the Censys Platform **search API**, which is **not available on the free tier** (free API is lookup-only). A **Starter** tier or higher is required for any Censys results; the **Enterprise Adversary Investigation** entitlement is additionally required for certificate history.
+- Paginates the current-state host search up to `_CENSYS_SEARCH_MAX_PAGES` (10 × 100 hosts) instead of a single page.
+- When the entitlement is present, pivots each distinct leaf certificate through the threat-hunting host-observation endpoint to recover **historical origins** — IPs that served the cert in the past but no longer appear in the current snapshot (e.g. rotated infrastructure). Non-Cloudflare historical IPs not already in the current hits are folded into `origin_candidates` tagged `source: censys_history`.
+- Credit cost at Enterprise: ~1 credit per search call, +1 per extra results page, 5 per cert-history page.
+- Paid-only or entitlement failures are surfaced explicitly in results (per-cert history errors are recorded without aborting the run).
 
 ### Shodan
 
@@ -296,6 +298,7 @@ Notes:
 - `DATABASE_URL` is required. The default points to the Docker Compose Postgres service.
 - `INTEL_DATABASE_URL` is optional and only needed if the raw intel tables should live in a different PostgreSQL database than case storage.
 - All provider keys are optional. Missing keys degrade gracefully.
+- `CENSYS_API_KEY` requires a **Starter tier or higher** Censys Platform account — the free tier's API is lookup-only and cannot run the cert→host search. Certificate history additionally needs the Enterprise Adversary Investigation entitlement.
 - `MATTERMOST_WEBHOOK_URL` is optional. When set, the backend sends non-blocking alerts for analysis completion and failure.
 - Email alerts are optional and mirror the Mattermost notifications. They are enabled only when both `SMTP_HOST` and `ALERT_EMAIL_TO` are set; otherwise sends are silent no-ops.
 - `SMTP_PORT` defaults to `587` and `SMTP_STARTTLS` defaults to `true`. `SMTP_USERNAME`/`SMTP_PASSWORD` are optional (authentication is skipped when unset).

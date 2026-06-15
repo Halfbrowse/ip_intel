@@ -547,11 +547,13 @@ def get_censys(domain: str) -> dict:
                 "fields":    ["host.ip", "host.autonomous_system"],
                 "page_size": 100,
             })
+        # The generated SDK returns resp.result (a SearchQueryResponse) whose
+        # .hits each wrap the host under host_v1.resource — navigate via
+        # model_dump() so we don't depend on drifting typed attribute paths.
+        payload = resp.result.model_dump() if hasattr(getattr(resp, "result", None), "model_dump") else {}
         hits = []
-        for record in (resp.search_response.results or []):
-            ip = getattr(record, "ip", None) or (
-                record.get("host", {}).get("ip") if isinstance(record, dict) else None
-            )
+        for hit in (payload.get("hits") or []):
+            ip = ((hit.get("host_v1") or {}).get("resource") or {}).get("ip")
             if ip:
                 hits.append({"ip": ip})
         log_ok(f"Censys: {len(hits)} hits")

@@ -1,25 +1,65 @@
 services:
-  # Optional VPN egress for outbound provider traffic (rate-limit bypass).
-  # Only started with: docker compose --profile vpn up
-  # Then set OUTBOUND_PROXY_URL=http://vpn:8888 (e.g. in .env) so ip-intel
-  # routes provider HTTP calls through gluetun's built-in HTTP proxy.
-  vpn:
-    image: qmcgaw/gluetun
+  # ── VPN egress with on-demand IP rotation (rate-limit bypass) ──────────────
+  # ProtonVPN via the protonvpn-cli-community control API, matching the
+  # tiktok_tool setup on the shared `shared_net` network. Started with:
+  #   docker compose --profile vpn up
+  #
+  # protonvpn-cli exposes a control API (connect/disconnect/reconnect/status)
+  # on :8000 — utils/vpn.py calls it (VPN_API_BASE_URL) to rotate the exit IP.
+  # It is NOT an HTTP proxy, so a tinyproxy sidecar shares its network
+  # namespace to give the app a forward proxy (OUTBOUND_PROXY_URL) whose exit
+  # IP rotates with the VPN. Only provider traffic is proxied; DB/DNS/raw
+  # socket probes stay direct (see utils/outbound.py).
+  protonvpn-cli:
+    image: ghcr.io/jonasjancarik/protonvpn-cli-community:latest
+    container_name: protonvpn-cli
     profiles: ["vpn"]
+    privileged: true
     cap_add:
       - NET_ADMIN
     devices:
-      - /dev/net/tun
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - protonvpn-config:/root/.pvpn-cli
+    env_file:
+      - .env
     environment:
-      # VPN credentials/config come from .env — see gluetun docs for your provider.
-      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER:-}
-      VPN_TYPE: ${VPN_TYPE:-wireguard}
-      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:-}
-      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:-}
-      SERVER_COUNTRIES: ${SERVER_COUNTRIES:-}
-      # Built-in HTTP proxy, reachable on the compose network as vpn:8888.
-      HTTPPROXY: "on"
-      HTTPPROXY_LISTENING_ADDRESS: ":8888"
+      - PROTONVPN_USERNAME=${PROTONVPN_USERNAME:-}
+      - PROTONVPN_PASSWORD=${PROTONVPN_PASSWORD:-}
+      - OPENVPN_USERNAME=${OPENVPN_USERNAME:-}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
+      - PROTONVPN_TIER=${PROTONVPN_TIER:-1}
+      - PROTONVPN_PROTOCOL=${PROTONVPN_PROTOCOL:-udp}
+      - VPN_ENABLE_KILLSWITCH=true
+      # Expose the control API to other containers on shared_net.
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+    healthcheck:
+      test: ["CMD-SHELL", "protonvpn status | grep -q Connected"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - shared_net
+    restart: unless-stopped
+
+  # Forward HTTP proxy living inside the VPN container's network namespace, so
+  # its egress IP is always the current ProtonVPN exit IP. The app reaches it
+  # on shared_net via the protonvpn-cli container (shared netns) at :8888.
+  protonvpn-proxy:
+    image: vimagick/tinyproxy
+    container_name: protonvpn-proxy
+    profiles: ["vpn"]
+    depends_on:
+      protonvpn-cli:
+        condition: service_healthy
+    network_mode: "service:protonvpn-cli"
+    volumes:
+      # Default image config only allows 127.0.0.1; this opens the proxy to the
+      # docker private ranges so the app (on shared_net) can reach it. Verify
+      # the in-image config path on first run (some builds use /etc/tinyproxy.conf).
+      - ./config/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
     restart: unless-stopped
 
   postgres:
@@ -46,9 +86,17 @@ services:
     environment:
       DATABASE_URL: postgresql://ip_intel:ip_intel@postgres:5432/ip_intel
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:9000}
-      # With the `vpn` profile active, set OUTBOUND_PROXY_URL=http://vpn:8888
-      # to route outbound provider HTTP calls through the VPN. Empty = direct.
+      # Empty by default = direct connection / no rotation, so runs without the
+      # `vpn` profile work unchanged. To enable the rotating VPN egress, set in
+      # .env (the `vpn` profile must be up):
+      #   OUTBOUND_PROXY_URL=http://protonvpn-cli:8888   (tinyproxy in VPN netns)
+      #   VPN_API_BASE_URL=http://protonvpn-cli:8000      (rotation control API)
       OUTBOUND_PROXY_URL: ${OUTBOUND_PROXY_URL:-}
+      VPN_API_BASE_URL: ${VPN_API_BASE_URL:-}
+      COUNTRY_CODES: ${COUNTRY_CODES:-NL, DE, LT}
+      DEFAULT_COUNTRY_CODE: ${DEFAULT_COUNTRY_CODE:-}
+      # Set to 1 to disable rotation even when the VPN is up (local/dev).
+      VPN_ROTATE_DISABLE: ${VPN_ROTATE_DISABLE:-}
     volumes:
       - ./data:/app/data
     depends_on:
@@ -61,6 +109,18 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    networks:
+      - default
+      - shared_net
+
+networks:
+  # Shared cross-project network the ProtonVPN container lives on (same as
+  # tiktok_tool). Created once with: docker network create shared_net
+  shared_net:
+    external: true
+    name: shared_net
+  default:
 
 volumes:
   postgres_data:
+  protonvpn-config:

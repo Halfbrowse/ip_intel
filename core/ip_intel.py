@@ -15,8 +15,10 @@ Sources (all free, no API keys required by default):
     - hackertarget: Reverse IP lookup — skipped automatically for Cloudflare IPs
     - CIRCL pDNS  : Passive / historical DNS records (pdns.circl.lu)
     - Origin probe: Resolves crt.sh subdomains and flags any that bypass Cloudflare
-    - Censys      : Searches indexed TLS certs for IPs serving the domain's cert
-                    (optional — set CENSYS_API_KEY in .env)
+    - Censys      : Searches indexed TLS certs for IPs serving the domain's cert,
+                    plus historical cert→host observations (rotated origins)
+                    (optional — set CENSYS_API_KEY; needs Starter+ tier, and
+                    Enterprise Adversary Investigation for cert history)
     - Shodan      : Searches indexed banners for ssl:"domain" hits
                     (optional — set SHODAN_API_KEY in .env)
     - Netlas      : Searches indexed TLS banners by cert CN — free tier available
@@ -72,6 +74,7 @@ from sources.signal_dns import (
 )
 from sources.signal_transport import fetch_ssh_host_key, fetch_tls_certificate, parse_certificate_der
 from utils.outbound import httpx_kwargs, requests_kwargs
+from utils.vpn import vpn_rotation_batch
 from sources.signal_web import (
     extract_page_enrichment,
     afetch_homepage_profile,
@@ -898,13 +901,125 @@ def urlscan_historical_ips(domain: str) -> list[dict]:
 
 # ── Censys cert search ────────────────────────────────────────────────────────
 
-def censys_cert_search(domain: str) -> dict:
+# Safety caps so a popular cert can't make a single run paginate forever.
+_CENSYS_SEARCH_MAX_PAGES   = 10   # 10 * 100 = up to 1000 current hosts
+_CENSYS_HISTORY_MAX_CERTS  = 5    # distinct leaf certs to pull history for
+_CENSYS_HISTORY_MAX_PAGES  = 5    # history pages per cert (100 ranges each)
+
+
+def _as_dict(obj) -> dict:
+    """Normalize a Censys SDK model (or dict) into a plain dict for defensive
+    navigation. The generated SDK models are deeply nested and have drifted
+    between versions, so we never rely on typed attribute paths."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump()
+        except Exception:
+            pass
+    return {}
+
+
+def _censys_parse_host_hit(hit) -> tuple[dict | None, str | None]:
+    """Turn one search hit into our normalized host entry and pull the leaf
+    cert fingerprint (presented_chain[0]) so we can pivot on cert history."""
+    host = (_as_dict(hit).get("host_v1") or {}).get("resource") or {}
+    ip   = host.get("ip")
+    if not ip:
+        return None, None
+
+    asn_block = host.get("autonomous_system") or {}
+    loc_block = host.get("location") or {}
+
+    services: list[str] = []
+    fingerprint: str | None = None
+    for svc in (host.get("services") or []):
+        port  = svc.get("port")
+        proto = svc.get("transport_protocol") or ""
+        if port:
+            services.append(f"{port}/{str(proto).lower()}")
+        if fingerprint is None:
+            chain = (svc.get("tls") or {}).get("presented_chain") or []
+            if chain:  # leaf cert is first in the presented chain
+                fingerprint = chain[0].get("fingerprint_sha256")
+
+    entry = {
+        "ip":         ip,
+        "cloudflare": is_cloudflare_ip(ip),
+        "asn":        asn_block.get("asn"),
+        "asn_name":   asn_block.get("description") or asn_block.get("name"),
+        "country":    loc_block.get("country_code"),
+        "services":   services,
+    }
+    return entry, fingerprint
+
+
+def _iso(value) -> str | None:
+    """Render a datetime (or already-string) timestamp as ISO-8601 text."""
+    if value is None:
+        return None
+    iso = getattr(value, "isoformat", None)
+    return iso() if callable(iso) else str(value)
+
+
+def _censys_cert_history(sdk, fingerprints: list[str]) -> list[dict]:
+    """Historical host observations for each leaf-cert fingerprint via the
+    Censys threat-hunting endpoint. This is the Enterprise-only pivot that
+    surfaces IPs that served the cert in the past — including rotated origins
+    that no longer appear in the current-state host search.
+
+    Requires the Adversary Investigation entitlement; if the account lacks it
+    the per-cert call is recorded as an error rather than aborting the run."""
+    history: list[dict] = []
+    for fp in fingerprints:
+        try:
+            page_token: str | None = None
+            for _ in range(_CENSYS_HISTORY_MAX_PAGES):
+                req: dict = {"certificate_id": fp, "page_size": 100}
+                if page_token:
+                    req["page_token"] = page_token
+                resp    = sdk.threat_hunting.get_host_observations_with_certificate(request=req)
+                payload = _as_dict(_as_dict(getattr(resp, "result", None)).get("result"))
+                ranges  = payload.get("ranges") or []
+                for rng in ranges:
+                    ip = rng.get("ip")
+                    if not ip:
+                        continue
+                    history.append({
+                        "certificate": fp,
+                        "ip":          ip,
+                        "cloudflare":  is_cloudflare_ip(ip),
+                        "port":        rng.get("port"),
+                        "transport":   rng.get("transport_protocol"),
+                        "first_seen":  _iso(rng.get("start_time")),
+                        "last_seen":   _iso(rng.get("end_time")),
+                    })
+                page_token = payload.get("next_page_token")
+                if not page_token or not ranges:
+                    break
+        except Exception as exc:
+            history.append({"certificate": fp, "_error": str(exc)})
+    return history
+
+
+def censys_cert_search(domain: str, *, include_history: bool = True) -> dict:
     """
     Search Censys Platform for hosts currently serving a TLS cert whose CN
     matches the target domain. Any result that isn't a Cloudflare IP is a
     candidate origin server.
 
-    Requires a free Censys account — add to .env:
+    Paginates the current-state host search (up to _CENSYS_SEARCH_MAX_PAGES)
+    and, when ``include_history`` is set, pivots each distinct leaf cert
+    through the threat-hunting host-observation endpoint to recover historical
+    origins. Historical IPs that aren't Cloudflare and aren't already in the
+    current hits are folded into ``origin_candidates``.
+
+    Requires a Censys Starter tier or higher for the search API; cert history
+    additionally needs the Enterprise Adversary Investigation entitlement.
+    Add to .env:
         CENSYS_API_KEY=<personal-access-token>
     """
     api_key = os.environ.get("CENSYS_API_KEY")
@@ -914,57 +1029,59 @@ def censys_cert_search(domain: str) -> dict:
 
     from censys_platform import SDK
 
-    result: dict = {"hits": [], "origin_candidates": []}
+    result: dict = {"hits": [], "origin_candidates": [], "history": []}
+    fingerprints: list[str] = []
+    seen_ips: set[str] = set()
     try:
         with SDK(personal_access_token=api_key) as sdk:
             query = f'host.services.tls.leaf_certificate.subject.common_name = "{domain}"'
-            resp = sdk.global_data.search(search_query_input_body={
-                "query":     query,
-                "fields":    ["host.ip", "host.autonomous_system", "host.location", "host.services"],
-                "page_size": 100,
-            })
+            page_token: str | None = None
+            for _ in range(_CENSYS_SEARCH_MAX_PAGES):
+                body: dict = {
+                    "query":     query,
+                    "fields":    ["host.ip", "host.autonomous_system", "host.location", "host.services"],
+                    "page_size": 100,
+                }
+                if page_token:
+                    body["page_token"] = page_token
+                resp    = sdk.global_data.search(search_query_input_body=body)
+                payload = _as_dict(getattr(resp, "result", None))
+                hits    = payload.get("hits") or []
+                for hit in hits:
+                    entry, fp = _censys_parse_host_hit(hit)
+                    if entry is None:
+                        continue
+                    result["hits"].append(entry)
+                    seen_ips.add(entry["ip"])
+                    if not entry["cloudflare"]:
+                        result["origin_candidates"].append(entry)
+                    if fp and fp not in fingerprints:
+                        fingerprints.append(fp)
+                page_token = payload.get("next_page_token")
+                if not page_token or not hits:
+                    break
 
-        for record in (resp.search_response.results or []):
-            ip = getattr(record, "ip", None) or (
-                record.get("host", {}).get("ip") if isinstance(record, dict) else None
-            )
-            if not ip:
+            result["total"] = int(payload.get("total_hits") or len(result["hits"]))
+
+            if include_history and fingerprints:
+                result["history"] = _censys_cert_history(
+                    sdk, fingerprints[:_CENSYS_HISTORY_MAX_CERTS]
+                )
+
+        # Fold historical origins (non-Cloudflare, not already seen) into the
+        # candidate list so downstream scoring picks up rotated infrastructure.
+        for obs in result["history"]:
+            ip = obs.get("ip")
+            if not ip or obs.get("cloudflare") or ip in seen_ips or "_error" in obs:
                 continue
-
-            asn_block  = getattr(record, "autonomous_system", None) or {}
-            loc_block  = getattr(record, "location", None) or {}
-            svc_block  = getattr(record, "services", None) or []
-
-            if isinstance(asn_block, dict):
-                asn      = asn_block.get("asn")
-                asn_name = asn_block.get("description")
-            else:
-                asn      = getattr(asn_block, "asn", None)
-                asn_name = getattr(asn_block, "description", None)
-
-            if isinstance(loc_block, dict):
-                country = loc_block.get("country_code")
-            else:
-                country = getattr(loc_block, "country_code", None)
-
-            services = []
-            for s in svc_block:
-                port  = s.get("port")  if isinstance(s, dict) else getattr(s, "port", None)
-                proto = s.get("transport_protocol", "") if isinstance(s, dict) else getattr(s, "transport_protocol", "")
-                if port:
-                    services.append(f"{port}/{str(proto).lower()}")
-
-            entry = {
+            seen_ips.add(ip)
+            result["origin_candidates"].append({
                 "ip":         ip,
-                "cloudflare": is_cloudflare_ip(ip),
-                "asn":        asn,
-                "asn_name":   asn_name,
-                "country":    country,
-                "services":   services,
-            }
-            result["hits"].append(entry)
-            if not entry["cloudflare"]:
-                result["origin_candidates"].append(entry)
+                "cloudflare": False,
+                "source":     "censys_history",
+                "first_seen": obs.get("first_seen"),
+                "last_seen":  obs.get("last_seen"),
+            })
 
     except Exception as exc:
         result["error"] = str(exc)
@@ -2307,19 +2424,25 @@ async def _analyze_domain_async(
         group_two_sources += " (async)..."
         log(group_two_sources)
         _spf_txt = dns_records.get("TXT", [])
-        await asyncio.gather(
-            _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
-            _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
-            _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
-            _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain) if enable_wordlist_probe else _empty_list()),
-            _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
-            _oc_task("urlscan",         _run_serial_urlscan(_aurlscan_historical_ips(domain, client)) if enable_urlscan else _empty_list()),
-            _task("urlscan_analytics",  _run_serial_urlscan(_aurlscan_fetch_analytics(domain, client)) if enable_urlscan else _empty_dict()),
-            _task("spf_details_tmp",    acollect_spf_details(domain, _spf_txt)),
-            # _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
-            # _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
-            # _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
-        )
+        # Rotate the VPN exit IP before the origin-discovery batch so the
+        # per-source-IP rate-limited providers (urlscan ~50/day, HackerTarget,
+        # crt.sh) and the direct origin probes all run from a fresh IP. No-op
+        # unless VPN_API_BASE_URL is configured (see utils.vpn). Traffic reaches
+        # that IP via OUTBOUND_PROXY_URL (the tinyproxy sidecar in the VPN netns).
+        async with vpn_rotation_batch(nested_label="origin_discovery"):
+            await asyncio.gather(
+                _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
+                _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
+                _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
+                _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain) if enable_wordlist_probe else _empty_list()),
+                _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
+                _oc_task("urlscan",         _run_serial_urlscan(_aurlscan_historical_ips(domain, client)) if enable_urlscan else _empty_list()),
+                _task("urlscan_analytics",  _run_serial_urlscan(_aurlscan_fetch_analytics(domain, client)) if enable_urlscan else _empty_dict()),
+                _task("spf_details_tmp",    acollect_spf_details(domain, _spf_txt)),
+                _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
+                # _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
+                # _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
+            )
 
     _spf_details = result.pop("spf_details_tmp", {}) or {}
     _cb("spf_origins", _spf_details.get("origins", []))
