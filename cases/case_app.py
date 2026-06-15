@@ -132,6 +132,16 @@ async def api_create_case(request: Request) -> JSONResponse:
     )
 
 
+@app.post("/api/cases/{case_id}/recompute")
+async def api_recompute_case(case_id: str) -> dict[str, Any]:
+    """Re-score an existing case's pairs and clusters from stored scan data."""
+    case_row = get_case(case_id)
+    if case_row is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+    counts = await asyncio.to_thread(runtime.recompute_case, case_id)
+    return {"case_id": case_id, "status": "recomputed", **counts}
+
+
 @app.get("/api/cases/{case_id}")
 def api_get_case(case_id: str, request: Request) -> Response:
     case_row = get_case(case_id)

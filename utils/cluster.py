@@ -194,7 +194,10 @@ def _summarize_cluster(members: list[str], edges_used: list[dict]) -> dict:
         "edge_count":     len(internal_edges),
         "strong_edges":   strong_edges,
         "max_edge_score": max_score,
-        "top_evidence":   [{"path": p, "edges": n} for p, n in top_evidence],
+        "top_evidence":   [
+            {"path": p, "label": _edge_labels([p])[0], "edges": n}
+            for p, n in top_evidence
+        ],
         "edges":          internal_edges,
     }
 
@@ -241,6 +244,29 @@ def _node_cluster_lookup(clusters: list[dict]) -> dict[str, int]:
     return lookup
 
 
+def _node_kind(node_id: str) -> str:
+    import ipaddress
+    try:
+        ipaddress.ip_address(node_id)
+        return "ip"
+    except ValueError:
+        return "domain"
+
+
+def _edge_labels(paths: list[str]) -> list[str]:
+    """Plain-English labels for an edge's matched paths (deduped, in order)."""
+    from utils.evidence_meta import evidence_definition
+    labels: list[str] = []
+    for path in paths:
+        if str(path).startswith("observed_ip:"):
+            label = "Observed IP address"
+        else:
+            label = evidence_definition(str(path)).label
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
 def build_graph_payload(result: dict) -> dict:
     """
     Produce a serializable {nodes, edges} payload suitable for vis-network
@@ -260,6 +286,7 @@ def build_graph_payload(result: dict) -> dict:
             "group":   f"cluster-{idx}",
             "color":   _CLUSTER_COLORS[idx % len(_CLUSTER_COLORS)],
             "cluster": idx,
+            "kind":    _node_kind(domain),
         })
     for iso in isolates:
         nodes.append({
@@ -268,6 +295,7 @@ def build_graph_payload(result: dict) -> dict:
             "group":   "isolate",
             "color":   _ISOLATE_COLOR,
             "cluster": None,
+            "kind":    _node_kind(iso),
         })
 
     edges: list[dict] = []
@@ -286,6 +314,7 @@ def build_graph_payload(result: dict) -> dict:
                 "to":     b,
                 "score":  edge["score"],
                 "paths":  paths,
+                "labels": _edge_labels(paths),
                 "visual": visual,
                 # Edge thickness scaled by score. Cap so one high-score edge
                 # doesn't dominate the rendering.

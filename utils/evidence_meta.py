@@ -313,22 +313,164 @@ EVIDENCE_DEFINITIONS: dict[str, EvidenceDefinition] = {
         caveat="Resellers and shared ad operations can introduce noise.",
         base_importance="supporting",
     ),
+    "tls_certs.probes[*].cn": EvidenceDefinition(
+        path="tls_certs.probes[*].cn",
+        label="Shared certificate name",
+        category="Transport",
+        description="Both targets served TLS certificates issued for the same name.",
+        why_it_matters="Certificates naming the same host suggest shared or migrated infrastructure.",
+        caveat="Default or wildcard hosting certificates can repeat across unrelated customers.",
+        base_importance="strong",
+    ),
+    "dns.AAAA": EvidenceDefinition(
+        path="dns.AAAA",
+        label="Shared IPv6 address",
+        category="Infrastructure",
+        description="Both targets resolved to the same IPv6 address.",
+        why_it_matters="Current DNS overlap can show the same live hosting or routing destination.",
+        caveat="Popular hosting providers can place unrelated sites on the same address pool.",
+        base_importance="strong",
+    ),
+    "crt_sh.certs[*].id": EvidenceDefinition(
+        path="crt_sh.certs[*].id",
+        label="Shared certificate-transparency entry",
+        category="Transport",
+        description="Both targets appeared on the same logged certificate.",
+        why_it_matters="Domains listed on one certificate were requested together by the same operator.",
+        caveat="Hosting providers sometimes bundle many customer domains on one certificate.",
+        base_importance="strong",
+    ),
+    "censys.hits[*].ip": EvidenceDefinition(
+        path="censys.hits[*].ip",
+        label="Shared Censys host",
+        category="Infrastructure",
+        description="Both targets were observed on the same host in Censys scan data.",
+        why_it_matters="Internet-wide scan overlap supports a shared hosting footprint.",
+        caveat="Scan observations can be historical or reflect shared platforms.",
+        base_importance="supporting",
+    ),
+    "shodan.hits[*].ip": EvidenceDefinition(
+        path="shodan.hits[*].ip",
+        label="Shared Shodan host",
+        category="Infrastructure",
+        description="Both targets were observed on the same host in Shodan scan data.",
+        why_it_matters="Internet-wide scan overlap supports a shared hosting footprint.",
+        caveat="Scan observations can be historical or reflect shared platforms.",
+        base_importance="supporting",
+    ),
+    "netlas.hits[*].ip": EvidenceDefinition(
+        path="netlas.hits[*].ip",
+        label="Shared Netlas host",
+        category="Infrastructure",
+        description="Both targets were observed on the same host in Netlas scan data.",
+        why_it_matters="Internet-wide scan overlap supports a shared hosting footprint.",
+        caveat="Scan observations can be historical or reflect shared platforms.",
+        base_importance="supporting",
+    ),
+    "dns.MX[*].exchange": EvidenceDefinition(
+        path="dns.MX[*].exchange",
+        label="Shared mail server",
+        category="Email operations",
+        description="Both targets route mail through the same mail server hostname.",
+        why_it_matters="It can support other evidence when the mail setup is distinctive.",
+        caveat="Large mail providers serve millions of unrelated domains, so this is weak alone.",
+        base_importance="low-signal",
+    ),
+    "whois.creation_date": EvidenceDefinition(
+        path="whois.creation_date",
+        label="Same registration date",
+        category="Registration",
+        description="Both domains were registered on the same date.",
+        why_it_matters="Coordinated campaigns often register batches of domains together.",
+        caveat="Any two domains can coincidentally share a registration date.",
+        base_importance="supporting",
+    ),
+    "whois.country": EvidenceDefinition(
+        path="whois.country",
+        label="Same registration country",
+        category="Registration",
+        description="Both domains list the same registrant country.",
+        why_it_matters="It adds light context when stronger evidence already points the same way.",
+        caveat="Country alone is shared by huge numbers of unrelated domains.",
+        base_importance="low-signal",
+    ),
+    "dns.SOA.rname": EvidenceDefinition(
+        path="dns.SOA.rname",
+        label="Shared DNS admin contact",
+        category="DNS",
+        description="Both zones list the same administrative contact in their SOA record.",
+        why_it_matters="A shared zone contact can indicate the same DNS administrator.",
+        caveat="DNS hosting providers set this to a provider-wide value for all customers.",
+        base_importance="low-signal",
+    ),
+    "dns.SOA.serial": EvidenceDefinition(
+        path="dns.SOA.serial",
+        label="Identical DNS zone serial",
+        category="DNS",
+        description="Both zones report the same serial number.",
+        why_it_matters="Identical serials can hint at zones managed and updated together.",
+        caveat="Date-based serials collide naturally across unrelated zones.",
+        base_importance="low-signal",
+    ),
+    "crt_sh.issuers": EvidenceDefinition(
+        path="crt_sh.issuers",
+        label="Same certificate authority",
+        category="Transport",
+        description="Both targets obtained certificates from the same authority.",
+        why_it_matters="It is only meaningful alongside stronger certificate evidence.",
+        caveat="A handful of free authorities issue most certificates on the internet.",
+        base_importance="low-signal",
+    ),
+    "page_metadata.fb_app_id": EvidenceDefinition(
+        path="page_metadata.fb_app_id",
+        label="Shared Facebook app ID",
+        category="Web identity",
+        description="Both sites embed the same Facebook application ID.",
+        why_it_matters="App IDs are tied to a developer account, often the same operator.",
+        caveat="Shared themes or plugins can carry an app ID along.",
+        base_importance="supporting",
+    ),
+    "page_metadata.authors": EvidenceDefinition(
+        path="page_metadata.authors",
+        label="Shared author name",
+        category="Identity",
+        description="Both sites credit the same author in page metadata.",
+        why_it_matters="Recurring bylines can connect content operations.",
+        caveat="Common names and syndicated content create false positives.",
+        base_importance="supporting",
+    ),
+    "page_metadata.rel_me": EvidenceDefinition(
+        path="page_metadata.rel_me",
+        label="Shared linked profile",
+        category="Identity",
+        description="Both sites declare the same verified profile link.",
+        why_it_matters="rel=me links are deliberate, operator-controlled identity claims.",
+        caveat="Copied templates can carry stale profile links.",
+        base_importance="supporting",
+    ),
 }
 
 
-DEFAULT_EVIDENCE = EvidenceDefinition(
-    path="",
-    label="Shared signal",
-    category="Other",
-    description="The pair shared the same value at this path.",
-    why_it_matters="Any overlap can add context when it aligns with stronger evidence.",
-    caveat="Unknown paths should be treated as supporting context until reviewed.",
-    base_importance="supporting",
-)
+def _label_from_path(path: str) -> str:
+    """Derive a readable label from a dot-path, e.g.
+    'page_metadata.script_urls' -> 'Shared script urls'."""
+    leaf = path.split(".")[-1].replace("[*]", "").replace("_", " ").strip()
+    return f"Shared {leaf}" if leaf else "Shared signal"
 
 
 def evidence_definition(path: str) -> EvidenceDefinition:
-    return EVIDENCE_DEFINITIONS.get(path, DEFAULT_EVIDENCE)
+    known = EVIDENCE_DEFINITIONS.get(path)
+    if known is not None:
+        return known
+    return EvidenceDefinition(
+        path=path,
+        label=_label_from_path(path),
+        category="Other",
+        description="Both targets shared the same value for this attribute.",
+        why_it_matters="Any overlap can add context when it aligns with stronger evidence.",
+        caveat="This attribute is not in the curated catalog, so treat it as supporting context.",
+        base_importance="supporting",
+    )
 
 
 def evidence_catalog() -> list[dict[str, Any]]:

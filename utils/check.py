@@ -45,7 +45,46 @@ LIST_MATCH_FIELDS: dict[str, list[str]] = {
     "censys.hits":          ["ip"],
     "shodan.hits":          ["ip"],
     "netlas.hits":          ["ip"],
+    "dns.MX":               ["exchange"],
 }
+
+
+# Values that look like identity data but are actually privacy-proxy
+# boilerplate, registrar redaction notices, or placeholder text. Two domains
+# both saying "REDACTED FOR PRIVACY" share nothing except that both
+# registrars honour GDPR — never match on these.
+_GENERIC_VALUE_MARKERS = (
+    "redacted",
+    "privacy",
+    "not disclosed",
+    "non-public",
+    "nonpublic",
+    "data protected",
+    "gdpr",
+    "whoisguard",
+    "whois agent",
+    "domains by proxy",
+    "identity protect",
+    "contact privacy",
+    "statutory masking",
+    "query the rdds",
+    "please query",
+    "registrant of",
+    "n/a",
+    "none",
+    "not available",
+    "select request email form",
+)
+
+
+def _is_generic_value(v) -> bool:
+    """True for redacted/placeholder strings that carry no identity signal."""
+    if not isinstance(v, str):
+        return False
+    text = v.strip().lower()
+    if not text:
+        return True
+    return any(marker in text for marker in _GENERIC_VALUE_MARKERS)
 
 
 # Paths that describe the scan itself rather than the domain's real-world
@@ -56,6 +95,14 @@ LIST_MATCH_FIELDS: dict[str, list[str]] = {
 #
 # The freshness / live_probe data is still *used* by the scoring and cert
 # quality logic (as context), it's just excluded from being its own match.
+# NOTE: matching is now allowlist-based (see _path_is_scored below): only
+# paths with an explicit weight in MATCH_WEIGHTS count as evidence.
+# Everything else in the payload — HTTP status codes, meta tags, header
+# order, scan provenance, provider errors, "type": "domain", and so on — is
+# context that every pair of live websites trivially shares. Scoring those
+# paths used to inflate unrelated pairs with dozens of meaningless 5-point
+# matches. The excluded prefixes below are kept as a fast short-circuit for
+# large context subtrees.
 _EXCLUDED_PATH_PREFIXES = (
     "live_probe",       # headers, server, platform, status, etc. — context only
     "freshness",        # freshness annotations — context only
@@ -64,6 +111,10 @@ _EXCLUDED_PATH_PREFIXES = (
     "discovered_from",  # provenance, not identity
     "discovery_reason", # provenance
     "discovery_kind",   # provenance
+    "page_metadata.http_fingerprint",  # status/header shape — hosting noise
+    "page_metadata.meta_tags",         # viewport/og:* boilerplate
+    "page_metadata.social_meta",       # og:*/twitter:* boilerplate
+    "source_errors",    # shared provider failures are not shared identity
 )
 
 
@@ -115,6 +166,48 @@ def _extract_field(items, field):
     return out
 
 
+def _path_is_scored(path: str) -> bool:
+    """Only paths with an explicit evidence weight count as matches."""
+    return path in MATCH_WEIGHTS
+
+
+# DKIM selector names that ship as provider or tooling defaults. Two domains
+# both using selector "mail" or "k2" just means both use a common mail stack.
+_DEFAULT_DKIM_SELECTORS = {
+    "default", "dkim", "mail", "email", "smtp", "mx",
+    "k1", "k2", "k3", "s1", "s2", "s1024", "s2048",
+    "selector", "selector1", "selector2",
+    "google", "zoho", "mandrill", "sendgrid", "mailjet", "amazonses",
+    "pm", "ctct1", "ctct2", "sig1", "everlytickey1", "everlytickey2",
+}
+
+_HOSTNAME_RE = None
+
+
+def _looks_like_hostname(value: str) -> bool:
+    global _HOSTNAME_RE
+    if _HOSTNAME_RE is None:
+        import re
+        _HOSTNAME_RE = re.compile(r"^(\*\.)?([a-z0-9-]+\.)+[a-z]{2,}$")
+    return bool(_HOSTNAME_RE.match(value.strip().lower()))
+
+
+def _value_ok_for_path(path: str, v) -> bool:
+    """Per-path value validation against known-junk values."""
+    if path == "email_security.dmarc_report_uris":
+        # Older scans stored the DMARC tag names ("rua"/"ruf") instead of the
+        # report mailboxes; only real addresses/URIs are evidence.
+        return isinstance(v, str) and ("@" in v or v.startswith("http"))
+    if path == "email_security.dkim_selectors":
+        return isinstance(v, str) and v.strip().lower() not in _DEFAULT_DKIM_SELECTORS
+    if path == "tls_certs.probes[*].cn":
+        # Placeholder certificates ("TRAEFIK DEFAULT CERT", "localhost",
+        # Kubernetes fake certs, ...) ship with the proxy software itself —
+        # only hostname-shaped names are evidence.
+        return isinstance(v, str) and _looks_like_hostname(v)
+    return True
+
+
 def find_matches(a, b, path=""):
     """Yield (dot-path, value) pairs where `a` and `b` share a value."""
     if type(a) is not type(b):
@@ -141,6 +234,9 @@ def find_matches(a, b, path=""):
         fields = LIST_MATCH_FIELDS.get(path)
         if fields:
             for field in fields:
+                field_path = f"{path}[*].{field}"
+                if not _path_is_scored(field_path):
+                    continue
                 a_vals = _extract_field(a, field)
                 b_vals = _extract_field(b, field)
                 shared = []
@@ -150,15 +246,22 @@ def find_matches(a, b, path=""):
                         # domains "sharing" a CF anycast IP means nothing.
                         if field == "ip" and isinstance(v, str) and _is_cloudflare_ip_local(v):
                             continue
+                        if _is_generic_value(v) or not _value_ok_for_path(field_path, v):
+                            continue
                         shared.append(v)
                 if shared:
-                    yield f"{path}[*].{field}", shared
+                    yield field_path, shared
             return
 
-        # Fallback: shared list items via whole-value equality.
+        if not _path_is_scored(path):
+            return
+
+        # Shared list items via whole-value equality.
         shared = []
         for item in a:
-            if _is_failed(item) or _is_trivial(item):
+            if _is_failed(item) or _is_trivial(item) or _is_generic_value(item):
+                continue
+            if not _value_ok_for_path(path, item):
                 continue
             if item in b and item not in shared:
                 # If this list is an IP path, drop CF anycast IPs.
@@ -171,7 +274,10 @@ def find_matches(a, b, path=""):
             yield path, shared
 
     else:
-        if a == b and not _is_trivial(a):
+        if not _path_is_scored(path):
+            return
+        if (a == b and not _is_trivial(a) and not _is_generic_value(a)
+                and _value_ok_for_path(path, a)):
             yield path, a
 
 
@@ -258,9 +364,15 @@ MATCH_WEIGHTS: dict[str, int] = {
     "tls_certs.probes[*].cn":                      40,
     "non_cf_ips":                                  30,
     "dns.A":                                       25,
+    "dns.AAAA":                                    25,
     "hackertarget.hits[*].ip":                     20,
     "urlscan.hits[*].ip":                          15,
     "circl_pdns.records[*].rdata":                 15,
+    "crt_sh.certs[*].id":                          15,
+    "censys.hits[*].ip":                           20,
+    "shodan.hits[*].ip":                           20,
+    "netlas.hits[*].ip":                           20,
+    "dns.MX[*].exchange":                           3,
     "page_metadata.google_analytics":              35,
     "page_metadata.gtm_ids":                       30,
     "page_metadata.facebook_pixel":                35,
@@ -536,16 +648,63 @@ def score_matches(matches: dict, cross_refs: list[dict],
     return total
 
 
+def confidence_from_score(score: int | float) -> int:
+    """
+    Map an open-ended evidence score onto a bounded 0–100 confidence.
+
+    Raw scores are additive weights with no upper bound (a pair sharing a
+    TLS fingerprint plus IPs plus trackers can exceed 300), so showing the
+    raw number as a percentage was meaningless. The saturating curve keeps
+    ordering, never reaches 100 (this is correlation, not proof), and is
+    calibrated so a single crypto-strength match (~100) lands around 60%
+    and corroborated multi-signal pairs climb into the 75–90% band.
+    """
+    s = max(0, float(score or 0))
+    return int(round(100 * s / (s + 65)))
+
+
+# Paths that, when present at full quality, justify calling the link strong
+# regardless of the numeric confidence.
+_DECISIVE_PATHS = {
+    "microsoft_tenant.tenant_guid",
+    "legal_pages.registration_ids",
+}
+
+
+def link_strength(matches: dict, confidence: int,
+                  cert_quality: dict | None = None,
+                  freshness: dict | None = None) -> str:
+    """Classify a pair as strong / moderate / weak for non-technical display."""
+    paths = set(matches or {})
+    cert_ok = (cert_quality or {}).get("quality") == "strong"
+    ssh_ok = ("ssh_host_keys.probes[*].fingerprint_sha256" in paths
+              and not (freshness or {}).get("platform_demotes_ssh"))
+
+    if ((cert_ok and "tls_certs.probes[*].fingerprint_sha256" in paths)
+            or ssh_ok
+            or paths & _DECISIVE_PATHS
+            or confidence >= 65):
+        return "strong"
+    has_strong_signal = any(MATCH_WEIGHTS.get(p, 0) >= 30 for p in paths)
+    if confidence >= 35 or has_strong_signal:
+        return "moderate"
+    return "weak"
+
+
 def compare_pair(a: dict, b: dict) -> dict:
     """Produce the full comparison payload for one pair of scans."""
     matches      = {path: value for path, value in find_matches(a, b)}
     cross_refs   = analyze_urlscan_cross_referrers(a, b)
     cert_quality = assess_cert_match_quality(a, b)
     freshness    = assess_freshness_context(a, b, matches)
+    score        = score_matches(matches, cross_refs, cert_quality, freshness)
+    confidence   = confidence_from_score(score)
     return {
         "a_domain":           a.get("domain") or a.get("input"),
         "b_domain":           b.get("domain") or b.get("input"),
-        "score":              score_matches(matches, cross_refs, cert_quality, freshness),
+        "score":              score,
+        "confidence":         confidence,
+        "strength":           link_strength(matches, confidence, cert_quality, freshness),
         "match_count":        len(matches),
         "cert_quality":       cert_quality,
         "freshness":          freshness,

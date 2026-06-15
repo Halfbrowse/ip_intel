@@ -3,14 +3,22 @@ from __future__ import annotations
 import itertools
 import threading
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any
 
 from utils import cluster
 from utils import check
 from core import ip_intel
 from core import basic
-from core.analysis_service import AnalysisRun, analyze_target, clean_target, normalize_inputs, pairing_label, parse_csv_targets
+from core.analysis_service import (
+    AnalysisRun,
+    analyze_target,
+    build_helper_rows,
+    clean_target,
+    normalize_inputs,
+    pairing_label,
+    parse_csv_targets,
+)
 from cases.case_store import (
     JOB_STAGES,
     append_job_log,
@@ -30,6 +38,7 @@ from cases.case_store import (
     replace_cluster,
     replace_pairings,
     save_search_run,
+    update_case_summary,
     update_job_progress,
 )
 from utils.evidence_meta import evidence_definition
@@ -38,6 +47,11 @@ from integrations.email_alerts import send_case_email
 
 
 DEFAULT_CLUSTER_THRESHOLD = 30
+
+# Per-case concurrency for target analysis. Each target spends most of its
+# time waiting on network I/O (DNS, WHOIS, TLS probes, provider APIs), so a
+# small pool cuts wall-clock time roughly linearly without hammering sources.
+ANALYSIS_WORKERS = 4
 
 
 class CaseRuntime:
@@ -132,91 +146,100 @@ class CaseRuntime:
             percent=5,
         )
 
+        analysis_pool = ThreadPoolExecutor(
+            max_workers=ANALYSIS_WORKERS, thread_name_prefix="target-analysis"
+        )
+        pending: dict[Future[AnalysisRun], dict[str, Any]] = {}
+
+        def _analyze(item: dict[str, Any]) -> AnalysisRun:
+            self._log(job_id, "info", f"Analyzing {item['target']}", stage="enrichment")
+            return analyze_target(
+                item["target"],
+                depth=item["depth"],
+                discovered_from=item["discovered_from"],
+                discovery_reason=item["discovery_reason"],
+                discovery_kind=item["discovery_kind"],
+                is_seed=item["is_seed"],
+                logger=lambda level, message: self._log(
+                    job_id,
+                    level,
+                    message,
+                    stage="enrichment",
+                ),
+            )
+
+        def _submit(item: dict[str, Any]) -> None:
+            pending[analysis_pool.submit(_analyze, item)] = item
+
         try:
-            while queue:
-                item = queue.pop(0)
-                current_target = item["target"]
-                update_job_progress(
-                    job_id,
-                    stage="enrichment",
-                    current_target=current_target,
-                    total_targets=total_targets,
-                    completed_targets=completed_targets,
-                    failed_targets=failed_targets,
-                    percent=_job_percent("enrichment", completed_targets, failed_targets, total_targets),
-                )
-                self._log(job_id, "info", f"Analyzing {current_target}", stage="enrichment")
+            # Targets are analyzed concurrently: seeds first, then follow-up
+            # targets discovered along the way are fed back into the pool.
+            for item in queue:
+                _submit(item)
+            queue.clear()
 
-                try:
-                    run = analyze_target(
-                        current_target,
-                        depth=item["depth"],
-                        discovered_from=item["discovered_from"],
-                        discovery_reason=item["discovery_reason"],
-                        discovery_kind=item["discovery_kind"],
-                        is_seed=item["is_seed"],
-                        logger=lambda level, message: self._log(
-                            job_id,
-                            level,
-                            message,
-                            stage="enrichment",
-                        ),
-                    )
-                    run_id = save_search_run(
-                        case_id,
-                        root_input=item["root_input"],
-                        normalized_target=run.normalized_target,
-                        target_type=run.target_type,
-                        depth=run.depth,
-                        discovered_from=run.discovered_from,
-                        discovery_reason=run.discovery_reason,
-                        discovery_kind=run.discovery_kind,
-                        is_seed=run.is_seed,
-                        status=run.status,
-                        error=run.error,
-                        payload=run.payload,
-                        helpers=run.helpers,
-                    )
-                    saved_runs.append({"id": run_id, "analysis": run})
-                    completed_targets += 1
-                    self._log(job_id, "success", f"Completed {current_target}", stage="enrichment")
-
-                    for discovered in run.discovered_targets:
-                        target = clean_target(str(discovered.get("target") or ""))
-                        if not target or target in seen_targets or item["depth"] >= 1:
-                            continue
-                        seen_targets.add(target)
-                        queue.append(
-                            {
-                                "target": target,
-                                "root_input": item["root_input"],
-                                "depth": item["depth"] + 1,
-                                "discovered_from": run.normalized_target,
-                                "discovery_reason": discovered.get("reason"),
-                                "discovery_kind": discovered.get("kind"),
-                                "is_seed": False,
-                            }
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    item = pending.pop(future)
+                    current_target = item["target"]
+                    try:
+                        run = future.result()
+                        run_id = save_search_run(
+                            case_id,
+                            root_input=item["root_input"],
+                            normalized_target=run.normalized_target,
+                            target_type=run.target_type,
+                            depth=run.depth,
+                            discovered_from=run.discovered_from,
+                            discovery_reason=run.discovery_reason,
+                            discovery_kind=run.discovery_kind,
+                            is_seed=run.is_seed,
+                            status=run.status,
+                            error=run.error,
+                            payload=run.payload,
+                            helpers=run.helpers,
                         )
-                        total_targets += 1
-                        self._log(
-                            job_id,
-                            "info",
-                            f"Queued follow-up target {target}",
-                            stage="enrichment",
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    failed_targets += 1
-                    self._log(job_id, "warning", f"Failed {current_target}: {exc}", stage="enrichment")
+                        saved_runs.append({"id": run_id, "analysis": run})
+                        completed_targets += 1
+                        self._log(job_id, "success", f"Completed {current_target}", stage="enrichment")
 
-                update_job_progress(
-                    job_id,
-                    stage="enrichment",
-                    current_target=current_target,
-                    total_targets=total_targets,
-                    completed_targets=completed_targets,
-                    failed_targets=failed_targets,
-                    percent=_job_percent("enrichment", completed_targets, failed_targets, total_targets),
-                )
+                        for discovered in run.discovered_targets:
+                            target = clean_target(str(discovered.get("target") or ""))
+                            if not target or target in seen_targets or item["depth"] >= 1:
+                                continue
+                            seen_targets.add(target)
+                            total_targets += 1
+                            self._log(
+                                job_id,
+                                "info",
+                                f"Queued follow-up target {target}",
+                                stage="enrichment",
+                            )
+                            _submit(
+                                {
+                                    "target": target,
+                                    "root_input": item["root_input"],
+                                    "depth": item["depth"] + 1,
+                                    "discovered_from": run.normalized_target,
+                                    "discovery_reason": discovered.get("reason"),
+                                    "discovery_kind": discovered.get("kind"),
+                                    "is_seed": False,
+                                }
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        failed_targets += 1
+                        self._log(job_id, "warning", f"Failed {current_target}: {exc}", stage="enrichment")
+
+                    update_job_progress(
+                        job_id,
+                        stage="enrichment",
+                        current_target=current_target,
+                        total_targets=total_targets,
+                        completed_targets=completed_targets,
+                        failed_targets=failed_targets,
+                        percent=_job_percent("enrichment", completed_targets, failed_targets, total_targets),
+                    )
 
             update_job_progress(
                 job_id,
@@ -283,12 +306,63 @@ class CaseRuntime:
                 percent=100,
                 error=str(exc),
             )
+        finally:
+            analysis_pool.shutdown(wait=False, cancel_futures=True)
+
+    def recompute_case(self, case_id: str) -> dict[str, int]:
+        """
+        Re-run pairing, clustering, and the case summary from the stored scan
+        runs without re-scanning anything. Used to apply scoring fixes to
+        cases that were analyzed before those fixes existed.
+        """
+        runs: list[dict[str, Any]] = []
+        for row in list_search_runs(case_id, only_success=True):
+            payload = dict(row.get("payload") or {})
+            runs.append(
+                {
+                    "id": row["id"],
+                    "analysis": AnalysisRun(
+                        target=str(row.get("root_input") or row["normalized_target"]),
+                        normalized_target=row["normalized_target"],
+                        target_type=str(row.get("target_type") or "domain"),
+                        depth=int(row.get("depth") or 0),
+                        discovered_from=row.get("discovered_from"),
+                        discovery_reason=row.get("discovery_reason"),
+                        discovery_kind=row.get("discovery_kind"),
+                        is_seed=bool(row.get("is_seed")),
+                        payload=payload,
+                        helpers=build_helper_rows(payload),
+                        status=str(row.get("status") or "completed"),
+                    ),
+                }
+            )
+
+        pairings = self._build_pairings(case_id, runs)
+        replace_pairings(case_id, pairings)
+        cluster_payload, graph_payload = self._build_clusters(runs, pairings)
+        replace_cluster(
+            case_id,
+            threshold=self._cluster_threshold,
+            payload=cluster_payload,
+            graph_payload=graph_payload,
+        )
+        update_case_summary(case_id, self._build_summary(runs, pairings, cluster_payload))
+        return {
+            "runs": len(runs),
+            "pairs": len(pairings),
+            "clusters": int(cluster_payload.get("cluster_count", 0)),
+        }
 
     def _build_pairings(self, case_id: str, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         pairings: list[dict[str, Any]] = []
         successful = [item for item in runs if item["analysis"].status == "completed"]
 
         for left, right in itertools.combinations(successful, 2):
+            if _same_site(left["analysis"].normalized_target, right["analysis"].normalized_target):
+                # A domain always "matches" its own subdomains — comparing
+                # gnawo.com to www.gnawo.com proves nothing and used to
+                # flood the results with meaningless 100% pairs.
+                continue
             pairing = _pair_record(
                 scope="within_case",
                 left_run_id=left["id"],
@@ -305,6 +379,8 @@ class CaseRuntime:
                 left["analysis"].normalized_target,
                 left["analysis"].helpers,
             ):
+                if _same_site(left["analysis"].normalized_target, historical["normalized_target"]):
+                    continue
                 right_payload = dict(historical["payload"] or {})
                 right_analysis = AnalysisRun(
                     target=historical["root_input"],
@@ -432,6 +508,17 @@ class CaseRuntime:
 
     def _log(self, job_id: str, level: str, message: str, *, stage: str | None = None) -> None:
         append_job_log(job_id, level=level, message=message, stage=stage)
+
+
+def _same_site(left: str, right: str) -> bool:
+    """True when both targets are hostnames under the same registrable apex."""
+    left = str(left or "").strip().lower()
+    right = str(right or "").strip().lower()
+    if not left or not right:
+        return False
+    if ip_intel.is_ip(left) or ip_intel.is_ip(right):
+        return left == right
+    return basic._apex(left) == basic._apex(right)
 
 
 def _job_percent(stage: str, completed_targets: int, failed_targets: int, total_targets: int) -> int:
@@ -564,10 +651,19 @@ def _pair_record(
 
 def _pair_summary(pair: dict[str, Any]) -> str:
     paths = pair.get("top_paths", []) or []
-    if not paths:
+    labels: list[str] = []
+    for path in paths:
+        label = evidence_definition(path).label
+        if label not in labels:
+            labels.append(label)
+        if len(labels) == 3:
+            break
+    if not labels:
         return "The pair only shared low-level context."
-    labels = [evidence_definition(path).label for path in paths[:3]]
-    summary = ", ".join(labels[:-1] + [labels[-1]]) if len(labels) == 1 else ", ".join(labels[:-1]) + f", and {labels[-1]}"
+    if len(labels) == 1:
+        summary = labels[0]
+    else:
+        summary = ", ".join(labels[:-1]) + f", and {labels[-1]}"
     return f"Overlap driven by {summary.lower()}."
 
 
@@ -786,6 +882,8 @@ def build_pairs_response(case_id: str) -> dict[str, Any]:
                 "left": left,
                 "right": right,
                 "score": row["score"],
+                "confidence": payload.get("confidence", check.confidence_from_score(row["score"])),
+                "strength": payload.get("strength"),
                 "summary": payload.get("summary"),
                 "evidence": top_evidence,
                 "evidence_count": len(evidence_items),

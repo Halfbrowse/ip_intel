@@ -766,6 +766,20 @@ def get_cluster(case_id: str) -> dict[str, Any] | None:
             return cur.fetchone()
 
 
+def update_case_summary(case_id: str, summary: dict[str, Any]) -> None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE cases
+                SET summary = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (Jsonb(summary), case_id),
+            )
+
+
 def complete_case(
     case_id: str,
     job_id: str,

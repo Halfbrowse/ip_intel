@@ -758,6 +758,70 @@ button {
   fill: var(--text);
   font-size: 0.8rem;
   font-weight: 400;
+  user-select: none;
+}
+
+.graph-node-label.ip {
+  font-size: 0.66rem;
+  opacity: 0.75;
+}
+
+.graph-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 0.78rem;
+  color: var(--text-muted, var(--text));
+}
+
+.graph-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.graph-legend-swatch {
+  display: inline-block;
+  width: 16px;
+  height: 4px;
+  border-radius: 2px;
+}
+
+.graph-legend-swatch.round {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+}
+
+.graph-edge-hit {
+  cursor: pointer;
+}
+
+.graph-detail-panel {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: var(--surface);
+  display: grid;
+  gap: 8px;
+}
+
+.graph-detail-panel .simple-list {
+  margin: 0;
+}
+
+.linkage-signal-chips {
+  margin-top: 2px;
 }
 
 .graph-tooltip {

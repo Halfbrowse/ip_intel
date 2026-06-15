@@ -557,10 +557,20 @@ def _compact_mail_client_config(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _flatten_report_uris(value: Any) -> list[str]:
+    # parse_dmarc_report_uris returns {"rua": [...], "ruf": [...]}; iterating
+    # the dict directly yielded the tag names "rua"/"ruf", which then matched
+    # between every pair of DMARC-enabled domains. Flatten the URI entries.
+    if isinstance(value, dict):
+        items: list[Any] = [entry for uris in value.values() for entry in (uris or [])]
+    else:
+        items = list(value or [])
+
     flattened: list[str] = []
-    for item in value or []:
-        if isinstance(item, dict) and item.get("address"):
-            flattened.append(str(item["address"]).lower())
+    for item in items:
+        if isinstance(item, dict):
+            address = item.get("address") or item.get("raw")
+            if address:
+                flattened.append(str(address).lower())
         elif str(item or "").strip():
             flattened.append(str(item).lower())
     return sorted({item for item in flattened if item})

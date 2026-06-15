@@ -306,10 +306,41 @@ export function normalizeJob(payload, fallbackId = null) {
   };
 }
 
+// Mirrors the backend's saturating score→confidence curve so pairs stored
+// before the confidence field existed still display a bounded percentage
+// instead of a raw additive score clamped at 100.
+export function confidenceFromScore(score) {
+  const value = Number(score);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.round((100 * value) / (value + 65));
+}
+
+function naiveApex(host) {
+  const text = String(host || "").toLowerCase();
+  if (!text || /^[\d.:]+$/.test(text)) {
+    return text;
+  }
+  const parts = text.split(".");
+  return parts.length <= 2 ? text : parts.slice(-2).join(".");
+}
+
+// True when both sides of a pair live under the same registrable domain.
+// Comparing a domain against its own subdomains always "matches", so these
+// pairs are noise; new cases no longer produce them, and this hides them
+// for cases analyzed before that fix.
+export function isSameSitePair(pair) {
+  if (!pair?.left || !pair?.right) {
+    return false;
+  }
+  return naiveApex(pair.left) === naiveApex(pair.right);
+}
+
 export function normalizePairs(payload) {
-  return coerceArray(payload?.pairs ?? payload?.items ?? payload?.results ?? payload).map(
-    (item, index) => normalizePairItem(item, index),
-  );
+  return coerceArray(payload?.pairs ?? payload?.items ?? payload?.results ?? payload)
+    .map((item, index) => normalizePairItem(item, index))
+    .filter((pair) => !isSameSitePair(pair));
 }
 
 export function normalizePairDetail(payload, fallbackId = null) {
@@ -439,13 +470,20 @@ function normalizePairItem(item, index) {
     right ||= readableValue(entities[1]);
   }
 
+  const rawConfidence = pickFirst(raw, ["confidence"]);
+  const rawScore = pickFirst(raw, ["score"]);
+
   return {
     raw,
     id: pickFirst(raw, ["id", "pair_id", "pairId", "uuid"], index + 1),
     scope: pickFirst(raw, ["scope", "group", "type"], "pair"),
     left,
     right,
-    score: resolvePercent(pickFirst(raw, ["score", "confidence", "strength"])),
+    score:
+      rawConfidence !== null
+        ? resolvePercent(rawConfidence)
+        : confidenceFromScore(rawScore),
+    strength: pickFirst(raw, ["strength"]) || null,
     status: normalizeStatus(pickFirst(raw, ["status", "classification", "verdict"], "unknown")),
     summary: summarizeText(
       pickFirst(raw, ["summary", "description", "explanation", "rationale"]),
@@ -467,6 +505,25 @@ function normalizeClusterItem(item, index, fallbackType) {
     .map((entry) => readableValue(entry))
     .filter(Boolean);
 
+  // max_edge_score is a raw additive evidence score, not a percentage —
+  // run it through the same saturating curve as pair confidences.
+  const rawEdgeScore = pickFirst(raw, ["max_edge_score", "maxEdgeScore"]);
+  const rawConfidence = pickFirst(raw, ["confidence"]);
+  const score =
+    rawConfidence !== null
+      ? resolvePercent(rawConfidence)
+      : rawEdgeScore !== null
+        ? confidenceFromScore(rawEdgeScore)
+        : resolvePercent(pickFirst(raw, ["score", "strength"]));
+
+  const topEvidence = coerceArray(pickFirst(raw, ["top_evidence", "topEvidence"], []))
+    .map((entry) =>
+      typeof entry === "string"
+        ? entry
+        : entry?.label || (entry?.path ? formatLabel(String(entry.path).split(".").pop()) : null),
+    )
+    .filter(Boolean);
+
   return {
     raw,
     id: pickFirst(raw, ["id", "cluster_id", "clusterId", "key"], `${fallbackType}-${index + 1}`),
@@ -474,10 +531,12 @@ function normalizeClusterItem(item, index, fallbackType) {
       pickFirst(raw, ["label", "name", "title", "summary_key", "key"]) ||
       `${formatLabel(fallbackType)} ${index + 1}`,
     type: pickFirst(raw, ["type", "cluster_type", "kind", "signal"], fallbackType),
-    score: resolvePercent(pickFirst(raw, ["score", "confidence", "strength"])),
+    score,
     summary: summarizeText(pickFirst(raw, ["summary", "description", "note"])),
     memberCount:
       pickFirst(raw, ["member_count", "memberCount", "count", "size"], null) ?? members.length,
+    targetCount: pickFirst(raw, ["target_count", "targetCount"], null),
+    topEvidence,
     members,
   };
 }

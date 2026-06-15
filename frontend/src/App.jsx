@@ -274,9 +274,9 @@ function HomePage() {
       <section className="panel section-stack">
         <div className="panel-header">
           <div>
-            <p className="eyebrow">API</p>
+            <p className="eyebrow">History</p>
             <h2>Cases</h2>
-            <p className="section-copy">Loaded from `/api/cases` and ready to drill into.</p>
+            <p className="section-copy">Every analysis submitted so far, newest first.</p>
           </div>
           <button className="secondary-button" onClick={casesRequest.refresh} type="button">
             Refresh
@@ -654,15 +654,26 @@ function evidenceNoun(item) {
   return lowerFirst(label);
 }
 
-function linkStrength(score) {
-  const value = score === null || score === undefined ? 0 : score;
-  if (value >= 70) {
-    return { tier: "strong", label: "Strong link", tone: "success" };
+const STRENGTH_TIERS = {
+  strong: { tier: "strong", label: "Strong link", tone: "success" },
+  moderate: { tier: "moderate", label: "Moderate link", tone: "warning" },
+  weak: { tier: "weak", label: "Weak link", tone: "neutral" },
+};
+
+function linkStrength(pair) {
+  // The backend classifies new pairs; fall back to confidence thresholds
+  // (same cutoffs as the backend) for pairs stored before that existed.
+  if (pair?.strength && STRENGTH_TIERS[pair.strength]) {
+    return STRENGTH_TIERS[pair.strength];
   }
-  if (value >= 30) {
-    return { tier: "moderate", label: "Moderate link", tone: "warning" };
+  const value = pair?.score ?? 0;
+  if (value >= 65) {
+    return STRENGTH_TIERS.strong;
   }
-  return { tier: "weak", label: "Weak link", tone: "neutral" };
+  if (value >= 35) {
+    return STRENGTH_TIERS.moderate;
+  }
+  return STRENGTH_TIERS.weak;
 }
 
 function connectionReason(pair) {
@@ -672,7 +683,7 @@ function connectionReason(pair) {
   }
   const best = sorted[0];
   const noun = evidenceNoun(best);
-  const { tier } = linkStrength(pair.score);
+  const { tier } = linkStrength(pair);
 
   if (tier === "strong") {
     return `These domains share ${noun} — ${
@@ -779,9 +790,9 @@ function buildCaseExplanation(seedTargets, pairs) {
     let moderate = 0;
     let weak = 0;
     bestByDomain.forEach((score) => {
-      if (score >= 70) {
+      if (score >= 65) {
         strong += 1;
-      } else if (score >= 30) {
+      } else if (score >= 35) {
         moderate += 1;
       } else {
         weak += 1;
@@ -790,7 +801,7 @@ function buildCaseExplanation(seedTargets, pairs) {
 
     if (strong >= 2) {
       const phrase = dominantCategoryPhrase(
-        seedPairs.filter((pair) => (pair.score ?? 0) >= 70),
+        seedPairs.filter((pair) => (pair.score ?? 0) >= 65),
       );
       sentences.push(
         `${strong} of the ${seeds.length} submitted domains appear tightly linked${
@@ -804,7 +815,7 @@ function buildCaseExplanation(seedTargets, pairs) {
       }
     } else if (moderate >= 2) {
       const phrase = dominantCategoryPhrase(
-        seedPairs.filter((pair) => (pair.score ?? 0) >= 30),
+        seedPairs.filter((pair) => (pair.score ?? 0) >= 35),
       );
       sentences.push(
         `${moderate} of the ${seeds.length} submitted domains show a moderate connection${
@@ -987,10 +998,16 @@ function DomainLinkageExplorer({ caseId, pairs, seedTargets, request }) {
 }
 
 const LinkageCard = memo(function LinkageCard({ caseId, expanded, onToggle, other, pair }) {
-  const strength = linkStrength(pair.score);
+  const strength = linkStrength(pair);
   const reason = connectionReason(pair);
   const barWidth = Math.max(4, Math.min(100, pair.score ?? 0));
   const signalCount = pair.evidenceCount ?? pair.evidence.length;
+  // Name the strongest shared signals on the collapsed card, so "9 signals"
+  // is never a mystery: the count alone told the reader nothing.
+  const topSignalNames = [
+    ...new Set(sortEvidence(pair.evidence).map((item) => item.title || formatLabel(item.type))),
+  ].slice(0, 3);
+  const unnamedCount = signalCount - topSignalNames.length;
 
   return (
     <article className={`linkage-card ${expanded ? "expanded" : ""}`}>
@@ -1010,11 +1027,22 @@ const LinkageCard = memo(function LinkageCard({ caseId, expanded, onToggle, othe
             {pair.scope === "historical" ? (
               <span className="chip linkage-scope-chip">From an earlier case</span>
             ) : null}
-            <span className="linkage-signal-count">
-              {signalCount} signal{signalCount === 1 ? "" : "s"}
-            </span>
           </span>
           <span className="card-copy linkage-reason">{reason}</span>
+          {topSignalNames.length > 0 ? (
+            <span className="chip-row linkage-signal-chips">
+              {topSignalNames.map((name) => (
+                <span className="chip evidence-chip" key={name}>
+                  {name}
+                </span>
+              ))}
+              {unnamedCount > 0 ? (
+                <span className="chip digest-more-chip">
+                  +{unnamedCount} more signal{unnamedCount === 1 ? "" : "s"}
+                </span>
+              ) : null}
+            </span>
+          ) : null}
           <span className="strength-track" aria-hidden="true">
             <span
               className={`strength-fill ${strength.tier}`}
@@ -1311,7 +1339,7 @@ function CaseSummaryPage() {
         seedTargets={seedTargets}
       />
 
-      <RawDataDisclosure label="Raw case payload" value={caseDetail.raw} />
+      <RawDataDisclosure label="Technical details (advanced)" value={caseDetail.raw} />
     </div>
   );
 }
@@ -1353,7 +1381,7 @@ function CasePairPage() {
     () => normalizePairDetail(pairRequest.data, pairId),
     [pairRequest.data, pairId],
   );
-  const strength = linkStrength(pair.score);
+  const strength = linkStrength(pair);
   const reason = connectionReason(pair);
   const barWidth = Math.max(4, Math.min(100, pair.score ?? 0));
   const scalarEntries = useMemo(
@@ -1372,7 +1400,7 @@ function CasePairPage() {
       <section className="panel section-stack">
         <div className="panel-header">
           <div>
-            <p className="eyebrow">Pair {pair.id || pairId}</p>
+            <p className="eyebrow">Connection</p>
             <h2>{pair.left && pair.right ? `${pair.left} and ${pair.right}` : "Pair detail"}</h2>
           </div>
           <button className="secondary-button" onClick={pairRequest.refresh} type="button">
@@ -1402,8 +1430,8 @@ function CasePairPage() {
         </div>
 
         <div className="subject-grid">
-          <SubjectCard label="Left entity" value={pair.left || "Unavailable"} />
-          <SubjectCard label="Right entity" value={pair.right || "Unavailable"} />
+          <SubjectCard label="First domain" value={pair.left || "Unavailable"} />
+          <SubjectCard label="Second domain" value={pair.right || "Unavailable"} />
         </div>
 
         {pair.summary ? (
@@ -1440,7 +1468,7 @@ function CasePairPage() {
         </section>
       ) : null}
 
-      <RawDataDisclosure label="Raw pair payload" value={pair.raw} />
+      <RawDataDisclosure label="Technical details (advanced)" value={pair.raw} />
     </div>
   );
 }
@@ -1464,8 +1492,11 @@ function CaseClustersPage() {
         <div className="panel-header">
           <div>
             <p className="eyebrow">Clusters</p>
-            <h2>Cluster review</h2>
-            <p className="section-copy">Loaded from `/api/cases/:caseId/clusters`.</p>
+            <h2>Groups of connected domains</h2>
+            <p className="section-copy">
+              Domains that link to each other strongly enough are grouped into clusters.
+              The map below shows who connects to whom and how strongly.
+            </p>
           </div>
           <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
             Refresh
@@ -1495,37 +1526,64 @@ function CaseClustersPage() {
                 </div>
 
                 <div className="cluster-grid">
-                  {group.clusters.map((cluster) => (
-                    <article className="cluster-card" key={cluster.id}>
-                      <div className="cluster-card-top">
-                        <div>
-                          <p className="eyebrow">{cluster.type ? formatLabel(cluster.type) : "Cluster"}</p>
-                          <h4>{cluster.label}</h4>
+                  {group.clusters.map((cluster) => {
+                    const domainMembers = cluster.members.filter(
+                      (member) => !/^[\d.:]+$/.test(member),
+                    );
+                    return (
+                      <article className="cluster-card" key={cluster.id}>
+                        <div className="cluster-card-top">
+                          <div>
+                            <p className="eyebrow">Connected group</p>
+                            <h4>{cluster.label}</h4>
+                          </div>
+                          {cluster.score !== null ? (
+                            <strong title="Confidence of the strongest connection in this group">
+                              {formatPercent(cluster.score)}
+                            </strong>
+                          ) : null}
                         </div>
-                        {cluster.score !== null ? <strong>{formatPercent(cluster.score)}</strong> : null}
-                      </div>
 
-                      <div className="inline-metrics">
-                        <InlineMetric
-                          label="Members"
-                          value={formatMaybeNumber(cluster.memberCount || cluster.members.length)}
-                        />
-                        <InlineMetric label="Cluster ID" value={cluster.id} />
-                      </div>
-
-                      {cluster.summary ? <p className="card-copy">{cluster.summary}</p> : null}
-
-                      {cluster.members.length > 0 ? (
-                        <div className="chip-row">
-                          {cluster.members.slice(0, 6).map((member) => (
-                            <span className="chip" key={`${cluster.id}-${member}`}>
-                              {member}
-                            </span>
-                          ))}
+                        <div className="inline-metrics">
+                          <InlineMetric
+                            label="Domains"
+                            value={formatMaybeNumber(
+                              cluster.targetCount ?? domainMembers.length,
+                            )}
+                          />
+                          <InlineMetric
+                            label="Shared IPs"
+                            value={formatMaybeNumber(
+                              cluster.members.length - domainMembers.length,
+                            )}
+                          />
                         </div>
-                      ) : null}
-                    </article>
-                  ))}
+
+                        {cluster.topEvidence.length > 0 ? (
+                          <p className="card-copy">
+                            Linked by {cluster.topEvidence.slice(0, 3).join(", ").toLowerCase()}.
+                          </p>
+                        ) : cluster.summary ? (
+                          <p className="card-copy">{cluster.summary}</p>
+                        ) : null}
+
+                        {domainMembers.length > 0 ? (
+                          <div className="chip-row">
+                            {domainMembers.slice(0, 6).map((member) => (
+                              <span className="chip" key={`${cluster.id}-${member}`}>
+                                {member}
+                              </span>
+                            ))}
+                            {domainMembers.length > 6 ? (
+                              <span className="chip digest-more-chip">
+                                +{domainMembers.length - 6} more
+                              </span>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </article>
+                    );
+                  })}
                 </div>
               </section>
             ))}
@@ -1533,7 +1591,7 @@ function CaseClustersPage() {
         ) : null}
       </section>
 
-      <RawDataDisclosure label="Raw cluster payload" value={clustersRequest.data} />
+      <RawDataDisclosure label="Technical details (advanced)" value={clustersRequest.data} />
     </div>
   );
 }
@@ -1548,9 +1606,7 @@ function NotFoundPage() {
             <h1>Page not found</h1>
           </div>
         </div>
-        <p className="section-copy">
-          The requested route is not part of this small routed frontend rewrite.
-        </p>
+        <p className="section-copy">This page does not exist.</p>
         <div className="action-row">
           <Link className="primary-button" to="/">
             Return to cases
@@ -1607,7 +1663,7 @@ function AppShell({ children }) {
           <strong>Intel</strong>
         </Link>
         <div className="header-side">
-          <p className="header-copy">Frontend routes for cases, jobs, pairs, and clusters.</p>
+          <p className="header-copy">Find out which domains are run by the same operator.</p>
           <button
             aria-pressed={theme === "dark"}
             className="secondary-button theme-toggle"
