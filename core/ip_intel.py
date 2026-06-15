@@ -938,13 +938,18 @@ def _censys_parse_host_hit(hit) -> tuple[dict | None, str | None]:
     fingerprint: str | None = None
     for svc in (host.get("services") or []):
         port  = svc.get("port")
+        # transport_protocol may arrive as a ServiceTransportProtocol enum
+        # whose str() is the member name ("ServiceTransportProtocol.TCP");
+        # use its .value ("tcp") when present.
         proto = svc.get("transport_protocol") or ""
+        proto = getattr(proto, "value", proto)
         if port:
             services.append(f"{port}/{str(proto).lower()}")
         if fingerprint is None:
-            chain = (svc.get("tls") or {}).get("presented_chain") or []
-            if chain:  # leaf cert is first in the presented chain
-                fingerprint = chain[0].get("fingerprint_sha256")
+            # The served leaf cert lives under svc["cert"]; presented_chain[0]
+            # is frequently the issuing intermediate, so pivot cert history on
+            # the leaf fingerprint instead.
+            fingerprint = (svc.get("cert") or {}).get("fingerprint_sha256")
 
     entry = {
         "ip":         ip,
@@ -1040,18 +1045,23 @@ def censys_cert_search(domain: str, *, include_history: bool = True) -> dict:
     seen_ips: set[str] = set()
     try:
         with SDK(personal_access_token=api_key, organization_id=org_id) as sdk:
-            query = f'host.services.tls.leaf_certificate.subject.common_name = "{domain}"'
+            query = f'host.services.cert.names = "{domain}"'
             page_token: str | None = None
             for _ in range(_CENSYS_SEARCH_MAX_PAGES):
+                # No `fields` selection: this SDK/API version only populates
+                # top-level selected fields, returning empty nested objects
+                # (autonomous_system, location, services) under `fields`, so we
+                # request the full host resource.
                 body: dict = {
                     "query":     query,
-                    "fields":    ["host.ip", "host.autonomous_system", "host.location", "host.services"],
                     "page_size": 100,
                 }
                 if page_token:
                     body["page_token"] = page_token
                 resp    = sdk.global_data.search(search_query_input_body=body)
-                payload = _as_dict(getattr(resp, "result", None))
+                # resp.result wraps the real payload under a further "result"
+                # key (same shape _censys_cert_history unwraps).
+                payload = _as_dict(_as_dict(getattr(resp, "result", None)).get("result"))
                 hits    = payload.get("hits") or []
                 for hit in hits:
                     entry, fp = _censys_parse_host_hit(hit)

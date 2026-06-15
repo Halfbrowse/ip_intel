@@ -544,16 +544,18 @@ def get_censys(domain: str) -> dict:
 
     try:
         with SDK(personal_access_token=api_key, organization_id=org_id) as sdk:
-            query = f'host.services.tls.leaf_certificate.subject.common_name = "{domain}"'
+            query = f'host.services.cert.names = "{domain}"'
             resp = sdk.global_data.search(search_query_input_body={
                 "query":     query,
-                "fields":    ["host.ip", "host.autonomous_system"],
+                "fields":    ["host.ip"],
                 "page_size": 100,
             })
         # The generated SDK returns resp.result (a SearchQueryResponse) whose
-        # .hits each wrap the host under host_v1.resource — navigate via
+        # model_dump() nests the real payload under a further "result" key;
+        # each hit wraps the host under host_v1.resource. Navigate via
         # model_dump() so we don't depend on drifting typed attribute paths.
-        payload = resp.result.model_dump() if hasattr(getattr(resp, "result", None), "model_dump") else {}
+        outer   = resp.result.model_dump() if hasattr(getattr(resp, "result", None), "model_dump") else {}
+        payload = outer.get("result") or outer
         hits = []
         for hit in (payload.get("hits") or []):
             ip = ((hit.get("host_v1") or {}).get("resource") or {}).get("ip")
