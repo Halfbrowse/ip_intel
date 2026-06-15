@@ -1273,6 +1273,11 @@ SERVICES = [
     ("page_metadata", get_page_metadata),
 ]
 
+# Cert-search providers that cost one paid/rate-limited API call per target.
+# Gated behind analyze(run_providers=...) so subdomain follow-ups don't each
+# fire their own Censys/Shodan/Netlas query.
+_PROVIDER_SERVICES = {"censys", "shodan", "netlas"}
+
 
 # steps per analyze() call: one per service + TLS probe + SSH probe
 STEPS_PER_DOMAIN = len(SERVICES) + 2
@@ -1294,7 +1299,8 @@ def _bump(overall_bar, step_label: str, domain: str) -> None:
 def analyze(domain: str, *, is_followup: bool = False,
             all_results: dict | None = None,
             overall_bar=None,
-            follow_siblings: bool = True) -> dict:
+            follow_siblings: bool = True,
+            run_providers: bool = True) -> dict:
     """
     Run every service on `domain`, plus TLS + SSH probes on non-CF IPs.
 
@@ -1304,6 +1310,14 @@ def analyze(domain: str, *, is_followup: bool = False,
     step. `overall_bar` is a tqdm bar tracking total run progress.
     `follow_siblings=False` disables sibling discovery (useful when called
     from batch mode so we don't explode the scan count).
+
+    `run_providers=False` skips the paid/rate-limited cert-search providers
+    (Censys, Shodan, Netlas). Each of those is an API call per target, so
+    running them on every discovered subdomain is what makes a single case
+    burn 30+ Censys calls. A subdomain's certs/origins are already covered by
+    its apex's provider search plus crt.sh / DNS / TLS probing, so callers
+    pass run_providers=False for subdomain follow-ups and keep them only for
+    apex-level targets.
     """
     started = time.time()
     prefix  = "└─ " if is_followup else ""
@@ -1322,6 +1336,14 @@ def analyze(domain: str, *, is_followup: bool = False,
 
     # ── 1. External services ──────────────────────────────────────────────────
     for name, fn in SERVICES:
+        if name in _PROVIDER_SERVICES and not run_providers:
+            # Skip the per-target paid cert-search APIs on follow-ups; record a
+            # marker so the key is present and downstream code treats it like
+            # any other skipped service.
+            results[name] = {"skipped": True,
+                             "reason": "provider cert search runs on apex targets only"}
+            _bump(overall_bar, name, domain)
+            continue
         try:
             results[name] = fn(domain)
         except Exception as exc:

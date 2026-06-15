@@ -418,6 +418,7 @@ class CaseRuntime:
                 if pairing is not None:
                     pairings.append(pairing)
 
+        pairings = _apply_subdomain_rollup(runs, pairings)
         pairings.sort(key=lambda item: (item["scope"], -item["score"], item["left_target"], item["right_target"]))
         return pairings
 
@@ -542,6 +543,156 @@ def _same_site(left: str, right: str) -> bool:
     if ip_intel.is_ip(left) or ip_intel.is_ip(right):
         return left == right
     return basic._apex(left) == basic._apex(right)
+
+
+# A subdomain link credits its apex at a slight discount: the matched
+# infrastructure was the subdomain's, one indirection from the apex itself.
+_SUBDOMAIN_ROLLUP_DISCOUNT = 0.8
+
+
+def _rollup_summary(info: dict[str, Any]) -> str:
+    return (
+        f"Main-domain link inferred from {info['via_left']} ↔ {info['via_right']} "
+        f"(inherited {info['source_score']} → {info['score']} from that overlap)."
+    )
+
+
+def _apply_subdomain_rollup(
+    runs: list[dict[str, Any]],
+    pairings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Make a subdomain's cross-domain link count for its apex ("main domain").
+
+    A follow-up subdomain like ``vpn.a.com`` can link hard to a different apex
+    (``b.com``) while the apexes themselves share nothing directly — both hide
+    behind Cloudflare — so the operator-level link ``a.com ↔ b.com`` never
+    surfaces. We take the single strongest such subdomain link per apex pair
+    (max-only, no stacking), discount it slightly, and roll it up onto the apex
+    pairing so the main-domain relationship carries the weight and the apex
+    joins the subdomain's cluster.
+    """
+    # apex label -> a scanned apex-level run id we can attach a pairing to.
+    apex_run: dict[str, str] = {}
+    for run in runs:
+        analysis = run["analysis"]
+        if analysis.target_type != "domain":
+            continue
+        label = analysis.normalized_target
+        if label == basic._apex(label):
+            apex_run.setdefault(label, run["id"])
+
+    # Best (max) discounted rollup per apex pair, with its source sub-pairing.
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for pairing in pairings:
+        if pairing["scope"] != "within_case":
+            continue
+        left, right = pairing["left_target"], pairing["right_target"]
+        if ip_intel.is_ip(left) or ip_intel.is_ip(right):
+            continue
+        apex_l, apex_r = basic._apex(left), basic._apex(right)
+        if apex_l == apex_r:
+            continue
+        # At least one endpoint must be an actual subdomain; a direct
+        # apex↔apex pairing already credits the main domains.
+        if left == apex_l and right == apex_r:
+            continue
+        if apex_l not in apex_run or apex_r not in apex_run:
+            continue  # apex was never scanned — nothing to attach to
+        rolled = int(round(pairing["score"] * _SUBDOMAIN_ROLLUP_DISCOUNT))
+        if rolled <= 0:
+            continue
+        key = tuple(sorted((apex_l, apex_r)))
+        current = best.get(key)
+        if current is None or rolled > current["score"]:
+            best[key] = {
+                "score": rolled,
+                "apex_a": key[0],
+                "apex_b": key[1],
+                "via_left": left,
+                "via_right": right,
+                "source_score": pairing["score"],
+                "source_payload": pairing["payload"],
+            }
+
+    if not best:
+        return pairings
+
+    # Existing direct apex↔apex within-case pairings, for de-duplication.
+    direct: dict[tuple[str, str], dict[str, Any]] = {}
+    for pairing in pairings:
+        if pairing["scope"] != "within_case":
+            continue
+        l, r = pairing["left_target"], pairing["right_target"]
+        if (l == basic._apex(l) and r == basic._apex(r)
+                and basic._apex(l) != basic._apex(r)):
+            direct[tuple(sorted((l, r)))] = pairing
+
+    for key, info in best.items():
+        provenance = {
+            "kind": "subdomain_rollup",
+            "via": [info["via_left"], info["via_right"]],
+            "source_score": info["source_score"],
+            "discount": _SUBDOMAIN_ROLLUP_DISCOUNT,
+        }
+        existing = direct.get(key)
+        if existing is not None:
+            # Keep one row per apex pair: take the stronger of the direct
+            # evidence and the rolled-up subdomain link.
+            if info["score"] > existing["score"]:
+                existing["score"] = info["score"]
+                existing["payload"]["derived_boost"] = provenance
+                existing["payload"]["summary"] = _rollup_summary(info)
+            continue
+
+        src = info["source_payload"] or {}
+        rollup_evidence = {
+            "id": "subdomain_rollup",
+            "type": "subdomain_rollup",
+            "label": "Linked through a subdomain",
+            "category": "Infrastructure",
+            "importance": "strong",
+            "description": (
+                f"{info['via_left']} ↔ {info['via_right']} overlap is attributed "
+                f"to the apex domains that own those hostnames."
+            ),
+            "why_it_matters": (
+                "A subdomain caught sharing infrastructure with another domain "
+                "implicates the operator behind its apex, even when the apexes "
+                "hide behind a CDN and share nothing directly."
+            ),
+            "caveat": (
+                "Inferred link: the apexes did not match directly — the evidence "
+                "below belongs to the subdomain that carried it."
+            ),
+            "matched_values": [info["via_left"], info["via_right"]],
+        }
+        payload = {
+            "scope": "within_case",
+            "a_domain": info["apex_a"],
+            "b_domain": info["apex_b"],
+            "score": info["score"],
+            "match_count": 0,
+            "derived": provenance,
+            "matches": {},
+            "top_paths": src.get("top_paths", []),
+            "subdomain_overlap": src.get("subdomain_overlap"),
+            "summary": _rollup_summary(info),
+            "evidence_items": [rollup_evidence, *(src.get("evidence_items") or [])],
+        }
+        pairings.append({
+            "id": str(uuid.uuid4()),
+            "scope": "within_case",
+            "left_run_id": apex_run[info["apex_a"]],
+            "right_run_id": apex_run[info["apex_b"]],
+            "left_target": info["apex_a"],
+            "right_target": info["apex_b"],
+            "score": info["score"],
+            "match_count": 0,
+            "payload": payload,
+        })
+
+    return pairings
 
 
 def _job_percent(stage: str, completed_targets: int, failed_targets: int, total_targets: int) -> int:

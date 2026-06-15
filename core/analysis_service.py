@@ -111,7 +111,15 @@ def analyze_target(
     if target_type == "ip":
         payload = _analyze_ip(normalized_target, logger=logger)
     else:
-        payload = _analyze_domain(normalized_target, logger=logger)
+        # Paid cert-search providers (Censys/Shodan/Netlas) run once per target,
+        # so only fire them on apex-level domains. A seed is always honored even
+        # if entered as a subdomain; discovered subdomain follow-ups inherit
+        # their apex's provider coverage and skip the calls.
+        is_apex = basic._apex(normalized_target) == normalized_target
+        run_providers = is_seed or is_apex
+        payload = _analyze_domain(
+            normalized_target, logger=logger, run_providers=run_providers
+        )
 
     payload["scan_depth"] = depth
     payload["discovered_from"] = discovered_from
@@ -139,7 +147,12 @@ def analyze_target(
     )
 
 
-def _analyze_domain(domain: str, *, logger: StageLogger | None = None) -> dict[str, Any]:
+def _analyze_domain(
+    domain: str,
+    *,
+    logger: StageLogger | None = None,
+    run_providers: bool = True,
+) -> dict[str, Any]:
     with _basic_runtime(logger):
         payload = basic.analyze(
             domain,
@@ -147,6 +160,7 @@ def _analyze_domain(domain: str, *, logger: StageLogger | None = None) -> dict[s
             all_results=None,
             overall_bar=None,
             follow_siblings=False,
+            run_providers=run_providers,
         )
 
     payload["input"] = domain
