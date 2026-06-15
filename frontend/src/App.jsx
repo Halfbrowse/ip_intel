@@ -261,6 +261,24 @@ function HomePage() {
           </div>
         </div>
 
+        <div className="submission-card">
+          <div>
+            <p className="eyebrow">OpenCTI website channels</p>
+            <p className="section-copy">
+              Pull the domains from the 100 most recently created website-type channels
+              on OpenCTI and open a case seeded with them.
+            </p>
+          </div>
+          <button
+            className="secondary-button"
+            disabled={submitState.busy}
+            onClick={() => ingestOpenCtiWebsite()}
+            type="button"
+          >
+            {submitState.busy ? "Submitting..." : "Ingest last 100 website channels"}
+          </button>
+        </div>
+
         <div className="callout subtle">
           <p>
             Accepted input: one domain or IP in the text field, or a CSV where the first
@@ -370,6 +388,36 @@ function HomePage() {
       setSubmitState({
         busy: false,
         error: error.message || "Case submission failed.",
+      });
+      return;
+    }
+    setSubmitState({ busy: false, error: null });
+  }
+
+  async function ingestOpenCtiWebsite() {
+    setSubmitState({ busy: true, error: null });
+    try {
+      const response = await fetch("/api/ingest/opencti-website", {
+        method: "POST",
+        headers: { Accept: "application/json" },
+      });
+      const payload = await parseSubmitPayload(response);
+      if (!response.ok) {
+        const message =
+          (payload && typeof payload === "object" && (payload.detail || payload.message || payload.error)) ||
+          (typeof payload === "string" ? payload : null) ||
+          `OpenCTI ingest failed with status ${response.status}.`;
+        throw new Error(message);
+      }
+      const caseId = payload?.case_id || payload?.case?.id;
+      if (!caseId) {
+        throw new Error("The backend did not return a case ID.");
+      }
+      window.location.assign(`/cases/${caseId}/progress`);
+    } catch (error) {
+      setSubmitState({
+        busy: false,
+        error: error.message || "OpenCTI ingest failed.",
       });
       return;
     }

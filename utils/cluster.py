@@ -341,6 +341,101 @@ def build_graph_payload(result: dict) -> dict:
     }
 
 
+def collapse_graph_to_apex(payload: dict, apex_of) -> dict:
+    """
+    Fold a {nodes, edges} graph so each *domain* node becomes its registrable
+    apex ("main domain"); IP nodes are left as-is. Subdomain nodes merge into
+    their apex, same-site edges (a subdomain to its own apex) disappear, and
+    parallel edges between the same collapsed pair are merged.
+
+    The merged edge keeps the strongest score and the union of evidence, plus a
+    ``contributors`` list recording the original subdomain-level links that fed
+    it — so the UI can show "linked via vpn.a.com ↔ b.com" when an apex↔apex
+    connection is expanded. ``apex_of`` is injected (e.g. ``basic._apex``) to
+    keep this module dependency-free.
+    """
+    def collapse_id(node_id: str) -> str:
+        if _node_kind(node_id) == "ip":
+            return node_id
+        return apex_of(node_id) or node_id
+
+    nodes: list[dict] = []
+    seen_nodes: set[str] = set()
+    for node in payload.get("nodes") or []:
+        cid = collapse_id(node["id"])
+        if cid in seen_nodes:
+            continue
+        seen_nodes.add(cid)
+        nodes.append({**node, "id": cid, "label": cid})
+
+    merged: dict[tuple[str, str], dict] = {}
+    for edge in payload.get("edges") or []:
+        a, b = collapse_id(edge["from"]), collapse_id(edge["to"])
+        if a == b:
+            continue  # same-site (subdomain ↔ its own apex) — nothing to show
+        key = tuple(sorted((a, b)))
+        contributor = {
+            "from": edge["from"],
+            "to": edge["to"],
+            "score": edge.get("score", 0),
+            "labels": edge.get("labels") or [],
+            "via_subdomain": edge["from"] != a or edge["to"] != b,
+        }
+        existing = merged.get(key)
+        if existing is None:
+            paths = list(edge.get("paths") or [])
+            merged[key] = {
+                "from": key[0],
+                "to": key[1],
+                "score": edge.get("score", 0),
+                "paths": paths,
+                "labels": list(edge.get("labels") or []),
+                "visual": edge.get("visual", "weak"),
+                "width": edge.get("width", 1),
+                "color": edge.get("color"),
+                "contributors": [contributor],
+            }
+        else:
+            existing["contributors"].append(contributor)
+            for path in edge.get("paths") or []:
+                if path not in existing["paths"]:
+                    existing["paths"].append(path)
+            for label in edge.get("labels") or []:
+                if label not in existing["labels"]:
+                    existing["labels"].append(label)
+            if edge.get("score", 0) > existing["score"]:
+                existing["score"] = edge["score"]
+                existing["width"] = edge.get("width", existing["width"])
+            # Promote the strongest visual tier present on any contributing edge.
+            if _visual_rank(edge.get("visual", "weak")) > _visual_rank(existing["visual"]):
+                existing["visual"] = edge.get("visual", "weak")
+                existing["color"] = edge.get("color")
+
+    edges: list[dict] = []
+    for item in merged.values():
+        item["contributors"].sort(key=lambda c: -(c.get("score") or 0))
+        item["title"] = f"score {item['score']}\n" + "\n".join(f"· {p}" for p in item["paths"])
+        edges.append(item)
+
+    return {
+        **payload,
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            **(payload.get("stats") or {}),
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        },
+    }
+
+
+_VISUAL_ORDER = {"weak": 0, "infra": 1, "strong": 2}
+
+
+def _visual_rank(visual: str) -> int:
+    return _VISUAL_ORDER.get(str(visual), 0)
+
+
 def write_html_graph(payload: dict, out_file: Path) -> None:
     """
     Write a self-contained interactive HTML page with a vis-network graph.

@@ -340,7 +340,11 @@ export function isSameSitePair(pair) {
 export function normalizePairs(payload) {
   return coerceArray(payload?.pairs ?? payload?.items ?? payload?.results ?? payload)
     .map((item, index) => normalizePairItem(item, index))
-    .filter((pair) => !isSameSitePair(pair));
+    .filter((pair) => !isSameSitePair(pair))
+    // Subdomain pairs whose weight has been rolled up onto an apex pairing are
+    // folded away here so the case view compares main domains; the underlying
+    // subdomain link stays visible on the connection map when expanded.
+    .filter((pair) => !pair.foldedIntoApex);
 }
 
 export function normalizePairDetail(payload, fallbackId = null) {
@@ -494,6 +498,8 @@ function normalizePairItem(item, index) {
       pickFirst(raw, ["evidence_count", "evidenceCount"], null) ?? evidence.length,
     evidenceCounts: raw.evidence_counts || raw.evidenceCounts || null,
     isSeedPair: Boolean(raw.is_seed_pair),
+    foldedIntoApex: raw.folded_into_apex || raw.foldedIntoApex || null,
+    derived: Boolean(raw.derived),
   };
 }
 

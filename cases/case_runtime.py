@@ -489,7 +489,13 @@ class CaseRuntime:
             "clusters": cluster_items,
             "isolates": isolates,
         }
-        return result, cluster.build_graph_payload(result)
+        # Collapse the graph so the connection map compares *main domains*:
+        # subdomains fold into their apex and their cross-domain links ride
+        # along as edge contributors, visible when a connection is expanded.
+        graph = cluster.collapse_graph_to_apex(
+            cluster.build_graph_payload(result), basic._apex
+        )
+        return result, graph
 
     def _build_summary(
         self,
@@ -603,6 +609,10 @@ def _apply_subdomain_rollup(
         if rolled <= 0:
             continue
         key = tuple(sorted((apex_l, apex_r)))
+        # This subdomain pairing is now represented by an apex pairing, so the
+        # frontend folds it away and shows it only when the apex connection is
+        # expanded ("compare main domains" view).
+        pairing["payload"]["folded_into_apex"] = [key[0], key[1]]
         current = best.get(key)
         if current is None or rolled > current["score"]:
             best[key] = {
@@ -1083,6 +1093,11 @@ def build_pairs_response(case_id: str) -> dict[str, Any]:
                 "top_paths": payload.get("top_paths", []),
                 "match_count": row["match_count"],
                 "is_seed_pair": is_seed_pair,
+                # Subdomain pair already represented by an apex rollup — hidden
+                # from the main "compare main domains" list, shown on expand.
+                "folded_into_apex": payload.get("folded_into_apex") or None,
+                # Apex pairing that inherited a subdomain link's weight.
+                "derived": bool(payload.get("derived") or payload.get("derived_boost")),
             }
         )
     return {

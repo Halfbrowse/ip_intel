@@ -224,9 +224,9 @@ def _get_domains() -> list[str]:
     try:
         api = OpenCTIApiClient(url, token, log_level="error")
         log.info("Fetching Domain-Name observables...")
-        observables = api.stix_cyber_observable.list(
-            types=["Domain-Name"],
-            getAll=True,
+        observables = api.channel.list(
+            types=["website"],
+            
         )
         domains = []
         for obs in observables:
@@ -304,6 +304,85 @@ def _channel_candidate_domains(channel: dict) -> list[str]:
             seen.add(domain)
             candidates.append(domain)
     return candidates
+
+
+def _channel_is_website(channel: dict) -> bool:
+    """True when a Channel SDO is of type 'website'. The field is normally a
+    list (`channel_types`) but tolerate a scalar or the singular key too."""
+    types = channel.get("channel_types")
+    if types is None:
+        types = channel.get("channel_type")
+    if isinstance(types, str):
+        types = [types]
+    if not isinstance(types, (list, tuple)):
+        return False
+    return any(str(t).strip().lower() == "website" for t in types)
+
+
+def fetch_website_channel_domains(limit: int = 100) -> list[str]:
+    """
+    Return the bare domains carried by the most recently created Channel SDOs
+    of type 'website' on OpenCTI (newest `limit` channels). Social-media
+    platform domains are dropped and the result is de-duplicated in order.
+
+    Used by the case UI's "ingest website channels" button, which seeds a new
+    case with these domains. Raises RuntimeError on configuration/connection
+    problems so the endpoint can report a clear error.
+    """
+    url = os.getenv("OPENCTI_URL", "").strip()
+    token = os.getenv("OPENCTI_TOKEN", "").strip()
+    if not url or not token:
+        raise RuntimeError("OPENCTI_URL or OPENCTI_TOKEN not set")
+
+    api = OpenCTIApiClient(url, token, log_level="error")
+    list_channels = getattr(getattr(api, "channel", None), "list", None)
+    if not callable(list_channels):
+        raise RuntimeError("pycti channel API is not available in this client version")
+
+    # Channels of type "website" only — `types=["website"]` filters server-side.
+    # Newest first and capped at `limit` gives "the last 100 created".
+    try:
+        channels = list_channels(
+            types=["website"],
+            first=limit,
+            orderBy="created_at",
+            orderMode="desc",
+        ) or []
+    except Exception as exc:  # noqa: BLE001 - pycti order/first args drift between versions
+        log.warning("Ordered channel list failed (%s); fetching all website channels", exc)
+        channels = list_channels(types=["website"]) or []
+        # Order/cap locally when the server wouldn't.
+        channels = sorted(
+            (c for c in channels if isinstance(c, dict)),
+            key=lambda c: str(c.get("created_at") or c.get("created") or ""),
+            reverse=True,
+        )[:limit]
+
+    domains: list[str] = []
+    seen: set[str] = set()
+    skipped_social = 0
+    for channel in channels:
+        if not isinstance(channel, dict):
+            continue
+        # Backstop if a server ignores the type filter: drop only channels that
+        # *explicitly* declare a non-website type. When the field is absent we
+        # trust the server-side `types=["website"]` filter rather than drop it.
+        has_type = channel.get("channel_types") is not None or channel.get("channel_type") is not None
+        if has_type and not _channel_is_website(channel):
+            continue
+        for domain in _channel_candidate_domains(channel):
+            if _is_social_media_domain(domain):
+                skipped_social += 1
+                continue
+            if domain in seen:
+                continue
+            seen.add(domain)
+            domains.append(domain)
+    log.info(
+        "Fetched %d website channel(s) from OpenCTI -> %d domain(s) (%d social-media skipped)",
+        len(channels), len(domains), skipped_social,
+    )
+    return domains
 
 
 def _get_channel_domains(exclude: set[str]) -> list[str]:

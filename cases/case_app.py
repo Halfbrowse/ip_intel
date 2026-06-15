@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from cases.case_runtime import CaseRuntime, build_case_response, build_job_response, build_pairs_response, parse_submission
+from core.analysis_service import normalize_inputs
 from cases.case_store import get_case, get_cluster, get_job, get_pairing, healthcheck, init_db, list_cases, load_case_inputs
 from utils.evidence_meta import evidence_catalog
 
@@ -162,6 +163,44 @@ async def api_create_case(request: Request) -> JSONResponse:
                 "case_id": identifiers["case_id"],
                 "job_id": identifiers["job_id"],
                 "status": "queued",
+            }
+        ),
+    )
+
+
+@app.post("/api/ingest/opencti-website")
+async def api_ingest_opencti_website() -> JSONResponse:
+    """Seed a new case with the domains from OpenCTI's most recently created
+    website-type Channel SDOs (the last 100)."""
+    # Imported lazily so the case app starts even when pycti / OpenCTI config
+    # is absent; the dependency is only needed when this button is used.
+    from integrations.opencti_ingest import fetch_website_channel_domains
+
+    try:
+        domains = await asyncio.to_thread(fetch_website_channel_domains, 100)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"OpenCTI fetch failed: {exc}")
+
+    inputs = normalize_inputs(domains)
+    if not inputs:
+        raise HTTPException(
+            status_code=404,
+            detail="No website-channel domains found on OpenCTI.",
+        )
+
+    identifiers = runtime.submit_case(inputs, input_mode="opencti_website")
+    case_row = get_case(identifiers["case_id"])
+    job_row = get_job(identifiers["job_id"])
+    return JSONResponse(
+        status_code=202,
+        content=jsonable_encoder(
+            {
+                "case": build_case_response(case_row) if case_row else {"id": identifiers["case_id"]},
+                "job": build_job_response(job_row) if job_row else {"id": identifiers["job_id"]},
+                "case_id": identifiers["case_id"],
+                "job_id": identifiers["job_id"],
+                "status": "queued",
+                "domain_count": len(inputs),
             }
         ),
     )

@@ -390,6 +390,24 @@ const ClusterGraph = memo(function ClusterGraph({ graph, seedTargets = new Set()
               <li key={label}>{label}</li>
             ))}
           </ul>
+          {subdomainContributors(selectedEdgeData).length > 0 ? (
+            <>
+              <p className="card-copy">Linked through subdomains:</p>
+              <ul className="simple-list">
+                {subdomainContributors(selectedEdgeData).map((contributor) => {
+                  const labels = contributor.labels && contributor.labels.length > 0
+                    ? ` — ${contributor.labels.slice(0, 3).join(", ")}`
+                    : "";
+                  return (
+                    <li key={`${contributor.from}|${contributor.to}`}>
+                      <strong>{contributor.from} ↔ {contributor.to}</strong>
+                      {labels}
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          ) : null}
         </div>
       ) : null}
 
@@ -423,6 +441,12 @@ const ClusterGraph = memo(function ClusterGraph({ graph, seedTargets = new Set()
     </section>
   );
 });
+
+// Edge contributors whose link came from a subdomain (rather than a direct
+// apex↔apex match) — these are what we surface when a connection is expanded.
+function subdomainContributors(edge) {
+  return (edge?.contributors || []).filter((contributor) => contributor.via_subdomain);
+}
 
 function looksLikeIp(value) {
   return /^[\d.]+$/.test(String(value || "")) || String(value || "").includes(":");
