@@ -438,6 +438,100 @@ def collapse_graph_to_apex(payload: dict, apex_of) -> dict:
     }
 
 
+def submitted_bridge_graph(payload: dict, apex_of, submitted) -> dict:
+    """
+    Reduce a full {nodes, edges} graph to just the *submitted* domains and the
+    subdomains that *bridge* one submitted domain to another.
+
+    Rendering rules (see the connection-map UI):
+      * Each submitted domain is drawn once, as a single apex node.
+      * A subdomain is drawn **iff** it carries a cross-domain link to a
+        *different* submitted domain — i.e. it is a genuine bridge. Non-bridging
+        subdomains, non-submitted domains, and IP nodes are dropped entirely.
+      * "Evidence" edges connect the real endpoints of each link (a submitted
+        apex, or one of its bridge subdomains).
+      * A light "membership" edge ties every bridge subdomain back to the apex
+        it belongs to, so the reader can see which submitted domain it sits under.
+
+    ``apex_of`` is injected (e.g. ``basic._apex``) to keep this module
+    dependency-free; ``submitted`` is the set of submitted domain labels.
+    """
+    submitted_apex = {apex_of(s) for s in submitted}
+    # Original node metadata, so rebuilt nodes keep their colour / cluster group.
+    meta = {node["id"]: node for node in (payload.get("nodes") or [])}
+
+    nodes: dict[str, dict] = {}
+    membership: set[tuple[str, str]] = set()
+    evidence: list[dict] = []
+
+    def add_apex(apex: str) -> None:
+        if apex not in nodes:
+            nodes[apex] = {
+                **meta.get(apex, {}),
+                "id": apex,
+                "label": apex,
+                "kind": "apex",
+                "role": "submitted",
+            }
+
+    def add_bridge(node_id: str, apex: str) -> None:
+        if node_id not in nodes:
+            nodes[node_id] = {
+                **meta.get(node_id, {}),
+                "id": node_id,
+                "label": node_id,
+                "kind": "subdomain",
+                "role": "bridge",
+                "apex": apex,
+            }
+        membership.add((apex, node_id))
+
+    for edge in payload.get("edges") or []:
+        u, v = edge["from"], edge["to"]
+        au, av = apex_of(u), apex_of(v)
+        if au == av:
+            continue  # same-site link — nothing to bridge
+        if au not in submitted_apex or av not in submitted_apex:
+            continue  # at least one side isn't a submitted domain — drop it
+        add_apex(au)
+        add_apex(av)
+        # An endpoint is either the apex itself (direct link) or a bridge subdomain.
+        nu = au if u == au else u
+        nv = av if v == av else v
+        if nu != au:
+            add_bridge(nu, au)
+        if nv != av:
+            add_bridge(nv, av)
+        evidence.append({**edge, "from": nu, "to": nv, "kind": "evidence"})
+
+    edges: list[dict] = list(evidence)
+    for apex, sub in sorted(membership):
+        edges.append({
+            "from": apex,
+            "to": sub,
+            "kind": "membership",
+            "visual": "owns",
+            "score": 0,
+            "width": 1,
+            "labels": [],
+            "paths": [],
+            "contributors": [],
+        })
+
+    return {
+        **payload,
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "stats": {
+            **(payload.get("stats") or {}),
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "submitted_count": len(submitted_apex),
+            "bridge_count": sum(1 for n in nodes.values() if n.get("role") == "bridge"),
+        },
+    }
+
+
 _VISUAL_ORDER = {"weak": 0, "infra": 1, "strong": 2}
 
 

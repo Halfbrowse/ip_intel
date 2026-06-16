@@ -241,9 +241,12 @@ def test_build_clusters_include_observed_ips_from_current_and_historical_runs(mo
         "198.51.100.20",
     ]
     assert payload["clusters"][0]["related_ip_count"] == 2
-    assert {node["label"] for node in graph["nodes"]} == {
-        "alpha.example",
-        "beta.example",
-        "198.51.100.10",
-        "198.51.100.20",
-    }
+    # Observed IPs stay in the cluster payload (above), but the connection map is
+    # now limited to submitted domains and the subdomains that bridge them. IP
+    # nodes and non-submitted historical partners (beta.example here) are left
+    # off the graph, so with a single submitted domain there are no qualifying
+    # cross-submitted links to draw.
+    graph_labels = {node["label"] for node in graph["nodes"]}
+    assert "198.51.100.10" not in graph_labels
+    assert "198.51.100.20" not in graph_labels
+    assert graph_labels <= {"alpha.example"}

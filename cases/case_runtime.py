@@ -492,23 +492,32 @@ class CaseRuntime:
             "clusters": cluster_items,
             "isolates": isolates,
         }
-        # Collapse the graph so the connection map compares *main domains*:
-        # subdomains fold into their apex and their cross-domain links ride
-        # along as edge contributors, visible when a connection is expanded.
-        graph = cluster.collapse_graph_to_apex(
-            cluster.build_graph_payload(result), basic._apex
+        # Reduce the graph to the *submitted* domains plus the subdomains that
+        # bridge one submitted domain to another. Everything else (non-submitted
+        # domains, IPs, non-bridging subdomains) is dropped so the connection map
+        # shows only the story that matters: who was asked about, and what links
+        # them.
+        submitted = {
+            pairing_label(run["analysis"].payload)
+            for run in runs
+            if run["analysis"].is_seed
+        }
+        graph = cluster.submitted_bridge_graph(
+            cluster.build_graph_payload(result), basic._apex, submitted
         )
-        # Point each collapsed apex↔apex edge at the apex pairing that the
-        # summary page shows for those two domains, so clicking a relationship
-        # in the graph and selecting the same two entities on the summary render
-        # the identical evidence packet. (Per-subdomain contributors keep their
-        # own pairing ids, threaded through build_graph_payload.)
+        # Point each apex↔apex evidence edge at the apex pairing that the summary
+        # page shows for those two domains, so clicking a relationship in the
+        # graph and selecting the same two entities on the summary render the
+        # identical evidence packet. (Bridge-subdomain edges keep their own
+        # pairing ids, threaded through build_graph_payload.)
         apex_pairing_id: dict[frozenset[str], str] = {}
         for item in pairings:
             left, right = item["left_target"], item["right_target"]
             if basic._apex(left) == left and basic._apex(right) == right and left != right:
                 apex_pairing_id[frozenset((left, right))] = item["id"]
         for edge in graph.get("edges", []):
+            if edge.get("kind") == "membership":
+                continue
             pairing_id = apex_pairing_id.get(frozenset((edge["from"], edge["to"])))
             if pairing_id:
                 edge["pairing_id"] = pairing_id
