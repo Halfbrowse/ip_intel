@@ -6,6 +6,7 @@ import {
   useDeferredValue,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
@@ -910,6 +911,143 @@ function buildCaseExplanation(seedTargets, pairs) {
 /* Domain-centric linkage explorer and the pair digest.   */
 /* ----------------------------------------------------- */
 
+function DomainSearchSelect({ seeds, others, value, onSelect }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const containerRef = useRef(null);
+  const inputRef = useRef(null);
+
+  const options = useMemo(() => {
+    const seen = new Set();
+    const entries = [];
+    seeds.forEach((domain) => {
+      if (domain && !seen.has(domain)) {
+        seen.add(domain);
+        entries.push({ domain, seed: true });
+      }
+    });
+    others.forEach((domain) => {
+      if (domain && !seen.has(domain)) {
+        seen.add(domain);
+        entries.push({ domain, seed: false });
+      }
+    });
+    return entries;
+  }, [seeds, others]);
+
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      return options;
+    }
+    return options.filter((option) => option.domain.toLowerCase().includes(needle));
+  }, [options, query]);
+
+  // Close on a click outside or an Escape press while the menu is open.
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+    const handleClick = (event) => {
+      if (containerRef.current && !containerRef.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      setActiveIndex(0);
+      inputRef.current?.focus();
+    }
+  }, [open]);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [query]);
+
+  const choose = (domain) => {
+    onSelect(domain);
+    setOpen(false);
+  };
+
+  const onKeyDown = (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveIndex((index) => Math.min(index + 1, filtered.length - 1));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveIndex((index) => Math.max(index - 1, 0));
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const option = filtered[activeIndex];
+      if (option) {
+        choose(option.domain);
+      }
+    } else if (event.key === "Escape") {
+      setOpen(false);
+    }
+  };
+
+  return (
+    <div className="domain-search" ref={containerRef}>
+      <button
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        className="domain-search-trigger"
+        onClick={() => setOpen((current) => !current)}
+        type="button"
+      >
+        <span className="domain-search-value">{value || "Select a domain"}</span>
+        <span aria-hidden="true" className="domain-search-caret">
+          {open ? "▴" : "▾"}
+        </span>
+      </button>
+
+      {open ? (
+        <div className="domain-search-menu">
+          <input
+            className="domain-search-input"
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Search domains..."
+            ref={inputRef}
+            type="text"
+            value={query}
+          />
+          <ul className="domain-search-options" role="listbox">
+            {filtered.length === 0 ? (
+              <li className="domain-search-empty">No domains match "{query}".</li>
+            ) : (
+              filtered.map((option, index) => (
+                <li key={option.domain}>
+                  <button
+                    className={`domain-search-option ${
+                      option.domain === value ? "selected" : ""
+                    } ${index === activeIndex ? "active" : ""}`}
+                    onClick={() => choose(option.domain)}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    type="button"
+                  >
+                    <span className="domain-search-option-name">{option.domain}</span>
+                    {option.seed ? (
+                      <span className="chip domain-search-seed-chip">Submitted</span>
+                    ) : null}
+                  </button>
+                </li>
+              ))
+            )}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function DomainLinkageExplorer({ caseId, pairs, seedTargets, request }) {
   const domainLists = useMemo(() => {
     const seeds = [...new Set(seedTargets)].filter(Boolean);
@@ -983,42 +1121,13 @@ function DomainLinkageExplorer({ caseId, pairs, seedTargets, request }) {
         <EmptyState message="No comparison results are available for this case yet." />
       ) : null}
 
-      {domainLists.seeds.length > 0 ? (
-        <div className="domain-selector" role="group" aria-label="Select a domain">
-          {domainLists.seeds.map((domain) => (
-            <button
-              className={`domain-chip ${domain === activeDomain ? "active" : ""}`}
-              key={domain}
-              onClick={() => selectDomain(domain)}
-              type="button"
-            >
-              {domain}
-            </button>
-          ))}
-        </div>
-      ) : null}
-
-      {domainLists.others.length > 0 ? (
-        <details
-          className="domain-extra"
-          open={domainLists.others.includes(activeDomain) || undefined}
-        >
-          <summary>
-            Discovered and historical domains ({domainLists.others.length})
-          </summary>
-          <div className="domain-selector">
-            {domainLists.others.map((domain) => (
-              <button
-                className={`domain-chip secondary ${domain === activeDomain ? "active" : ""}`}
-                key={domain}
-                onClick={() => selectDomain(domain)}
-                type="button"
-              >
-                {domain}
-              </button>
-            ))}
-          </div>
-        </details>
+      {allDomains.length > 0 ? (
+        <DomainSearchSelect
+          seeds={domainLists.seeds}
+          others={domainLists.others}
+          value={activeDomain}
+          onSelect={selectDomain}
+        />
       ) : null}
 
       {activeDomain && rows.length === 0 && !request?.loading ? (

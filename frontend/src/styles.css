@@ -892,6 +892,125 @@ button {
   margin-top: 12px;
 }
 
+.domain-search {
+  position: relative;
+  max-width: 420px;
+}
+
+.domain-search-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 11px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font-weight: 700;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease;
+}
+
+.domain-search-trigger:hover {
+  border-color: var(--accent);
+}
+
+.domain-search-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.domain-search-caret {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.domain-search-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-strong);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+}
+
+.domain-search-input {
+  margin: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.92rem;
+}
+
+.domain-search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.domain-search-options {
+  list-style: none;
+  margin: 0;
+  padding: 0 6px 6px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.domain-search-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.92rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.domain-search-option.active {
+  background: var(--surface);
+}
+
+.domain-search-option.selected {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.domain-search-option-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.domain-search-seed-chip {
+  flex-shrink: 0;
+}
+
+.domain-search-empty {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
 .linkage-list {
   display: grid;
   gap: 14px;
