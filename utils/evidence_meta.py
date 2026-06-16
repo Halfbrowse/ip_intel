@@ -129,9 +129,9 @@ EVIDENCE_DEFINITIONS: dict[str, EvidenceDefinition] = {
         label="Shared AdSense publisher ID",
         category="Web identity",
         description="Both targets exposed the same AdSense publisher identifier.",
-        why_it_matters="Publisher IDs often tie back to the same monetization account.",
+        why_it_matters="Publisher IDs tie back to the same Google AdSense payment account, a near-identity ownership signal.",
         caveat="Shared templates or publisher resellers can reduce the signal.",
-        base_importance="strong",
+        base_importance="decisive",
     ),
     "page_metadata.favicon_md5": EvidenceDefinition(
         path="page_metadata.favicon_md5",

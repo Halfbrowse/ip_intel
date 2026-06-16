@@ -77,12 +77,41 @@ _GENERIC_VALUE_MARKERS = (
 )
 
 
+# Email domains belonging to registrars, hosting providers, and privacy
+# proxies. A WHOIS / contact email at one of these is a registrar role address
+# (abuse@godaddy.com, hostmaster@cloudflare.com) — it identifies the provider,
+# not the domain owner. Two domains "sharing" abuse@godaddy.com share a
+# registrar, nothing more; treat it like a shared Cloudflare IP and never let
+# it stand as an identity match.
+_GENERIC_EMAIL_DOMAINS = (
+    "godaddy.com", "secureserver.net", "namecheap.com", "namecheaphosting.com",
+    "cloudflare.com", "domainsbyproxy.com", "whoisguard.com",
+    "withheldforprivacy.com", "withheldforprivacy.email", "privacyguardian.org",
+    "contactprivacy.com", "privacyprotect.org", "gandi.net", "ovh.net",
+    "ionos.com", "1and1.com", "hostgator.com", "bluehost.com", "googledomains.com",
+    "markmonitor.com", "cscglobal.com", "tucows.com", "enom.com", "enomdomains.com",
+    "publicdomainregistry.com", "wildwestdomains.com", "porkbun.com", "dynadot.com",
+    "name.com", "networksolutions.com", "register.com", "fastdomain.com",
+    "key-systems.net", "1api.net", "hostinger.com", "squarespace.com",
+)
+
+
+def _is_generic_email(text: str) -> bool:
+    """True for registrar/provider/privacy-proxy emails (not owner identity)."""
+    if "@" not in text:
+        return False
+    domain = text.rpartition("@")[2].strip()
+    return any(domain == d or domain.endswith("." + d) for d in _GENERIC_EMAIL_DOMAINS)
+
+
 def _is_generic_value(v) -> bool:
     """True for redacted/placeholder strings that carry no identity signal."""
     if not isinstance(v, str):
         return False
     text = v.strip().lower()
     if not text:
+        return True
+    if _is_generic_email(text):
         return True
     return any(marker in text for marker in _GENERIC_VALUE_MARKERS)
 
@@ -378,10 +407,18 @@ MATCH_WEIGHTS: dict[str, int] = {
     "shodan.hits[*].ip":                           20,
     "netlas.hits[*].ip":                           20,
     "dns.MX[*].exchange":                           3,
-    "page_metadata.google_analytics":              35,
-    "page_metadata.gtm_ids":                       30,
-    "page_metadata.facebook_pixel":                35,
-    "page_metadata.yandex_metrika":                35,
+    # Analytics / ad-tech IDs are account-bound: a shared property, pixel, or
+    # publisher ID points at the same operator/marketing account, not just a
+    # shared platform (everyone uses GA). They sit in the shared-origin tier —
+    # below crypto fingerprints, around a shared non-proxied IP. AdSense
+    # publisher IDs bind to a Google *payment* account, the strongest of the
+    # set, so they edge out the rest. GTM containers are weakest here because
+    # agencies routinely reuse one container across unrelated clients.
+    "page_metadata.google_analytics":              45,
+    "page_metadata.gtm_ids":                       40,
+    "page_metadata.facebook_pixel":                42,
+    "page_metadata.yandex_metrika":                42,
+    "page_metadata.tiktok_pixel":                  30,
     "whois.creation_date":                         25,
     "whois.registrar":                              3,
     "whois.emails":                                10,
@@ -390,7 +427,7 @@ MATCH_WEIGHTS: dict[str, int] = {
     "dns.SOA.serial":                              10,
     "dns.NS":                                      10,
     "crt_sh.issuers":                               2,
-    "page_metadata.adsense_publisher_ids":         35,
+    "page_metadata.adsense_publisher_ids":         48,
     "page_metadata.fb_app_id":                     20,
     "page_metadata.favicon_md5":                   18,
     "page_metadata.favicon_murmurhash3":           18,

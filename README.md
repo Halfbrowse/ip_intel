@@ -178,6 +178,7 @@ extras already declared in `pyproject.toml`.
 - `POST /api/cases` — create a case (JSON `{"target": "..."}` or multipart with a CSV `file`)
 - `GET /api/cases` — list all cases
 - `GET /api/cases/{case_id}` — get a case and its status
+- `POST /api/cases/{case_id}/recompute` — re-score a case's pairs and clusters from stored scan data (no re-scanning)
 
 ### Jobs
 
@@ -193,6 +194,26 @@ extras already declared in `pyproject.toml`.
 
 - `GET /api/meta/evidence` — evidence type catalog used by the frontend
 - `GET /api/health` — health check
+
+### Recomputing all cases
+
+`recompute` re-scores stored scan data without re-scanning, so run it after changing
+evidence weights or extraction logic (e.g. `utils/check.py`, `utils/evidence_meta.py`,
+`sources/signal_web.py`). To recompute every case, run `recompute_case` in-process via
+`docker compose exec` (no HTTP, no `jq`):
+
+```bash
+docker compose exec ip-intel python -c "
+from cases.case_runtime import CaseRuntime
+from cases.case_store import list_cases
+rt = CaseRuntime()
+for c in list_cases():
+    print(c['id'], rt.recompute_case(c['id']))
+"
+```
+
+Each line prints `<case_id> {counts}` as it goes. For a single case, hit the endpoint
+instead: `curl -s -X POST http://localhost:9000/api/cases/<case_id>/recompute`.
 
 ## Correlation Model
 

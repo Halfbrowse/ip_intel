@@ -159,7 +159,20 @@ _REGISTRATION_LINE_RE = re.compile(
     r"(?im)^.*\b(?:company|commercial|trade|business|merchant|enterprise|register|registration|registered|"
     r"chamber of commerce|vat|tax|gst|abn|uen|cvr|siren|siret|rcs|hrb|uid|ust-?id|cif|nif|bin|iin)\b.*$"
 )
-_VAT_TOKEN_RE = re.compile(r"\b[A-Z]{2}[A-Z0-9][A-Z0-9 ./-]{6,18}\b")
+_VAT_TOKEN_RE = re.compile(r"\b([A-Z]{2}[ ]?[A-Z0-9][A-Z0-9 ./-]{5,18}[A-Z0-9])\b")
+# Structured company/registration identifiers. We only accept tokens that look
+# like an actual ID — bare numeric IDs (Companies House 8-digit, SIREN 9-digit,
+# SIRET 14-digit), German HRB/HRA, and UK regional prefixes — never whole
+# sentences that merely contain the word "registration".
+_REG_ID_TOKEN_RE = re.compile(
+    r"(?i)\b("
+    r"HR[AB]\s*\d{1,7}"              # German commercial register (HRB / HRA)
+    r"|(?:SC|OC|NI|SO|NL|FC|GE|RC)\d{6}"  # UK Companies House regional prefixes
+    r"|\d{14}"                       # SIRET
+    r"|\d{9,12}"                     # SIREN and other long numeric IDs
+    r"|\d{8}"                        # Companies House / generic 8-digit
+    r")\b"
+)
 _STREET_WORD_RE = re.compile(
     r"(?i)\b(?:street|st\.|road|rd\.|avenue|ave\.|boulevard|blvd|lane|ln\.|drive|dr\.|way|place|"
     r"strasse|straße|allee|weg|gasse|rue|route|via|viale|rua|calle|carrera|chauss[ée]e|quay|parkway|"
@@ -935,16 +948,37 @@ def _extract_entity_names(text: str) -> list[str]:
     return entities
 
 
+def _normalize_vat(token: str) -> str | None:
+    """Compact a VAT-shaped token, validating it actually looks like a VAT id."""
+    compact = re.sub(r"[ ./-]", "", token).upper()
+    if re.fullmatch(r"[A-Z]{2}[A-Z0-9]\d{6,12}", compact):
+        return compact
+    return None
+
+
 def _extract_registration_ids(text: str) -> list[str]:
+    """Pull structured company/registration identifiers from legal-page text.
+
+    Only lines that mention a registration concept are inspected, and only
+    structured ID tokens (not the surrounding prose) are kept — so a sentence
+    like "voluntary registration for the services we offer" no longer becomes a
+    spurious, decisive "shared registration ID" match.
+    """
     hits: list[str] = []
+
+    def _push(value: str) -> None:
+        if value and value not in hits:
+            hits.append(value)
+
     for line in _line_values(text):
-        if _REGISTRATION_LINE_RE.search(line):
-            value = _clean_candidate(line)
-            if value not in hits:
-                hits.append(value)
+        if not _REGISTRATION_LINE_RE.search(line):
+            continue
+        for match in _REG_ID_TOKEN_RE.finditer(line):
+            _push(re.sub(r"\s+", " ", match.group(1)).strip().upper())
         for vat in _VAT_TOKEN_RE.findall(line):
-            if vat not in hits:
-                hits.append(vat)
+            normalized = _normalize_vat(vat)
+            if normalized:
+                _push(normalized)
     return hits
 
 
