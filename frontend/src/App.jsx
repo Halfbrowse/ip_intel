@@ -1642,6 +1642,12 @@ function CaseClustersPage() {
     () => new Set(clustersRequest.data?.seed_targets ?? []),
     [clustersRequest.data],
   );
+  // Render the graph's edge evidence with the same pair digest the summary page
+  // uses, so the two surfaces always show the identical evidence packet.
+  const renderPairEvidence = useCallback(
+    (pairingId) => <PairDigest caseId={caseId} pair={{ id: pairingId, evidence: [] }} />,
+    [caseId],
+  );
 
   return (
     <div className="page-stack">
@@ -1669,7 +1675,12 @@ function CaseClustersPage() {
         ) : null}
         {graph?.nodes?.length > 0 ? (
           <Suspense fallback={<LoadingState message="Loading the cluster map..." />}>
-            <ClusterGraph graph={graph} seedTargets={seedTargets} />
+            <ClusterGraph
+              caseId={caseId}
+              graph={graph}
+              seedTargets={seedTargets}
+              renderPairEvidence={renderPairEvidence}
+            />
           </Suspense>
         ) : null}
 

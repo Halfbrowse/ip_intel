@@ -315,6 +315,9 @@ def build_graph_payload(result: dict) -> dict:
                 "score":  edge["score"],
                 "paths":  paths,
                 "labels": _edge_labels(paths),
+                # The pair this edge came from; lets the UI render the same
+                # evidence packet the summary page shows for the same entities.
+                "pairing_id": edge.get("pairing_id"),
                 "visual": visual,
                 # Edge thickness scaled by score. Cap so one high-score edge
                 # doesn't dominate the rendering.
@@ -379,6 +382,7 @@ def collapse_graph_to_apex(payload: dict, apex_of) -> dict:
             "to": edge["to"],
             "score": edge.get("score", 0),
             "labels": edge.get("labels") or [],
+            "pairing_id": edge.get("pairing_id"),
             "via_subdomain": edge["from"] != a or edge["to"] != b,
         }
         existing = merged.get(key)
@@ -390,6 +394,9 @@ def collapse_graph_to_apex(payload: dict, apex_of) -> dict:
                 "score": edge.get("score", 0),
                 "paths": paths,
                 "labels": list(edge.get("labels") or []),
+                # Apex pairing id is assigned authoritatively after collapse;
+                # seed it from a direct apex↔apex edge when one is present.
+                "pairing_id": edge.get("pairing_id") if not contributor["via_subdomain"] else None,
                 "visual": edge.get("visual", "weak"),
                 "width": edge.get("width", 1),
                 "color": edge.get("color"),
@@ -397,6 +404,8 @@ def collapse_graph_to_apex(payload: dict, apex_of) -> dict:
             }
         else:
             existing["contributors"].append(contributor)
+            if not contributor["via_subdomain"] and edge.get("pairing_id"):
+                existing["pairing_id"] = edge.get("pairing_id")
             for path in edge.get("paths") or []:
                 if path not in existing["paths"]:
                     existing["paths"].append(path)

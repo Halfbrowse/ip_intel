@@ -776,6 +776,73 @@ button {
   white-space: nowrap;
 }
 
+.graph-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 14px 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.graph-control {
+  display: grid;
+  gap: 5px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-muted, var(--text));
+}
+
+.graph-control select {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font-size: 0.84rem;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+
+.graph-control input[type="range"] {
+  width: 140px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.graph-control.tiers {
+  gap: 6px;
+}
+
+.graph-tier-toggles {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.graph-tier-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  text-transform: capitalize;
+  letter-spacing: normal;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.secondary-button.small {
+  padding: 8px 14px;
+  font-size: 0.8rem;
+}
+
 .graph-legend {
   display: flex;
   flex-wrap: wrap;

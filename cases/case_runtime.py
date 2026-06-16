@@ -453,6 +453,9 @@ class CaseRuntime:
                     "score": item["score"],
                     "paths": list(matches.keys()),
                     "has_strong": bool(cluster.STRONG_PATHS & set(matches.keys())),
+                    # Carry the pairing id so the graph can point each edge back
+                    # at the exact pair whose evidence the summary page renders.
+                    "pairing_id": item["id"],
                 }
             )
 
@@ -495,6 +498,20 @@ class CaseRuntime:
         graph = cluster.collapse_graph_to_apex(
             cluster.build_graph_payload(result), basic._apex
         )
+        # Point each collapsed apex↔apex edge at the apex pairing that the
+        # summary page shows for those two domains, so clicking a relationship
+        # in the graph and selecting the same two entities on the summary render
+        # the identical evidence packet. (Per-subdomain contributors keep their
+        # own pairing ids, threaded through build_graph_payload.)
+        apex_pairing_id: dict[frozenset[str], str] = {}
+        for item in pairings:
+            left, right = item["left_target"], item["right_target"]
+            if basic._apex(left) == left and basic._apex(right) == right and left != right:
+                apex_pairing_id[frozenset((left, right))] = item["id"]
+        for edge in graph.get("edges", []):
+            pairing_id = apex_pairing_id.get(frozenset((edge["from"], edge["to"])))
+            if pairing_id:
+                edge["pairing_id"] = pairing_id
         return result, graph
 
     def _build_summary(
