@@ -25,9 +25,12 @@ import {
   formatLabel,
   formatPercent,
   isTerminalStatus,
+  formatDate,
   normalizeCaseDetail,
   normalizeCases,
   normalizeClusterGroups,
+  normalizeGraphClusters,
+  normalizeGraphLinks,
   normalizeJob,
   normalizePairDetail,
   normalizePairs,
@@ -123,6 +126,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<HomePage />} />
+      <Route path="/graph" element={<GraphExplorerPage />} />
       <Route path="/cases/:caseId" element={<CaseLayout />}>
         <Route index element={<Navigate replace to="summary" />} />
         <Route
@@ -205,6 +209,9 @@ function HomePage() {
           <MetricCard label="Cases available" value={cases.length} />
           <MetricCard label="Jobs in flight" value={runningCases} />
           <MetricCard label="Cases with summaries" value={readySummaries} />
+          <Link className="primary-button" to="/graph">
+            Explore the connection graph
+          </Link>
         </div>
       </section>
 
@@ -1763,6 +1770,291 @@ function CaseClustersPage() {
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/* Global graph explorer: lake-wide connections + shared-node evidence */
+/* ------------------------------------------------------------------ */
+
+function formatWindow(range) {
+  const [first, last] = range || [];
+  if (!first && !last) {
+    return "window unknown";
+  }
+  if (first && last && first !== last) {
+    return `${formatDate(first)} → ${formatDate(last)}`;
+  }
+  return formatDate(first || last);
+}
+
+const SELECTOR_KIND_LABELS = {
+  tls_cert_sha256: "TLS certificate fingerprint",
+  tls_spki: "TLS public key (SPKI)",
+  tls_san: "Certificate SAN",
+  shared_ip: "Shared IP address",
+  ssh_fp: "SSH host key",
+  tracking_id: "Tracking / analytics ID",
+  favicon_mmh3: "Favicon fingerprint",
+  favicon_md5: "Favicon hash",
+  html_hash: "Homepage content hash",
+  nameserver: "Nameserver",
+  network_cidr: "Network block",
+  asn: "ASN",
+};
+
+function sharedNodeLabel(kind) {
+  return SELECTOR_KIND_LABELS[kind] || formatLabel(kind);
+}
+
+function GraphExplorerPage() {
+  const [input, setInput] = useState("");
+  const [target, setTarget] = useState("");
+  const [expanded, setExpanded] = useState(null);
+
+  const linksPath = target ? `/api/graph/links/${encodeURIComponent(target)}` : null;
+  const linksRequest = useApi(linksPath);
+  const links = useMemo(() => normalizeGraphLinks(linksRequest.data), [linksRequest.data]);
+
+  const clustersRequest = useApi("/api/graph/clusters");
+  const clusters = useMemo(
+    () => normalizeGraphClusters(clustersRequest.data),
+    [clustersRequest.data],
+  );
+
+  const submit = () => {
+    const value = input.trim().toLowerCase();
+    if (value) {
+      setTarget(value);
+      setExpanded(null);
+    }
+  };
+
+  return (
+    <AppShell>
+      <div className="breadcrumb-row">
+        <Link className="text-link" to="/">
+          All cases
+        </Link>
+        <span>/</span>
+        <span>Connection graph</span>
+      </div>
+
+      <section className="hero-panel compact">
+        <div className="hero-copy">
+          <p className="eyebrow">Lake-wide attribution graph</p>
+          <h1>Surface every connection a domain has across the whole corpus.</h1>
+          <p>
+            Enter any domain we have analysed. Connections are global — they are not
+            scoped to a case — and each one shows exactly which shared certificates, IPs,
+            trackers, or infrastructure link the two, how rare each is, and when they
+            overlapped.
+          </p>
+        </div>
+      </section>
+
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Pivot</p>
+            <h2>Find connections</h2>
+          </div>
+        </div>
+        <div className="submission-card">
+          <label className="search-field">
+            <span>Registrable domain</span>
+            <input
+              name="graph-target"
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  submit();
+                }
+              }}
+              placeholder="example.com"
+              type="text"
+              value={input}
+            />
+          </label>
+          <button
+            className="primary-button"
+            disabled={!input.trim()}
+            onClick={submit}
+            type="button"
+          >
+            Surface connections
+          </button>
+        </div>
+
+        {linksRequest.loading && !linksRequest.data ? (
+          <LoadingState message="Scoring connections across the lake..." />
+        ) : null}
+        {linksRequest.error ? <ErrorState message={linksRequest.error} /> : null}
+        {target && !linksRequest.loading && !linksRequest.error && links.length === 0 ? (
+          <EmptyState
+            message={`No attributing connections found for ${target}. It may be unanalysed, or only shares noise infrastructure.`}
+          />
+        ) : null}
+
+        {links.length > 0 ? (
+          <div className="linkage-list">
+            {links.map((link) => (
+              <GraphLinkCard
+                expanded={expanded === link.target}
+                key={link.target}
+                link={link}
+                onToggle={() => setExpanded((current) => (current === link.target ? null : link.target))}
+              />
+            ))}
+          </div>
+        ) : null}
+      </section>
+
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Communities</p>
+            <h2>Strongest clusters lake-wide</h2>
+            <p className="section-copy">
+              Connected components over the whole attributing graph, rolled up to
+              registrable domains.
+            </p>
+          </div>
+          <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
+            Refresh
+          </button>
+        </div>
+        {clustersRequest.loading && !clustersRequest.data ? (
+          <LoadingState message="Loading clusters..." />
+        ) : null}
+        {clusters.length === 0 && !clustersRequest.loading ? (
+          <EmptyState message="No clusters yet. Run a global recompute after ingesting domains." />
+        ) : null}
+        {clusters.length > 0 ? (
+          <div className="cluster-grid">
+            {clusters.map((cluster) => (
+              <article className="cluster-card" key={cluster.id}>
+                <div className="cluster-card-top">
+                  <div>
+                    <p className="eyebrow">Cluster</p>
+                    <h4>{cluster.id}</h4>
+                  </div>
+                  <strong title="Domains in this cluster">{cluster.size}</strong>
+                </div>
+                <div className="chip-row">
+                  {cluster.members.slice(0, 8).map((member) => (
+                    <button
+                      className="chip"
+                      key={`${cluster.id}-${member}`}
+                      onClick={() => {
+                        setInput(member);
+                        setTarget(member);
+                        setExpanded(null);
+                        window.scrollTo({ top: 0, behavior: "smooth" });
+                      }}
+                      type="button"
+                    >
+                      {member}
+                    </button>
+                  ))}
+                  {cluster.members.length > 8 ? (
+                    <span className="chip digest-more-chip">+{cluster.members.length - 8} more</span>
+                  ) : null}
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+      </section>
+    </AppShell>
+  );
+}
+
+const GraphLinkCard = memo(function GraphLinkCard({ expanded, link, onToggle }) {
+  const strength = linkStrength(link);
+  const barWidth = Math.max(4, Math.min(100, link.confidence ?? 0));
+  const topKinds = [...new Set(link.evidence.map((node) => sharedNodeLabel(node.kind)))].slice(0, 3);
+
+  return (
+    <article className={`linkage-card ${expanded ? "expanded" : ""}`}>
+      <button
+        aria-expanded={expanded}
+        className="linkage-card-main"
+        onClick={onToggle}
+        type="button"
+      >
+        <span className="linkage-percent">
+          <strong>{formatPercent(link.confidence)}</strong>
+          <span className={`status-badge compact ${strength.tone}`}>{strength.label}</span>
+        </span>
+        <span className="linkage-body">
+          <span className="linkage-domains">
+            <strong>{link.target}</strong>
+          </span>
+          <span className="card-copy linkage-reason">
+            {link.evidence.length} shared node{link.evidence.length === 1 ? "" : "s"} · score{" "}
+            {Math.round(link.score)}
+          </span>
+          {topKinds.length > 0 ? (
+            <span className="chip-row linkage-signal-chips">
+              {topKinds.map((name) => (
+                <span className="chip evidence-chip" key={name}>
+                  {name}
+                </span>
+              ))}
+            </span>
+          ) : null}
+          <span className="strength-track" aria-hidden="true">
+            <span className={`strength-fill ${strength.tier}`} style={{ width: `${barWidth}%` }} />
+          </span>
+        </span>
+        <span aria-hidden="true" className="linkage-caret">
+          {expanded ? "▴" : "▾"}
+        </span>
+      </button>
+      {expanded ? (
+        <div className="pair-digest">
+          <ul className="digest-items">
+            {link.evidence.map((node) => (
+              <li className="digest-item" key={node.id}>
+                <span className="digest-item-label">
+                  {sharedNodeLabel(node.kind)}
+                  {node.attributing ? null : (
+                    <span className="chip digest-more-chip" style={{ marginLeft: 8 }}>
+                      noise
+                    </span>
+                  )}
+                </span>
+                <span className="chip-row digest-item-values">
+                  <span className="chip evidence-chip" title={node.value}>
+                    {node.value}
+                  </span>
+                  {node.degree !== null ? (
+                    <span className="chip" title="How many entities share this node (lower is rarer)">
+                      degree {node.degree}
+                    </span>
+                  ) : null}
+                  {node.weight !== null ? (
+                    <span className="chip" title="base × rarity × time-overlap">
+                      weight {Math.round(node.weight)}
+                    </span>
+                  ) : null}
+                  {node.timeOverlap !== null ? (
+                    <span className="chip" title="Time-window overlap factor">
+                      overlap {node.timeOverlap}
+                    </span>
+                  ) : null}
+                </span>
+                <span className="card-copy" style={{ fontSize: "0.85em", opacity: 0.8 }}>
+                  seed: {formatWindow(node.windowA)} · {link.target}: {formatWindow(node.windowB)} ·{" "}
+                  {node.sources.length ? `via ${node.sources.join(", ")}` : "source unknown"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </article>
+  );
+});
 
 function NotFoundPage() {
   return (

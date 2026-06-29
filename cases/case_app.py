@@ -21,6 +21,8 @@ from cases.case_runtime import CaseRuntime, build_case_response, build_job_respo
 from core.analysis_service import normalize_inputs
 from cases.case_store import get_case, get_cluster, get_job, get_pairing, healthcheck, init_db, list_cases, load_case_inputs
 from utils.evidence_meta import evidence_catalog
+from utils import check
+from db import intel_db
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -204,6 +206,96 @@ async def api_ingest_opencti_website() -> JSONResponse:
             }
         ),
     )
+
+
+@app.post("/api/ingest")
+async def api_ingest(request: Request) -> JSONResponse:
+    """Primary lake-global ingestion: run a domain / IP / CSV through the
+    pipeline. A case label is optional metadata (a collection tag) — it scopes
+    nothing in correlation, which is always global. Connections surface across
+    the whole corpus afterwards via /api/graph/links/{value}.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    target: str | None = None
+    csv_content: bytes | None = None
+    label: str | None = None
+
+    if "application/json" in content_type:
+        payload = await request.json()
+        target = str((payload or {}).get("target") or "").strip() or None
+        label = str((payload or {}).get("label") or "").strip() or None
+    elif "multipart/form-data" in content_type:
+        form = await request.form()
+        target = str(form.get("target") or "").strip() or None
+        label = str(form.get("label") or "").strip() or None
+        upload = form.get("file")
+        if upload is not None and hasattr(upload, "read"):
+            csv_content = await upload.read()
+    else:
+        raise HTTPException(status_code=415, detail="Use JSON or multipart form data.")
+
+    inputs, input_mode = parse_submission(target=target, csv_content=csv_content)
+    if not inputs:
+        raise HTTPException(status_code=400, detail="Submit a domain, IP, or CSV with at least one valid target.")
+
+    identifiers = runtime.submit_case(inputs, input_mode=label or input_mode)
+    case_row = get_case(identifiers["case_id"])
+    job_row = get_job(identifiers["job_id"])
+    return JSONResponse(
+        status_code=202,
+        content=jsonable_encoder(
+            {
+                "case": build_case_response(case_row) if case_row else {"id": identifiers["case_id"]},
+                "job": build_job_response(job_row) if job_row else {"id": identifiers["job_id"]},
+                "case_id": identifiers["case_id"],
+                "job_id": identifiers["job_id"],
+                "label": label,
+                "status": "queued",
+            }
+        ),
+    )
+
+
+# ── Global correlation graph (case-free) ─────────────────────────────────────
+
+@app.get("/api/graph/links/{value:path}")
+def api_graph_links(value: str, request: Request) -> Response:
+    """Ranked cross-corpus connections for an entity / registrable domain, each
+    with its shared-node evidence breakdown."""
+    links = check.links_for(value)
+    return _etag_json_response(request, {"target": value, "total": len(links), "links": links})
+
+
+@app.get("/api/graph/link")
+def api_graph_link(a: str, b: str, request: Request) -> Response:
+    """Connecting evidence (shared selectors / IPs) between two domains."""
+    if not a or not b:
+        raise HTTPException(status_code=400, detail="Provide both 'a' and 'b' query parameters.")
+    return _etag_json_response(request, {"link": check.link_evidence(a, b)})
+
+
+@app.get("/api/graph/clusters")
+def api_graph_clusters(request: Request, min_size: int = 2, limit: int = 100) -> Response:
+    """Strongest clusters lake-wide."""
+    clusters = intel_db.list_graph_clusters(min_size=min_size, limit=limit)
+    return _etag_json_response(request, {"total": len(clusters), "clusters": clusters})
+
+
+@app.get("/api/graph/cluster/{value:path}")
+def api_graph_cluster(value: str) -> dict[str, Any]:
+    """The cluster a registrable domain belongs to, with its members."""
+    cluster = intel_db.graph_cluster_for(value)
+    if cluster is None:
+        raise HTTPException(status_code=404, detail="No cluster for this target.")
+    return {"target": value, **cluster}
+
+
+@app.post("/api/graph/recompute")
+async def api_graph_recompute() -> dict[str, Any]:
+    """Global recompute: rebuild the whole correlation graph + clusters from
+    stored intel (no rescanning). Run after changing extraction/weight logic."""
+    counts = await asyncio.to_thread(intel_db.rebuild_all_correlation)
+    return {"status": "recomputed", **counts}
 
 
 @app.post("/api/cases/{case_id}/recompute")

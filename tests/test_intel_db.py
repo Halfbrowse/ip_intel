@@ -96,6 +96,37 @@ class IdentifierExtractionTests(unittest.TestCase):
         )
 
 
+class EntityClassificationTests(unittest.TestCase):
+    """Pure classification logic for the correlation layer — no database."""
+
+    def test_registrable_domain(self) -> None:
+        self.assertEqual(intel_db.registrable_domain("example.com"), "example.com")
+        self.assertEqual(intel_db.registrable_domain("www.example.com"), "example.com")
+        self.assertEqual(intel_db.registrable_domain("x.a.example.com"), "example.com")
+        self.assertEqual(intel_db.registrable_domain("*.example.com"), "example.com")
+        self.assertIsNone(intel_db.registrable_domain("203.0.113.5"))
+        self.assertIsNone(intel_db.registrable_domain("localhost"))
+
+    def test_classify_entity(self) -> None:
+        self.assertEqual(
+            intel_db.classify_entity("example.com"),
+            {"kind": "domain", "value": "example.com", "registrable_domain": "example.com"},
+        )
+        self.assertEqual(
+            intel_db.classify_entity("x.a.example.com"),
+            {"kind": "subdomain", "value": "x.a.example.com", "registrable_domain": "example.com"},
+        )
+        self.assertEqual(
+            intel_db.classify_entity("203.0.113.5"),
+            {"kind": "ip", "value": "203.0.113.5", "registrable_domain": None},
+        )
+        self.assertEqual(
+            intel_db.classify_entity("HTTPS://WWW.Example.com/path"),
+            {"kind": "domain", "value": "example.com", "registrable_domain": "example.com"},
+        )
+        self.assertIsNone(intel_db.classify_entity("not a host"))
+
+
 class IntelDbTests(unittest.TestCase):
     """Persistence tests against a disposable PostgreSQL database.
 
@@ -399,6 +430,208 @@ class IntelDbTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result["extra"], {"a": 1})
         self.assertEqual(len(intel_db.find_by_identifier("resolved_ip", "51.15.23.7")), 1)
+
+    def test_correlation_layer_upserts(self) -> None:
+        """entities/selectors/observations/entity_edges upserts are idempotent,
+        widen time windows, and maintain selector degree."""
+        with intel_db._conn() as c:
+            # Two subdomains of two different apexes sharing one leaf cert.
+            e_sub_a = intel_db.upsert_entity_value(
+                c, "x.a.com", first_seen="2026-01-01T00:00:00+00:00", last_seen="2026-01-01T00:00:00+00:00"
+            )
+            e_sub_b = intel_db.upsert_entity_value(
+                c, "y.b.com", first_seen="2026-02-01T00:00:00+00:00", last_seen="2026-02-01T00:00:00+00:00"
+            )
+            e_apex_a = intel_db.upsert_entity_value(c, "a.com")
+            e_ip = intel_db.upsert_entity_value(c, "203.0.113.9")
+            assert e_sub_a and e_sub_b and e_apex_a and e_ip
+
+            sel = intel_db.upsert_selector(
+                c, kind="tls_cert_sha256", value="deadbeef",
+                first_seen="2026-01-01T00:00:00+00:00", last_seen="2026-01-01T00:00:00+00:00",
+            )
+
+            intel_db.record_observation(
+                c, entity_id=e_sub_a, selector_id=sel, source="self_scan",
+                first_seen="2026-01-01T00:00:00+00:00", last_seen="2026-01-15T00:00:00+00:00", search_id=None,
+            )
+            intel_db.record_observation(
+                c, entity_id=e_sub_b, selector_id=sel, source="censys",
+                first_seen="2026-02-01T00:00:00+00:00", last_seen="2026-02-10T00:00:00+00:00",
+            )
+            # Re-observe the same edge with a wider window: must widen, not duplicate.
+            intel_db.record_observation(
+                c, entity_id=e_sub_a, selector_id=sel, source="self_scan",
+                first_seen="2025-12-01T00:00:00+00:00", last_seen="2026-03-01T00:00:00+00:00",
+            )
+
+            intel_db.record_entity_edge(
+                c, src_entity_id=e_sub_a, dst_entity_id=e_apex_a, kind="subdomain_of", source="dns",
+            )
+            intel_db.record_entity_edge(
+                c, src_entity_id=e_apex_a, dst_entity_id=e_ip, kind="resolves_to", source="dns_a",
+            )
+            intel_db.record_entity_edge(  # idempotent
+                c, src_entity_id=e_sub_a, dst_entity_id=e_apex_a, kind="subdomain_of", source="dns",
+            )
+
+            degree = intel_db.recompute_selector_degree(c, sel)
+            self.assertEqual(degree, 2)  # two distinct entities exhibit the cert
+
+            obs_count = c.execute(
+                "SELECT count(*) AS n FROM observations WHERE selector_id = %s", (sel,)
+            ).fetchone()["n"]
+            self.assertEqual(obs_count, 2)  # (e_sub_a, self_scan) widened; (e_sub_b, censys)
+
+            widened = c.execute(
+                "SELECT first_seen, last_seen FROM observations WHERE entity_id = %s AND selector_id = %s AND source = 'self_scan'",
+                (e_sub_a, sel),
+            ).fetchone()
+            self.assertEqual(widened["first_seen"], "2025-12-01T00:00:00+00:00")
+            self.assertEqual(widened["last_seen"], "2026-03-01T00:00:00+00:00")
+
+            edge_count = c.execute("SELECT count(*) AS n FROM entity_edges").fetchone()["n"]
+            self.assertEqual(edge_count, 2)
+
+            # Subdomain rollup is recorded on the entity.
+            rd = c.execute(
+                "SELECT registrable_domain, kind FROM entities WHERE id = %s", (e_sub_b,)
+            ).fetchone()
+            self.assertEqual(rd["registrable_domain"], "b.com")
+            self.assertEqual(rd["kind"], "subdomain")
+
+            # Denylist flag and batch degree recompute.
+            intel_db.set_selector_attributing(c, sel, False)
+            intel_db.recompute_all_selector_degrees(c)
+            final = c.execute(
+                "SELECT entity_count, attributing FROM selectors WHERE id = %s", (sel,)
+            ).fetchone()
+            self.assertEqual(final["entity_count"], 2)
+            self.assertFalse(final["attributing"])
+            c.commit()
+
+    def _scan_with_subdomain_cert(self, apex: str, sub: str, sha256: str, ts: str) -> dict:
+        return {
+            "input": apex,
+            "type": "domain",
+            "timestamp": ts,
+            "ip_details": {},
+            "subdomains": [sub],
+            "subdomain_followups": [
+                {
+                    "subdomain": sub,
+                    "status": "completed",
+                    "result": {
+                        "input": sub,
+                        "type": "domain",
+                        "timestamp": ts,
+                        "ip_details": {
+                            "203.0.113.50": {
+                                "sources": ["dns"],
+                                "asn_info": {"asn": "AS64600", "network_cidr": "203.0.113.0/24"},
+                            }
+                        },
+                        "non_cf_tls_certs": [
+                            {
+                                "ip": "203.0.113.50",
+                                "port": 443,
+                                "cn": sub,
+                                "sans": [sub],
+                                "not_before": "2026-01-01T00:00:00+00:00",
+                                "not_after": "2026-04-01T00:00:00+00:00",
+                                "sha256": sha256,
+                                "spki_sha256": "spki-" + sha256,
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+    def test_correlation_transitive_and_backfill_determinism(self) -> None:
+        """A leaf cert shared only between x.a.com and y.b.com links the two
+        registrable apexes through the subdomain entities — and a global rebuild
+        reproduces the identical graph from stored intel."""
+        shared = "deadbeefcert"
+        intel_db.save_search(self._scan_with_subdomain_cert("a.com", "x.a.com", shared, "2026-03-01T00:00:00+00:00"))
+        intel_db.save_search(self._scan_with_subdomain_cert("b.com", "y.b.com", shared, "2026-03-02T00:00:00+00:00"))
+
+        def assert_graph() -> None:
+            with psycopg.connect(TEST_DATABASE_URL, row_factory=psycopg.rows.dict_row) as conn:
+                sel = conn.execute(
+                    "SELECT id, entity_count, attributing FROM selectors WHERE kind = 'tls_cert_sha256' AND value = %s",
+                    (shared,),
+                ).fetchone()
+                self.assertIsNotNone(sel)
+                self.assertEqual(sel["entity_count"], 2)
+                self.assertTrue(sel["attributing"])
+
+                exhibitors = {
+                    row["value"]
+                    for row in conn.execute(
+                        """SELECT e.value FROM observations o
+                           JOIN entities e ON e.id = o.entity_id
+                           WHERE o.selector_id = %s""",
+                        (sel["id"],),
+                    ).fetchall()
+                }
+                self.assertEqual(exhibitors, {"x.a.com", "y.b.com"})
+
+                # Subdomain entities roll up to their apex via subdomain_of edges.
+                edges = {
+                    (row["src"], row["dst"], row["kind"])
+                    for row in conn.execute(
+                        """SELECT s.value AS src, d.value AS dst, ee.kind
+                           FROM entity_edges ee
+                           JOIN entities s ON s.id = ee.src_entity_id
+                           JOIN entities d ON d.id = ee.dst_entity_id
+                           WHERE ee.kind = 'subdomain_of'"""
+                    ).fetchall()
+                }
+                self.assertIn(("x.a.com", "a.com", "subdomain_of"), edges)
+                self.assertIn(("y.b.com", "b.com", "subdomain_of"), edges)
+
+                rd = conn.execute(
+                    "SELECT registrable_domain FROM entities WHERE kind = 'subdomain' AND value = 'x.a.com'"
+                ).fetchone()
+                self.assertEqual(rd["registrable_domain"], "a.com")
+
+        # Inline path (finalize_search) populated and counted degree to 2.
+        assert_graph()
+
+        # Global recompute rebuilds the identical graph from stored intel only.
+        counts = intel_db.rebuild_all_correlation()
+        self.assertEqual(counts["searches"], 2)
+        self.assertGreaterEqual(counts["observations"], 2)
+        assert_graph()
+
+    def test_correlation_denylist_seeds_noise(self) -> None:
+        intel_db.save_search(
+            {
+                "input": "noisy.example",
+                "type": "domain",
+                "timestamp": "2026-03-03T00:00:00+00:00",
+                "ip_details": {},
+                "dns": {"NS": ["ns1.cloudflare.com", "ns2.cloudflare.com"]},
+                "non_cf_tls_certs": [
+                    {"ip": "203.0.113.51", "port": 443, "cn": "noisy.example",
+                     "sans": ["localhost"], "sha256": "abc123"}
+                ],
+            }
+        )
+        intel_db.rebuild_all_correlation()
+        with psycopg.connect(TEST_DATABASE_URL, row_factory=psycopg.rows.dict_row) as conn:
+            ns = conn.execute(
+                "SELECT attributing FROM selectors WHERE kind = 'nameserver' AND value = 'ns1.cloudflare.com'"
+            ).fetchone()
+            self.assertIsNotNone(ns)
+            self.assertFalse(ns["attributing"])  # boring-NS provider → non-attributing
+
+            san = conn.execute(
+                "SELECT attributing FROM selectors WHERE kind = 'tls_san' AND value = 'localhost'"
+            ).fetchone()
+            self.assertIsNotNone(san)
+            self.assertFalse(san["attributing"])  # default/shared-host cert SAN → non-attributing
 
     def test_sqlite_migration_preserves_ids_and_json(self) -> None:
         fd, sqlite_path = tempfile.mkstemp(suffix=".db")

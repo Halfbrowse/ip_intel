@@ -12,7 +12,9 @@ Batch mode — pairwise compare every JSON in a directory:
 import argparse
 import itertools
 import json
+import math
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -855,6 +857,197 @@ def compare_pair(a: dict, b: dict) -> dict:
         "matches":            matches,
         "urlscan_cross_refs": cross_refs,
     }
+
+
+# ── Global graph linkage (selector-centric attribution) ─────────────────────
+#
+# The pairwise functions above compare two scan payloads field-by-field. The
+# functions below instead score linkage over the *global* correlation graph
+# (db.intel_db entities/selectors/observations/entity_edges): two registrable
+# domains link when they share an attributing selector or a shared IP, anywhere
+# in the lake — including transitively through subdomains and IPs. Each shared
+# node is scored by base_weight × rarity(degree) × time-overlap, and every link
+# carries the evidence breakdown (the deliverable, never a bare score).
+#
+# These read only the derived graph, so they are case-free and identical for the
+# apex-to-apex and transitive-subdomain cases (the graph already resolved both).
+
+_RARITY_FLOOR = 0.04
+_OVERLAP_FLOOR = 0.25
+# IPs shared by more registrable domains than this are shared infrastructure
+# (CDN/cloud pools) and contribute nothing even before the denylist applies.
+_IP_NOISE_DEGREE = 50
+# Selector kinds strong enough to call a link "strong" on their own.
+_DECISIVE_SELECTOR_KINDS = {"tls_cert_sha256", "ssh_fp", "shared_ip", "tracking_id"}
+
+
+def rarity_weight(degree: int | None) -> float:
+    """Inverse-frequency factor keyed on a node's global degree.
+
+    A selector/IP shared by just two entities scores 1.0; the weight decays
+    toward a floor as it becomes common, so a cert shared by 2 is huge while a
+    nameserver/ASN shared by 40,000 is ~noise — without any manual list.
+    """
+    d = int(degree or 0)
+    if d < 2:
+        return 1.0
+    return max(_RARITY_FLOOR, 1.0 / math.log2(d))
+
+
+def _parse_dt(value) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    for candidate in (text, text[:19], text[:10]):
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
+
+
+def time_overlap_factor(a_first, a_last, b_first, b_last) -> float:
+    """1.0 when the two observation windows intersect, decaying with the gap.
+
+    Shared infra served in the same month scores full; the same selector seen
+    years apart is attenuated toward a floor. Unknown windows get full credit.
+    """
+    af, al, bf, bl = _parse_dt(a_first), _parse_dt(a_last), _parse_dt(b_first), _parse_dt(b_last)
+    if not (af and al and bf and bl):
+        return 1.0
+    if al < af:
+        af, al = al, af
+    if bl < bf:
+        bf, bl = bl, bf
+    latest_start, earliest_end = max(af, bf), min(al, bl)
+    if latest_start <= earliest_end:
+        return 1.0
+    gap_days = (latest_start - earliest_end).days
+    return max(_OVERLAP_FLOOR, 1.0 - gap_days / 365.0)
+
+
+def _score_selector_row(row: dict) -> tuple[dict, float]:
+    from utils.evidence_meta import selector_base_weight
+
+    kind = row["kind"]
+    degree = int(row.get("entity_count") or 0)
+    base = selector_base_weight(kind)
+    rarity = rarity_weight(degree)
+    overlap = time_overlap_factor(row.get("a_first"), row.get("a_last"), row.get("b_first"), row.get("b_last"))
+    weight = base * rarity * overlap
+    sources = sorted({s for s in (list(row.get("a_sources") or []) + list(row.get("b_sources") or [])) if s})
+    evidence = {
+        "node_type": "selector",
+        "kind": kind,
+        "value": row["value"],
+        "degree": degree,
+        "attributing": True,
+        "base_weight": round(base, 2),
+        "rarity": round(rarity, 3),
+        "time_overlap": round(overlap, 3),
+        "weight": round(weight, 2),
+        "sources": sources,
+        "window_a": [row.get("a_first"), row.get("a_last")],
+        "window_b": [row.get("b_first"), row.get("b_last")],
+    }
+    return evidence, weight
+
+
+def _score_ip_row(row: dict) -> tuple[dict, float]:
+    from utils.evidence_meta import selector_base_weight
+
+    degree = int(row.get("degree") or 0)
+    noisy = bool(row.get("noisy_net")) or degree > _IP_NOISE_DEGREE
+    base = selector_base_weight("shared_ip")
+    rarity = 0.0 if noisy else rarity_weight(degree)
+    overlap = time_overlap_factor(row.get("a_first"), row.get("a_last"), row.get("b_first"), row.get("b_last"))
+    weight = base * rarity * overlap
+    evidence = {
+        "node_type": "ip",
+        "kind": "shared_ip",
+        "value": row["value"],
+        "degree": degree,
+        "attributing": not noisy,
+        "base_weight": round(base, 2),
+        "rarity": round(rarity, 3),
+        "time_overlap": round(overlap, 3),
+        "weight": round(weight, 2),
+        "sources": ["resolves_to"],
+        "window_a": [row.get("a_first"), row.get("a_last")],
+        "window_b": [row.get("b_first"), row.get("b_last")],
+    }
+    return evidence, weight
+
+
+def _graph_strength(score: float, evidence: list[dict]) -> str:
+    decisive = any(
+        e.get("kind") in _DECISIVE_SELECTOR_KINDS and e.get("attributing") and e.get("weight", 0) >= 50
+        for e in evidence
+    )
+    if decisive or score >= 65:
+        return "strong"
+    if score >= 30:
+        return "moderate"
+    return "weak"
+
+
+def _assemble_link(shared_selectors: list[dict], shared_ips: list[dict]) -> dict:
+    evidence: list[dict] = []
+    total = 0.0
+    for row in shared_selectors:
+        ev, weight = _score_selector_row(row)
+        evidence.append(ev)
+        total += weight
+    for row in shared_ips:
+        ev, weight = _score_ip_row(row)
+        # Keep non-attributing shared IPs out of the breakdown (present in the
+        # graph, but they must never create a link); the noise test relies on this.
+        if weight > 0:
+            evidence.append(ev)
+            total += weight
+    evidence.sort(key=lambda e: e["weight"], reverse=True)
+    return {
+        "score": round(total, 2),
+        "confidence": confidence_from_score(total),
+        "strength": _graph_strength(total, evidence),
+        "evidence": evidence,
+        "shared_node_count": len(evidence),
+    }
+
+
+def link_evidence(a_value: str, b_value: str) -> dict:
+    """Score and explain the linkage between two entities / registrable domains."""
+    from db import intel_db
+
+    link = _assemble_link(
+        intel_db.shared_selectors_between(a_value, b_value),
+        intel_db.shared_ips_between(a_value, b_value),
+    )
+    link["a"] = a_value
+    link["b"] = b_value
+    return link
+
+
+def links_for(value: str, *, limit: int = 50, min_score: float = 1.0) -> list[dict]:
+    """Ranked cross-corpus connections for one entity / registrable domain.
+
+    Candidates whose only shared nodes are non-attributing fall out for free:
+    they score 0 and are dropped by min_score.
+    """
+    from db import intel_db
+
+    results: list[dict] = []
+    for rd, bundle in intel_db.link_candidates_for(value).items():
+        link = _assemble_link(bundle.get("selectors") or [], bundle.get("ips") or [])
+        if link["score"] < min_score:
+            continue
+        link["target"] = rd
+        link["registrable_domain"] = rd
+        results.append(link)
+    results.sort(key=lambda link: link["score"], reverse=True)
+    return results[:limit] if limit else results
 
 
 def compare_directory(scans_dir: Path, out_dir: Path) -> None:

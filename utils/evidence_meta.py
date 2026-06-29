@@ -451,6 +451,49 @@ EVIDENCE_DEFINITIONS: dict[str, EvidenceDefinition] = {
 }
 
 
+# ── Correlation-layer base weights ──────────────────────────────────────────
+#
+# Per-selector-kind base weights for the graph linkage engine (utils/check.py).
+# These encode the strongest→weakest ordering the product has always had — exact
+# current TLS fingerprint > dedicated shared IP > … > bare ASN — as numbers. The
+# graph scorer multiplies a base weight by an inverse-frequency (rarity) factor
+# and a time-overlap factor; the base weight is the per-kind ceiling, rarity and
+# overlap only ever attenuate it. Edit these (then global-recompute) to retune.
+
+# Readable strength tiers map onto the same scale `score_matches` uses, so the
+# pairwise and graph paths stay comparable.
+IMPORTANCE_TIER_WEIGHTS: dict[str, float] = {
+    "decisive": 100.0,
+    "strong": 70.0,
+    "supporting": 40.0,
+    "low-signal": 15.0,
+}
+
+# "shared_ip" is a pseudo-kind: a shared `ip` entity that two domains both
+# resolve to is scored like a selector (a CDN-free dedicated IP is strong).
+SELECTOR_BASE_WEIGHTS: dict[str, float] = {
+    "tls_cert_sha256": 100.0,   # exact current leaf cert — decisive
+    "ssh_fp": 95.0,             # shared SSH host key — decisive
+    "shared_ip": 85.0,          # dedicated shared origin IP — strong+
+    "tls_spki": 80.0,           # shared public-key (SPKI) reuse — strong
+    "tracking_id": 70.0,        # GA/GTM/pixel/AdSense — strong (operator account)
+    "html_hash": 45.0,          # identical homepage body — supporting+
+    "favicon_mmh3": 45.0,       # favicon fingerprint — supporting
+    "favicon_md5": 40.0,        # favicon md5 — supporting
+    "tls_san": 40.0,            # cert names overlap (not full fp) — supporting
+    "network_cidr": 30.0,       # same network block — supporting-
+    "nameserver": 25.0,         # shared nameserver — supporting-
+    "asn": 15.0,                # bare ASN — low-signal
+}
+
+_DEFAULT_SELECTOR_WEIGHT = 40.0
+
+
+def selector_base_weight(kind: str) -> float:
+    """Base (pre-rarity, pre-overlap) weight for a selector kind / shared node."""
+    return SELECTOR_BASE_WEIGHTS.get(str(kind or ""), _DEFAULT_SELECTOR_WEIGHT)
+
+
 def _label_from_path(path: str) -> str:
     """Derive a readable label from a dot-path, e.g.
     'page_metadata.script_urls' -> 'Shared script urls'."""

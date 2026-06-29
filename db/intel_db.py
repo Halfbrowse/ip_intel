@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from pathlib import Path
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -326,6 +328,76 @@ CREATE TABLE IF NOT EXISTS search_fields (
 );
 CREATE INDEX IF NOT EXISTS idx_sf_search_id ON search_fields(search_id);
 
+-- ── Correlation layer (derived, rebuildable by global recompute) ─────────────
+-- These tables are NOT part of the append-only raw substrate. They are a
+-- normalized projection of the raw `searches`/child tables built so that
+-- linkage becomes graph reachability over shared observables. Everything here
+-- can be dropped and rebuilt from the raw intel by the backfill / recompute.
+
+CREATE TABLE IF NOT EXISTS entities (
+    id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind                TEXT    NOT NULL,   -- 'domain' | 'subdomain' | 'ip'
+    value               TEXT    NOT NULL,   -- fqdn or IP
+    registrable_domain  TEXT,               -- eTLD+1 rollup (parent of a subdomain, NULL for ip)
+    first_seen          TEXT,
+    last_seen           TEXT,
+    UNIQUE (kind, value)
+);
+CREATE INDEX IF NOT EXISTS idx_entities_value        ON entities(value);
+CREATE INDEX IF NOT EXISTS idx_entities_registrable  ON entities(registrable_domain);
+CREATE INDEX IF NOT EXISTS idx_entities_kind         ON entities(kind);
+
+CREATE TABLE IF NOT EXISTS selectors (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind            TEXT    NOT NULL,   -- 'tls_cert_sha256' | 'tls_spki' | 'tls_san'
+                                        -- | 'favicon_mmh3' | 'tracking_id' | 'ssh_fp'
+                                        -- | 'jarm' | 'asn' | 'network_cidr' | 'nameserver' ...
+    value           TEXT    NOT NULL,
+    entity_count    INTEGER NOT NULL DEFAULT 0,   -- global degree: distinct entities exhibiting this selector
+    attributing     BOOLEAN NOT NULL DEFAULT TRUE, -- false = known-shared noise, never links
+    first_seen      TEXT,
+    last_seen       TEXT,
+    UNIQUE (kind, value)
+);
+CREATE INDEX IF NOT EXISTS idx_selectors_kind_value  ON selectors(kind, value);
+CREATE INDEX IF NOT EXISTS idx_selectors_attributing ON selectors(attributing);
+
+CREATE TABLE IF NOT EXISTS observations (
+    entity_id   BIGINT  NOT NULL REFERENCES entities(id),
+    selector_id BIGINT  NOT NULL REFERENCES selectors(id),
+    first_seen  TEXT,                  -- when this entity was seen with this selector
+    last_seen   TEXT,
+    source      TEXT    NOT NULL DEFAULT '',  -- 'crtsh' | 'censys' | 'censys_history' | 'self_scan' | ...
+    search_id   BIGINT  REFERENCES searches(id),  -- raw searches row that produced it
+    PRIMARY KEY (entity_id, selector_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_observations_selector ON observations(selector_id);
+CREATE INDEX IF NOT EXISTS idx_observations_entity   ON observations(entity_id);
+CREATE INDEX IF NOT EXISTS idx_observations_search   ON observations(search_id);
+
+CREATE TABLE IF NOT EXISTS entity_edges (
+    src_entity_id   BIGINT  NOT NULL REFERENCES entities(id),
+    dst_entity_id   BIGINT  NOT NULL REFERENCES entities(id),
+    kind            TEXT    NOT NULL,   -- 'resolves_to' | 'subdomain_of'
+    first_seen      TEXT,
+    last_seen       TEXT,
+    source          TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (src_entity_id, dst_entity_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_dst ON entity_edges(dst_entity_id, kind);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_src ON entity_edges(src_entity_id, kind);
+
+-- Materialized global clusters: connected components over the attributing graph,
+-- rolled up to registrable_domain. Rebuilt by recompute / on schedule, never
+-- inline on ingest (full-graph clustering is too heavy per-ingest at lake scale).
+CREATE TABLE IF NOT EXISTS graph_clusters (
+    registrable_domain  TEXT    PRIMARY KEY,
+    cluster_id          TEXT    NOT NULL,   -- stable representative (min member)
+    component_size      INTEGER NOT NULL,
+    computed_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_graph_clusters_cid ON graph_clusters(cluster_id);
+
 """
 
 
@@ -585,7 +657,13 @@ _IDENTIFIER_HANDLE_TYPES = {
 }
 
 
-_ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields"]
+# Derived correlation-layer tables. Kept separate from _CHILD_TABLES because
+# they are NOT append-only children of a single search — they are a global
+# projection rebuildable from the raw intel. Listed in _ALL_TABLES so schema
+# resets (tests) drop them too; ordered so dependents precede their referents.
+_CORRELATION_TABLES = ["graph_clusters", "entity_edges", "observations", "selectors", "entities"]
+
+_ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", *_CORRELATION_TABLES]
 
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY = False
@@ -688,6 +766,56 @@ def _is_public_ip(value: str) -> bool:
         or ip.is_unspecified
         or ip.is_link_local
     )
+
+
+def registrable_domain(value: Any) -> str | None:
+    """Best-effort eTLD+1 (registrable apex) for a hostname.
+
+    Dependency-free "last two labels" heuristic, matching the existing apex
+    logic in utils/check.py (`_apex_of`). It does not understand multi-label
+    public suffixes such as `co.uk`, but the whole codebase already accepts that
+    trade-off rather than pulling in the public-suffix list. Returns None for
+    inputs that are not hostnames (e.g. IPs or junk).
+    """
+    text = str(value or "").strip().lower().strip("[]").rstrip(".").lstrip(".")
+    if not text:
+        return None
+    if text.startswith("*."):
+        text = text[2:]
+    if text.startswith("www."):
+        text = text[4:]
+    try:
+        ipaddress.ip_address(text)
+        return None
+    except ValueError:
+        pass
+    parts = [p for p in text.split(".") if p]
+    if len(parts) < 2:
+        return None
+    return ".".join(parts[-2:])
+
+
+def classify_entity(value: Any) -> dict[str, Any] | None:
+    """Map a raw value to an entity record: {kind, value, registrable_domain}.
+
+    kind is 'ip', 'domain' (the value *is* its registrable apex) or 'subdomain'
+    (a hostname below its registrable apex). Returns None when the value cannot
+    be normalized into an IP or a hostname.
+    """
+    norm, typ = _normalize_candidate_target(value)
+    if not norm or not typ:
+        return None
+    if typ == "ip":
+        return {"kind": "ip", "value": norm, "registrable_domain": None}
+    # Collapse a leading www. so the apex site and "www" host are one entity,
+    # matching how _normalize_target dedups targets everywhere else.
+    if norm.startswith("www."):
+        norm = norm[4:]
+    apex = registrable_domain(norm)
+    if not apex:
+        return None
+    kind = "domain" if norm == apex else "subdomain"
+    return {"kind": kind, "value": norm, "registrable_domain": apex}
 
 
 def _is_noisy_pivot_domain(target: str) -> bool:
@@ -2372,6 +2500,14 @@ def finalize_search(search_id: int, result: dict, *, timestamp: str) -> None:
             (search_id, "related_targets_summary", _json(related_summary)),
         )
 
+    # Derived correlation layer, in its own transaction: the raw append-only save
+    # above is already committed, so a projection failure can never lose intel.
+    try:
+        with _conn() as c:
+            persist_correlation(c, result, search_id=search_id, recount=True)
+    except Exception:  # pragma: no cover - defensive; correlation is rebuildable
+        pass
+
 
 def get_result(search_id: int) -> dict | None:
     init_db()
@@ -2405,6 +2541,862 @@ def save_search(result: dict) -> int:
     return sid
 
 
+
+
+# ── Correlation layer: upsert helpers ───────────────────────────────────────
+#
+# These operate on a caller-supplied connection so a single ingest/backfill can
+# batch many upserts inside one transaction (mirroring _save_child_tables). They
+# are idempotent: re-running widens the observed time window rather than
+# duplicating rows, which is what makes a global recompute deterministic.
+#
+# Time columns are ISO-8601 TEXT, matching the rest of the schema. LEAST/GREATEST
+# ignore NULLs and compare ISO strings lexicographically (correct for a fixed
+# format), so windows widen monotonically across repeated observations.
+
+def upsert_entity(
+    c: psycopg.Connection[Any],
+    *,
+    kind: str,
+    value: str,
+    registrable_domain: str | None,
+    first_seen: str | None = None,
+    last_seen: str | None = None,
+) -> int:
+    """Insert-or-widen an entity; returns its id. Unique on (kind, value)."""
+    row = c.execute(
+        """INSERT INTO entities (kind, value, registrable_domain, first_seen, last_seen)
+           VALUES (%s,%s,%s,%s,%s)
+           ON CONFLICT (kind, value) DO UPDATE SET
+               registrable_domain = COALESCE(EXCLUDED.registrable_domain, entities.registrable_domain),
+               first_seen = LEAST(entities.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(entities.last_seen, EXCLUDED.last_seen)
+           RETURNING id""",
+        (kind, value, registrable_domain, _safe_iso(first_seen), _safe_iso(last_seen)),
+    ).fetchone()
+    return int(row["id"])
+
+
+def upsert_entity_value(
+    c: psycopg.Connection[Any],
+    value: Any,
+    *,
+    first_seen: str | None = None,
+    last_seen: str | None = None,
+) -> int | None:
+    """Classify a raw value and upsert it as an entity; None if not a host/IP."""
+    info = classify_entity(value)
+    if info is None:
+        return None
+    return upsert_entity(
+        c,
+        kind=info["kind"],
+        value=info["value"],
+        registrable_domain=info["registrable_domain"],
+        first_seen=first_seen,
+        last_seen=last_seen,
+    )
+
+
+def upsert_selector(
+    c: psycopg.Connection[Any],
+    *,
+    kind: str,
+    value: str,
+    first_seen: str | None = None,
+    last_seen: str | None = None,
+) -> int:
+    """Insert-or-widen a selector; returns its id. Unique on (kind, value).
+
+    Does not touch `attributing` or `entity_count` on conflict: the denylist
+    (attributing) and degree (entity_count) are maintained by dedicated helpers
+    so repeated observation never clobbers a noise decision.
+    """
+    row = c.execute(
+        """INSERT INTO selectors (kind, value, entity_count, attributing, first_seen, last_seen)
+           VALUES (%s,%s,0,TRUE,%s,%s)
+           ON CONFLICT (kind, value) DO UPDATE SET
+               first_seen = LEAST(selectors.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(selectors.last_seen, EXCLUDED.last_seen)
+           RETURNING id""",
+        (kind, value, _safe_iso(first_seen), _safe_iso(last_seen)),
+    ).fetchone()
+    return int(row["id"])
+
+
+def record_observation(
+    c: psycopg.Connection[Any],
+    *,
+    entity_id: int,
+    selector_id: int,
+    source: str,
+    first_seen: str | None = None,
+    last_seen: str | None = None,
+    search_id: int | None = None,
+) -> None:
+    """Insert-or-widen a provenance-bearing entity→selector edge."""
+    c.execute(
+        """INSERT INTO observations (entity_id, selector_id, source, first_seen, last_seen, search_id)
+           VALUES (%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (entity_id, selector_id, source) DO UPDATE SET
+               first_seen = LEAST(observations.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(observations.last_seen, EXCLUDED.last_seen),
+               search_id  = COALESCE(observations.search_id, EXCLUDED.search_id)""",
+        (entity_id, selector_id, str(source or ""), _safe_iso(first_seen), _safe_iso(last_seen), search_id),
+    )
+
+
+def record_entity_edge(
+    c: psycopg.Connection[Any],
+    *,
+    src_entity_id: int,
+    dst_entity_id: int,
+    kind: str,
+    source: str = "",
+    first_seen: str | None = None,
+    last_seen: str | None = None,
+) -> None:
+    """Insert-or-widen a structural entity→entity edge (resolves_to / subdomain_of)."""
+    c.execute(
+        """INSERT INTO entity_edges (src_entity_id, dst_entity_id, kind, source, first_seen, last_seen)
+           VALUES (%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (src_entity_id, dst_entity_id, kind) DO UPDATE SET
+               first_seen = LEAST(entity_edges.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(entity_edges.last_seen, EXCLUDED.last_seen)""",
+        (src_entity_id, dst_entity_id, str(kind), str(source or ""), _safe_iso(first_seen), _safe_iso(last_seen)),
+    )
+
+
+def set_selector_attributing(c: psycopg.Connection[Any], selector_id: int, attributing: bool) -> None:
+    """Flag (or unflag) a selector as non-attributing noise (denylist)."""
+    c.execute("UPDATE selectors SET attributing = %s WHERE id = %s", (bool(attributing), selector_id))
+
+
+def recompute_selector_degree(c: psycopg.Connection[Any], selector_id: int) -> int:
+    """Recompute one selector's degree (distinct entities) and return it."""
+    c.execute(
+        """UPDATE selectors SET entity_count = (
+               SELECT count(DISTINCT entity_id) FROM observations WHERE selector_id = %s
+           ) WHERE id = %s""",
+        (selector_id, selector_id),
+    )
+    row = c.execute("SELECT entity_count FROM selectors WHERE id = %s", (selector_id,)).fetchone()
+    return int(row["entity_count"]) if row else 0
+
+
+def recompute_all_selector_degrees(c: psycopg.Connection[Any]) -> None:
+    """Recompute every selector's degree from observations (batch; used by backfill)."""
+    c.execute(
+        """UPDATE selectors s SET entity_count = COALESCE(o.cnt, 0)
+           FROM (
+               SELECT selector_id, count(DISTINCT entity_id) AS cnt
+               FROM observations GROUP BY selector_id
+           ) o
+           WHERE s.id = o.selector_id"""
+    )
+    c.execute(
+        "UPDATE selectors SET entity_count = 0 "
+        "WHERE id NOT IN (SELECT selector_id FROM observations)"
+    )
+
+
+# ── Correlation layer: selector extraction ──────────────────────────────────
+#
+# extract_selectors() is THE single place that maps a raw analysis result (the
+# same dict the signal sources build and finalize_search persists) into the
+# normalized correlation model: entities, selector observations, and structural
+# entity edges. It is run both inline (finalize_search) and by the backfill /
+# global recompute, so live ingest and a from-scratch rebuild go through the
+# identical code path — which is what makes recompute deterministic.
+#
+# The owning entity of a selector is the host that *exhibits* it (the scanned
+# domain/subdomain for content/cert selectors, the IP for asn/cidr/ssh). Two
+# entities sharing a selector are linkage candidates; rarity + denylist scoring
+# (utils/check.py) decides how strong, so extraction is deliberately generous.
+
+# Page-metadata tracking IDs → namespaced tracking_id selector values.
+_TRACKING_SELECTOR_MAP = [
+    ("ga_property", ("google_analytics", "ga_ids")),
+    ("gtm_container", ("gtm_ids", "google_tag_manager")),
+    ("fb_pixel", ("facebook_pixel",)),
+    ("tiktok_pixel", ("tiktok_pixel",)),
+    ("yandex_metrika", ("yandex_metrika",)),
+    ("adsense_publisher", ("adsense_publisher_ids",)),
+    ("fb_app_id", ("fb_app_id", "facebook_app_id")),
+]
+
+
+def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Project one analysis result into {entities, observations, edges}.
+
+    Values are raw (host/IP strings + selector values); persistence classifies
+    and upserts them. Recurses into subdomain_followups so a subdomain's own
+    certs/selectors are attributed to the subdomain entity (the mechanism behind
+    transitive, subdomain-mediated linkage).
+    """
+    out_entities: list[dict[str, Any]] = []
+    out_obs: list[dict[str, Any]] = []
+    out_edges: list[dict[str, Any]] = []
+    seen_ent: dict[str, dict[str, Any]] = {}
+    seen_obs: set[tuple[str, str, str, str]] = set()
+    seen_edges: set[tuple[str, str, str]] = set()
+
+    def add_entity(value: Any, first: str | None, last: str | None) -> str | None:
+        info = classify_entity(value)
+        if not info:
+            return None
+        v = info["value"]
+        rec = seen_ent.get(v)
+        if rec is None:
+            seen_ent[v] = {"value": v, "first_seen": first, "last_seen": last}
+            out_entities.append(seen_ent[v])
+        return v
+
+    def add_edge_raw(src: str, dst: str, kind: str, source: str, first: str | None, last: str | None) -> None:
+        if not src or not dst or src == dst:
+            return
+        key = (src, dst, kind)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        out_edges.append({"src": src, "dst": dst, "kind": kind, "source": source, "first_seen": first, "last_seen": last})
+
+    def register_host(value: Any, first: str | None, last: str | None) -> str | None:
+        """Add a host/IP entity; for a subdomain also add its apex + subdomain_of edge."""
+        info = classify_entity(value)
+        if not info:
+            return None
+        add_entity(info["value"], first, last)
+        if info["kind"] == "subdomain" and info["registrable_domain"]:
+            add_entity(info["registrable_domain"], first, last)
+            add_edge_raw(info["value"], info["registrable_domain"], "subdomain_of", "dns", first, last)
+        return info["value"]
+
+    def add_obs(entity: Any, kind: str, value: Any, source: str, first: str | None, last: str | None) -> None:
+        ev = register_host(entity, first, last)
+        sv = str(value or "").strip()
+        if not ev or not sv:
+            return
+        key = (ev, kind, sv, source)
+        if key in seen_obs:
+            return
+        seen_obs.add(key)
+        out_obs.append({"entity": ev, "kind": kind, "value": sv, "source": source, "first_seen": first, "last_seen": last})
+
+    def add_resolves(host: Any, ip: Any, source: str, first: str | None, last: str | None) -> None:
+        hv = register_host(host, first, last)
+        iv = register_host(ip, first, last)
+        if hv and iv:
+            add_edge_raw(hv, iv, "resolves_to", source, first, last)
+
+    def _collect(res: dict[str, Any]) -> None:
+        if not isinstance(res, Mapping):
+            return
+        ts = str(res.get("timestamp") or datetime.now(timezone.utc).isoformat())
+        owner = register_host(res.get("input"), ts, ts)
+
+        # ── TLS certs (live probes + origin scans) exhibited by the owner ──
+        tls_list = list(res.get("non_cf_tls_certs") or [])
+        if res.get("tls_cert"):
+            tls_list.append(res["tls_cert"])
+        for cert in tls_list:
+            if not isinstance(cert, Mapping):
+                continue
+            nb, na = _safe_iso(cert.get("not_before")), _safe_iso(cert.get("not_after"))
+            if owner:
+                add_obs(owner, "tls_cert_sha256", _normalize_identifier_hash(cert.get("sha256")), "self_scan", nb, na)
+                add_obs(owner, "tls_spki", _normalize_identifier_hash(cert.get("spki_sha256")), "self_scan", nb, na)
+                for san in cert.get("sans") or []:
+                    add_obs(owner, "tls_san", _normalize_tls_identity(san), "self_scan", nb, na)
+            if cert.get("ip") and owner:
+                add_resolves(owner, cert.get("ip"), "tls", ts, ts)
+
+        origin = res.get("origin_candidates") or {}
+        for scan_key, scan_src in [("scan", "self_scan"), ("provider_scan", "self_scan"), ("country_scan", "self_scan")]:
+            scan_result = origin.get(scan_key) or {}
+            if not isinstance(scan_result, Mapping):
+                continue
+            for hit in scan_result.get("hits") or []:
+                if not isinstance(hit, Mapping):
+                    continue
+                nb, na = _safe_iso(hit.get("not_before")), _safe_iso(hit.get("not_after"))
+                if owner:
+                    add_obs(owner, "tls_cert_sha256", _normalize_identifier_hash(hit.get("sha256")), scan_src, nb, na)
+                    add_obs(owner, "tls_spki", _normalize_identifier_hash(hit.get("spki_sha256")), scan_src, nb, na)
+                    for san in hit.get("sans") or []:
+                        add_obs(owner, "tls_san", _normalize_tls_identity(san), scan_src, nb, na)
+                    if hit.get("ip"):
+                        add_resolves(owner, hit.get("ip"), scan_src, ts, ts)
+
+        # ── Provider hits: origin IPs (+ ASN), time-tagged by source ──
+        for provider in ("censys", "shodan", "netlas"):
+            provider_result = origin.get(provider) or {}
+            if not isinstance(provider_result, Mapping):
+                continue
+            for hit in provider_result.get("hits") or []:
+                if not isinstance(hit, Mapping) or not hit.get("ip"):
+                    continue
+                hit_source = str(hit.get("source") or provider)  # honours censys_history tagging
+                if owner:
+                    add_resolves(owner, hit.get("ip"), hit_source, ts, ts)
+                if hit.get("asn"):
+                    add_obs(hit.get("ip"), "asn", _normalize_asn(hit.get("asn")), hit_source, ts, ts)
+
+        # ── Resolved + observed IPs and their ASN / CIDR ──
+        dns = res.get("dns") or {}
+        for ip in _iter_dns_host_values(dns.get("A")):
+            if owner:
+                add_resolves(owner, ip, "dns_a", ts, ts)
+        for ip in _iter_dns_host_values(dns.get("AAAA")):
+            if owner:
+                add_resolves(owner, ip, "dns_aaaa", ts, ts)
+
+        ip_details = normalize_ip_details(res.get("ip_details"))
+        for ip, info in ip_details.items():
+            if owner:
+                src = (info.get("sources") or ["dns"])[0]
+                add_resolves(owner, ip, str(src), ts, ts)
+            asn_info = info.get("asn_info") or {}
+            add_obs(ip, "asn", _normalize_asn(asn_info.get("asn")), "rdap", ts, ts)
+            add_obs(ip, "network_cidr", asn_info.get("network_cidr") or asn_info.get("asn_cidr"), "rdap", ts, ts)
+            for domain in info.get("other_domains_on_ip") or []:
+                add_resolves(domain, ip, "reverse_ip", ts, ts)
+
+        if res.get("type") == "ip" and owner:
+            asn_info = res.get("asn_info") or {}
+            add_obs(owner, "asn", _normalize_asn(asn_info.get("asn")), "rdap", ts, ts)
+            add_obs(owner, "network_cidr", asn_info.get("network_cidr") or asn_info.get("asn_cidr"), "rdap", ts, ts)
+
+        # ── SSH host keys exhibited by the IP they were grabbed from ──
+        for probe in (res.get("ssh_host_keys") or {}).get("probes") or []:
+            if not isinstance(probe, Mapping) or probe.get("error"):
+                continue
+            fp = _normalize_identifier_hash(probe.get("fingerprint_sha256"))
+            if probe.get("ip") and fp:
+                add_obs(probe.get("ip"), "ssh_fp", fp, "self_scan", ts, ts)
+                if owner:
+                    add_resolves(owner, probe.get("ip"), "ssh", ts, ts)
+
+        # ── Web content selectors exhibited by the owner ──
+        page = res.get("page_metadata") or {}
+        if owner:
+            add_obs(owner, "favicon_mmh3", page.get("favicon_mmh3"), "self_scan", ts, ts)
+            add_obs(owner, "favicon_md5", page.get("favicon_md5"), "self_scan", ts, ts)
+            add_obs(owner, "html_hash", page.get("homepage_html_hash"), "self_scan", ts, ts)
+            for selector_name, keys in _TRACKING_SELECTOR_MAP:
+                for key in keys:
+                    for value in _normalize_text_list(page.get(key) or []):
+                        add_obs(owner, "tracking_id", f"{selector_name}|{value}", "self_scan", ts, ts)
+
+        # ── Nameservers exhibited by the owner domain ──
+        if owner:
+            for ns in _iter_dns_host_values(dns.get("NS")):
+                add_obs(owner, "nameserver", _normalize_tls_identity(ns), "dns", ts, ts)
+            whois_row = res.get("whois") or {}
+            if isinstance(whois_row, Mapping) and not whois_row.get("error"):
+                for ns in _normalize_nameservers(whois_row.get("nameservers")):
+                    add_obs(owner, "nameserver", ns, "whois", ts, ts)
+
+        # ── CT certs (crt.sh) SANs exhibited by the owner ──
+        ct = res.get("cert_transparency") or {}
+        if owner:
+            for cert in ct.get("certs") or []:
+                if not isinstance(cert, Mapping):
+                    continue
+                nb, na = _safe_iso(cert.get("not_before")), _safe_iso(cert.get("not_after"))
+                for san in cert.get("sans") or []:
+                    add_obs(owner, "tls_san", _normalize_tls_identity(san), "crtsh", nb, na)
+            for san in ct.get("cross_domain_sans") or []:
+                add_obs(owner, "tls_san", _normalize_tls_identity(san), "crtsh", ts, ts)
+
+        # ── Discovered subdomains become entities under their apex ──
+        for sub in _normalize_text_list(res.get("subdomains") or []):
+            register_host(sub, ts, ts)
+        for sub in _normalize_text_list(res.get("zone_transfer") or []):
+            register_host(sub, ts, ts)
+
+        # ── Recurse into subdomain followups (subdomain owns its own selectors) ──
+        for followup in res.get("subdomain_followups") or []:
+            if isinstance(followup, Mapping) and isinstance(followup.get("result"), Mapping):
+                _collect(dict(followup["result"]))
+
+    _collect(result)
+    return {"entities": out_entities, "observations": out_obs, "edges": out_edges}
+
+
+# ── Correlation layer: persistence / rebuild ────────────────────────────────
+
+def persist_correlation(
+    c: psycopg.Connection[Any],
+    result: dict[str, Any],
+    *,
+    search_id: int | None = None,
+    recount: bool = True,
+) -> set[int]:
+    """Upsert the correlation projection of one result. Returns touched selector ids.
+
+    When recount is True (live ingest), the degree of every touched selector is
+    refreshed immediately. Backfill passes recount=False and batch-recomputes
+    all degrees once at the end.
+    """
+    data = extract_selectors(result)
+    ent_ids: dict[str, int] = {}
+    for ent in data["entities"]:
+        info = classify_entity(ent["value"])
+        if not info:
+            continue
+        ent_ids[info["value"]] = upsert_entity(
+            c,
+            kind=info["kind"],
+            value=info["value"],
+            registrable_domain=info["registrable_domain"],
+            first_seen=ent.get("first_seen"),
+            last_seen=ent.get("last_seen"),
+        )
+
+    touched: set[int] = set()
+    for obs in data["observations"]:
+        eid = ent_ids.get(obs["entity"])
+        if eid is None:
+            eid = upsert_entity_value(c, obs["entity"], first_seen=obs.get("first_seen"), last_seen=obs.get("last_seen"))
+            if eid is None:
+                continue
+            ent_ids[obs["entity"]] = eid
+        sel_id = upsert_selector(
+            c, kind=obs["kind"], value=obs["value"],
+            first_seen=obs.get("first_seen"), last_seen=obs.get("last_seen"),
+        )
+        record_observation(
+            c, entity_id=eid, selector_id=sel_id, source=obs["source"],
+            first_seen=obs.get("first_seen"), last_seen=obs.get("last_seen"), search_id=search_id,
+        )
+        touched.add(sel_id)
+
+    for edge in data["edges"]:
+        s = ent_ids.get(edge["src"])
+        d = ent_ids.get(edge["dst"])
+        if s is None or d is None:
+            continue
+        record_entity_edge(
+            c, src_entity_id=s, dst_entity_id=d, kind=edge["kind"], source=edge["source"],
+            first_seen=edge.get("first_seen"), last_seen=edge.get("last_seen"),
+        )
+
+    if recount:
+        for sel_id in touched:
+            recompute_selector_degree(c, sel_id)
+    return touched
+
+
+def _truncate_correlation(c: psycopg.Connection[Any]) -> None:
+    c.execute("TRUNCATE entity_edges, observations, selectors, entities RESTART IDENTITY CASCADE")
+
+
+def rebuild_all_correlation() -> dict[str, int]:
+    """Global recompute: rebuild the whole correlation graph from raw intel.
+
+    Drops the derived tables and re-projects every stored search (oldest first
+    so time windows widen monotonically), then recomputes degrees and seeds the
+    denylist. This is the deterministic "recompute without rescanning" path.
+    """
+    init_db()
+    with _conn() as c:
+        _truncate_correlation(c)
+        ids = [int(row["id"]) for row in c.execute("SELECT id FROM searches ORDER BY id ASC").fetchall()]
+        for sid in ids:
+            result = get_result(sid)
+            if result is not None:
+                persist_correlation(c, result, search_id=sid, recount=False)
+        recompute_all_selector_degrees(c)
+        denylisted = seed_denylist(c)
+        counts = {
+            "searches": len(ids),
+            "entities": c.execute("SELECT count(*) AS n FROM entities").fetchone()["n"],
+            "selectors": c.execute("SELECT count(*) AS n FROM selectors").fetchone()["n"],
+            "observations": c.execute("SELECT count(*) AS n FROM observations").fetchone()["n"],
+            "entity_edges": c.execute("SELECT count(*) AS n FROM entity_edges").fetchone()["n"],
+            "denylisted_selectors": denylisted,
+        }
+    # Clusters depend on the freshly seeded denylist, so rebuild them last.
+    counts.update(rebuild_clusters())
+    return counts
+
+
+def rebuild_correlation_for_search(search_id: int) -> set[int]:
+    """Incrementally (re)project a single search into the correlation graph."""
+    init_db()
+    result = get_result(search_id)
+    if result is None:
+        return set()
+    with _conn() as c:
+        touched = persist_correlation(c, result, search_id=search_id, recount=True)
+    return touched
+
+
+# ── Correlation layer: denylist seeding ─────────────────────────────────────
+
+def _degree_threshold() -> int:
+    try:
+        return int(os.getenv("CORRELATION_DEGREE_THRESHOLD", "50"))
+    except ValueError:
+        return 50
+
+
+_BORING_NS_PROVIDERS_CACHE: set[str] | None = None
+
+
+def _boring_ns_providers() -> set[str]:
+    global _BORING_NS_PROVIDERS_CACHE
+    if _BORING_NS_PROVIDERS_CACHE is None:
+        path = Path(__file__).resolve().parent.parent / "config" / "boring_ns_providers.txt"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        _BORING_NS_PROVIDERS_CACHE = {
+            line.strip().lower() for line in lines if line.strip() and not line.strip().startswith("#")
+        }
+    return _BORING_NS_PROVIDERS_CACHE
+
+
+def _is_boring_nameserver(value: str) -> bool:
+    text = str(value or "").strip().lower().rstrip(".")
+    return any(token and (text == token or token in text) for token in _boring_ns_providers())
+
+
+def seed_denylist(c: psycopg.Connection[Any]) -> int:
+    """Mark non-attributing (noise) selectors. Returns how many were flagged.
+
+    Complementary to rarity weighting: a denylisted selector NEVER creates a
+    link regardless of degree. Re-runnable (also resets known-good selectors to
+    attributing so a lowered threshold or edited list takes effect on recompute).
+    """
+    # Start from a clean slate so recompute is deterministic w.r.t. the rules below.
+    c.execute("UPDATE selectors SET attributing = TRUE")
+
+    threshold = _degree_threshold()
+    # 1) High-degree selectors of any kind are shared infrastructure noise
+    #    (Cloudflare universal-SSL SAN sets, big nameservers/ASNs, ...).
+    c.execute("UPDATE selectors SET attributing = FALSE WHERE entity_count > %s", (threshold,))
+
+    # 2) Known noise ASNs (CDN/proxy, shared-hosting, big mail).
+    noise_asns = sorted(_CDN_PROXY_ASNS | _SHARED_HOSTING_ASNS | _MAIL_ASNS)
+    if noise_asns:
+        c.execute(
+            "UPDATE selectors SET attributing = FALSE WHERE kind = 'asn' AND value = ANY(%s)",
+            (noise_asns,),
+        )
+
+    # 3) Big-provider / registrar nameservers from the boring-NS list.
+    for row in c.execute("SELECT id, value FROM selectors WHERE kind = 'nameserver'").fetchall():
+        if _is_boring_nameserver(row["value"]):
+            c.execute("UPDATE selectors SET attributing = FALSE WHERE id = %s", (row["id"],))
+
+    # 4) Shared-host / default certificate SANs (cPanel/Apache defaults, localhost…).
+    for row in c.execute("SELECT id, value FROM selectors WHERE kind = 'tls_san'").fetchall():
+        value = row["value"]
+        if _is_low_signal_tls_identity(value) or _text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS):
+            c.execute("UPDATE selectors SET attributing = FALSE WHERE id = %s", (row["id"],))
+
+    return c.execute("SELECT count(*) AS n FROM selectors WHERE attributing = FALSE").fetchone()["n"]
+
+
+# ── Correlation layer: linkage queries ──────────────────────────────────────
+#
+# The "what else exhibits this selector / resolves to this IP" lookups that turn
+# linkage into a single indexed query. They return rows; rarity × time-overlap ×
+# base-weight scoring and evidence shaping live in utils/check.py.
+
+def _resolve_side(value: Any) -> tuple[str, str, str] | None:
+    """Map an input to (mode, key, self_key): mode 'rd' (registrable domain) or
+    'ip', key is what we filter the entity set on, self_key excludes self-links.
+    """
+    info = classify_entity(value)
+    if not info:
+        return None
+    if info["kind"] == "ip":
+        return ("ip", info["value"], info["value"])
+    rd = info["registrable_domain"]
+    if not rd:
+        return None
+    return ("rd", rd, rd)
+
+
+def _side_entity_sql(mode: str) -> str:
+    if mode == "ip":
+        return "SELECT id FROM entities WHERE kind = 'ip' AND value = %s"
+    return "SELECT id FROM entities WHERE registrable_domain = %s"
+
+
+def shared_selectors_between(a_value: str, b_value: str) -> list[dict[str, Any]]:
+    """Attributing selectors exhibited by both sides, with per-side windows."""
+    init_db()
+    a = _resolve_side(a_value)
+    b = _resolve_side(b_value)
+    if not a or not b:
+        return []
+    a_sql, b_sql = _side_entity_sql(a[0]), _side_entity_sql(b[0])
+    with _conn() as c:
+        rows = c.execute(
+            f"""WITH a_ent AS ({a_sql}), b_ent AS ({b_sql})
+                SELECT sel.kind, sel.value, sel.entity_count,
+                       min(oa.first_seen) AS a_first, max(oa.last_seen) AS a_last,
+                       min(ob.first_seen) AS b_first, max(ob.last_seen) AS b_last,
+                       array_agg(DISTINCT oa.source) AS a_sources,
+                       array_agg(DISTINCT ob.source) AS b_sources
+                FROM selectors sel
+                JOIN observations oa ON oa.selector_id = sel.id AND oa.entity_id IN (SELECT id FROM a_ent)
+                JOIN observations ob ON ob.selector_id = sel.id AND ob.entity_id IN (SELECT id FROM b_ent)
+                WHERE sel.attributing
+                GROUP BY sel.kind, sel.value, sel.entity_count""",
+            (a[1], b[1]),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def shared_ips_between(a_value: str, b_value: str) -> list[dict[str, Any]]:
+    """Shared `ip` entities both sides resolve to, with degree + noise flag."""
+    init_db()
+    a = _resolve_side(a_value)
+    b = _resolve_side(b_value)
+    if not a or not b:
+        return []
+    a_sql, b_sql = _side_entity_sql(a[0]), _side_entity_sql(b[0])
+    with _conn() as c:
+        rows = c.execute(
+            f"""WITH a_ent AS ({a_sql}), b_ent AS ({b_sql}),
+                     a_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l
+                              FROM entity_edges WHERE kind='resolves_to' AND src_entity_id IN (SELECT id FROM a_ent)
+                              GROUP BY dst_entity_id),
+                     b_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l
+                              FROM entity_edges WHERE kind='resolves_to' AND src_entity_id IN (SELECT id FROM b_ent)
+                              GROUP BY dst_entity_id)
+                SELECT ip.value,
+                       a_ip.f AS a_first, a_ip.l AS a_last,
+                       b_ip.f AS b_first, b_ip.l AS b_last,
+                       (SELECT count(DISTINCT e.registrable_domain)
+                          FROM entity_edges ee JOIN entities e ON e.id = ee.src_entity_id
+                          WHERE ee.dst_entity_id = ip.id AND ee.kind='resolves_to') AS degree,
+                       EXISTS (SELECT 1 FROM observations o JOIN selectors s ON s.id = o.selector_id
+                               WHERE o.entity_id = ip.id AND s.kind IN ('asn','network_cidr')
+                                 AND s.attributing = FALSE) AS noisy_net
+                FROM entities ip
+                JOIN a_ip ON a_ip.ip_id = ip.id
+                JOIN b_ip ON b_ip.ip_id = ip.id
+                WHERE ip.kind = 'ip'""",
+            (a[1], b[1]),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def link_candidates_for(value: str) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """Cross-corpus pivot: every other registrable domain that shares an
+    attributing selector or a shared IP with `value`.
+
+    Returns {rd: {"selectors": [...], "ips": [...]}} for aggregation/scoring by
+    the caller. This is the engine behind "add a domain, surface connections".
+    """
+    init_db()
+    side = _resolve_side(value)
+    if not side:
+        return {}
+    side_sql = _side_entity_sql(side[0])
+    out: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+    def bucket(rd: str) -> dict[str, list[dict[str, Any]]]:
+        return out.setdefault(rd, {"selectors": [], "ips": []})
+
+    with _conn() as c:
+        sel_rows = c.execute(
+            f"""WITH a_ent AS ({side_sql})
+                SELECT e2.registrable_domain AS rd, sel.kind, sel.value, sel.entity_count,
+                       min(oa.first_seen) AS a_first, max(oa.last_seen) AS a_last,
+                       min(ob.first_seen) AS b_first, max(ob.last_seen) AS b_last,
+                       array_agg(DISTINCT oa.source) AS a_sources,
+                       array_agg(DISTINCT ob.source) AS b_sources
+                FROM selectors sel
+                JOIN observations oa ON oa.selector_id = sel.id AND oa.entity_id IN (SELECT id FROM a_ent)
+                JOIN observations ob ON ob.selector_id = sel.id
+                JOIN entities e2 ON e2.id = ob.entity_id
+                WHERE sel.attributing
+                  AND e2.registrable_domain IS NOT NULL
+                  AND e2.registrable_domain <> %s
+                GROUP BY e2.registrable_domain, sel.kind, sel.value, sel.entity_count""",
+            (side[1], side[2]),
+        ).fetchall()
+        for row in sel_rows:
+            bucket(row["rd"])["selectors"].append(dict(row))
+
+        ip_rows = c.execute(
+            f"""WITH a_ent AS ({side_sql}),
+                     a_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l
+                              FROM entity_edges WHERE kind='resolves_to' AND src_entity_id IN (SELECT id FROM a_ent)
+                              GROUP BY dst_entity_id)
+                SELECT e2.registrable_domain AS rd, ip.value,
+                       a_ip.f AS a_first, a_ip.l AS a_last,
+                       min(ee.first_seen) AS b_first, max(ee.last_seen) AS b_last,
+                       (SELECT count(DISTINCT e3.registrable_domain)
+                          FROM entity_edges ee2 JOIN entities e3 ON e3.id = ee2.src_entity_id
+                          WHERE ee2.dst_entity_id = ip.id AND ee2.kind='resolves_to') AS degree,
+                       EXISTS (SELECT 1 FROM observations o JOIN selectors s ON s.id = o.selector_id
+                               WHERE o.entity_id = ip.id AND s.kind IN ('asn','network_cidr')
+                                 AND s.attributing = FALSE) AS noisy_net
+                FROM a_ip
+                JOIN entities ip ON ip.id = a_ip.ip_id
+                JOIN entity_edges ee ON ee.dst_entity_id = ip.id AND ee.kind='resolves_to'
+                JOIN entities e2 ON e2.id = ee.src_entity_id
+                WHERE e2.registrable_domain IS NOT NULL
+                  AND e2.registrable_domain <> %s
+                GROUP BY e2.registrable_domain, ip.id, ip.value, a_ip.f, a_ip.l""",
+            (side[1], side[2]),
+        ).fetchall()
+        for row in ip_rows:
+            bucket(row["rd"])["ips"].append(dict(row))
+
+    return out
+
+
+# ── Correlation layer: global clustering ────────────────────────────────────
+#
+# Clusters are connected components over the *whole* attributing graph, rolled
+# up to registrable_domain. Two registrable domains are unioned when they share
+# an attributing selector or a (non-noise) shared IP whose fan-out is small
+# enough to be meaningful — the same rarity intuition the scorer uses, applied
+# as a binary edge so one moderately-shared node can't merge the whole lake.
+# Materialized into graph_clusters; rebuilt by recompute / on schedule, not
+# inline on ingest.
+
+def _cluster_max_fanout() -> int:
+    try:
+        return int(os.getenv("CORRELATION_CLUSTER_MAX_FANOUT", "25"))
+    except ValueError:
+        return 25
+
+
+def rebuild_clusters() -> dict[str, int]:
+    """Recompute and materialize global clusters from the attributing graph."""
+    init_db()
+    fanout = _cluster_max_fanout()
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            # Keep the lexicographically smaller representative for stable ids.
+            if rb < ra:
+                ra, rb = rb, ra
+            parent[rb] = ra
+
+    def union_group(rds: list[str]) -> None:
+        members = [rd for rd in rds if rd]
+        for other in members[1:]:
+            union(members[0], other)
+
+    with _conn() as c:
+        for row in c.execute(
+            """SELECT array_agg(DISTINCT e.registrable_domain) AS rds
+               FROM selectors sel
+               JOIN observations o ON o.selector_id = sel.id
+               JOIN entities e ON e.id = o.entity_id
+               WHERE sel.attributing AND e.registrable_domain IS NOT NULL
+               GROUP BY sel.id
+               HAVING count(DISTINCT e.registrable_domain) BETWEEN 2 AND %s""",
+            (fanout,),
+        ).fetchall():
+            union_group(row["rds"])
+
+        for row in c.execute(
+            """SELECT array_agg(DISTINCT e.registrable_domain) AS rds
+               FROM entities ip
+               JOIN entity_edges ee ON ee.dst_entity_id = ip.id AND ee.kind = 'resolves_to'
+               JOIN entities e ON e.id = ee.src_entity_id
+               WHERE ip.kind = 'ip' AND e.registrable_domain IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM observations o JOIN selectors s ON s.id = o.selector_id
+                     WHERE o.entity_id = ip.id AND s.kind IN ('asn','network_cidr') AND s.attributing = FALSE
+                 )
+               GROUP BY ip.id
+               HAVING count(DISTINCT e.registrable_domain) BETWEEN 2 AND %s""",
+            (fanout,),
+        ).fetchall():
+            union_group(row["rds"])
+
+        components: dict[str, list[str]] = defaultdict(list)
+        for rd in list(parent):
+            components[find(rd)].append(rd)
+
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute("TRUNCATE graph_clusters")
+        cluster_count = 0
+        clustered = 0
+        for members in components.values():
+            if len(members) < 2:
+                continue
+            cluster_count += 1
+            cluster_id = min(members)
+            size = len(members)
+            for member in members:
+                c.execute(
+                    """INSERT INTO graph_clusters (registrable_domain, cluster_id, component_size, computed_at)
+                       VALUES (%s,%s,%s,%s)
+                       ON CONFLICT (registrable_domain) DO UPDATE SET
+                           cluster_id = EXCLUDED.cluster_id,
+                           component_size = EXCLUDED.component_size,
+                           computed_at = EXCLUDED.computed_at""",
+                    (member, cluster_id, size, now),
+                )
+                clustered += 1
+
+    return {"clusters": cluster_count, "clustered_domains": clustered}
+
+
+def list_graph_clusters(*, min_size: int = 2, limit: int = 100) -> list[dict[str, Any]]:
+    """Strongest clusters lake-wide (largest first)."""
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT cluster_id, component_size,
+                      array_agg(registrable_domain ORDER BY registrable_domain) AS members
+               FROM graph_clusters
+               WHERE component_size >= %s
+               GROUP BY cluster_id, component_size
+               ORDER BY component_size DESC, cluster_id
+               LIMIT %s""",
+            (min_size, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def graph_cluster_for(value: str) -> dict[str, Any] | None:
+    """The cluster a registrable domain belongs to (with its members), if any."""
+    side = _resolve_side(value)
+    if not side or side[0] != "rd":
+        return None
+    init_db()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT cluster_id, component_size FROM graph_clusters WHERE registrable_domain = %s",
+            (side[1],),
+        ).fetchone()
+        if not row:
+            return None
+        members = [
+            r["registrable_domain"]
+            for r in c.execute(
+                "SELECT registrable_domain FROM graph_clusters WHERE cluster_id = %s ORDER BY registrable_domain",
+                (row["cluster_id"],),
+            ).fetchall()
+        ]
+    return {"cluster_id": row["cluster_id"], "component_size": row["component_size"], "members": members}
 
 
 # ── Queries ───────────────────────────────────────────────────────────────────

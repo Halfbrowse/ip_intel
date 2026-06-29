@@ -385,6 +385,66 @@ export function normalizeClusterGroups(payload) {
     }));
 }
 
+// ── Global correlation graph ────────────────────────────────────────────────
+// Shapes the /api/graph/links response into ranked connections, each carrying
+// its shared-node evidence breakdown (the deliverable — never a bare score).
+
+export function normalizeGraphLinks(payload) {
+  return coerceArray(payload?.links ?? payload).map((item, index) => normalizeGraphLink(item, index));
+}
+
+export function normalizeGraphLink(item, index = 0) {
+  const raw = item || {};
+  const target = readableValue(pickFirst(raw, ["target", "registrable_domain", "rd", "b"], `link-${index}`));
+  return {
+    raw,
+    target,
+    score: typeof raw.score === "number" ? raw.score : Number(raw.score) || 0,
+    confidence: resolvePercent(pickFirst(raw, ["confidence"])) ?? confidenceFromScore(raw.score),
+    strength: pickFirst(raw, ["strength"]) || null,
+    sharedNodeCount: pickFirst(raw, ["shared_node_count", "sharedNodeCount"], null),
+    evidence: coerceArray(raw.evidence).map((node, nodeIndex) => normalizeSharedNode(node, nodeIndex)),
+  };
+}
+
+function normalizeSharedNode(node, index) {
+  const raw = node || {};
+  const window = (value) => {
+    const range = coerceArray(value);
+    return range.length ? range.map((entry) => (entry ? String(entry) : null)) : [null, null];
+  };
+  return {
+    id: `${raw.kind || "node"}-${raw.value || index}`,
+    nodeType: pickFirst(raw, ["node_type", "nodeType"], "selector"),
+    kind: pickFirst(raw, ["kind"], "unknown"),
+    value: readableValue(pickFirst(raw, ["value"])) || "—",
+    degree: pickFirst(raw, ["degree"], null),
+    attributing: raw.attributing !== false,
+    baseWeight: pickFirst(raw, ["base_weight", "baseWeight"], null),
+    rarity: pickFirst(raw, ["rarity"], null),
+    timeOverlap: pickFirst(raw, ["time_overlap", "timeOverlap"], null),
+    weight: pickFirst(raw, ["weight"], null),
+    sources: coerceArray(raw.sources).map((entry) => readableValue(entry)).filter(Boolean),
+    windowA: window(pickFirst(raw, ["window_a", "windowA"])),
+    windowB: window(pickFirst(raw, ["window_b", "windowB"])),
+  };
+}
+
+export function normalizeGraphClusters(payload) {
+  return coerceArray(payload?.clusters ?? payload).map((item, index) => {
+    const raw = item || {};
+    const members = coerceArray(pickFirst(raw, ["members"], []))
+      .map((entry) => readableValue(entry))
+      .filter(Boolean);
+    return {
+      raw,
+      id: pickFirst(raw, ["cluster_id", "clusterId", "id"], `cluster-${index}`),
+      size: pickFirst(raw, ["component_size", "componentSize", "size"], members.length),
+      members,
+    };
+  });
+}
+
 export function normalizeEvidenceMeta(payload) {
   const collection = payload?.evidence ?? payload?.evidence_types ?? payload?.items ?? payload;
 

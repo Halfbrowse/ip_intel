@@ -26,12 +26,13 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 | `core/basic.py` | Legacy OSINT helpers used by the analysis pipeline |
 | `db/intel_db.py` | PostgreSQL schema, persistence, and history for raw intel runs |
 | `scripts/migrate_sqlite_to_postgres.py` | One-off migration of a legacy SQLite intel database into PostgreSQL |
+| `scripts/backfill_correlation.py` | Rebuild the derived correlation graph (entities/selectors/observations/edges/clusters) from all stored intel |
 | `sources/signal_dns.py` | DNS and email-security signals (SPF, DKIM, DMARC, MX) |
 | `sources/signal_transport.py` | TLS and SSH certificate parsing |
 | `sources/signal_web.py` | Web page metadata extraction (favicons, tracking IDs, headers) |
-| `utils/check.py` | Pairwise comparison logic |
-| `utils/cluster.py` | Clustering algorithm |
-| `utils/evidence_meta.py` | Evidence type definitions and catalog |
+| `utils/check.py` | Pairwise comparison logic + global graph linkage scoring (`link_evidence`, `links_for`) |
+| `utils/cluster.py` | Per-case cluster graph rendering (global clustering is materialized in `db/intel_db.py`) |
+| `utils/evidence_meta.py` | Evidence type catalog + per-selector base weights and strength tiers |
 | `integrations/mattermost_alerts.py` | Optional Mattermost webhook notifications |
 | `integrations/opencti_ingest.py` | OpenCTI ingestion worker (Domain-Name observables and Channel SDOs) |
 | `frontend/` | React frontend built with Vite |
@@ -190,6 +191,17 @@ extras already declared in `pyproject.toml`.
 - `GET /api/cases/{case_id}/pairs/{pair_id}` — detailed evidence for a single pair
 - `GET /api/cases/{case_id}/clusters` — cluster graph for a case
 
+### Correlation graph (global, case-free)
+
+These operate on the lake-wide attribution graph and are not scoped to a case:
+
+- `POST /api/ingest` — primary ingestion. JSON `{"target": "...", "label": "..."}` or multipart with a CSV `file`; `label` is an optional collection tag that scopes nothing in correlation.
+- `GET /api/graph/links/{value}` — ranked cross-corpus connections for an entity / registrable domain, each with its shared-node evidence breakdown (selector kind, value, degree, weight, time-overlap window, sources).
+- `GET /api/graph/link?a=<rd>&b=<rd>` — the connecting evidence between two domains.
+- `GET /api/graph/clusters` — the strongest clusters lake-wide.
+- `GET /api/graph/cluster/{value}` — the cluster a registrable domain belongs to, with members.
+- `POST /api/graph/recompute` — global recompute: rebuild the whole correlation graph + clusters from stored intel (no rescanning).
+
 ### Meta
 
 - `GET /api/meta/evidence` — evidence type catalog used by the frontend
@@ -227,6 +239,56 @@ The app correlates on:
 - per-target provider-origin hits
 
 Noise handling is applied to common mail, CDN, proxy, and shared-hosting patterns so those overlaps remain visible but are easier to interpret as weaker evidence.
+
+### Selector-centric attribution graph
+
+On top of the append-only raw `searches` substrate, the app builds a **derived,
+rebuildable correlation graph** (`db/intel_db.py`) that models shared observables
+as first-class nodes, so linkage becomes graph reachability — including the
+transitive, subdomain-mediated case (if `x.a.com` and `y.b.com` present the same
+leaf certificate, `a.com` and `b.com` link through the subdomains):
+
+- **entities** — domains, subdomains, and IPs you enrich and traverse, each
+  rolled up to its `registrable_domain`.
+- **selectors** — lightweight observables implying shared ownership
+  (`tls_cert_sha256`, `tls_spki`, `tls_san`, `favicon_mmh3`, `tracking_id`,
+  `ssh_fp`, `nameserver`, `asn`, `network_cidr`, …), each with a global
+  `entity_count` (degree) and an `attributing` flag.
+- **observations** — provenance-bearing entity→selector edges (`source` +
+  `search_id` + observed time window).
+- **entity_edges** — structural `resolves_to` / `subdomain_of` edges.
+
+Two registrable domains link when they share an **attributing** selector or a
+non-noise shared IP. Each shared node is scored by **base weight × rarity ×
+time-overlap**: rarity is `1/log2(degree)` (a cert shared by 2 entities is huge;
+a nameserver/ASN shared by 40,000 is ~noise), and observation windows that
+overlap score higher than the same selector seen years apart. Base weights and
+strength tiers live in `utils/evidence_meta.py`; the linkage/scoring engine is in
+`utils/check.py` (`link_evidence`, `links_for`); clustering is connected
+components over the whole attributing graph (`graph_clusters`).
+
+A configurable **denylist** marks selectors non-attributing — known CDN/cloud
+ASNs, big-provider nameservers, default/shared-host cert SANs, and any selector
+whose degree exceeds `CORRELATION_DEGREE_THRESHOLD` (default 50). Denylisted
+nodes are kept in the graph but never create a link.
+
+#### Backfill and global recompute
+
+The correlation layer is populated inline on every analysis and is fully
+rebuildable from stored intel without rescanning:
+
+```bash
+# build/rebuild the whole graph from all stored searches, compute degrees, seed
+# the denylist, and materialize clusters
+uv run python -m scripts.backfill_correlation
+# or, in a running container
+docker compose exec ip-intel python -m scripts.backfill_correlation
+```
+
+`POST /api/graph/recompute` does the same in-process. Because extraction and
+scoring read only the stored substrate, changing a base weight in
+`evidence_meta.py` (rescore: in-memory) or extraction logic (`POST
+/api/graph/recompute`) reproduces everything deterministically — no rescan.
 
 ## Evidence Strength
 
