@@ -132,6 +132,23 @@ def analyze_target(
         discovered_targets = _extract_discovered_targets(payload, normalized_target)
 
     helpers = build_helper_rows(payload)
+
+    # Persist the analysed result into the global intel store (db/intel_db.py) so
+    # the pool and correlation graph populate on every ingest. The case-layer run
+    # is saved separately by the caller; this is best-effort and must never break
+    # the ingest, so any failure is logged and swallowed.
+    try:
+        from datetime import datetime, timezone
+
+        from db import intel_db
+
+        payload.setdefault("input", normalized_target)
+        payload.setdefault("type", target_type)
+        payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        intel_db.save_search(payload)
+    except Exception as exc:  # pragma: no cover - defensive; correlation is rebuildable
+        _log(logger, "warning", f"Intel store save failed: {exc}")
+
     return AnalysisRun(
         target=target,
         normalized_target=normalized_target,
