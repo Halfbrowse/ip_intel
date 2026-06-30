@@ -1,714 +1,128 @@
-import {
-  Suspense,
-  lazy,
-  memo,
-  useCallback,
-  useDeferredValue,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import {
-  Link,
-  NavLink,
-  Navigate,
-  Outlet,
-  Route,
-  Routes,
-  useOutletContext,
-  useParams,
-} from "./router.jsx";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { Link, NavLink, Navigate, Route, Routes } from "./router.jsx";
 
 import {
   fetchJson,
+  formatDate,
   formatLabel,
   formatPercent,
   isTerminalStatus,
-  formatDate,
-  normalizeCaseDetail,
-  normalizeCases,
-  normalizeClusterGroups,
+  normalizeConnectionPairs,
   normalizeGraphClusters,
   normalizeGraphLinks,
   normalizeJob,
-  normalizePairDetail,
-  normalizePairs,
+  normalizePool,
+  normalizeSelectorGroups,
+  normalizeSelectorKinds,
   useApi,
 } from "./api.js";
 import {
-  DescriptionGrid,
   EmptyState,
   ErrorState,
   InlineMetric,
   LoadingState,
   MetricCard,
   ProgressBar,
-  RawDataDisclosure,
-  StatusBadge,
-  SubjectCard,
-  formatDisplayValue,
-  formatMaybeDate,
-  formatMaybeNumber,
-  formatStatusLabel,
 } from "./components/primitives.jsx";
 
-// Heavy views load on demand so the initial route ships less JavaScript:
-// the cluster graph pulls in the d3 modules, and the progress/log view is
-// only needed while a job is running.
-const ClusterGraph = lazy(() => import("./components/ClusterGraph.jsx"));
-const CaseProgressPage = lazy(() => import("./components/CaseProgressPage.jsx"));
-
-const RAW_CASE_EXCLUDES = new Set([
-  "id",
-  "case_id",
-  "caseId",
-  "uuid",
-  "title",
-  "name",
-  "label",
-  "summary",
-  "overview",
-  "description",
-  "job",
-  "latest_job",
-  "latestJob",
-  "current_job",
-  "currentJob",
-  "metrics",
-  "counts",
-  "pairs",
-  "pair_count",
-  "pairCount",
-  "clusters",
-  "cluster_count",
-  "clusterCount",
-  "targets",
-  "subjects",
-  "entities",
-  "members",
-  "highlights",
-  "findings",
-  "notes",
-  "evidence",
-  "evidence_items",
-  "evidenceItems",
-]);
-
-const RAW_PAIR_EXCLUDES = new Set([
-  "id",
-  "pair_id",
-  "pairId",
-  "left",
-  "right",
-  "lhs",
-  "rhs",
-  "domain_a",
-  "domain_b",
-  "score",
-  "confidence",
-  "strength",
-  "status",
-  "classification",
-  "verdict",
-  "summary",
-  "description",
-  "explanation",
-  "entities",
-  "subjects",
-  "members",
-  "evidence",
-  "evidence_items",
-  "evidenceItems",
-]);
+/* ============================================================== */
+/* Routing                                                         */
+/* ============================================================== */
 
 export default function App() {
   return (
     <Routes>
-      <Route path="/" element={<HomePage />} />
-      <Route path="/graph" element={<GraphExplorerPage />} />
-      <Route path="/cases/:caseId" element={<CaseLayout />}>
-        <Route index element={<Navigate replace to="summary" />} />
-        <Route
-          path="progress"
-          element={
-            <Suspense fallback={<LoadingState message="Loading the progress view..." />}>
-              <CaseProgressPage />
-            </Suspense>
-          }
-        />
-        <Route path="summary" element={<CaseSummaryPage />} />
-        <Route path="pairs/:pairId" element={<CasePairPage />} />
-        <Route path="clusters" element={<CaseClustersPage />} />
-      </Route>
+      <Route path="/" element={<PoolPage />} />
+      <Route path="/connections" element={<ConnectionsPage />} />
+      <Route path="/clusters" element={<ClustersPage />} />
+      <Route path="/cases/*" element={<Navigate replace to="/" />} />
       <Route path="*" element={<NotFoundPage />} />
     </Routes>
   );
 }
 
-function HomePage() {
-  const casesRequest = useApi("/api/cases");
-  const [search, setSearch] = useState("");
-  const [targetInput, setTargetInput] = useState("");
-  const [csvFile, setCsvFile] = useState(null);
-  const [submitState, setSubmitState] = useState({
-    busy: false,
-    error: null,
-  });
-  const deferredSearch = useDeferredValue(search);
-  const cases = useMemo(
-    () => normalizeCases(casesRequest.data).sort(sortCases),
-    [casesRequest.data],
-  );
-  const query = deferredSearch.trim().toLowerCase();
-  const filteredCases = useMemo(
-    () =>
-      query
-        ? cases.filter((caseItem) => {
-            const haystack = [
-              caseItem.id,
-              caseItem.title,
-              caseItem.summaryText,
-              caseItem.status,
-              caseItem.jobId,
-              caseItem.targets.join(" "),
-            ]
-              .filter(Boolean)
-              .join(" ")
-              .toLowerCase();
-            return haystack.includes(query);
-          })
-        : cases,
-    [cases, query],
-  );
+/* ============================================================== */
+/* Shell + theme                                                  */
+/* ============================================================== */
 
-  const runningCases = useMemo(
-    () => cases.filter((caseItem) => !isTerminalStatus(caseItem.status)).length,
-    [cases],
-  );
-  const readySummaries = useMemo(
-    () => cases.filter((caseItem) => caseItem.summaryText).length,
-    [cases],
-  );
+const THEME_STORAGE_KEY = "theme";
 
-  const LIST_CAP = 200;
-  const visibleCases = filteredCases.slice(0, LIST_CAP);
+export function getInitialTheme() {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === "light" || stored === "dark") {
+      return stored;
+    }
+  } catch {
+    // Ignore storage errors and fall back to the system preference.
+  }
+  return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+}
 
+function useTheme() {
+  const [theme, setTheme] = useState(getInitialTheme);
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, next);
+    } catch {
+      // Best-effort persistence.
+    }
+    setTheme(next);
+  };
+  return { theme, toggleTheme };
+}
+
+const NAV_ITEMS = [
+  { to: "/", label: "Pool" },
+  { to: "/connections", label: "Connections" },
+  { to: "/clusters", label: "Clusters" },
+];
+
+function AppShell({ children }) {
+  const { theme, toggleTheme } = useTheme();
   return (
-    <AppShell>
-      <section className="hero-panel">
-        <div className="hero-copy">
-          <p className="eyebrow">Submission workspace</p>
-          <h1>Submit domains or IPs and follow the overlap case as it runs.</h1>
-          <p>
-            Start with one target or a CSV, then explore which domains are linked, how
-            strongly, and why — in plain English.
-          </p>
-        </div>
-        <div className="hero-stats">
-          <MetricCard label="Cases available" value={cases.length} />
-          <MetricCard label="Jobs in flight" value={runningCases} />
-          <MetricCard label="Cases with summaries" value={readySummaries} />
-          <Link className="primary-button" to="/graph">
-            Explore the connection graph
-          </Link>
-        </div>
-      </section>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">New case</p>
-            <h2>Submit targets</h2>
-            <p className="section-copy">
-              Add one domain or IP directly, or upload a CSV and we will process the first
-              column only.
-            </p>
-          </div>
-        </div>
-
-        <div className="submission-grid">
-          <div className="submission-card">
-            <label className="search-field">
-              <span>Single domain or IP</span>
-              <input
-                name="target"
-                onChange={(event) => setTargetInput(event.target.value)}
-                placeholder="example.com or 203.0.113.10"
-                type="text"
-                value={targetInput}
-              />
-            </label>
-            <button
-              className="primary-button"
-              disabled={submitState.busy || !targetInput.trim()}
-              onClick={() => submitCase({ target: targetInput.trim() })}
-              type="button"
+    <div className="app-shell">
+      <header className="app-header">
+        <Link className="brand-mark" to="/">
+          <span>IP</span>
+          <strong>Intel</strong>
+        </Link>
+        <nav className="case-nav" aria-label="Sections">
+          {NAV_ITEMS.map((item) => (
+            <NavLink
+              className={({ isActive }) => (isActive ? "case-nav-link active" : "case-nav-link")}
+              key={item.to}
+              to={item.to}
             >
-              {submitState.busy ? "Submitting..." : "Start single-target case"}
-            </button>
-          </div>
-
-          <div className="submission-card">
-            <label className="search-field file-field">
-              <span>CSV upload</span>
-              <input
-                accept=".csv,text/csv"
-                onChange={(event) => setCsvFile(event.target.files?.[0] || null)}
-                type="file"
-              />
-            </label>
-            <button
-              className="primary-button"
-              disabled={submitState.busy || !csvFile}
-              onClick={() => submitCase({ file: csvFile })}
-              type="button"
-            >
-              {submitState.busy ? "Submitting..." : "Upload CSV case"}
-            </button>
-          </div>
-        </div>
-
-        <div className="submission-card">
-          <div>
-            <p className="eyebrow">OpenCTI website channels</p>
-            <p className="section-copy">
-              Pull the domains from the 100 most recently created website-type channels
-              on OpenCTI and open a case seeded with them.
-            </p>
-          </div>
+              {item.label}
+            </NavLink>
+          ))}
+        </nav>
+        <div className="header-side">
           <button
-            className="secondary-button"
-            disabled={submitState.busy}
-            onClick={() => ingestOpenCtiWebsite()}
+            aria-pressed={theme === "dark"}
+            className="secondary-button theme-toggle"
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Switch to the light theme" : "Switch to the dark theme"}
             type="button"
           >
-            {submitState.busy ? "Submitting..." : "Ingest last 100 website channels"}
+            <span aria-hidden="true" className="theme-toggle-indicator" />
+            {theme === "dark" ? "Light mode" : "Dark mode"}
           </button>
         </div>
-
-        <div className="callout subtle">
-          <p>
-            Accepted input: one domain or IP in the text field, or a CSV where the first
-            column contains domains or IPs. Duplicate rows are deduplicated server-side.
-          </p>
-        </div>
-
-        {submitState.error ? <ErrorState message={submitState.error} /> : null}
-      </section>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">History</p>
-            <h2>Cases</h2>
-            <p className="section-copy">Every analysis submitted so far, newest first.</p>
-          </div>
-          <button className="secondary-button" onClick={casesRequest.refresh} type="button">
-            Refresh
-          </button>
-        </div>
-
-        <label className="search-field">
-          <span>Search cases</span>
-          <input
-            name="case-search"
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Filter by title, case ID, target, or status"
-            type="search"
-            value={search}
-          />
-        </label>
-
-        {casesRequest.loading && !casesRequest.data ? (
-          <LoadingState message="Loading cases..." />
-        ) : null}
-
-        {casesRequest.error ? <ErrorState message={casesRequest.error} /> : null}
-
-        {!casesRequest.loading && !casesRequest.error && filteredCases.length === 0 ? (
-          <EmptyState
-            message={
-              cases.length === 0
-                ? "No cases were returned by the backend yet."
-                : "No cases match the current search."
-            }
-          />
-        ) : null}
-
-        {filteredCases.length > LIST_CAP ? (
-          <p className="section-copy">
-            Showing {LIST_CAP} of {filteredCases.length} cases. Refine the search to see more.
-          </p>
-        ) : null}
-
-        {filteredCases.length > 0 ? (
-          <div className="case-grid">
-            {visibleCases.map((caseItem) => (
-              <CaseCard caseItem={caseItem} key={caseItem.id} />
-            ))}
-          </div>
-        ) : null}
-      </section>
-    </AppShell>
-  );
-
-  async function submitCase({ file, target }) {
-    setSubmitState({ busy: true, error: null });
-    try {
-      let response;
-      if (file) {
-        const formData = new FormData();
-        formData.append("file", file);
-        response = await fetch("/api/cases", {
-          method: "POST",
-          body: formData,
-          headers: {
-            Accept: "application/json",
-          },
-        });
-      } else {
-        response = await fetch("/api/cases", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          body: JSON.stringify({ target }),
-        });
-      }
-
-      const payload = await parseSubmitPayload(response);
-      if (!response.ok) {
-        const message =
-          (payload && typeof payload === "object" && (payload.detail || payload.message || payload.error)) ||
-          (typeof payload === "string" ? payload : null) ||
-          `Case submission failed with status ${response.status}.`;
-        throw new Error(message);
-      }
-
-      const caseId = payload?.case_id || payload?.case?.id;
-      if (!caseId) {
-        throw new Error("The backend did not return a case ID.");
-      }
-      window.location.assign(`/cases/${caseId}/progress`);
-    } catch (error) {
-      setSubmitState({
-        busy: false,
-        error: error.message || "Case submission failed.",
-      });
-      return;
-    }
-    setSubmitState({ busy: false, error: null });
-  }
-
-  async function ingestOpenCtiWebsite() {
-    setSubmitState({ busy: true, error: null });
-    try {
-      const response = await fetch("/api/ingest/opencti-website", {
-        method: "POST",
-        headers: { Accept: "application/json" },
-      });
-      const payload = await parseSubmitPayload(response);
-      if (!response.ok) {
-        const message =
-          (payload && typeof payload === "object" && (payload.detail || payload.message || payload.error)) ||
-          (typeof payload === "string" ? payload : null) ||
-          `OpenCTI ingest failed with status ${response.status}.`;
-        throw new Error(message);
-      }
-      const caseId = payload?.case_id || payload?.case?.id;
-      if (!caseId) {
-        throw new Error("The backend did not return a case ID.");
-      }
-      window.location.assign(`/cases/${caseId}/progress`);
-    } catch (error) {
-      setSubmitState({
-        busy: false,
-        error: error.message || "OpenCTI ingest failed.",
-      });
-      return;
-    }
-    setSubmitState({ busy: false, error: null });
-  }
-
-  async function parseSubmitPayload(response) {
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      return response.json();
-    }
-
-    const text = await response.text();
-    if (!text) {
-      return null;
-    }
-
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
-  }
-}
-
-const CaseCard = memo(function CaseCard({ caseItem }) {
-  const caseRunning = !isTerminalStatus(caseItem.status);
-  return (
-    <article className="case-card">
-      <div className="case-card-header">
-        <div>
-          <p className="eyebrow">Case {caseItem.id}</p>
-          <h3>{caseItem.title}</h3>
-          <p className="card-copy">
-            {caseItem.summaryText || "Open the summary page to inspect the case detail."}
-          </p>
-        </div>
-        <StatusBadge status={caseItem.status} />
-      </div>
-
-      {caseItem.targets.length > 0 ? (
-        <div className="chip-row">
-          {caseItem.targets.slice(0, 4).map((target) => (
-            <span className="chip" key={target}>
-              {target}
-            </span>
-          ))}
-        </div>
-      ) : null}
-
-      <div className="inline-metrics">
-        <InlineMetric label="Pairs" value={formatMaybeNumber(caseItem.pairCount)} />
-        <InlineMetric label="Clusters" value={formatMaybeNumber(caseItem.clusterCount)} />
-        <InlineMetric label="Updated" value={formatMaybeDate(caseItem.updatedAt)} />
-      </div>
-
-      {caseRunning && caseItem.progress !== null ? (
-        <div className="mini-progress">
-          <div className="mini-progress-top">
-            <span>Progress</span>
-            <strong>{formatPercent(caseItem.progress)}</strong>
-          </div>
-          <ProgressBar value={caseItem.progress} />
-        </div>
-      ) : null}
-
-      <div className="action-row">
-        <Link className="primary-button" to={`/cases/${caseItem.id}/summary`}>
-          Open summary
-        </Link>
-        {caseRunning ? (
-          <Link className="text-link" to={`/cases/${caseItem.id}/progress`}>
-            Progress
-          </Link>
-        ) : null}
-        <Link className="text-link" to={`/cases/${caseItem.id}/clusters`}>
-          Clusters
-        </Link>
-      </div>
-    </article>
-  );
-});
-
-function isCaseActive(caseDetail) {
-  const status = String(caseDetail?.status || "").toLowerCase();
-  return status === "running" || status === "queued" || status === "pending";
-}
-
-function CaseLayout() {
-  const { caseId } = useParams();
-  const [livePolling, setLivePolling] = useState(false);
-  const caseRequest = useApi(`/api/cases/${caseId}`, {
-    pollInterval: livePolling ? 4000 : 0,
-  });
-  const caseDetail = useMemo(
-    () => normalizeCaseDetail(caseRequest.data, caseId),
-    [caseRequest.data, caseId],
-  );
-  const caseActive = Boolean(caseRequest.data) && isCaseActive(caseDetail);
-
-  useEffect(() => {
-    setLivePolling(caseActive);
-  }, [caseActive]);
-
-  const navItems = useMemo(() => {
-    const items = [{ to: "summary", label: "Summary" }];
-    if (caseActive) {
-      items.push({ to: "progress", label: "Progress" });
-    }
-    items.push({ to: "clusters", label: "Clusters" });
-    return items;
-  }, [caseActive]);
-
-  return (
-    <AppShell>
-      <div className="breadcrumb-row">
-        <Link className="text-link" to="/">
-          All cases
-        </Link>
-        <span>/</span>
-        <span>{caseDetail.title}</span>
-      </div>
-
-      <section className="hero-panel compact">
-        <div className="hero-copy">
-          <p className="eyebrow">Case {caseDetail.id || caseId}</p>
-          <h1>{caseDetail.title}</h1>
-          <p>
-            {caseDetail.summaryText ||
-              "This case answers one question: are these domains controlled by the same entity, and with what confidence?"}
-          </p>
-        </div>
-        <div className="hero-side-stack">
-          <StatusBadge status={caseDetail.status} />
-          <div className="inline-metrics">
-            <InlineMetric label="Pairs" value={formatMaybeNumber(caseDetail.pairCount)} />
-            <InlineMetric label="Clusters" value={formatMaybeNumber(caseDetail.clusterCount)} />
-            <InlineMetric label="Targets" value={caseDetail.targets.length || "—"} />
-          </div>
-        </div>
-      </section>
-
-      <nav className="case-nav" aria-label="Case sections">
-        {navItems.map((item) => (
-          <NavLink
-            className={({ isActive }) =>
-              isActive ? "case-nav-link active" : "case-nav-link"
-            }
-            key={item.to}
-            to={item.to}
-          >
-            {item.label}
-          </NavLink>
-        ))}
-      </nav>
-
-      {caseRequest.error && !caseRequest.data ? (
-        <ErrorState message={caseRequest.error} />
-      ) : null}
-
-      <Outlet context={{ caseId, caseDetail, caseRequest, caseActive }} />
-    </AppShell>
+      </header>
+      <main className="app-main">{children}</main>
+    </div>
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Evidence vocabulary: plain-English framing for the backend signals. */
-/* ------------------------------------------------------------------ */
-
-const IMPORTANCE_RANK = {
-  decisive: 0,
-  key: 0,
-  anchoring: 0,
-  strong: 1,
-  supporting: 2,
-  "low-signal": 3,
-  low_signal: 3,
-};
-
-function importanceRank(importance) {
-  const rank = IMPORTANCE_RANK[String(importance || "").toLowerCase()];
-  return rank === undefined ? 2 : rank;
-}
-
-function importanceTone(importance) {
-  switch (importanceRank(importance)) {
-    case 0:
-      return "success";
-    case 1:
-      return "warning";
-    case 3:
-      return "neutral";
-    default:
-      return "info";
-  }
-}
-
-const CATEGORY_INFO = {
-  Transport: {
-    title: "TLS certificates & SSH keys",
-    blurb: "Cryptographic fingerprints served by the live servers.",
-  },
-  Infrastructure: {
-    title: "Shared IP addresses",
-    blurb: "Current and historical hosting overlap.",
-  },
-  "Web identity": {
-    title: "Tracking & analytics IDs",
-    blurb: "Analytics, tag-manager, and advertising accounts embedded in the pages.",
-  },
-  "Web content": {
-    title: "Page content & favicons",
-    blurb: "Visual and build artifacts served by the sites.",
-  },
-  Identity: {
-    title: "Ownership identity",
-    blurb: "Legal entities, social handles, and verification tokens.",
-  },
-  Registration: {
-    title: "Domain registration",
-    blurb: "WHOIS contacts and registrar records.",
-  },
-  DNS: {
-    title: "DNS & nameservers",
-    blurb: "Delegation and resolution overlap.",
-  },
-  "Email policy": {
-    title: "Email configuration",
-    blurb: "SPF, DKIM, and DMARC policy overlap.",
-  },
-  "Email operations": {
-    title: "Mail infrastructure",
-    blurb: "Mail servers and autodiscover endpoints.",
-  },
-  "SaaS identity": {
-    title: "SaaS tenants",
-    blurb: "Shared cloud-service accounts such as Microsoft 365.",
-  },
-  "Well-known files": {
-    title: "Site metadata files",
-    blurb: "security.txt, ads.txt, and app-link files.",
-  },
-  Other: {
-    title: "Other shared signals",
-    blurb: "Additional overlap captured during the scan.",
-  },
-};
-
-const CATEGORY_PHRASES = {
-  Transport: "shared TLS certificates or SSH keys",
-  Infrastructure: "shared hosting IPs",
-  "Web identity": "shared tracking and analytics IDs",
-  "Web content": "matching page content",
-  Identity: "shared ownership identity details",
-  Registration: "shared registration records",
-  DNS: "shared DNS infrastructure",
-  "Email policy": "shared email configuration",
-  "Email operations": "shared mail infrastructure",
-  "SaaS identity": "a shared SaaS tenant",
-  "Well-known files": "shared site metadata files",
-  Other: "shared low-level signals",
-};
-
-function sortEvidence(evidence) {
-  return [...(evidence || [])].sort(
-    (a, b) => importanceRank(a.importance) - importanceRank(b.importance),
-  );
-}
-
-function lowerFirst(text) {
-  if (!text) {
-    return text;
-  }
-  return text.charAt(0).toLowerCase() + text.slice(1);
-}
-
-function evidenceNoun(item) {
-  const label = item.title || formatLabel(item.type);
-  if (/^shared\s+/i.test(label)) {
-    return `the same ${label.replace(/^shared\s+/i, "")}`;
-  }
-  return lowerFirst(label);
-}
+/* ============================================================== */
+/* Shared evidence rendering                                      */
+/* ============================================================== */
 
 const STRENGTH_TIERS = {
   strong: { tier: "strong", label: "Strong link", tone: "success" },
@@ -716,1074 +130,18 @@ const STRENGTH_TIERS = {
   weak: { tier: "weak", label: "Weak link", tone: "neutral" },
 };
 
-function linkStrength(pair) {
-  // The backend classifies new pairs; fall back to confidence thresholds
-  // (same cutoffs as the backend) for pairs stored before that existed.
-  if (pair?.strength && STRENGTH_TIERS[pair.strength]) {
-    return STRENGTH_TIERS[pair.strength];
+function linkStrength(link) {
+  if (link?.strength && STRENGTH_TIERS[link.strength]) {
+    return STRENGTH_TIERS[link.strength];
   }
-  const value = pair?.score ?? 0;
+  const value = link?.score ?? 0;
   if (value >= 65) {
     return STRENGTH_TIERS.strong;
   }
-  if (value >= 35) {
+  if (value >= 30) {
     return STRENGTH_TIERS.moderate;
   }
   return STRENGTH_TIERS.weak;
-}
-
-function connectionReason(pair) {
-  const sorted = sortEvidence(pair.evidence);
-  if (sorted.length === 0) {
-    return "No shared evidence was recorded for this pair, so the connection is unsupported.";
-  }
-  const best = sorted[0];
-  const noun = evidenceNoun(best);
-  const { tier } = linkStrength(pair);
-
-  if (tier === "strong") {
-    return `These domains share ${noun} — ${
-      lowerFirst(best.whyItMatters) || "a strong sign that they are run by the same entity."
-    }`;
-  }
-  if (tier === "moderate") {
-    const why = best.whyItMatters ? `${best.whyItMatters} ` : "";
-    return `These domains overlap on ${noun}. ${why}Treat this as a moderate signal that needs corroboration.`;
-  }
-  const nouns = [...new Set(sorted.slice(0, 2).map((item) => evidenceNoun(item)))];
-  return `The only overlap is ${nouns.join(" and ")} — ${
-    lowerFirst(best.caveat) ||
-    "signals that many unrelated sites share, so this is weak evidence of common control."
-  }`;
-}
-
-function categorySummaryLine(items) {
-  const best = items[0];
-  const noun = evidenceNoun(best);
-  const extraCount = items.length - 1;
-  const extra =
-    extraCount > 0 ? ` plus ${extraCount} related signal${extraCount === 1 ? "" : "s"}` : "";
-  switch (importanceRank(best.importance)) {
-    case 0:
-      return `Both sites present ${noun}${extra}. ${best.whyItMatters || ""}`.trim();
-    case 1:
-      return `Both sites share ${noun}${extra}. ${best.whyItMatters || ""}`.trim();
-    case 3:
-      return `They match on ${noun}${extra}, but ${
-        lowerFirst(best.caveat) || "this is common across unrelated sites, so it counts for little."
-      }`;
-    default:
-      return `They also share ${noun}${extra} — supporting context rather than proof on its own.`;
-  }
-}
-
-function groupEvidence(evidence) {
-  const sorted = sortEvidence(evidence);
-  const byCategory = new Map();
-  sorted.forEach((item) => {
-    const category = item.category || "Other";
-    if (!byCategory.has(category)) {
-      byCategory.set(category, []);
-    }
-    byCategory.get(category).push(item);
-  });
-
-  return [...byCategory.entries()]
-    .map(([category, items]) => {
-      const info = CATEGORY_INFO[category] || { title: category, blurb: "" };
-      return {
-        category,
-        title: info.title,
-        blurb: info.blurb,
-        items,
-        bestImportance: items[0].importance,
-        bestRank: importanceRank(items[0].importance),
-        summary: categorySummaryLine(items),
-      };
-    })
-    .sort((a, b) => a.bestRank - b.bestRank || b.items.length - a.items.length);
-}
-
-function dominantCategoryPhrase(pairs) {
-  const counts = new Map();
-  pairs.forEach((pair) => {
-    const best = sortEvidence(pair.evidence)[0];
-    if (!best) {
-      return;
-    }
-    const category = best.category || "Other";
-    counts.set(category, (counts.get(category) || 0) + 1);
-  });
-  let topCategory = null;
-  let topCount = 0;
-  counts.forEach((count, category) => {
-    if (count > topCount) {
-      topCount = count;
-      topCategory = category;
-    }
-  });
-  return topCategory ? CATEGORY_PHRASES[topCategory] || CATEGORY_PHRASES.Other : null;
-}
-
-function buildCaseExplanation(seedTargets, pairs) {
-  const seeds = [...new Set(seedTargets)].filter(Boolean);
-  const seedPairs = pairs.filter((pair) => pair.isSeedPair);
-  const historicalPairs = pairs.filter((pair) => pair.scope === "historical");
-  const sentences = [];
-
-  if (seeds.length >= 2) {
-    const bestByDomain = new Map(seeds.map((domain) => [domain, 0]));
-    seedPairs.forEach((pair) => {
-      const score = pair.score ?? 0;
-      [pair.left, pair.right].forEach((domain) => {
-        if (bestByDomain.has(domain) && score > bestByDomain.get(domain)) {
-          bestByDomain.set(domain, score);
-        }
-      });
-    });
-
-    let strong = 0;
-    let moderate = 0;
-    let weak = 0;
-    bestByDomain.forEach((score) => {
-      if (score >= 65) {
-        strong += 1;
-      } else if (score >= 35) {
-        moderate += 1;
-      } else {
-        weak += 1;
-      }
-    });
-
-    if (strong >= 2) {
-      const phrase = dominantCategoryPhrase(
-        seedPairs.filter((pair) => (pair.score ?? 0) >= 65),
-      );
-      sentences.push(
-        `${strong} of the ${seeds.length} submitted domains appear tightly linked${
-          phrase ? `, mainly through ${phrase}` : ""
-        }.`,
-      );
-      if (moderate > 0) {
-        sentences.push(
-          `${moderate} more show${moderate === 1 ? "s" : ""} only a moderate connection.`,
-        );
-      }
-    } else if (moderate >= 2) {
-      const phrase = dominantCategoryPhrase(
-        seedPairs.filter((pair) => (pair.score ?? 0) >= 35),
-      );
-      sentences.push(
-        `${moderate} of the ${seeds.length} submitted domains show a moderate connection${
-          phrase ? ` through ${phrase}` : ""
-        } — suggestive, but not conclusive on its own.`,
-      );
-    } else {
-      sentences.push(
-        `No strong connections were found between the ${seeds.length} submitted domains.`,
-      );
-    }
-
-    if (weak > 0 && (strong >= 2 || moderate >= 2)) {
-      sentences.push(
-        `${weak} show${weak === 1 ? "s" : ""} only weak or no overlap with the rest.`,
-      );
-    }
-  } else if (seeds.length === 1) {
-    sentences.push(
-      `One domain was submitted, so it is compared against its discovered subdomains and against domains from earlier cases.`,
-    );
-  }
-
-  if (historicalPairs.length > 0) {
-    const top = historicalPairs.reduce((bestSoFar, pair) =>
-      (pair.score ?? 0) > (bestSoFar.score ?? 0) ? pair : bestSoFar,
-    );
-    sentences.push(
-      `Earlier cases surfaced ${historicalPairs.length} historical match${
-        historicalPairs.length === 1 ? "" : "es"
-      }; the strongest is ${top.left} and ${top.right} at ${formatPercent(top.score)}.`,
-    );
-  }
-
-  if (sentences.length === 0) {
-    return pairs.length === 0
-      ? "No overlap between the analyzed domains has been recorded yet."
-      : null;
-  }
-  return sentences.join(" ");
-}
-
-/* ----------------------------------------------------- */
-/* Domain-centric linkage explorer and the pair digest.   */
-/* ----------------------------------------------------- */
-
-function DomainSearchSelect({ seeds, others, value, onSelect }) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const [activeIndex, setActiveIndex] = useState(0);
-  const containerRef = useRef(null);
-  const inputRef = useRef(null);
-
-  const options = useMemo(() => {
-    const seen = new Set();
-    const entries = [];
-    seeds.forEach((domain) => {
-      if (domain && !seen.has(domain)) {
-        seen.add(domain);
-        entries.push({ domain, seed: true });
-      }
-    });
-    others.forEach((domain) => {
-      if (domain && !seen.has(domain)) {
-        seen.add(domain);
-        entries.push({ domain, seed: false });
-      }
-    });
-    return entries;
-  }, [seeds, others]);
-
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (!needle) {
-      return options;
-    }
-    return options.filter((option) => option.domain.toLowerCase().includes(needle));
-  }, [options, query]);
-
-  // Close on a click outside or an Escape press while the menu is open.
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-    const handleClick = (event) => {
-      if (containerRef.current && !containerRef.current.contains(event.target)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, [open]);
-
-  useEffect(() => {
-    if (open) {
-      setQuery("");
-      setActiveIndex(0);
-      inputRef.current?.focus();
-    }
-  }, [open]);
-
-  useEffect(() => {
-    setActiveIndex(0);
-  }, [query]);
-
-  const choose = (domain) => {
-    onSelect(domain);
-    setOpen(false);
-  };
-
-  const onKeyDown = (event) => {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      setActiveIndex((index) => Math.min(index + 1, filtered.length - 1));
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      setActiveIndex((index) => Math.max(index - 1, 0));
-    } else if (event.key === "Enter") {
-      event.preventDefault();
-      const option = filtered[activeIndex];
-      if (option) {
-        choose(option.domain);
-      }
-    } else if (event.key === "Escape") {
-      setOpen(false);
-    }
-  };
-
-  return (
-    <div className="domain-search" ref={containerRef}>
-      <button
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        className="domain-search-trigger"
-        onClick={() => setOpen((current) => !current)}
-        type="button"
-      >
-        <span className="domain-search-value">{value || "Select a domain"}</span>
-        <span aria-hidden="true" className="domain-search-caret">
-          {open ? "▴" : "▾"}
-        </span>
-      </button>
-
-      {open ? (
-        <div className="domain-search-menu">
-          <input
-            className="domain-search-input"
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={onKeyDown}
-            placeholder="Search domains..."
-            ref={inputRef}
-            type="text"
-            value={query}
-          />
-          <ul className="domain-search-options" role="listbox">
-            {filtered.length === 0 ? (
-              <li className="domain-search-empty">No domains match "{query}".</li>
-            ) : (
-              filtered.map((option, index) => (
-                <li key={option.domain}>
-                  <button
-                    className={`domain-search-option ${
-                      option.domain === value ? "selected" : ""
-                    } ${index === activeIndex ? "active" : ""}`}
-                    onClick={() => choose(option.domain)}
-                    onMouseEnter={() => setActiveIndex(index)}
-                    type="button"
-                  >
-                    <span className="domain-search-option-name">{option.domain}</span>
-                    {option.seed ? (
-                      <span className="chip domain-search-seed-chip">Submitted</span>
-                    ) : null}
-                  </button>
-                </li>
-              ))
-            )}
-          </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function DomainLinkageExplorer({ caseId, pairs, seedTargets, request }) {
-  const domainLists = useMemo(() => {
-    const seeds = [...new Set(seedTargets)].filter(Boolean);
-    const seedSet = new Set(seeds);
-    const others = new Set();
-    pairs.forEach((pair) => {
-      [pair.left, pair.right].forEach((domain) => {
-        if (domain && !seedSet.has(domain)) {
-          others.add(domain);
-        }
-      });
-    });
-    return { seeds, others: [...others].sort() };
-  }, [pairs, seedTargets]);
-
-  const allDomains = useMemo(
-    () => [...domainLists.seeds, ...domainLists.others],
-    [domainLists],
-  );
-
-  const [selected, setSelected] = useState(null);
-  const [expandedPairId, setExpandedPairId] = useState(null);
-  const togglePair = useCallback((pairId) => {
-    setExpandedPairId((current) => (current === pairId ? null : pairId));
-  }, []);
-  const activeDomain =
-    selected && allDomains.includes(selected) ? selected : allDomains[0] ?? null;
-
-  const rows = useMemo(() => {
-    if (!activeDomain) {
-      return [];
-    }
-    return pairs
-      .filter((pair) => pair.left === activeDomain || pair.right === activeDomain)
-      .map((pair) => ({
-        pair,
-        other: pair.left === activeDomain ? pair.right : pair.left,
-      }))
-      .sort((a, b) => (b.pair.score ?? 0) - (a.pair.score ?? 0));
-  }, [pairs, activeDomain]);
-
-  const selectDomain = (domain) => {
-    setSelected(domain);
-    setExpandedPairId(null);
-  };
-
-  return (
-    <section className="panel section-stack">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">Domain linkage</p>
-          <h2>Who is linked to whom?</h2>
-          <p className="section-copy">
-            Pick a domain to see every other domain ranked by linkage confidence, strongest
-            first. Click a connection to see what the two sites have in common.
-          </p>
-        </div>
-        {request ? (
-          <button className="secondary-button" onClick={request.refresh} type="button">
-            Refresh
-          </button>
-        ) : null}
-      </div>
-
-      {request?.loading && !request?.data ? (
-        <LoadingState message="Loading connections..." />
-      ) : null}
-      {request?.error ? <ErrorState message={request.error} /> : null}
-
-      {allDomains.length === 0 && !request?.loading ? (
-        <EmptyState message="No comparison results are available for this case yet." />
-      ) : null}
-
-      {allDomains.length > 0 ? (
-        <DomainSearchSelect
-          seeds={domainLists.seeds}
-          others={domainLists.others}
-          value={activeDomain}
-          onSelect={selectDomain}
-        />
-      ) : null}
-
-      {activeDomain && rows.length === 0 && !request?.loading ? (
-        <EmptyState
-          message={`No recorded overlap between ${activeDomain} and any other domain in this case.`}
-        />
-      ) : null}
-
-      {rows.length > 0 ? (
-        <div className="linkage-list">
-          {rows.map(({ pair, other }) => (
-            <LinkageCard
-              caseId={caseId}
-              expanded={expandedPairId === pair.id}
-              key={pair.id}
-              onToggle={togglePair}
-              other={other}
-              pair={pair}
-            />
-          ))}
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-const LinkageCard = memo(function LinkageCard({ caseId, expanded, onToggle, other, pair }) {
-  const strength = linkStrength(pair);
-  const reason = connectionReason(pair);
-  const barWidth = Math.max(4, Math.min(100, pair.score ?? 0));
-  const signalCount = pair.evidenceCount ?? pair.evidence.length;
-  // Name the strongest shared signals on the collapsed card, so "9 signals"
-  // is never a mystery: the count alone told the reader nothing.
-  const topSignalNames = [
-    ...new Set(sortEvidence(pair.evidence).map((item) => item.title || formatLabel(item.type))),
-  ].slice(0, 3);
-  const unnamedCount = signalCount - topSignalNames.length;
-
-  return (
-    <article className={`linkage-card ${expanded ? "expanded" : ""}`}>
-      <button
-        aria-expanded={expanded}
-        className="linkage-card-main"
-        onClick={() => onToggle(pair.id)}
-        type="button"
-      >
-        <span className="linkage-percent">
-          <strong>{pair.score === null ? "—" : formatPercent(pair.score)}</strong>
-          <span className={`status-badge compact ${strength.tone}`}>{strength.label}</span>
-        </span>
-        <span className="linkage-body">
-          <span className="linkage-domains">
-            <strong>{other || "Unknown domain"}</strong>
-            {pair.scope === "historical" ? (
-              <span className="chip linkage-scope-chip">From an earlier case</span>
-            ) : null}
-          </span>
-          <span className="card-copy linkage-reason">{reason}</span>
-          {topSignalNames.length > 0 ? (
-            <span className="chip-row linkage-signal-chips">
-              {topSignalNames.map((name) => (
-                <span className="chip evidence-chip" key={name}>
-                  {name}
-                </span>
-              ))}
-              {unnamedCount > 0 ? (
-                <span className="chip digest-more-chip">
-                  +{unnamedCount} more signal{unnamedCount === 1 ? "" : "s"}
-                </span>
-              ) : null}
-            </span>
-          ) : null}
-          <span className="strength-track" aria-hidden="true">
-            <span
-              className={`strength-fill ${strength.tier}`}
-              style={{ width: `${barWidth}%` }}
-            />
-          </span>
-        </span>
-        <span aria-hidden="true" className="linkage-caret">
-          {expanded ? "▴" : "▾"}
-        </span>
-      </button>
-      {expanded ? <PairDigest caseId={caseId} pair={pair} /> : null}
-    </article>
-  );
-});
-
-// The pairs list ships only the top few evidence items per pair, so the
-// digest fetches the full evidence lazily on first expand. Resolved details
-// are cached in memory so re-expanding a card is instant.
-const pairEvidenceCache = new Map();
-
-function usePairEvidence(caseId, pairId) {
-  const cacheKey = caseId && pairId ? `${caseId}/${pairId}` : null;
-  const [state, setState] = useState(() => {
-    if (!cacheKey) {
-      return { evidence: null, loading: false, error: null };
-    }
-    const cached = pairEvidenceCache.get(cacheKey);
-    return cached
-      ? { evidence: cached, loading: false, error: null }
-      : { evidence: null, loading: true, error: null };
-  });
-
-  useEffect(() => {
-    if (!cacheKey) {
-      return undefined;
-    }
-    const cached = pairEvidenceCache.get(cacheKey);
-    if (cached) {
-      setState({ evidence: cached, loading: false, error: null });
-      return undefined;
-    }
-
-    let active = true;
-    setState({ evidence: null, loading: true, error: null });
-    fetchJson(`/api/cases/${caseId}/pairs/${pairId}`)
-      .then((payload) => {
-        const detail = normalizePairDetail(payload, pairId);
-        pairEvidenceCache.set(cacheKey, detail.evidence);
-        if (active) {
-          setState({ evidence: detail.evidence, loading: false, error: null });
-        }
-      })
-      .catch((error) => {
-        if (active) {
-          setState({
-            evidence: null,
-            loading: false,
-            error: error.message || "Failed to load the shared evidence.",
-          });
-        }
-      });
-    return () => {
-      active = false;
-    };
-  }, [cacheKey, caseId, pairId]);
-
-  return state;
-}
-
-const PairDigest = memo(function PairDigest({ caseId = null, pair }) {
-  const lazyDetail = usePairEvidence(caseId, caseId ? pair.id : null);
-  const evidence = caseId ? lazyDetail.evidence : pair.evidence;
-  const groups = useMemo(() => groupEvidence(evidence || []), [evidence]);
-
-  if (caseId && lazyDetail.loading) {
-    return (
-      <div className="pair-digest">
-        <DigestShimmer />
-      </div>
-    );
-  }
-
-  return (
-    <div className="pair-digest">
-      {caseId && lazyDetail.error ? <ErrorState message={lazyDetail.error} /> : null}
-      {!(caseId && lazyDetail.error) && groups.length === 0 ? (
-        <EmptyState message="No shared evidence was recorded for this pair." />
-      ) : null}
-      {groups.map((group) => (
-        <EvidenceCategoryGroup group={group} key={group.category} />
-      ))}
-      {caseId && pair.id ? (
-        <div className="action-row">
-          <Link className="text-link" to={`/cases/${caseId}/pairs/${pair.id}`}>
-            Open full pair detail
-          </Link>
-        </div>
-      ) : null}
-    </div>
-  );
-});
-
-function DigestShimmer() {
-  return (
-    <div aria-label="Loading shared evidence" className="digest-shimmer" role="status">
-      <span className="shimmer-line wide" />
-      <span className="shimmer-line" />
-      <span className="shimmer-line narrow" />
-    </div>
-  );
-}
-
-const DIGEST_PREVIEW_COUNT = 3;
-
-const EvidenceCategoryGroup = memo(function EvidenceCategoryGroup({ group }) {
-  const [showAll, setShowAll] = useState(false);
-  const visibleItems = showAll ? group.items : group.items.slice(0, DIGEST_PREVIEW_COUNT);
-  const hiddenCount = group.items.length - DIGEST_PREVIEW_COUNT;
-
-  return (
-    <section className="digest-group">
-      <div className="digest-group-head">
-        <div className="digest-group-title">
-          <strong>{group.title}</strong>
-          <span className="digest-count">
-            {group.items.length} signal{group.items.length === 1 ? "" : "s"}
-          </span>
-        </div>
-        <span className={`status-badge compact ${importanceTone(group.bestImportance)}`}>
-          {formatLabel(group.bestImportance || "supporting")}
-        </span>
-      </div>
-      <p className="card-copy digest-summary">{group.summary}</p>
-      <ul className="digest-items">
-        {visibleItems.map((item) => (
-          <li className="digest-item" key={item.id}>
-            <span className="digest-item-label">{item.title || formatLabel(item.type)}</span>
-            <span className="chip-row digest-item-values">
-              {evidenceValues(item)
-                .slice(0, 2)
-                .map((value) => (
-                  <span className="chip evidence-chip" key={`${item.id}-${value}`} title={value}>
-                    {value}
-                  </span>
-                ))}
-              {evidenceValues(item).length > 2 ? (
-                <span className="chip digest-more-chip">
-                  +{evidenceValues(item).length - 2} more
-                </span>
-              ) : null}
-            </span>
-          </li>
-        ))}
-      </ul>
-      {hiddenCount > 0 ? (
-        <button
-          className="show-all-button"
-          onClick={() => setShowAll((current) => !current)}
-          type="button"
-        >
-          {showAll
-            ? `Show top ${DIGEST_PREVIEW_COUNT}`
-            : `Show all ${group.items.length} signals`}
-        </button>
-      ) : null}
-    </section>
-  );
-});
-
-function evidenceValues(item) {
-  if (item.matchedValues?.length) {
-    return item.matchedValues;
-  }
-  return item.value ? [item.value] : [];
-}
-
-/* ----------------- */
-/* Case detail pages */
-/* ----------------- */
-
-function CaseSummaryPage() {
-  const { caseId, caseDetail, caseRequest, caseActive } = useCaseContext();
-  const pairsRequest = useApi(`/api/cases/${caseId}/pairs`, {
-    pollInterval: caseActive ? 6000 : 0,
-  });
-  const pairs = useMemo(() => normalizePairs(pairsRequest.data), [pairsRequest.data]);
-  const seedTargets = useMemo(() => {
-    const fromPairs = pairsRequest.data?.seed_targets;
-    if (Array.isArray(fromPairs) && fromPairs.length > 0) {
-      return fromPairs;
-    }
-    return caseDetail.targets;
-  }, [pairsRequest.data, caseDetail.targets]);
-  const explanation = useMemo(
-    () => buildCaseExplanation(seedTargets, pairs),
-    [seedTargets, pairs],
-  );
-  const highlightLines = useMemo(
-    () =>
-      collectStringList(
-        caseDetail.raw?.highlights ?? caseDetail.raw?.findings ?? caseDetail.raw?.notes,
-      ),
-    [caseDetail.raw],
-  );
-  const metricEntries = useMemo(() => buildMetricEntries(caseDetail), [caseDetail]);
-  const scalarEntries = useMemo(
-    () => collectScalarEntries(caseDetail.raw, RAW_CASE_EXCLUDES).slice(0, 8),
-    [caseDetail.raw],
-  );
-
-  return (
-    <div className="page-stack">
-      {caseRequest.loading && !caseRequest.data ? (
-        <LoadingState message="Loading case detail..." />
-      ) : null}
-
-      {caseActive ? <ActiveJobNotice caseDetail={caseDetail} caseId={caseId} /> : null}
-
-      <div className="page-grid two-column">
-        <section className="panel section-stack">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Overview</p>
-              <h2>What this case found</h2>
-              {caseDetail.summaryText ? (
-                <p className="section-copy">{caseDetail.summaryText}</p>
-              ) : null}
-            </div>
-            <button className="secondary-button" onClick={caseRequest.refresh} type="button">
-              Refresh
-            </button>
-          </div>
-
-          {explanation ? (
-            <div className="callout">
-              <p>{explanation}</p>
-            </div>
-          ) : null}
-
-          {metricEntries.length > 0 ? (
-            <div className="metric-grid">
-              {metricEntries.map((metric) => (
-                <MetricCard key={metric.label} label={metric.label} value={metric.value} />
-              ))}
-            </div>
-          ) : null}
-
-          {caseDetail.targets.length > 0 ? (
-            <div className="section-stack tight">
-              <h3>Targets</h3>
-              <div className="chip-row">
-                {caseDetail.targets.map((target) => (
-                  <span className="chip" key={target}>
-                    {target}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : null}
-
-          {highlightLines.length > 0 ? (
-            <div className="section-stack tight">
-              <h3>Highlights</h3>
-              <ul className="simple-list">
-                {highlightLines.map((line) => (
-                  <li key={line}>{line}</li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-        </section>
-
-        <aside className="panel section-stack">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Metadata</p>
-              <h2>Case details</h2>
-            </div>
-          </div>
-
-          {scalarEntries.length > 0 ? (
-            <DescriptionGrid entries={scalarEntries} />
-          ) : (
-            <EmptyState message="No scalar summary fields were exposed for this case." />
-          )}
-        </aside>
-      </div>
-
-      <DomainLinkageExplorer
-        caseId={caseId}
-        pairs={pairs}
-        request={pairsRequest}
-        seedTargets={seedTargets}
-      />
-
-      <RawDataDisclosure label="Technical details (advanced)" value={caseDetail.raw} />
-    </div>
-  );
-}
-
-function ActiveJobNotice({ caseDetail, caseId }) {
-  const job = normalizeJob(caseDetail.raw?.job ?? caseDetail.raw?.latest_job, caseDetail.jobId);
-  const percent = job.percent ?? caseDetail.progress ?? 0;
-
-  return (
-    <section className="panel section-stack active-job-strip">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">Job running</p>
-          <h2>{formatStatusLabel(caseDetail.status)}</h2>
-          <p className="section-copy">
-            {job.summary || "The case is still being processed. Results update automatically."}
-          </p>
-        </div>
-        <div className="progress-figure">
-          <strong>{formatPercent(percent)}</strong>
-          <span>{job.currentStep || "Working..."}</span>
-        </div>
-      </div>
-      <ProgressBar value={percent} />
-      <div className="action-row">
-        <Link className="text-link" to={`/cases/${caseId}/progress`}>
-          View detailed progress and logs
-        </Link>
-      </div>
-    </section>
-  );
-}
-
-function CasePairPage() {
-  const { caseId } = useCaseContext();
-  const { pairId } = useParams();
-  const pairRequest = useApi(`/api/cases/${caseId}/pairs/${pairId}`);
-  const pair = useMemo(
-    () => normalizePairDetail(pairRequest.data, pairId),
-    [pairRequest.data, pairId],
-  );
-  const strength = linkStrength(pair);
-  const reason = connectionReason(pair);
-  const barWidth = Math.max(4, Math.min(100, pair.score ?? 0));
-  const scalarEntries = useMemo(
-    () => collectScalarEntries(pair.raw, RAW_PAIR_EXCLUDES).slice(0, 8),
-    [pair.raw],
-  );
-
-  return (
-    <div className="page-stack">
-      <div className="breadcrumb-row">
-        <Link className="text-link" to={`/cases/${caseId}/summary`}>
-          Back to summary
-        </Link>
-      </div>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Connection</p>
-            <h2>{pair.left && pair.right ? `${pair.left} and ${pair.right}` : "Pair detail"}</h2>
-          </div>
-          <button className="secondary-button" onClick={pairRequest.refresh} type="button">
-            Refresh
-          </button>
-        </div>
-
-        {pairRequest.loading && !pairRequest.data ? (
-          <LoadingState message="Loading pair detail..." />
-        ) : null}
-        {pairRequest.error ? <ErrorState message={pairRequest.error} /> : null}
-
-        <div className="linkage-headline">
-          <div className="linkage-percent">
-            <strong>{pair.score === null ? "—" : formatPercent(pair.score)}</strong>
-            <span className={`status-badge compact ${strength.tone}`}>{strength.label}</span>
-          </div>
-          <div className="linkage-body">
-            <p className="card-copy linkage-reason">{reason}</p>
-            <div className="strength-track" aria-hidden="true">
-              <div
-                className={`strength-fill ${strength.tier}`}
-                style={{ width: `${barWidth}%` }}
-              />
-            </div>
-          </div>
-        </div>
-
-        <div className="subject-grid">
-          <SubjectCard label="First domain" value={pair.left || "Unavailable"} />
-          <SubjectCard label="Second domain" value={pair.right || "Unavailable"} />
-        </div>
-
-        {pair.summary ? (
-          <div className="callout">
-            <p>{pair.summary}</p>
-          </div>
-        ) : null}
-      </section>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Evidence digest</p>
-            <h2>What these domains have in common</h2>
-            <p className="section-copy">
-              Grouped by what the overlap means, strongest first. Expand a group to see every
-              matched value.
-            </p>
-          </div>
-        </div>
-
-        <PairDigest pair={pair} />
-      </section>
-
-      {scalarEntries.length > 0 ? (
-        <section className="panel section-stack">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Metadata</p>
-              <h2>Pair details</h2>
-            </div>
-          </div>
-          <DescriptionGrid entries={scalarEntries} />
-        </section>
-      ) : null}
-
-      <RawDataDisclosure label="Technical details (advanced)" value={pair.raw} />
-    </div>
-  );
-}
-
-function CaseClustersPage() {
-  const { caseId } = useCaseContext();
-  const clustersRequest = useApi(`/api/cases/${caseId}/clusters`);
-  const clusterGroups = useMemo(
-    () => normalizeClusterGroups(clustersRequest.data),
-    [clustersRequest.data],
-  );
-  const graph = clustersRequest.data?.graph ?? clustersRequest.data?.graph_payload ?? null;
-  const seedTargets = useMemo(
-    () => new Set(clustersRequest.data?.seed_targets ?? []),
-    [clustersRequest.data],
-  );
-  // Render the graph's edge evidence with the same pair digest the summary page
-  // uses, so the two surfaces always show the identical evidence packet.
-  const renderPairEvidence = useCallback(
-    (pairingId) => <PairDigest caseId={caseId} pair={{ id: pairingId, evidence: [] }} />,
-    [caseId],
-  );
-
-  return (
-    <div className="page-stack">
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Clusters</p>
-            <h2>Groups of connected domains</h2>
-            <p className="section-copy">
-              Domains that link to each other strongly enough are grouped into clusters.
-              The map below shows who connects to whom and how strongly.
-            </p>
-          </div>
-          <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
-            Refresh
-          </button>
-        </div>
-
-        {clustersRequest.loading && !clustersRequest.data ? (
-          <LoadingState message="Loading clusters..." />
-        ) : null}
-        {clustersRequest.error ? <ErrorState message={clustersRequest.error} /> : null}
-        {!clustersRequest.loading && !clustersRequest.error && clusterGroups.length === 0 ? (
-          <EmptyState message="No clusters were returned for this case." />
-        ) : null}
-        {graph?.nodes?.length > 0 ? (
-          <Suspense fallback={<LoadingState message="Loading the cluster map..." />}>
-            <ClusterGraph
-              caseId={caseId}
-              graph={graph}
-              seedTargets={seedTargets}
-              renderPairEvidence={renderPairEvidence}
-            />
-          </Suspense>
-        ) : null}
-
-        {clusterGroups.length > 0 ? (
-          <div className="section-stack">
-            {clusterGroups.map((group) => (
-              <section className="section-stack tight" key={group.key}>
-                <div className="group-heading">
-                  <h3>{group.label}</h3>
-                  <span>{group.clusters.length} clusters</span>
-                </div>
-
-                <div className="cluster-grid">
-                  {group.clusters.map((cluster) => {
-                    const domainMembers = cluster.members.filter(
-                      (member) => !/^[\d.:]+$/.test(member),
-                    );
-                    return (
-                      <article className="cluster-card" key={cluster.id}>
-                        <div className="cluster-card-top">
-                          <div>
-                            <p className="eyebrow">Connected group</p>
-                            <h4>{cluster.label}</h4>
-                          </div>
-                          {cluster.score !== null ? (
-                            <strong title="Confidence of the strongest connection in this group">
-                              {formatPercent(cluster.score)}
-                            </strong>
-                          ) : null}
-                        </div>
-
-                        <div className="inline-metrics">
-                          <InlineMetric
-                            label="Domains"
-                            value={formatMaybeNumber(
-                              cluster.targetCount ?? domainMembers.length,
-                            )}
-                          />
-                          <InlineMetric
-                            label="Shared IPs"
-                            value={formatMaybeNumber(
-                              cluster.members.length - domainMembers.length,
-                            )}
-                          />
-                        </div>
-
-                        {cluster.topEvidence.length > 0 ? (
-                          <p className="card-copy">
-                            Linked by {cluster.topEvidence.slice(0, 3).join(", ").toLowerCase()}.
-                          </p>
-                        ) : cluster.summary ? (
-                          <p className="card-copy">{cluster.summary}</p>
-                        ) : null}
-
-                        {domainMembers.length > 0 ? (
-                          <div className="chip-row">
-                            {domainMembers.slice(0, 6).map((member) => (
-                              <span className="chip" key={`${cluster.id}-${member}`}>
-                                {member}
-                              </span>
-                            ))}
-                            {domainMembers.length > 6 ? (
-                              <span className="chip digest-more-chip">
-                                +{domainMembers.length - 6} more
-                              </span>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </article>
-                    );
-                  })}
-                </div>
-              </section>
-            ))}
-          </div>
-        ) : null}
-      </section>
-
-      <RawDataDisclosure label="Technical details (advanced)" value={clustersRequest.data} />
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Global graph explorer: lake-wide connections + shared-node evidence */
-/* ------------------------------------------------------------------ */
-
-function formatWindow(range) {
-  const [first, last] = range || [];
-  if (!first && !last) {
-    return "window unknown";
-  }
-  if (first && last && first !== last) {
-    return `${formatDate(first)} → ${formatDate(last)}`;
-  }
-  return formatDate(first || last);
 }
 
 const SELECTOR_KIND_LABELS = {
@@ -1805,180 +163,77 @@ function sharedNodeLabel(kind) {
   return SELECTOR_KIND_LABELS[kind] || formatLabel(kind);
 }
 
-function GraphExplorerPage() {
-  const [input, setInput] = useState("");
-  const [target, setTarget] = useState("");
-  const [expanded, setExpanded] = useState(null);
-
-  const linksPath = target ? `/api/graph/links/${encodeURIComponent(target)}` : null;
-  const linksRequest = useApi(linksPath);
-  const links = useMemo(() => normalizeGraphLinks(linksRequest.data), [linksRequest.data]);
-
-  const clustersRequest = useApi("/api/graph/clusters");
-  const clusters = useMemo(
-    () => normalizeGraphClusters(clustersRequest.data),
-    [clustersRequest.data],
-  );
-
-  const submit = () => {
-    const value = input.trim().toLowerCase();
-    if (value) {
-      setTarget(value);
-      setExpanded(null);
-    }
-  };
-
-  return (
-    <AppShell>
-      <div className="breadcrumb-row">
-        <Link className="text-link" to="/">
-          All cases
-        </Link>
-        <span>/</span>
-        <span>Connection graph</span>
-      </div>
-
-      <section className="hero-panel compact">
-        <div className="hero-copy">
-          <p className="eyebrow">Lake-wide attribution graph</p>
-          <h1>Surface every connection a domain has across the whole corpus.</h1>
-          <p>
-            Enter any domain we have analysed. Connections are global — they are not
-            scoped to a case — and each one shows exactly which shared certificates, IPs,
-            trackers, or infrastructure link the two, how rare each is, and when they
-            overlapped.
-          </p>
-        </div>
-      </section>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Pivot</p>
-            <h2>Find connections</h2>
-          </div>
-        </div>
-        <div className="submission-card">
-          <label className="search-field">
-            <span>Registrable domain</span>
-            <input
-              name="graph-target"
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  submit();
-                }
-              }}
-              placeholder="example.com"
-              type="text"
-              value={input}
-            />
-          </label>
-          <button
-            className="primary-button"
-            disabled={!input.trim()}
-            onClick={submit}
-            type="button"
-          >
-            Surface connections
-          </button>
-        </div>
-
-        {linksRequest.loading && !linksRequest.data ? (
-          <LoadingState message="Scoring connections across the lake..." />
-        ) : null}
-        {linksRequest.error ? <ErrorState message={linksRequest.error} /> : null}
-        {target && !linksRequest.loading && !linksRequest.error && links.length === 0 ? (
-          <EmptyState
-            message={`No attributing connections found for ${target}. It may be unanalysed, or only shares noise infrastructure.`}
-          />
-        ) : null}
-
-        {links.length > 0 ? (
-          <div className="linkage-list">
-            {links.map((link) => (
-              <GraphLinkCard
-                expanded={expanded === link.target}
-                key={link.target}
-                link={link}
-                onToggle={() => setExpanded((current) => (current === link.target ? null : link.target))}
-              />
-            ))}
-          </div>
-        ) : null}
-      </section>
-
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Communities</p>
-            <h2>Strongest clusters lake-wide</h2>
-            <p className="section-copy">
-              Connected components over the whole attributing graph, rolled up to
-              registrable domains.
-            </p>
-          </div>
-          <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
-            Refresh
-          </button>
-        </div>
-        {clustersRequest.loading && !clustersRequest.data ? (
-          <LoadingState message="Loading clusters..." />
-        ) : null}
-        {clusters.length === 0 && !clustersRequest.loading ? (
-          <EmptyState message="No clusters yet. Run a global recompute after ingesting domains." />
-        ) : null}
-        {clusters.length > 0 ? (
-          <div className="cluster-grid">
-            {clusters.map((cluster) => (
-              <article className="cluster-card" key={cluster.id}>
-                <div className="cluster-card-top">
-                  <div>
-                    <p className="eyebrow">Cluster</p>
-                    <h4>{cluster.id}</h4>
-                  </div>
-                  <strong title="Domains in this cluster">{cluster.size}</strong>
-                </div>
-                <div className="chip-row">
-                  {cluster.members.slice(0, 8).map((member) => (
-                    <button
-                      className="chip"
-                      key={`${cluster.id}-${member}`}
-                      onClick={() => {
-                        setInput(member);
-                        setTarget(member);
-                        setExpanded(null);
-                        window.scrollTo({ top: 0, behavior: "smooth" });
-                      }}
-                      type="button"
-                    >
-                      {member}
-                    </button>
-                  ))}
-                  {cluster.members.length > 8 ? (
-                    <span className="chip digest-more-chip">+{cluster.members.length - 8} more</span>
-                  ) : null}
-                </div>
-              </article>
-            ))}
-          </div>
-        ) : null}
-      </section>
-    </AppShell>
-  );
+function formatWindow(range) {
+  const [first, last] = range || [];
+  if (!first && !last) {
+    return "window unknown";
+  }
+  if (first && last && first !== last) {
+    return `${formatDate(first)} → ${formatDate(last)}`;
+  }
+  return formatDate(first || last);
 }
 
-const GraphLinkCard = memo(function GraphLinkCard({ expanded, link, onToggle }) {
+const SharedNodeList = memo(function SharedNodeList({ evidence, leftLabel, rightLabel }) {
+  if (!evidence || evidence.length === 0) {
+    return <EmptyState message="No shared attributing nodes — the connection is unsupported." />;
+  }
+  return (
+    <ul className="digest-items">
+      {evidence.map((node) => (
+        <li className="digest-item" key={node.id}>
+          <span className="digest-item-label">
+            {sharedNodeLabel(node.kind)}
+            {node.attributing === false ? (
+              <span className="chip digest-more-chip" style={{ marginLeft: 8 }}>
+                noise
+              </span>
+            ) : null}
+          </span>
+          <span className="chip-row digest-item-values">
+            <span className="chip evidence-chip" title={node.value}>
+              {node.value}
+            </span>
+            {node.degree !== null && node.degree !== undefined ? (
+              <span className="chip" title="Entities that share this node (lower is rarer)">
+                degree {node.degree}
+              </span>
+            ) : null}
+            {node.weight !== null && node.weight !== undefined ? (
+              <span className="chip" title="base × rarity × time-overlap">
+                weight {Math.round(node.weight)}
+              </span>
+            ) : null}
+            {node.timeOverlap !== null && node.timeOverlap !== undefined ? (
+              <span className="chip" title="Time-window overlap factor">
+                overlap {node.timeOverlap}
+              </span>
+            ) : null}
+          </span>
+          <span className="card-copy" style={{ fontSize: "0.85em", opacity: 0.8 }}>
+            {leftLabel || "A"}: {formatWindow(node.windowA)} · {rightLabel || "B"}: {formatWindow(node.windowB)}
+            {node.sources?.length ? ` · via ${node.sources.join(", ")}` : " · source unknown"}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+});
+
+// A collapsible card for a single connection (a -> target, or a <-> b).
+const ConnectionCard = memo(function ConnectionCard({ link, expanded, onToggle, leftLabel, rightLabel }) {
   const strength = linkStrength(link);
   const barWidth = Math.max(4, Math.min(100, link.confidence ?? 0));
-  const topKinds = [...new Set(link.evidence.map((node) => sharedNodeLabel(node.kind)))].slice(0, 3);
+  const topKinds = [...new Set((link.evidence || []).map((node) => sharedNodeLabel(node.kind)))].slice(0, 3);
+  const heading = rightLabel ? `${leftLabel} ↔ ${rightLabel}` : link.target;
+  const key = link.b ?? link.target;
 
   return (
     <article className={`linkage-card ${expanded ? "expanded" : ""}`}>
       <button
         aria-expanded={expanded}
         className="linkage-card-main"
-        onClick={onToggle}
+        onClick={() => onToggle(key)}
         type="button"
       >
         <span className="linkage-percent">
@@ -1987,11 +242,11 @@ const GraphLinkCard = memo(function GraphLinkCard({ expanded, link, onToggle }) 
         </span>
         <span className="linkage-body">
           <span className="linkage-domains">
-            <strong>{link.target}</strong>
+            <strong>{heading}</strong>
           </span>
           <span className="card-copy linkage-reason">
-            {link.evidence.length} shared node{link.evidence.length === 1 ? "" : "s"} · score{" "}
-            {Math.round(link.score)}
+            {(link.evidence || []).length} shared node{(link.evidence || []).length === 1 ? "" : "s"} · score{" "}
+            {Math.round(link.score ?? 0)}
           </span>
           {topKinds.length > 0 ? (
             <span className="chip-row linkage-signal-chips">
@@ -2012,49 +267,684 @@ const GraphLinkCard = memo(function GraphLinkCard({ expanded, link, onToggle }) 
       </button>
       {expanded ? (
         <div className="pair-digest">
-          <ul className="digest-items">
-            {link.evidence.map((node) => (
-              <li className="digest-item" key={node.id}>
-                <span className="digest-item-label">
-                  {sharedNodeLabel(node.kind)}
-                  {node.attributing ? null : (
-                    <span className="chip digest-more-chip" style={{ marginLeft: 8 }}>
-                      noise
-                    </span>
-                  )}
-                </span>
-                <span className="chip-row digest-item-values">
-                  <span className="chip evidence-chip" title={node.value}>
-                    {node.value}
-                  </span>
-                  {node.degree !== null ? (
-                    <span className="chip" title="How many entities share this node (lower is rarer)">
-                      degree {node.degree}
-                    </span>
-                  ) : null}
-                  {node.weight !== null ? (
-                    <span className="chip" title="base × rarity × time-overlap">
-                      weight {Math.round(node.weight)}
-                    </span>
-                  ) : null}
-                  {node.timeOverlap !== null ? (
-                    <span className="chip" title="Time-window overlap factor">
-                      overlap {node.timeOverlap}
-                    </span>
-                  ) : null}
-                </span>
-                <span className="card-copy" style={{ fontSize: "0.85em", opacity: 0.8 }}>
-                  seed: {formatWindow(node.windowA)} · {link.target}: {formatWindow(node.windowB)} ·{" "}
-                  {node.sources.length ? `via ${node.sources.join(", ")}` : "source unknown"}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <SharedNodeList
+            evidence={link.evidence}
+            leftLabel={leftLabel || link.a || "seed"}
+            rightLabel={rightLabel || link.target || link.b}
+          />
         </div>
       ) : null}
     </article>
   );
 });
+
+/* ============================================================== */
+/* Ingestion                                                      */
+/* ============================================================== */
+
+async function postIngest({ file, target, label }) {
+  if (file) {
+    const formData = new FormData();
+    formData.append("file", file);
+    if (label) {
+      formData.append("label", label);
+    }
+    const response = await fetch("/api/ingest", { method: "POST", body: formData, headers: { Accept: "application/json" } });
+    return finishIngest(response);
+  }
+  const response = await fetch("/api/ingest", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ target, label }),
+  });
+  return finishIngest(response);
+}
+
+async function finishIngest(response) {
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = text;
+  }
+  if (!response.ok) {
+    const message =
+      (payload && typeof payload === "object" && (payload.detail || payload.message || payload.error)) ||
+      (typeof payload === "string" ? payload : null) ||
+      `Ingest failed with status ${response.status}.`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+function JobProgress({ jobId }) {
+  const jobRequest = useApi(jobId ? `/api/jobs/${jobId}` : null, { pollInterval: 4000 });
+  const job = useMemo(() => normalizeJob(jobRequest.data, jobId), [jobRequest.data, jobId]);
+  if (!jobId) {
+    return null;
+  }
+  const done = isTerminalStatus(job.status);
+  return (
+    <div className="callout">
+      <div className="mini-progress-top">
+        <span>Ingest job {jobId}</span>
+        <strong>{formatPercent(job.percent ?? 0)}</strong>
+      </div>
+      <ProgressBar value={job.percent ?? 0} />
+      <p className="card-copy">
+        {done
+          ? "Scan complete — the channels are in the pool. Refresh to see them and their connections."
+          : job.summary || job.currentStep || "Scanning… results join the pool as they finish."}
+      </p>
+    </div>
+  );
+}
+
+function IngestPanel({ onIngested }) {
+  const [targetInput, setTargetInput] = useState("");
+  const [label, setLabel] = useState("");
+  const [csvFile, setCsvFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [jobId, setJobId] = useState(null);
+
+  const run = async (args) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = await postIngest({ ...args, label: label.trim() || undefined });
+      setJobId(payload?.job_id || payload?.job?.id || null);
+      onIngested?.();
+    } catch (err) {
+      setError(err.message || "Ingest failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const ingestOpenCti = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/ingest/opencti-website", { method: "POST", headers: { Accept: "application/json" } });
+      const payload = await finishIngest(response);
+      setJobId(payload?.job_id || payload?.job?.id || null);
+      onIngested?.();
+    } catch (err) {
+      setError(err.message || "OpenCTI ingest failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="panel section-stack">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Add to the pool</p>
+          <h2>Ingest channels</h2>
+          <p className="section-copy">
+            Scan one domain or IP, or upload a CSV (first column). Everything joins one shared pool —
+            there are no cases.
+          </p>
+        </div>
+      </div>
+
+      <div className="submission-grid">
+        <div className="submission-card">
+          <label className="search-field">
+            <span>Single domain or IP</span>
+            <input
+              name="target"
+              onChange={(event) => setTargetInput(event.target.value)}
+              placeholder="example.com or 203.0.113.10"
+              type="text"
+              value={targetInput}
+            />
+          </label>
+          <button
+            className="primary-button"
+            disabled={busy || !targetInput.trim()}
+            onClick={() => run({ target: targetInput.trim() })}
+            type="button"
+          >
+            {busy ? "Submitting…" : "Scan & add to pool"}
+          </button>
+        </div>
+
+        <div className="submission-card">
+          <label className="search-field file-field">
+            <span>CSV upload</span>
+            <input accept=".csv,text/csv" onChange={(event) => setCsvFile(event.target.files?.[0] || null)} type="file" />
+          </label>
+          <button className="primary-button" disabled={busy || !csvFile} onClick={() => run({ file: csvFile })} type="button">
+            {busy ? "Submitting…" : "Upload CSV"}
+          </button>
+        </div>
+      </div>
+
+      <label className="search-field">
+        <span>Optional label (free-text tag, scopes nothing)</span>
+        <input name="label" onChange={(event) => setLabel(event.target.value)} placeholder="e.g. campaign-x" type="text" value={label} />
+      </label>
+
+      <div className="submission-card">
+        <div>
+          <p className="eyebrow">OpenCTI website channels</p>
+          <p className="section-copy">Add the domains from the 100 most recently created website-type channels.</p>
+        </div>
+        <button className="secondary-button" disabled={busy} onClick={ingestOpenCti} type="button">
+          {busy ? "Submitting…" : "Ingest last 100 website channels"}
+        </button>
+      </div>
+
+      {error ? <ErrorState message={error} /> : null}
+      {jobId ? <JobProgress jobId={jobId} /> : null}
+    </section>
+  );
+}
+
+/* ============================================================== */
+/* Pool page                                                      */
+/* ============================================================== */
+
+function PoolPage() {
+  const poolRequest = useApi("/api/pool");
+  const [search, setSearch] = useState("");
+  const domains = useMemo(() => normalizePool(poolRequest.data), [poolRequest.data]);
+  const clustered = useMemo(() => new Set(domains.filter((d) => d.clusterId).map((d) => d.clusterId)).size, [domains]);
+
+  const query = search.trim().toLowerCase();
+  const visible = useMemo(
+    () => (query ? domains.filter((d) => d.domain.toLowerCase().includes(query)) : domains),
+    [domains, query],
+  );
+
+  return (
+    <AppShell>
+      <section className="hero-panel">
+        <div className="hero-copy">
+          <p className="eyebrow">The pool</p>
+          <h1>One pool of channels. Ask who is connected to whom.</h1>
+          <p>
+            Every domain and IP you scan flows into a single correlation graph. Select channels to see
+            whether they are connected — and why — or browse the pool by the evidence that links them.
+          </p>
+        </div>
+        <div className="hero-stats">
+          <MetricCard label="Channels in pool" value={domains.length} />
+          <MetricCard label="Clusters" value={clustered} />
+          <Link className="primary-button" to="/connections">
+            Explore connections
+          </Link>
+        </div>
+      </section>
+
+      <IngestPanel onIngested={poolRequest.refresh} />
+
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Pool</p>
+            <h2>Channels</h2>
+            <p className="section-copy">Every channel analysed so far, most recently seen first.</p>
+          </div>
+          <button className="secondary-button" onClick={poolRequest.refresh} type="button">
+            Refresh
+          </button>
+        </div>
+
+        <label className="search-field">
+          <span>Search channels</span>
+          <input
+            name="pool-search"
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Filter by domain"
+            type="search"
+            value={search}
+          />
+        </label>
+
+        {poolRequest.loading && !poolRequest.data ? <LoadingState message="Loading the pool…" /> : null}
+        {poolRequest.error ? <ErrorState message={poolRequest.error} /> : null}
+        {!poolRequest.loading && visible.length === 0 ? (
+          <EmptyState message={domains.length === 0 ? "The pool is empty — ingest a domain to begin." : "No channels match the search."} />
+        ) : null}
+
+        {visible.length > 0 ? (
+          <div className="case-grid">
+            {visible.slice(0, 300).map((entry) => (
+              <article className="case-card" key={entry.domain}>
+                <div className="case-card-header">
+                  <div>
+                    <p className="eyebrow">Channel</p>
+                    <h3>{entry.domain}</h3>
+                  </div>
+                  {entry.clusterId ? <span className="chip">cluster · {entry.clusterSize}</span> : null}
+                </div>
+                <div className="inline-metrics">
+                  <InlineMetric label="Hosts" value={entry.hostCount ?? "—"} />
+                  <InlineMetric label="Last seen" value={entry.lastSeen ? formatDate(entry.lastSeen) : "—"} />
+                </div>
+                <div className="action-row">
+                  <Link className="primary-button" to={`/connections?focus=${encodeURIComponent(entry.domain)}`}>
+                    View connections
+                  </Link>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+      </section>
+    </AppShell>
+  );
+}
+
+/* ============================================================== */
+/* Connections page                                               */
+/* ============================================================== */
+
+function readFocusParam() {
+  try {
+    return new URLSearchParams(window.location.search).get("focus") || "";
+  } catch {
+    return "";
+  }
+}
+
+function ConnectionsPage() {
+  const [mode, setMode] = useState("domains");
+  return (
+    <AppShell>
+      <div className="breadcrumb-row">
+        <Link className="text-link" to="/">
+          Pool
+        </Link>
+        <span>/</span>
+        <span>Connections</span>
+      </div>
+
+      <section className="hero-panel compact">
+        <div className="hero-copy">
+          <p className="eyebrow">Connections explorer</p>
+          <h1>See how channels connect — by domain or by evidence.</h1>
+          <p>
+            Pick a set of channels to see which of them link to each other and to the wider pool, or
+            filter by an edge type (shared TLS cert, SSH key, IP…) to find every channel that carries it.
+          </p>
+        </div>
+      </section>
+
+      <nav className="case-nav" aria-label="Connection modes">
+        <button
+          className={mode === "domains" ? "case-nav-link active" : "case-nav-link"}
+          onClick={() => setMode("domains")}
+          type="button"
+        >
+          By domain
+        </button>
+        <button
+          className={mode === "edges" ? "case-nav-link active" : "case-nav-link"}
+          onClick={() => setMode("edges")}
+          type="button"
+        >
+          By edge type
+        </button>
+      </nav>
+
+      {mode === "domains" ? <ByDomainExplorer /> : <ByEdgeExplorer />}
+    </AppShell>
+  );
+}
+
+function ByDomainExplorer() {
+  const poolRequest = useApi("/api/pool");
+  const pool = useMemo(() => normalizePool(poolRequest.data).map((entry) => entry.domain), [poolRequest.data]);
+
+  const [selected, setSelected] = useState(() => {
+    const focus = readFocusParam();
+    return focus ? [focus] : [];
+  });
+  const [filter, setFilter] = useState("");
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [expanded, setExpanded] = useState(null);
+
+  const toggleDomain = useCallback((domain) => {
+    setSelected((current) =>
+      current.includes(domain) ? current.filter((d) => d !== domain) : [...current, domain],
+    );
+  }, []);
+
+  const filtered = useMemo(() => {
+    const needle = filter.trim().toLowerCase();
+    const base = needle ? pool.filter((d) => d.toLowerCase().includes(needle)) : pool;
+    return base.slice(0, 200);
+  }, [pool, filter]);
+
+  const run = useCallback(async () => {
+    if (selected.length < 1) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/graph/connections", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ domains: selected, pool_links: true }),
+      });
+      const payload = await finishIngest(response);
+      setResult(payload);
+      setExpanded(null);
+    } catch (err) {
+      setError(err.message || "Failed to score connections.");
+    } finally {
+      setBusy(false);
+    }
+  }, [selected]);
+
+  const pairs = useMemo(() => normalizeConnectionPairs(result), [result]);
+  const toggleExpanded = useCallback((key) => {
+    setExpanded((current) => (current === key ? null : key));
+  }, []);
+
+  return (
+    <>
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Select channels</p>
+            <h2>Pick the channels to compare</h2>
+          </div>
+          <button className="primary-button" disabled={busy || selected.length < 1} onClick={run} type="button">
+            {busy ? "Scoring…" : `Find connections (${selected.length})`}
+          </button>
+        </div>
+
+        {selected.length > 0 ? (
+          <div className="chip-row">
+            {selected.map((domain) => (
+              <button className="chip evidence-chip" key={domain} onClick={() => toggleDomain(domain)} type="button">
+                {domain} ✕
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="section-copy">No channels selected yet. Pick from the pool below (or arrive via a channel's “View connections”).</p>
+        )}
+
+        <label className="search-field">
+          <span>Add channels from the pool</span>
+          <input onChange={(event) => setFilter(event.target.value)} placeholder="Filter the pool" type="search" value={filter} />
+        </label>
+
+        {poolRequest.loading && !poolRequest.data ? <LoadingState message="Loading the pool…" /> : null}
+        {filtered.length > 0 ? (
+          <div className="chip-row">
+            {filtered.map((domain) => (
+              <button
+                className={`chip ${selected.includes(domain) ? "evidence-chip" : ""}`}
+                key={domain}
+                onClick={() => toggleDomain(domain)}
+                type="button"
+              >
+                {domain}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {error ? <ErrorState message={error} /> : null}
+      </section>
+
+      {result ? (
+        <section className="panel section-stack">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Within the selection</p>
+              <h2>
+                {result.connected_pair_count ?? pairs.filter((p) => p.connected).length} connected pair
+                {(result.connected_pair_count ?? 0) === 1 ? "" : "s"} of {pairs.length}
+              </h2>
+              <p className="section-copy">Click a pair to see exactly which shared nodes link them.</p>
+            </div>
+          </div>
+          {pairs.length === 0 ? (
+            <EmptyState message="Select at least two channels to compare them with each other." />
+          ) : (
+            <div className="linkage-list">
+              {pairs.map((pair) => (
+                <ConnectionCard
+                  expanded={expanded === (pair.b ?? pair.target)}
+                  key={`${pair.a}|${pair.b}`}
+                  leftLabel={pair.a}
+                  link={pair}
+                  onToggle={toggleExpanded}
+                  rightLabel={pair.b}
+                />
+              ))}
+            </div>
+          )}
+
+          <PoolLinksPanel poolLinks={result.pool_links} />
+        </section>
+      ) : null}
+    </>
+  );
+}
+
+function PoolLinksPanel({ poolLinks }) {
+  const entries = useMemo(() => Object.entries(poolLinks || {}), [poolLinks]);
+  const [expanded, setExpanded] = useState(null);
+  const toggle = useCallback((key) => setExpanded((c) => (c === key ? null : key)), []);
+  if (entries.length === 0) {
+    return null;
+  }
+  return (
+    <div className="section-stack">
+      <h3>Each channel’s strongest connections to the rest of the pool</h3>
+      {entries.map(([domain, rawLinks]) => {
+        const links = normalizeGraphLinks({ links: rawLinks });
+        return (
+          <div className="section-stack tight" key={domain}>
+            <div className="group-heading">
+              <h4>{domain}</h4>
+              <span>{links.length} pool link{links.length === 1 ? "" : "s"}</span>
+            </div>
+            {links.length === 0 ? (
+              <EmptyState message="No attributing connections to the wider pool." />
+            ) : (
+              <div className="linkage-list">
+                {links.slice(0, 8).map((link) => (
+                  <ConnectionCard
+                    expanded={expanded === `${domain}|${link.target}`}
+                    key={`${domain}|${link.target}`}
+                    leftLabel={domain}
+                    link={link}
+                    onToggle={() => toggle(`${domain}|${link.target}`)}
+                    rightLabel={link.target}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ByEdgeExplorer() {
+  const kindsRequest = useApi("/api/graph/selector-kinds");
+  const kinds = useMemo(() => normalizeSelectorKinds(kindsRequest.data), [kindsRequest.data]);
+  const [kind, setKind] = useState("");
+
+  const path = kind ? `/api/graph/by-selector?kind=${encodeURIComponent(kind)}` : "/api/graph/by-selector";
+  const groupsRequest = useApi(path);
+  const groups = useMemo(() => normalizeSelectorGroups(groupsRequest.data), [groupsRequest.data]);
+
+  return (
+    <section className="panel section-stack">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Browse by edge type</p>
+          <h2>Find channels that share an edge</h2>
+          <p className="section-copy">
+            Filter by the kind of evidence — a shared TLS certificate, SSH key, IP, nameserver, tracking ID —
+            to see every set of channels connected by it.
+          </p>
+        </div>
+        <button className="secondary-button" onClick={groupsRequest.refresh} type="button">
+          Refresh
+        </button>
+      </div>
+
+      <div className="chip-row">
+        <button className={`chip ${kind === "" ? "evidence-chip" : ""}`} onClick={() => setKind("")} type="button">
+          All edges
+        </button>
+        {kinds.map((entry) => (
+          <button
+            className={`chip ${kind === entry.kind ? "evidence-chip" : ""}`}
+            key={entry.kind}
+            onClick={() => setKind(entry.kind)}
+            type="button"
+          >
+            {sharedNodeLabel(entry.kind)}
+            {entry.groups !== null ? ` · ${entry.groups}` : ""}
+          </button>
+        ))}
+      </div>
+
+      {groupsRequest.loading && !groupsRequest.data ? <LoadingState message="Loading shared-edge groups…" /> : null}
+      {groupsRequest.error ? <ErrorState message={groupsRequest.error} /> : null}
+      {!groupsRequest.loading && groups.length === 0 ? (
+        <EmptyState message="No cross-channel groups for this edge type yet." />
+      ) : null}
+
+      {groups.length > 0 ? (
+        <div className="cluster-grid">
+          {groups.map((group) => (
+            <article className="cluster-card" key={group.id}>
+              <div className="cluster-card-top">
+                <div>
+                  <p className="eyebrow">{sharedNodeLabel(group.kind)}</p>
+                  <h4 title={group.value}>{group.value}</h4>
+                </div>
+                <strong title="Channels sharing this edge">{group.degree ?? group.domains.length}</strong>
+              </div>
+              <div className="chip-row">
+                {group.domains.slice(0, 10).map((domain) => (
+                  <Link className="chip" key={`${group.id}-${domain}`} to={`/connections?focus=${encodeURIComponent(domain)}`}>
+                    {domain}
+                  </Link>
+                ))}
+                {group.domains.length > 10 ? (
+                  <span className="chip digest-more-chip">+{group.domains.length - 10} more</span>
+                ) : null}
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/* ============================================================== */
+/* Clusters page                                                  */
+/* ============================================================== */
+
+function ClustersPage() {
+  const clustersRequest = useApi("/api/graph/clusters");
+  const clusters = useMemo(() => normalizeGraphClusters(clustersRequest.data), [clustersRequest.data]);
+  const [recomputing, setRecomputing] = useState(false);
+  const [recomputeMsg, setRecomputeMsg] = useState(null);
+
+  const recompute = async () => {
+    setRecomputing(true);
+    setRecomputeMsg(null);
+    try {
+      const payload = await fetchJson("/api/graph/recompute").catch(async () => {
+        const response = await fetch("/api/graph/recompute", { method: "POST", headers: { Accept: "application/json" } });
+        return finishIngest(response);
+      });
+      setRecomputeMsg(`Rebuilt: ${payload?.clusters ?? 0} clusters, ${payload?.entities ?? "?"} entities.`);
+      clustersRequest.refresh();
+    } catch (err) {
+      setRecomputeMsg(err.message || "Recompute failed.");
+    } finally {
+      setRecomputing(false);
+    }
+  };
+
+  return (
+    <AppShell>
+      <div className="breadcrumb-row">
+        <Link className="text-link" to="/">
+          Pool
+        </Link>
+        <span>/</span>
+        <span>Clusters</span>
+      </div>
+
+      <section className="panel section-stack">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Communities</p>
+            <h2>Clusters lake-wide</h2>
+            <p className="section-copy">
+              Connected components over the whole attributing graph, rolled up to registrable domains.
+            </p>
+          </div>
+          <div className="action-row">
+            <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
+              Refresh
+            </button>
+            <button className="secondary-button" disabled={recomputing} onClick={recompute} type="button">
+              {recomputing ? "Recomputing…" : "Recompute graph"}
+            </button>
+          </div>
+        </div>
+
+        {recomputeMsg ? <div className="callout"><p>{recomputeMsg}</p></div> : null}
+        {clustersRequest.loading && !clustersRequest.data ? <LoadingState message="Loading clusters…" /> : null}
+        {clustersRequest.error ? <ErrorState message={clustersRequest.error} /> : null}
+        {!clustersRequest.loading && clusters.length === 0 ? (
+          <EmptyState message="No clusters yet. Ingest channels, then recompute the graph." />
+        ) : null}
+
+        {clusters.length > 0 ? (
+          <div className="cluster-grid">
+            {clusters.map((cluster) => (
+              <article className="cluster-card" key={cluster.id}>
+                <div className="cluster-card-top">
+                  <div>
+                    <p className="eyebrow">Cluster</p>
+                    <h4>{cluster.id}</h4>
+                  </div>
+                  <strong title="Channels in this cluster">{cluster.size}</strong>
+                </div>
+                <div className="chip-row">
+                  {cluster.members.slice(0, 10).map((member) => (
+                    <Link className="chip" key={`${cluster.id}-${member}`} to={`/connections?focus=${encodeURIComponent(member)}`}>
+                      {member}
+                    </Link>
+                  ))}
+                  {cluster.members.length > 10 ? (
+                    <span className="chip digest-more-chip">+{cluster.members.length - 10} more</span>
+                  ) : null}
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+      </section>
+    </AppShell>
+  );
+}
 
 function NotFoundPage() {
   return (
@@ -2069,167 +959,10 @@ function NotFoundPage() {
         <p className="section-copy">This page does not exist.</p>
         <div className="action-row">
           <Link className="primary-button" to="/">
-            Return to cases
+            Back to the pool
           </Link>
         </div>
       </section>
     </AppShell>
   );
-}
-
-const THEME_STORAGE_KEY = "theme";
-
-export function getInitialTheme() {
-  try {
-    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-    if (stored === "light" || stored === "dark") {
-      return stored;
-    }
-  } catch {
-    // Ignore storage access errors and fall back to the system preference.
-  }
-
-  return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
-}
-
-function useTheme() {
-  const [theme, setTheme] = useState(getInitialTheme);
-
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-  }, [theme]);
-
-  const toggleTheme = () => {
-    const next = theme === "dark" ? "light" : "dark";
-    try {
-      window.localStorage.setItem(THEME_STORAGE_KEY, next);
-    } catch {
-      // Persisting the preference is best-effort.
-    }
-    setTheme(next);
-  };
-
-  return { theme, toggleTheme };
-}
-
-function AppShell({ children }) {
-  const { theme, toggleTheme } = useTheme();
-
-  return (
-    <div className="app-shell">
-      <header className="app-header">
-        <Link className="brand-mark" to="/">
-          <span>IP</span>
-          <strong>Intel</strong>
-        </Link>
-        <div className="header-side">
-          <p className="header-copy">Find out which domains are run by the same operator.</p>
-          <button
-            aria-pressed={theme === "dark"}
-            className="secondary-button theme-toggle"
-            onClick={toggleTheme}
-            title={theme === "dark" ? "Switch to the light theme" : "Switch to the dark theme"}
-            type="button"
-          >
-            <span aria-hidden="true" className="theme-toggle-indicator" />
-            {theme === "dark" ? "Light mode" : "Dark mode"}
-          </button>
-        </div>
-      </header>
-      <main className="app-main">{children}</main>
-    </div>
-  );
-}
-
-function useCaseContext() {
-  return useOutletContext();
-}
-
-function collectScalarEntries(source, excludes) {
-  if (!source || typeof source !== "object") {
-    return [];
-  }
-
-  return Object.entries(source)
-    .filter(([key, value]) => {
-      if (excludes.has(key)) {
-        return false;
-      }
-
-      if (value === null || value === undefined || value === "") {
-        return false;
-      }
-
-      if (Array.isArray(value)) {
-        return false;
-      }
-
-      return typeof value !== "object";
-    })
-    .map(([key, value]) => ({
-      label: formatLabel(key),
-      value: formatDisplayValue(value, key),
-    }));
-}
-
-function collectStringList(value) {
-  if (!value) {
-    return [];
-  }
-
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => {
-        if (typeof item === "string") {
-          return item;
-        }
-
-        if (item && typeof item === "object") {
-          return item.label ?? item.title ?? item.summary ?? item.description ?? null;
-        }
-
-        return null;
-      })
-      .filter(Boolean);
-  }
-
-  if (typeof value === "string") {
-    return [value];
-  }
-
-  return [];
-}
-
-function buildMetricEntries(caseDetail) {
-  const metrics = [];
-  const pushMetric = (label, value) => {
-    if (value === null || value === undefined || value === "") {
-      return;
-    }
-
-    metrics.push({ label, value });
-  };
-
-  pushMetric("Status", formatStatusLabel(caseDetail.status));
-  pushMetric("Pairs", formatMaybeNumber(caseDetail.pairCount));
-  pushMetric("Clusters", formatMaybeNumber(caseDetail.clusterCount));
-
-  Object.entries(caseDetail.metrics || {})
-    .slice(0, 4)
-    .forEach(([key, value]) => {
-      pushMetric(formatLabel(key), formatDisplayValue(value, key));
-    });
-
-  return metrics.slice(0, 6);
-}
-
-function sortCases(left, right) {
-  const leftDate = left.updatedAt ? Date.parse(left.updatedAt) : 0;
-  const rightDate = right.updatedAt ? Date.parse(right.updatedAt) : 0;
-
-  if (leftDate !== rightDate) {
-    return rightDate - leftDate;
-  }
-
-  return String(left.title).localeCompare(String(right.title));
 }

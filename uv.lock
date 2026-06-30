@@ -665,6 +665,7 @@ dependencies = [
     { name = "python-whois" },
     { name = "requests", extra = ["socks"] },
     { name = "shodan" },
+    { name = "tldextract" },
     { name = "tqdm" },
     { name = "uvicorn" },
 ]
@@ -690,6 +691,7 @@ requires-dist = [
     { name = "python-whois", specifier = ">=0.9" },
     { name = "requests", extras = ["socks"], specifier = ">=2.31" },
     { name = "shodan", specifier = ">=1.31" },
+    { name = "tldextract", specifier = ">=5.1" },
     { name = "tqdm", specifier = ">=4.66" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]

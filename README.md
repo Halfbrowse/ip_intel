@@ -4,8 +4,9 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 
 ## Highlights
 
-- Analysis is organised around **cases**: submit one target or a CSV of many, and all jobs, results, and pair comparisons are grouped under a single case.
-- Jobs stream live progress (stage, percent, current target, logs) through the polling API and UI.
+- Everything lives in **one global pool**: ingest a domain, an IP, or a CSV and it joins a single correlation graph — there are no cases or per-submission scoping. Correlation is always lake-wide.
+- The **connections explorer** lets you select N channels to see whether they are connected to each other and to the wider pool, or browse the pool **by edge type** (shared TLS cert, SSH key, IP, nameserver, tracking ID…) to find every channel that carries a given connection.
+- Jobs stream live progress (stage, percent, current target, logs) through the polling API and UI while an ingest scans.
 - Raw intel storage is append-only, so multiple runs of the same target are preserved instead of overwritten.
 - TLS relationships are time-aware: the app can distinguish shared certificates that are still current from ones only seen historically.
 - Discovered IPs from DNS, provider hits, and scan hits all flow into the same enrichment path and connection logic.
@@ -18,10 +19,10 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 | File | Purpose |
 |---|---|
 | `app.py` | Entry point — re-exports the FastAPI `app` from `cases/case_app.py` |
-| `cases/case_app.py` | FastAPI routes, static frontend serving, CORS |
-| `cases/case_runtime.py` | Case and job orchestration, background workers |
-| `cases/case_store.py` | PostgreSQL schema and queries for cases, jobs, pairs, clusters |
-| `core/analysis_service.py` | Per-target analysis runner, bridges case layer and core engine |
+| `cases/case_app.py` | FastAPI routes (pool, ingest, connections, jobs), static frontend serving, CORS |
+| `cases/case_runtime.py` | Ingest/job orchestration and background workers (internal; no longer user-facing "cases") |
+| `cases/case_store.py` | PostgreSQL schema/queries for the internal ingest jobs (legacy cases/pairs/clusters tables retained, unused by the UI) |
+| `core/analysis_service.py` | Per-target analysis runner, bridges the ingest layer and core engine |
 | `core/ip_intel.py` | Core intelligence engine and scanning/origin-discovery pipeline |
 | `core/basic.py` | Legacy OSINT helpers used by the analysis pipeline |
 | `db/intel_db.py` | PostgreSQL schema, persistence, and history for raw intel runs |
@@ -31,7 +32,7 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 | `sources/signal_transport.py` | TLS and SSH certificate parsing |
 | `sources/signal_web.py` | Web page metadata extraction (favicons, tracking IDs, headers) |
 | `utils/check.py` | Pairwise comparison logic + global graph linkage scoring (`link_evidence`, `links_for`) |
-| `utils/cluster.py` | Per-case cluster graph rendering (global clustering is materialized in `db/intel_db.py`) |
+| `utils/cluster.py` | Legacy cluster-graph rendering helpers (global clustering is materialized in `db/intel_db.py`) |
 | `utils/evidence_meta.py` | Evidence type catalog + per-selector base weights and strength tiers |
 | `integrations/mattermost_alerts.py` | Optional Mattermost webhook notifications |
 | `integrations/opencti_ingest.py` | OpenCTI ingestion worker (Domain-Name observables and Channel SDOs) |
@@ -41,8 +42,8 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 
 All storage is **PostgreSQL** (`DATABASE_URL`):
 
-- `cases/case_store.py` — cases, jobs, pair comparisons, and cluster results.
-- `db/intel_db.py` — raw intel runs, enriched IPs, identifiers, and per-target history. Search runs are append-only: every analysis is a new `searches` row, and all child tables (`ips`, `tls_certs`, `identifiers`, `discovered_targets`, ...) link back to it by `search_id` foreign keys so downstream analysis can join the raw intel directly.
+- `cases/case_store.py` — the internal ingest jobs (and legacy case/pair/cluster tables, retained but unused by the UI).
+- `db/intel_db.py` — raw intel runs and the derived correlation graph. Search runs are append-only: every analysis is a new `searches` row, and all child tables (`ips`, `tls_certs`, `identifiers`, `discovered_targets`, ...) link back to it by `search_id` foreign keys. The `entities`/`selectors`/`observations`/`entity_edges`/`graph_clusters` tables are the derived, rebuildable correlation layer (see [Selector-centric attribution graph](#selector-centric-attribution-graph)).
 
 Both modules use the same psycopg3 short-lived-connection conventions, so multiple workers can read and write concurrently. The intel tables can optionally live in a separate database by setting `INTEL_DATABASE_URL`; when unset, `DATABASE_URL` is used for everything (the docker-compose default).
 
@@ -174,32 +175,27 @@ extras already declared in `pyproject.toml`.
 
 ## API Overview
 
-### Cases
+There is no case API — everything is the global pool and its connections.
 
-- `POST /api/cases` — create a case (JSON `{"target": "..."}` or multipart with a CSV `file`)
-- `GET /api/cases` — list all cases
-- `GET /api/cases/{case_id}` — get a case and its status
-- `POST /api/cases/{case_id}/recompute` — re-score a case's pairs and clusters from stored scan data (no re-scanning)
+### Ingestion
 
-### Jobs
+- `POST /api/ingest` — add a domain / IP / CSV to the pool. JSON `{"target": "...", "label": "..."}` or multipart with a CSV `file`. `label` is an optional free-text tag on the ingest; it scopes nothing. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
+- `POST /api/ingest/opencti-website` — add the domains from OpenCTI's 100 most recent website-type Channel SDOs.
+- `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs).
 
-- `GET /api/jobs/{job_id}` — poll live job progress, stage, logs, and result
+### The pool
 
-### Pairs and Clusters
+- `GET /api/pool?search=&limit=` — every channel (registrable domain) in the pool, with host count, recency, and cluster membership.
 
-- `GET /api/cases/{case_id}/pairs` — pairwise comparison results for all targets in a case
-- `GET /api/cases/{case_id}/pairs/{pair_id}` — detailed evidence for a single pair
-- `GET /api/cases/{case_id}/clusters` — cluster graph for a case
+### Connections (global)
 
-### Correlation graph (global, case-free)
-
-These operate on the lake-wide attribution graph and are not scoped to a case:
-
-- `POST /api/ingest` — primary ingestion. JSON `{"target": "...", "label": "..."}` or multipart with a CSV `file`; `label` is an optional collection tag that scopes nothing in correlation.
-- `GET /api/graph/links/{value}` — ranked cross-corpus connections for an entity / registrable domain, each with its shared-node evidence breakdown (selector kind, value, degree, weight, time-overlap window, sources).
-- `GET /api/graph/link?a=<rd>&b=<rd>` — the connecting evidence between two domains.
+- `POST /api/graph/connections` — body `{"domains": ["a.com","b.com",…], "pool_links": true}`. Returns the pairwise links **among the selected channels** (which of them connect to each other, with evidence) and, when `pool_links` is set, each one's strongest connections to the wider pool.
+- `GET /api/graph/links/{value}` — ranked cross-corpus connections for one channel, each with its shared-node evidence breakdown (selector kind, value, degree, weight, time-overlap window, sources).
+- `GET /api/graph/link?a=<rd>&b=<rd>` — the connecting evidence between two channels.
+- `GET /api/graph/selector-kinds` — the edge types available for browsing (selector kind / `shared_ip`) and how many cross-channel groups each forms.
+- `GET /api/graph/by-selector?kind=<kind>&min_domains=2` — browse **by edge type**: groups of channels that share a selector of `kind` (e.g. every set of channels sharing a TLS cert / SSH key / IP). Omit `kind` for all edge types.
 - `GET /api/graph/clusters` — the strongest clusters lake-wide.
-- `GET /api/graph/cluster/{value}` — the cluster a registrable domain belongs to, with members.
+- `GET /api/graph/cluster/{value}` — the cluster a channel belongs to, with members.
 - `POST /api/graph/recompute` — global recompute: rebuild the whole correlation graph + clusters from stored intel (no rescanning).
 
 ### Meta
@@ -207,25 +203,7 @@ These operate on the lake-wide attribution graph and are not scoped to a case:
 - `GET /api/meta/evidence` — evidence type catalog used by the frontend
 - `GET /api/health` — health check
 
-### Recomputing all cases
-
-`recompute` re-scores stored scan data without re-scanning, so run it after changing
-evidence weights or extraction logic (e.g. `utils/check.py`, `utils/evidence_meta.py`,
-`sources/signal_web.py`). To recompute every case, run `recompute_case` in-process via
-`docker compose exec` (no HTTP, no `jq`):
-
-```bash
-docker compose exec ip-intel python -c "
-from cases.case_runtime import CaseRuntime
-from cases.case_store import list_cases
-rt = CaseRuntime()
-for c in list_cases():
-    print(c['id'], rt.recompute_case(c['id']))
-"
-```
-
-Each line prints `<case_id> {counts}` as it goes. For a single case, hit the endpoint
-instead: `curl -s -X POST http://localhost:9000/api/cases/<case_id>/recompute`.
+> The analysis/job machinery still runs each ingest internally (under `cases/case_runtime.py`), but it is no longer surfaced as "cases" — there is no per-submission scope, and all correlation is global. Run `POST /api/graph/recompute` (or `uv run python -m scripts.backfill_correlation`) after changing extraction or weighting logic.
 
 ## Correlation Model
 

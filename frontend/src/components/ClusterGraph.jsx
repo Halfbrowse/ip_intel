@@ -84,14 +84,31 @@ const ClusterGraph = memo(function ClusterGraph({
     if (!containerRef.current || typeof ResizeObserver === "undefined") {
       return undefined;
     }
+    let frame = 0;
     const observer = new ResizeObserver((entries) => {
       const next = Math.round(entries[0]?.contentRect?.width || 0);
-      if (next > 0) {
-        setWidth(next);
+      if (next <= 0) {
+        return;
       }
+      // Coalesce resize bursts to one update per frame, and skip same-width
+      // updates: width is a rebuild dependency of the simulation effect, so an
+      // undebounced observer rebuilds the force layout on every intermediate
+      // pixel while the window (or a flex reflow) is dragging.
+      if (frame) {
+        cancelAnimationFrame(frame);
+      }
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        setWidth((current) => (current === next ? current : next));
+      });
     });
     observer.observe(containerRef.current);
-    return () => observer.disconnect();
+    return () => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+      }
+      observer.disconnect();
+    };
   }, []);
 
   const allNodes = useMemo(

@@ -46,11 +46,20 @@ export function useApi(path, options = {}) {
         lastEtag = null;
       }
 
-      setState((previous) => ({
-        data: reset ? null : previous.data,
-        error: null,
-        loading: reset || previous.data === null,
-      }));
+      // Avoid a redundant re-render on every poll tick: only push a new state
+      // object when we are actually entering a loading view (a reset, or the
+      // very first load with no data yet). On a normal poll where data is
+      // present we return the same state ref so React bails out — the 304 and
+      // byte-identical paths below already do this, this closes the last gap.
+      if (reset) {
+        setState({ data: null, error: null, loading: true });
+      } else {
+        setState((previous) =>
+          previous.data === null && !previous.loading
+            ? { data: null, error: null, loading: true }
+            : previous,
+        );
+      }
 
       try {
         const headers = { Accept: "application/json" };
@@ -443,6 +452,55 @@ export function normalizeGraphClusters(payload) {
       members,
     };
   });
+}
+
+export function normalizePool(payload) {
+  return coerceArray(payload?.domains ?? payload)
+    .map((item) => {
+      const raw = item || {};
+      return {
+        domain: readableValue(pickFirst(raw, ["domain"])),
+        hostCount: pickFirst(raw, ["host_count", "hostCount"], null),
+        lastSeen: pickFirst(raw, ["last_seen", "lastSeen"], null),
+        clusterId: pickFirst(raw, ["cluster_id", "clusterId"], null),
+        clusterSize: pickFirst(raw, ["cluster_size", "clusterSize"], null),
+      };
+    })
+    .filter((entry) => entry.domain);
+}
+
+export function normalizeConnectionPairs(payload) {
+  return coerceArray(payload?.pairs).map((pair, index) => {
+    const link = normalizeGraphLink(pair, index);
+    return {
+      ...link,
+      a: readableValue(pair?.a),
+      b: readableValue(pair?.b),
+      connected: Boolean(pair?.connected),
+    };
+  });
+}
+
+export function normalizeSelectorGroups(payload) {
+  return coerceArray(payload?.groups ?? payload).map((item, index) => {
+    const raw = item || {};
+    return {
+      id: `${raw.kind || "group"}-${raw.value || index}`,
+      kind: pickFirst(raw, ["kind"], "unknown"),
+      value: readableValue(pickFirst(raw, ["value"])) || "—",
+      degree: pickFirst(raw, ["degree"], null),
+      domains: coerceArray(raw.domains).map((entry) => readableValue(entry)).filter(Boolean),
+    };
+  });
+}
+
+export function normalizeSelectorKinds(payload) {
+  return coerceArray(payload?.kinds ?? payload)
+    .map((item) => ({
+      kind: pickFirst(item || {}, ["kind"], "unknown"),
+      groups: pickFirst(item || {}, ["groups"], null),
+    }))
+    .filter((entry) => entry.kind && entry.kind !== "unknown");
 }
 
 export function normalizeEvidenceMeta(payload) {

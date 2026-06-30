@@ -21,6 +21,7 @@ import re
 import threading
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -768,27 +769,57 @@ def _is_public_ip(value: str) -> bool:
     )
 
 
-def registrable_domain(value: Any) -> str | None:
-    """Best-effort eTLD+1 (registrable apex) for a hostname.
+@lru_cache(maxsize=1)
+def _tld_extractor() -> Any:
+    """A tldextract extractor pinned to its bundled Public Suffix List snapshot.
 
-    Dependency-free "last two labels" heuristic, matching the existing apex
-    logic in utils/check.py (`_apex_of`). It does not understand multi-label
-    public suffixes such as `co.uk`, but the whole codebase already accepts that
-    trade-off rather than pulling in the public-suffix list. Returns None for
-    inputs that are not hostnames (e.g. IPs or junk).
+    `suffix_list_urls=()` + `cache_dir=None` make it fully offline: it never
+    touches the network (important behind the VPN/proxy), using the PSL baked
+    into the installed package. Returns None if tldextract is unavailable so the
+    caller can fall back to the naive heuristic.
+    """
+    try:
+        import tldextract
+
+        return tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+    except Exception:  # pragma: no cover - defensive: any import/init failure
+        return None
+
+
+def registrable_domain(value: Any) -> str | None:
+    """eTLD+1 (registrable apex) for a hostname, public-suffix aware.
+
+    Uses the Public Suffix List (via tldextract's offline snapshot) so multi-
+    label suffixes like `co.uk`, `com.au`, `co.jp` roll up correctly — e.g.
+    `news.bbc.co.uk` -> `bbc.co.uk`, not `co.uk`. Getting this right matters at
+    graph scale: the registrable domain is the entity-rollup key, so a wrong
+    apex would merge unrelated ccTLD domains into one node. Falls back to the
+    last-two-labels heuristic if tldextract is unavailable. Returns None for IPs
+    or anything that is not a hostname.
     """
     text = str(value or "").strip().lower().strip("[]").rstrip(".").lstrip(".")
     if not text:
         return None
     if text.startswith("*."):
         text = text[2:]
-    if text.startswith("www."):
-        text = text[4:]
     try:
         ipaddress.ip_address(text)
         return None
     except ValueError:
         pass
+
+    extractor = _tld_extractor()
+    if extractor is not None:
+        try:
+            extracted = extractor(text)
+            if extracted.domain and extracted.suffix:
+                return f"{extracted.domain}.{extracted.suffix}"
+        except Exception:  # pragma: no cover - fall through to the heuristic
+            pass
+
+    # Fallback: last two labels (also covers a bare apex with an unknown suffix).
+    if text.startswith("www."):
+        text = text[4:]
     parts = [p for p in text.split(".") if p]
     if len(parts) < 2:
         return None
@@ -3165,15 +3196,17 @@ def shared_ips_between(a_value: str, b_value: str) -> list[dict[str, Any]]:
     with _conn() as c:
         rows = c.execute(
             f"""WITH a_ent AS ({a_sql}), b_ent AS ({b_sql}),
-                     a_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l
+                     a_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l,
+                                     array_agg(DISTINCT source) AS srcs
                               FROM entity_edges WHERE kind='resolves_to' AND src_entity_id IN (SELECT id FROM a_ent)
                               GROUP BY dst_entity_id),
-                     b_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l
+                     b_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l,
+                                     array_agg(DISTINCT source) AS srcs
                               FROM entity_edges WHERE kind='resolves_to' AND src_entity_id IN (SELECT id FROM b_ent)
                               GROUP BY dst_entity_id)
                 SELECT ip.value,
-                       a_ip.f AS a_first, a_ip.l AS a_last,
-                       b_ip.f AS b_first, b_ip.l AS b_last,
+                       a_ip.f AS a_first, a_ip.l AS a_last, a_ip.srcs AS a_sources,
+                       b_ip.f AS b_first, b_ip.l AS b_last, b_ip.srcs AS b_sources,
                        (SELECT count(DISTINCT e.registrable_domain)
                           FROM entity_edges ee JOIN entities e ON e.id = ee.src_entity_id
                           WHERE ee.dst_entity_id = ip.id AND ee.kind='resolves_to') AS degree,
@@ -3229,12 +3262,14 @@ def link_candidates_for(value: str) -> dict[str, dict[str, list[dict[str, Any]]]
 
         ip_rows = c.execute(
             f"""WITH a_ent AS ({side_sql}),
-                     a_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l
+                     a_ip AS (SELECT dst_entity_id AS ip_id, min(first_seen) AS f, max(last_seen) AS l,
+                                     array_agg(DISTINCT source) AS srcs
                               FROM entity_edges WHERE kind='resolves_to' AND src_entity_id IN (SELECT id FROM a_ent)
                               GROUP BY dst_entity_id)
                 SELECT e2.registrable_domain AS rd, ip.value,
-                       a_ip.f AS a_first, a_ip.l AS a_last,
+                       a_ip.f AS a_first, a_ip.l AS a_last, a_ip.srcs AS a_sources,
                        min(ee.first_seen) AS b_first, max(ee.last_seen) AS b_last,
+                       array_agg(DISTINCT ee.source) AS b_sources,
                        (SELECT count(DISTINCT e3.registrable_domain)
                           FROM entity_edges ee2 JOIN entities e3 ON e3.id = ee2.src_entity_id
                           WHERE ee2.dst_entity_id = ip.id AND ee2.kind='resolves_to') AS degree,
@@ -3247,7 +3282,7 @@ def link_candidates_for(value: str) -> dict[str, dict[str, list[dict[str, Any]]]
                 JOIN entities e2 ON e2.id = ee.src_entity_id
                 WHERE e2.registrable_domain IS NOT NULL
                   AND e2.registrable_domain <> %s
-                GROUP BY e2.registrable_domain, ip.id, ip.value, a_ip.f, a_ip.l""",
+                GROUP BY e2.registrable_domain, ip.id, ip.value, a_ip.f, a_ip.l, a_ip.srcs""",
             (side[1], side[2]),
         ).fetchall()
         for row in ip_rows:
@@ -3397,6 +3432,120 @@ def graph_cluster_for(value: str) -> dict[str, Any] | None:
             ).fetchall()
         ]
     return {"cluster_id": row["cluster_id"], "component_size": row["component_size"], "members": members}
+
+
+# ── Pool + by-edge browsing ─────────────────────────────────────────────────
+#
+# The product is one global pool of channels (registrable domains). These power
+# the pool listing and the "browse by edge type" discovery mode (filter by a
+# selector kind — shared TLS cert / SSH fp / shared IP / nameserver / … — and
+# see which domains carry that connection).
+
+def list_pool_domains(*, search: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+    """Every registrable domain in the pool with host count, recency, cluster."""
+    init_db()
+    like = f"%{search.strip().lower()}%" if search and search.strip() else None
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT e.registrable_domain AS domain,
+                      count(*) AS host_count,
+                      max(e.last_seen) AS last_seen,
+                      gc.cluster_id,
+                      gc.component_size AS cluster_size
+               FROM entities e
+               LEFT JOIN graph_clusters gc ON gc.registrable_domain = e.registrable_domain
+               WHERE e.registrable_domain IS NOT NULL
+                 AND (%s::text IS NULL OR e.registrable_domain LIKE %s::text)
+               GROUP BY e.registrable_domain, gc.cluster_id, gc.component_size
+               ORDER BY max(e.last_seen) DESC NULLS LAST, e.registrable_domain
+               LIMIT %s""",
+            (like, like, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def selector_kind_counts(*, min_domains: int = 2) -> list[dict[str, Any]]:
+    """Edge types available for browsing: each selector kind (+ shared_ip) with
+    the number of cross-domain groups it forms."""
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT kind, count(*) AS groups FROM (
+                   SELECT sel.kind, sel.id
+                   FROM selectors sel
+                   JOIN observations o ON o.selector_id = sel.id
+                   JOIN entities e ON e.id = o.entity_id
+                   WHERE sel.attributing AND e.registrable_domain IS NOT NULL
+                   GROUP BY sel.kind, sel.id
+                   HAVING count(DISTINCT e.registrable_domain) >= %s
+               ) t GROUP BY kind""",
+            (min_domains,),
+        ).fetchall()
+        out = [dict(row) for row in rows]
+        ip_groups = c.execute(
+            """SELECT count(*) AS groups FROM (
+                   SELECT ip.id
+                   FROM entities ip
+                   JOIN entity_edges ee ON ee.dst_entity_id = ip.id AND ee.kind = 'resolves_to'
+                   JOIN entities e ON e.id = ee.src_entity_id
+                   WHERE ip.kind = 'ip' AND e.registrable_domain IS NOT NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM observations o JOIN selectors s ON s.id = o.selector_id
+                         WHERE o.entity_id = ip.id AND s.kind IN ('asn','network_cidr') AND s.attributing = FALSE
+                     )
+                   GROUP BY ip.id
+                   HAVING count(DISTINCT e.registrable_domain) >= %s
+               ) t""",
+            (min_domains,),
+        ).fetchone()
+    if ip_groups and ip_groups["groups"]:
+        out.append({"kind": "shared_ip", "groups": int(ip_groups["groups"])})
+    out.sort(key=lambda row: row["groups"], reverse=True)
+    return out
+
+
+def domains_by_selector(
+    *, kind: str | None = None, min_domains: int = 2, limit: int = 200
+) -> list[dict[str, Any]]:
+    """Groups of registrable domains that share an attributing selector (or a
+    non-noise shared IP when kind='shared_ip'), strongest fan-in first."""
+    init_db()
+    with _conn() as c:
+        if kind == "shared_ip":
+            rows = c.execute(
+                """SELECT 'shared_ip' AS kind, ip.value AS value,
+                          count(DISTINCT e.registrable_domain) AS degree,
+                          array_agg(DISTINCT e.registrable_domain) AS domains
+                   FROM entities ip
+                   JOIN entity_edges ee ON ee.dst_entity_id = ip.id AND ee.kind = 'resolves_to'
+                   JOIN entities e ON e.id = ee.src_entity_id
+                   WHERE ip.kind = 'ip' AND e.registrable_domain IS NOT NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM observations o JOIN selectors s ON s.id = o.selector_id
+                         WHERE o.entity_id = ip.id AND s.kind IN ('asn','network_cidr') AND s.attributing = FALSE
+                     )
+                   GROUP BY ip.id, ip.value
+                   HAVING count(DISTINCT e.registrable_domain) >= %s
+                   ORDER BY count(DISTINCT e.registrable_domain) DESC, ip.value
+                   LIMIT %s""",
+                (min_domains, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                """SELECT sel.kind, sel.value, sel.entity_count AS degree,
+                          array_agg(DISTINCT e.registrable_domain) AS domains
+                   FROM selectors sel
+                   JOIN observations o ON o.selector_id = sel.id
+                   JOIN entities e ON e.id = o.entity_id
+                   WHERE sel.attributing AND e.registrable_domain IS NOT NULL
+                     AND (%s::text IS NULL OR sel.kind = %s::text)
+                   GROUP BY sel.id, sel.kind, sel.value, sel.entity_count
+                   HAVING count(DISTINCT e.registrable_domain) >= %s
+                   ORDER BY count(DISTINCT e.registrable_domain) DESC, sel.kind, sel.value
+                   LIMIT %s""",
+                (kind, kind, min_domains, limit),
+            ).fetchall()
+    return [dict(row) for row in rows]
 
 
 # ── Queries ───────────────────────────────────────────────────────────────────

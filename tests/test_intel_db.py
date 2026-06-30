@@ -104,6 +104,10 @@ class EntityClassificationTests(unittest.TestCase):
         self.assertEqual(intel_db.registrable_domain("www.example.com"), "example.com")
         self.assertEqual(intel_db.registrable_domain("x.a.example.com"), "example.com")
         self.assertEqual(intel_db.registrable_domain("*.example.com"), "example.com")
+        # Multi-label public suffixes roll up correctly (not "co.uk").
+        self.assertEqual(intel_db.registrable_domain("bbc.co.uk"), "bbc.co.uk")
+        self.assertEqual(intel_db.registrable_domain("news.bbc.co.uk"), "bbc.co.uk")
+        self.assertEqual(intel_db.registrable_domain("shop.foo.com.au"), "foo.com.au")
         self.assertIsNone(intel_db.registrable_domain("203.0.113.5"))
         self.assertIsNone(intel_db.registrable_domain("localhost"))
 
@@ -119,6 +123,15 @@ class EntityClassificationTests(unittest.TestCase):
         self.assertEqual(
             intel_db.classify_entity("203.0.113.5"),
             {"kind": "ip", "value": "203.0.113.5", "registrable_domain": None},
+        )
+        # ccTLD apex is a 'domain'; its host is a 'subdomain' rolling up to it.
+        self.assertEqual(
+            intel_db.classify_entity("bbc.co.uk"),
+            {"kind": "domain", "value": "bbc.co.uk", "registrable_domain": "bbc.co.uk"},
+        )
+        self.assertEqual(
+            intel_db.classify_entity("news.bbc.co.uk"),
+            {"kind": "subdomain", "value": "news.bbc.co.uk", "registrable_domain": "bbc.co.uk"},
         )
         self.assertEqual(
             intel_db.classify_entity("HTTPS://WWW.Example.com/path"),

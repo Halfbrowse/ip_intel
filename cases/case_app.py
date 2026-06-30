@@ -17,9 +17,9 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from cases.case_runtime import CaseRuntime, build_case_response, build_job_response, build_pairs_response, parse_submission
+from cases.case_runtime import CaseRuntime, build_job_response, parse_submission
 from core.analysis_service import normalize_inputs
-from cases.case_store import get_case, get_cluster, get_job, get_pairing, healthcheck, init_db, list_cases, load_case_inputs
+from cases.case_store import get_job, healthcheck, init_db
 from utils.evidence_meta import evidence_catalog
 from utils import check
 from db import intel_db
@@ -123,47 +123,18 @@ def api_evidence_meta() -> dict[str, Any]:
     return {"evidence": evidence_catalog()}
 
 
-@app.get("/api/cases")
-def api_list_cases(request: Request) -> Response:
-    return _etag_json_response(
-        request,
-        {"cases": [build_case_response(row) for row in list_cases()]},
-    )
-
-
-@app.post("/api/cases")
-async def api_create_case(request: Request) -> JSONResponse:
-    content_type = (request.headers.get("content-type") or "").lower()
-    target: str | None = None
-    csv_content: bytes | None = None
-
-    if "application/json" in content_type:
-        payload = await request.json()
-        target = str((payload or {}).get("target") or "").strip() or None
-    elif "multipart/form-data" in content_type:
-        form = await request.form()
-        target = str(form.get("target") or "").strip() or None
-        upload = form.get("file")
-        if upload is not None and hasattr(upload, "read"):
-            csv_content = await upload.read()
-    else:
-        raise HTTPException(status_code=415, detail="Use JSON or multipart form data.")
-
-    inputs, input_mode = parse_submission(target=target, csv_content=csv_content)
-    if not inputs:
-        raise HTTPException(status_code=400, detail="Submit a domain, IP, or CSV with at least one valid target.")
-
-    identifiers = runtime.submit_case(inputs, input_mode=input_mode)
-    case_row = get_case(identifiers["case_id"])
+def _ingest_response(identifiers: dict[str, str], *, label: str | None, count: int) -> JSONResponse:
+    """Shared ingest acknowledgement: a job id to poll for progress. The scanned
+    targets flow straight into the global pool — there is no case to open."""
     job_row = get_job(identifiers["job_id"])
     return JSONResponse(
         status_code=202,
         content=jsonable_encoder(
             {
-                "case": build_case_response(case_row) if case_row else {"id": identifiers["case_id"]},
                 "job": build_job_response(job_row) if job_row else {"id": identifiers["job_id"]},
-                "case_id": identifiers["case_id"],
                 "job_id": identifiers["job_id"],
+                "label": label,
+                "accepted": count,
                 "status": "queued",
             }
         ),
@@ -172,10 +143,10 @@ async def api_create_case(request: Request) -> JSONResponse:
 
 @app.post("/api/ingest/opencti-website")
 async def api_ingest_opencti_website() -> JSONResponse:
-    """Seed a new case with the domains from OpenCTI's most recently created
-    website-type Channel SDOs (the last 100)."""
-    # Imported lazily so the case app starts even when pycti / OpenCTI config
-    # is absent; the dependency is only needed when this button is used.
+    """Add the domains from OpenCTI's 100 most recently created website-type
+    Channel SDOs to the pool."""
+    # Imported lazily so the app starts even when pycti / OpenCTI config is
+    # absent; the dependency is only needed when this button is used.
     from integrations.opencti_ingest import fetch_website_channel_domains
 
     try:
@@ -185,35 +156,18 @@ async def api_ingest_opencti_website() -> JSONResponse:
 
     inputs = normalize_inputs(domains)
     if not inputs:
-        raise HTTPException(
-            status_code=404,
-            detail="No website-channel domains found on OpenCTI.",
-        )
+        raise HTTPException(status_code=404, detail="No website-channel domains found on OpenCTI.")
 
     identifiers = runtime.submit_case(inputs, input_mode="opencti_website")
-    case_row = get_case(identifiers["case_id"])
-    job_row = get_job(identifiers["job_id"])
-    return JSONResponse(
-        status_code=202,
-        content=jsonable_encoder(
-            {
-                "case": build_case_response(case_row) if case_row else {"id": identifiers["case_id"]},
-                "job": build_job_response(job_row) if job_row else {"id": identifiers["job_id"]},
-                "case_id": identifiers["case_id"],
-                "job_id": identifiers["job_id"],
-                "status": "queued",
-                "domain_count": len(inputs),
-            }
-        ),
-    )
+    return _ingest_response(identifiers, label="opencti_website", count=len(inputs))
 
 
 @app.post("/api/ingest")
 async def api_ingest(request: Request) -> JSONResponse:
-    """Primary lake-global ingestion: run a domain / IP / CSV through the
-    pipeline. A case label is optional metadata (a collection tag) — it scopes
-    nothing in correlation, which is always global. Connections surface across
-    the whole corpus afterwards via /api/graph/links/{value}.
+    """Add a domain / IP / CSV to the global pool. Runs the analysis pipeline;
+    the results join the one shared correlation graph (no case scoping). An
+    optional `label` is just a free-text tag on the ingest. Poll the returned
+    job for progress; connections then surface via the /api/graph/* endpoints.
     """
     content_type = (request.headers.get("content-type") or "").lower()
     target: str | None = None
@@ -239,24 +193,51 @@ async def api_ingest(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="Submit a domain, IP, or CSV with at least one valid target.")
 
     identifiers = runtime.submit_case(inputs, input_mode=label or input_mode)
-    case_row = get_case(identifiers["case_id"])
-    job_row = get_job(identifiers["job_id"])
-    return JSONResponse(
-        status_code=202,
-        content=jsonable_encoder(
-            {
-                "case": build_case_response(case_row) if case_row else {"id": identifiers["case_id"]},
-                "job": build_job_response(job_row) if job_row else {"id": identifiers["job_id"]},
-                "case_id": identifiers["case_id"],
-                "job_id": identifiers["job_id"],
-                "label": label,
-                "status": "queued",
-            }
-        ),
-    )
+    return _ingest_response(identifiers, label=label, count=len(inputs))
+
+
+# ── The pool ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/pool")
+def api_pool(request: Request, search: str | None = None, limit: int = 1000) -> Response:
+    """Every channel (registrable domain) in the pool, with host count, recency,
+    and cluster membership."""
+    domains = intel_db.list_pool_domains(search=search, limit=limit)
+    return _etag_json_response(request, {"total": len(domains), "domains": domains})
 
 
 # ── Global correlation graph (case-free) ─────────────────────────────────────
+
+@app.post("/api/graph/connections")
+async def api_graph_connections(request: Request) -> dict[str, Any]:
+    """Connections within a selected set of channels: which of them link to each
+    other (with evidence), plus each one's strongest connections to the pool.
+
+    Body: {"domains": ["a.com", "b.com", ...], "pool_links": bool}
+    """
+    payload = await request.json()
+    domains = [str(d).strip() for d in (payload or {}).get("domains") or [] if str(d).strip()]
+    if len(domains) < 1:
+        raise HTTPException(status_code=400, detail="Provide a 'domains' list.")
+    pool_links = bool((payload or {}).get("pool_links"))
+    return check.connections_among(domains, pool_links=pool_links)
+
+
+@app.get("/api/graph/selector-kinds")
+def api_graph_selector_kinds(request: Request, min_domains: int = 2) -> Response:
+    """Edge types available for browsing (selector kind / shared_ip) + group counts."""
+    return _etag_json_response(request, {"kinds": intel_db.selector_kind_counts(min_domains=min_domains)})
+
+
+@app.get("/api/graph/by-selector")
+def api_graph_by_selector(
+    request: Request, kind: str | None = None, min_domains: int = 2, limit: int = 200
+) -> Response:
+    """Browse by edge type: groups of domains that share a selector of `kind`
+    (or any kind), e.g. all domain sets sharing a TLS cert / SSH key / IP."""
+    groups = intel_db.domains_by_selector(kind=kind, min_domains=min_domains, limit=limit)
+    return _etag_json_response(request, {"kind": kind, "total": len(groups), "groups": groups})
+
 
 @app.get("/api/graph/links/{value:path}")
 def api_graph_links(value: str, request: Request) -> Response:
@@ -298,84 +279,12 @@ async def api_graph_recompute() -> dict[str, Any]:
     return {"status": "recomputed", **counts}
 
 
-@app.post("/api/cases/{case_id}/recompute")
-async def api_recompute_case(case_id: str) -> dict[str, Any]:
-    """Re-score an existing case's pairs and clusters from stored scan data."""
-    case_row = get_case(case_id)
-    if case_row is None:
-        raise HTTPException(status_code=404, detail="Case not found.")
-    counts = await asyncio.to_thread(runtime.recompute_case, case_id)
-    return {"case_id": case_id, "status": "recomputed", **counts}
-
-
-@app.get("/api/cases/{case_id}")
-def api_get_case(case_id: str, request: Request) -> Response:
-    case_row = get_case(case_id)
-    if case_row is None:
-        raise HTTPException(status_code=404, detail="Case not found.")
-    return _etag_json_response(request, {"case": build_case_response(case_row)})
-
-
 @app.get("/api/jobs/{job_id}")
 def api_get_job(job_id: str) -> dict[str, Any]:
     job_row = get_job(job_id)
     if job_row is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     return {"job": build_job_response(job_row)}
-
-
-@app.get("/api/cases/{case_id}/pairs")
-def api_get_case_pairs(case_id: str, request: Request) -> Response:
-    case_row = get_case(case_id)
-    if case_row is None:
-        raise HTTPException(status_code=404, detail="Case not found.")
-    return _etag_json_response(request, build_pairs_response(case_id))
-
-
-@app.get("/api/cases/{case_id}/pairs/{pair_id}")
-def api_get_pair(case_id: str, pair_id: str) -> dict[str, Any]:
-    pair_row = get_pairing(case_id, pair_id)
-    if pair_row is None:
-        raise HTTPException(status_code=404, detail="Pair not found.")
-    payload = dict(pair_row.get("payload") or {})
-    payload.update(
-        {
-            "id": pair_row["id"],
-            "scope": pair_row["scope"],
-            "left": pair_row["left_target"],
-            "right": pair_row["right_target"],
-            "score": pair_row["score"],
-            "match_count": pair_row["match_count"],
-            "status": "completed",
-            "evidence": payload.get("evidence_items", []),
-            "left_subject": {
-                "label": pair_row["left_target"],
-                "payload": pair_row.get("left_payload") or {},
-            },
-            "right_subject": {
-                "label": pair_row["right_target"],
-                "payload": pair_row.get("right_payload") or {},
-            },
-        }
-    )
-    return {"pair": payload}
-
-
-@app.get("/api/cases/{case_id}/clusters")
-def api_get_clusters(case_id: str) -> dict[str, Any]:
-    cluster_row = get_cluster(case_id)
-    if cluster_row is None:
-        raise HTTPException(status_code=404, detail="Cluster data not found.")
-    payload = dict(cluster_row.get("payload") or {})
-    payload["graph"] = cluster_row.get("graph_payload") or {}
-    payload["threshold"] = cluster_row.get("threshold")
-    case_inputs = load_case_inputs(case_id)
-    payload["seed_targets"] = [
-        inp["normalized_target"]
-        for inp in case_inputs
-        if inp.get("normalized_target") and inp.get("is_seed")
-    ]
-    return payload
 
 
 @app.exception_handler(Exception)

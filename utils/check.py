@@ -964,6 +964,7 @@ def _score_ip_row(row: dict) -> tuple[dict, float]:
     rarity = 0.0 if noisy else rarity_weight(degree)
     overlap = time_overlap_factor(row.get("a_first"), row.get("a_last"), row.get("b_first"), row.get("b_last"))
     weight = base * rarity * overlap
+    sources = sorted({s for s in (list(row.get("a_sources") or []) + list(row.get("b_sources") or [])) if s})
     evidence = {
         "node_type": "ip",
         "kind": "shared_ip",
@@ -974,7 +975,7 @@ def _score_ip_row(row: dict) -> tuple[dict, float]:
         "rarity": round(rarity, 3),
         "time_overlap": round(overlap, 3),
         "weight": round(weight, 2),
-        "sources": ["resolves_to"],
+        "sources": sources or ["resolves_to"],
         "window_a": [row.get("a_first"), row.get("a_last")],
         "window_b": [row.get("b_first"), row.get("b_last")],
     }
@@ -1021,6 +1022,15 @@ def link_evidence(a_value: str, b_value: str) -> dict:
     """Score and explain the linkage between two entities / registrable domains."""
     from db import intel_db
 
+    # A node never links to itself: same registrable domain / IP is not evidence.
+    side_a = intel_db._resolve_side(a_value)
+    side_b = intel_db._resolve_side(b_value)
+    if side_a and side_b and side_a[0] == side_b[0] and side_a[1] == side_b[1]:
+        return {
+            "a": a_value, "b": b_value, "score": 0.0, "confidence": 0,
+            "strength": "weak", "evidence": [], "shared_node_count": 0, "self": True,
+        }
+
     link = _assemble_link(
         intel_db.shared_selectors_between(a_value, b_value),
         intel_db.shared_ips_between(a_value, b_value),
@@ -1028,6 +1038,46 @@ def link_evidence(a_value: str, b_value: str) -> dict:
     link["a"] = a_value
     link["b"] = b_value
     return link
+
+
+def connections_among(
+    domains: list[str], *, pool_links: bool = False, pool_limit: int = 8, max_domains: int = 30
+) -> dict:
+    """Score linkage within a selected set of channels.
+
+    Returns the pairwise links among the selected domains (so you can see which
+    of them are connected to each other and on what evidence), and optionally
+    each one's strongest connections to the wider pool.
+    """
+    from db import intel_db
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for value in domains:
+        side = intel_db._resolve_side(value)
+        if not side or side[1] in seen:
+            continue
+        seen.add(side[1])
+        resolved.append(side[1])
+        if len(resolved) >= max_domains:
+            break
+
+    pairs: list[dict] = []
+    for i in range(len(resolved)):
+        for j in range(i + 1, len(resolved)):
+            link = link_evidence(resolved[i], resolved[j])
+            link["connected"] = link["score"] > 0 and not link.get("self")
+            pairs.append(link)
+    pairs.sort(key=lambda link: link["score"], reverse=True)
+
+    result: dict = {
+        "domains": resolved,
+        "pairs": pairs,
+        "connected_pair_count": sum(1 for link in pairs if link["connected"]),
+    }
+    if pool_links:
+        result["pool_links"] = {d: links_for(d, limit=pool_limit) for d in resolved}
+    return result
 
 
 def links_for(value: str, *, limit: int = 50, min_score: float = 1.0) -> list[dict]:

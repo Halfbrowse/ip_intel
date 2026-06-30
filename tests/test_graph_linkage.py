@@ -97,6 +97,13 @@ class GraphLinkageDbTests(unittest.TestCase):
             "dns": {"A": [ip], "NS": ["ns1.cloudflare.com", "ns2.cloudflare.com"]},
         }
 
+    def _shared_ip_scan(self, domain: str, ip: str, ts: str) -> dict:
+        return {
+            "input": domain, "type": "domain", "timestamp": ts,
+            "ip_details": {ip: {"sources": ["dns"], "asn_info": {"asn": "AS64600", "network_cidr": "203.0.113.0/24"}}},
+            "dns": {"A": [ip]},
+        }
+
     # ── acceptance criteria ──────────────────────────────────────────────
     def test_apex_to_apex_shared_leaf_cert(self) -> None:
         intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
@@ -173,6 +180,61 @@ class GraphLinkageDbTests(unittest.TestCase):
         # CDN IP is noisy and the nameserver is denylisted → no cluster forms.
         self.assertIsNone(intel_db.graph_cluster_for("noise0.com"))
         self.assertEqual(intel_db.list_graph_clusters(), [])
+
+    def test_shared_ip_evidence_carries_real_source(self) -> None:
+        intel_db.save_search(self._shared_ip_scan("a.com", "203.0.113.99", "2026-03-01T00:00:00+00:00"))
+        intel_db.save_search(self._shared_ip_scan("b.com", "203.0.113.99", "2026-03-02T00:00:00+00:00"))
+
+        link = check.link_evidence("a.com", "b.com")
+        ip_nodes = [e for e in link["evidence"] if e["node_type"] == "ip"]
+        self.assertEqual(len(ip_nodes), 1)
+        self.assertEqual(ip_nodes[0]["value"], "203.0.113.99")
+        self.assertEqual(ip_nodes[0]["degree"], 2)
+        # Provenance is the actual resolution source, not a generic placeholder.
+        self.assertIn("dns_a", ip_nodes[0]["sources"])
+        self.assertNotIn("resolves_to", ip_nodes[0]["sources"])
+
+    def test_link_evidence_self_is_not_a_link(self) -> None:
+        intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
+        link = check.link_evidence("a.com", "a.com")
+        self.assertTrue(link.get("self"))
+        self.assertEqual(link["score"], 0.0)
+        self.assertEqual(link["evidence"], [])
+
+    def test_pool_listing_and_browse_by_edge(self) -> None:
+        intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
+        intel_db.save_search(self._apex_cert_scan("b.com", "203.0.113.2", "rarecert", "2026-03-02T00:00:00+00:00"))
+        intel_db.rebuild_all_correlation()
+
+        pool = {row["domain"] for row in intel_db.list_pool_domains()}
+        self.assertIn("a.com", pool)
+        self.assertIn("b.com", pool)
+
+        # Browse by edge type: the shared cert groups a.com + b.com together.
+        groups = intel_db.domains_by_selector(kind="tls_cert_sha256")
+        cert_group = next(g for g in groups if g["value"] == "rarecert")
+        self.assertEqual(set(cert_group["domains"]), {"a.com", "b.com"})
+
+        kinds = {row["kind"] for row in intel_db.selector_kind_counts()}
+        self.assertIn("tls_cert_sha256", kinds)
+
+        # A single-domain selector (only one registrable domain) is not a group.
+        self.assertEqual(
+            [g for g in intel_db.domains_by_selector(kind="favicon_mmh3")], []
+        )
+
+    def test_connections_among_selected_set(self) -> None:
+        intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
+        intel_db.save_search(self._apex_cert_scan("b.com", "203.0.113.2", "rarecert", "2026-03-02T00:00:00+00:00"))
+        intel_db.save_search(self._apex_cert_scan("c.com", "203.0.113.3", "loner", "2026-03-03T00:00:00+00:00"))
+
+        result = check.connections_among(["a.com", "b.com", "c.com"])
+        self.assertEqual(set(result["domains"]), {"a.com", "b.com", "c.com"})
+        self.assertEqual(len(result["pairs"]), 3)  # 3 choose 2
+        self.assertEqual(result["connected_pair_count"], 1)  # only a.com<->b.com
+        top = result["pairs"][0]
+        self.assertEqual({top["a"], top["b"]}, {"a.com", "b.com"})
+        self.assertTrue(top["connected"])
 
     def test_recompute_free_rescore_on_weight_change(self) -> None:
         intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
