@@ -108,6 +108,12 @@ class EntityClassificationTests(unittest.TestCase):
         self.assertEqual(intel_db.registrable_domain("bbc.co.uk"), "bbc.co.uk")
         self.assertEqual(intel_db.registrable_domain("news.bbc.co.uk"), "bbc.co.uk")
         self.assertEqual(intel_db.registrable_domain("shop.foo.com.au"), "foo.com.au")
+        # PSL *private* suffixes: each PaaS deployment is its own registrable
+        # domain, not merged under the platform apex (vercel.app, github.io, …).
+        self.assertEqual(
+            intel_db.registrable_domain("v0-meta-t.vercel.app"), "v0-meta-t.vercel.app"
+        )
+        self.assertEqual(intel_db.registrable_domain("foo.github.io"), "foo.github.io")
         self.assertIsNone(intel_db.registrable_domain("203.0.113.5"))
         self.assertIsNone(intel_db.registrable_domain("localhost"))
 
@@ -132,6 +138,16 @@ class EntityClassificationTests(unittest.TestCase):
         self.assertEqual(
             intel_db.classify_entity("news.bbc.co.uk"),
             {"kind": "subdomain", "value": "news.bbc.co.uk", "registrable_domain": "bbc.co.uk"},
+        )
+        # A PaaS deployment classifies as its own 'domain', not a subdomain of
+        # the platform — every *.vercel.app is a distinct operator.
+        self.assertEqual(
+            intel_db.classify_entity("v0-meta-t.vercel.app"),
+            {
+                "kind": "domain",
+                "value": "v0-meta-t.vercel.app",
+                "registrable_domain": "v0-meta-t.vercel.app",
+            },
         )
         self.assertEqual(
             intel_db.classify_entity("HTTPS://WWW.Example.com/path"),

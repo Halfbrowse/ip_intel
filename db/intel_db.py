@@ -777,11 +777,20 @@ def _tld_extractor() -> Any:
     touches the network (important behind the VPN/proxy), using the PSL baked
     into the installed package. Returns None if tldextract is unavailable so the
     caller can fall back to the naive heuristic.
+
+    `include_psl_private_domains=True` treats the PSL *private* section
+    (vercel.app, github.io, netlify.app, herokuapp.com, web.app, pages.dev,
+    blogspot.com, …) as public suffixes, so each PaaS deployment is its own
+    registrable domain (`v0-meta-t.vercel.app`, not `vercel.app`). Without this
+    every deployment on a platform would be merged under the platform apex,
+    which is wrong for attribution — each `*.vercel.app` is a different operator.
     """
     try:
         import tldextract
 
-        return tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+        return tldextract.TLDExtract(
+            suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True
+        )
     except Exception:  # pragma: no cover - defensive: any import/init failure
         return None
 

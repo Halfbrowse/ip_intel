@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes } from "./router.jsx";
 
 import {
@@ -464,18 +464,17 @@ function PoolPage() {
     <AppShell>
       <section className="hero-panel">
         <div className="hero-copy">
-          <p className="eyebrow">The pool</p>
-          <h1>One pool of channels. Ask who is connected to whom.</h1>
+          <h1>Channel pool</h1>
           <p>
-            Every domain and IP you scan flows into a single correlation graph. Select channels to see
-            whether they are connected — and why — or browse the pool by the evidence that links them.
+            Everything you've scanned, in one place. Open a channel to see what it's connected to, or
+            select several and compare them.
           </p>
         </div>
         <div className="hero-stats">
-          <MetricCard label="Channels in pool" value={domains.length} />
+          <MetricCard label="Channels" value={domains.length} />
           <MetricCard label="Clusters" value={clustered} />
           <Link className="primary-button" to="/connections">
-            Explore connections
+            Compare channels
           </Link>
         </div>
       </section>
@@ -485,9 +484,8 @@ function PoolPage() {
       <section className="panel section-stack">
         <div className="panel-header">
           <div>
-            <p className="eyebrow">Pool</p>
             <h2>Channels</h2>
-            <p className="section-copy">Every channel analysed so far, most recently seen first.</p>
+            <p className="section-copy">Most recently scanned first.</p>
           </div>
           <button className="secondary-button" onClick={poolRequest.refresh} type="button">
             Refresh
@@ -545,13 +543,14 @@ function PoolPage() {
 /* ============================================================== */
 
 // The custom router stores the full path (incl. any ?query) as the pathname, so
-// query strings break route matching. We pass a "focus" channel between pages
+// query strings break route matching. We hand a set of channels between pages
 // through sessionStorage instead and navigate to the bare /connections path.
-const FOCUS_KEY = "ipintel.focusDomain";
+const FOCUS_KEY = "ipintel.focus";
 
-function rememberFocus(domain) {
+function rememberFocus(domains) {
+  const list = Array.isArray(domains) ? domains : [domains];
   try {
-    window.sessionStorage.setItem(FOCUS_KEY, domain);
+    window.sessionStorage.setItem(FOCUS_KEY, JSON.stringify(list.filter(Boolean)));
   } catch {
     // Best-effort; navigation still works without a pre-selected channel.
   }
@@ -559,13 +558,17 @@ function rememberFocus(domain) {
 
 function takeFocus() {
   try {
-    const value = window.sessionStorage.getItem(FOCUS_KEY);
-    if (value) {
+    const raw = window.sessionStorage.getItem(FOCUS_KEY);
+    if (raw) {
       window.sessionStorage.removeItem(FOCUS_KEY);
     }
-    return value || "";
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [String(parsed)];
   } catch {
-    return "";
+    return [];
   }
 }
 
@@ -573,11 +576,8 @@ function ConnectionsPage() {
   const [mode, setMode] = useState("domains");
   // Selection is owned here so the by-edge view can add a channel and hand off
   // to the by-domain view without a route change (same-path navigation is a
-  // no-op in this router). The cross-page "focus" arrives via sessionStorage.
-  const [selected, setSelected] = useState(() => {
-    const focus = takeFocus();
-    return focus ? [focus] : [];
-  });
+  // no-op in this router). The cross-page selection arrives via sessionStorage.
+  const [selected, setSelected] = useState(() => takeFocus());
 
   const pickDomain = useCallback((domain) => {
     setSelected((current) => (current.includes(domain) ? current : [...current, domain]));
@@ -594,31 +594,25 @@ function ConnectionsPage() {
         <span>Connections</span>
       </div>
 
-      <section className="hero-panel compact">
-        <div className="hero-copy">
-          <p className="eyebrow">Connections explorer</p>
-          <h1>See how channels connect — by domain or by evidence.</h1>
-          <p>
-            Pick a set of channels to see which of them link to each other and to the wider pool, or
-            filter by an edge type (shared TLS cert, SSH key, IP…) to find every channel that carries it.
-          </p>
-        </div>
-      </section>
+      <div className="page-heading">
+        <h1>Connections</h1>
+        <p>Compare a set of channels, or browse by the evidence that links them.</p>
+      </div>
 
-      <nav className="case-nav" aria-label="Connection modes">
+      <nav className="segmented" aria-label="Connection modes">
         <button
-          className={mode === "domains" ? "case-nav-link active" : "case-nav-link"}
+          className={mode === "domains" ? "segmented-item active" : "segmented-item"}
           onClick={() => setMode("domains")}
           type="button"
         >
-          By domain
+          Compare channels
         </button>
         <button
-          className={mode === "edges" ? "case-nav-link active" : "case-nav-link"}
+          className={mode === "edges" ? "segmented-item active" : "segmented-item"}
           onClick={() => setMode("edges")}
           type="button"
         >
-          By edge type
+          Browse by shared edge
         </button>
       </nav>
 
@@ -640,18 +634,22 @@ function ByDomainExplorer({ selected, setSelected }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(null);
+  const autoRanRef = useRef(false);
 
   const toggleDomain = useCallback((domain) => {
     setSelected((current) =>
       current.includes(domain) ? current.filter((d) => d !== domain) : [...current, domain],
     );
-  }, []);
+  }, [setSelected]);
 
-  const filtered = useMemo(() => {
+  // Type-to-add: only show matches while typing, capped — never a wall of domains.
+  const suggestions = useMemo(() => {
     const needle = filter.trim().toLowerCase();
-    const base = needle ? pool.filter((d) => d.toLowerCase().includes(needle)) : pool;
-    return base.slice(0, 200);
-  }, [pool, filter]);
+    if (!needle) {
+      return [];
+    }
+    return pool.filter((d) => d.toLowerCase().includes(needle) && !selected.includes(d)).slice(0, 10);
+  }, [pool, filter, selected]);
 
   const run = useCallback(async () => {
     if (selected.length < 1) {
@@ -669,96 +667,123 @@ function ByDomainExplorer({ selected, setSelected }) {
       setResult(payload);
       setExpanded(null);
     } catch (err) {
-      setError(err.message || "Failed to score connections.");
+      setError(err.message || "Couldn't load connections.");
     } finally {
       setBusy(false);
     }
   }, [selected]);
 
+  // Arriving with channels already chosen (from the Pool or a cluster) shows
+  // their connections straight away — no extra click.
+  useEffect(() => {
+    if (!autoRanRef.current && selected.length >= 1 && !result && !busy) {
+      autoRanRef.current = true;
+      run();
+    }
+  }, [selected, result, busy, run]);
+
   const pairs = useMemo(() => normalizeConnectionPairs(result), [result]);
   const toggleExpanded = useCallback((key) => {
     setExpanded((current) => (current === key ? null : key));
   }, []);
+  const scoredCount = (result?.domains || []).length;
 
   return (
     <>
-      <section className="panel section-stack">
-        <div className="panel-header">
-          <div>
-            <p className="eyebrow">Select channels</p>
-            <h2>Pick the channels to compare</h2>
+      <section className="panel selection-bar">
+        <div className="selection-row">
+          <div className="selection-chips">
+            {selected.length === 0 ? (
+              <span className="muted">Add channels to compare, or open one from the Pool.</span>
+            ) : (
+              selected.map((domain) => (
+                <button className="token" key={domain} onClick={() => toggleDomain(domain)} title="Remove" type="button">
+                  {domain}
+                  <span aria-hidden="true" className="token-x">×</span>
+                </button>
+              ))
+            )}
           </div>
           <button className="primary-button" disabled={busy || selected.length < 1} onClick={run} type="button">
-            {busy ? "Scoring…" : `Find connections (${selected.length})`}
+            {busy ? "Working…" : "Show connections"}
           </button>
         </div>
 
-        {selected.length > 0 ? (
-          <div className="chip-row">
-            {selected.map((domain) => (
-              <button className="chip evidence-chip" key={domain} onClick={() => toggleDomain(domain)} type="button">
-                {domain} ✕
-              </button>
-            ))}
-          </div>
-        ) : (
-          <p className="section-copy">No channels selected yet. Pick from the pool below (or arrive via a channel's “View connections”).</p>
-        )}
-
-        <label className="search-field">
-          <span>Add channels from the pool</span>
-          <input onChange={(event) => setFilter(event.target.value)} placeholder="Filter the pool" type="search" value={filter} />
-        </label>
-
-        {poolRequest.loading && !poolRequest.data ? <LoadingState message="Loading the pool…" /> : null}
-        {filtered.length > 0 ? (
-          <div className="chip-row">
-            {filtered.map((domain) => (
-              <button
-                className={`chip ${selected.includes(domain) ? "evidence-chip" : ""}`}
-                key={domain}
-                onClick={() => toggleDomain(domain)}
-                type="button"
-              >
-                {domain}
-              </button>
-            ))}
-          </div>
-        ) : null}
+        <div className="autocomplete">
+          <input
+            className="autocomplete-input"
+            onChange={(event) => setFilter(event.target.value)}
+            placeholder="Type a domain to add…"
+            type="search"
+            value={filter}
+          />
+          {suggestions.length > 0 ? (
+            <div className="autocomplete-menu">
+              {suggestions.map((domain) => (
+                <button
+                  className="autocomplete-option"
+                  key={domain}
+                  onClick={() => {
+                    toggleDomain(domain);
+                    setFilter("");
+                  }}
+                  type="button"
+                >
+                  {domain}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
         {error ? <ErrorState message={error} /> : null}
       </section>
 
-      {result ? (
-        <section className="panel section-stack">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Within the selection</p>
-              <h2>
-                {result.connected_pair_count ?? pairs.filter((p) => p.connected).length} connected pair
-                {(result.connected_pair_count ?? 0) === 1 ? "" : "s"} of {pairs.length}
-              </h2>
-              <p className="section-copy">Click a pair to see exactly which shared nodes link them.</p>
-            </div>
-          </div>
-          {pairs.length === 0 ? (
-            <EmptyState message="Select at least two channels to compare them with each other." />
-          ) : (
-            <div className="linkage-list">
-              {pairs.map((pair) => (
-                <ConnectionCard
-                  expanded={expanded === (pair.b ?? pair.target)}
-                  key={`${pair.a}|${pair.b}`}
-                  leftLabel={pair.a}
-                  link={pair}
-                  onToggle={toggleExpanded}
-                  rightLabel={pair.b}
-                />
-              ))}
-            </div>
-          )}
+      {busy && !result ? <LoadingState message="Scoring connections…" /> : null}
 
-          <PoolLinksPanel poolLinks={result.pool_links} />
-        </section>
+      {result ? (
+        <>
+          {scoredCount >= 2 ? (
+            <section className="panel section-stack">
+              <div className="panel-header">
+                <div>
+                  <h2>
+                    {result.connected_pair_count ?? pairs.filter((p) => p.connected).length} of {pairs.length}{" "}
+                    pair{pairs.length === 1 ? "" : "s"} connected
+                  </h2>
+                  <p className="section-copy">Within your selection. Click a pair to see the shared certificates, IPs and other evidence.</p>
+                </div>
+              </div>
+              {pairs.length === 0 ? (
+                <EmptyState message="These channels share no attributing evidence with each other." />
+              ) : (
+                <div className="linkage-list">
+                  {pairs.map((pair) => (
+                    <ConnectionCard
+                      expanded={expanded === (pair.b ?? pair.target)}
+                      key={`${pair.a}|${pair.b}`}
+                      leftLabel={pair.a}
+                      link={pair}
+                      onToggle={toggleExpanded}
+                      rightLabel={pair.b}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          ) : null}
+
+          {result.pool_links ? (
+            <section className="panel section-stack">
+              <div className="panel-header">
+                <div>
+                  <h2>Connections to the rest of the pool</h2>
+                  <p className="section-copy">The strongest links each selected channel has across everything you've scanned.</p>
+                </div>
+              </div>
+              <PoolLinksPanel poolLinks={result.pool_links} />
+            </section>
+          ) : null}
+        </>
       ) : null}
     </>
   );
@@ -773,7 +798,6 @@ function PoolLinksPanel({ poolLinks }) {
   }
   return (
     <div className="section-stack">
-      <h3>Each channel’s strongest connections to the rest of the pool</h3>
       {entries.map(([domain, rawLinks]) => {
         const links = normalizeGraphLinks({ links: rawLinks });
         return (
@@ -818,11 +842,10 @@ function ByEdgeExplorer({ onPickDomain }) {
     <section className="panel section-stack">
       <div className="panel-header">
         <div>
-          <p className="eyebrow">Browse by edge type</p>
-          <h2>Find channels that share an edge</h2>
+          <h2>Channels that share an edge</h2>
           <p className="section-copy">
-            Filter by the kind of evidence — a shared TLS certificate, SSH key, IP, nameserver, tracking ID —
-            to see every set of channels connected by it.
+            Pick a kind of evidence — TLS certificate, SSH key, IP, nameserver, tracking ID — to see the
+            groups of channels connected by it.
           </p>
         </div>
         <button className="secondary-button" onClick={groupsRequest.refresh} type="button">
@@ -859,26 +882,35 @@ function ByEdgeExplorer({ onPickDomain }) {
             <article className="cluster-card" key={group.id}>
               <div className="cluster-card-top">
                 <div>
-                  <p className="eyebrow">{sharedNodeLabel(group.kind)}</p>
+                  <span className="muted">{sharedNodeLabel(group.kind)}</span>
                   <h4 title={group.value}>{group.value}</h4>
                 </div>
                 <strong title="Channels sharing this edge">{group.degree ?? group.domains.length}</strong>
               </div>
               <div className="chip-row">
-                {group.domains.slice(0, 10).map((domain) => (
+                {group.domains.slice(0, 12).map((domain) => (
                   <button
                     className="chip"
                     key={`${group.id}-${domain}`}
                     onClick={() => onPickDomain(domain)}
-                    title="Add to the by-domain selection"
+                    title="Add to the comparison"
                     type="button"
                   >
                     {domain}
                   </button>
                 ))}
-                {group.domains.length > 10 ? (
-                  <span className="chip digest-more-chip">+{group.domains.length - 10} more</span>
+                {group.domains.length > 12 ? (
+                  <span className="chip digest-more-chip">+{group.domains.length - 12} more</span>
                 ) : null}
+              </div>
+              <div className="action-row">
+                <Link
+                  className="text-link"
+                  onClick={() => rememberFocus(group.domains)}
+                  to="/connections"
+                >
+                  Compare all {group.domains.length} →
+                </Link>
               </div>
             </article>
           ))}
@@ -925,14 +957,11 @@ function ClustersPage() {
         <span>Clusters</span>
       </div>
 
-      <section className="panel section-stack">
-        <div className="panel-header">
+      <div className="page-heading">
+        <div className="page-heading-row">
           <div>
-            <p className="eyebrow">Communities</p>
-            <h2>Clusters lake-wide</h2>
-            <p className="section-copy">
-              Connected components over the whole attributing graph, rolled up to registrable domains.
-            </p>
+            <h1>Clusters</h1>
+            <p>Groups of channels that connect to each other through shared infrastructure.</p>
           </div>
           <div className="action-row">
             <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
@@ -943,40 +972,49 @@ function ClustersPage() {
             </button>
           </div>
         </div>
-
         {recomputeMsg ? <div className="callout"><p>{recomputeMsg}</p></div> : null}
-        {clustersRequest.loading && !clustersRequest.data ? <LoadingState message="Loading clusters…" /> : null}
-        {clustersRequest.error ? <ErrorState message={clustersRequest.error} /> : null}
-        {!clustersRequest.loading && clusters.length === 0 ? (
-          <EmptyState message="No clusters yet. Ingest channels, then recompute the graph." />
-        ) : null}
+      </div>
 
-        {clusters.length > 0 ? (
-          <div className="cluster-grid">
-            {clusters.map((cluster) => (
-              <article className="cluster-card" key={cluster.id}>
-                <div className="cluster-card-top">
-                  <div>
-                    <p className="eyebrow">Cluster</p>
-                    <h4>{cluster.id}</h4>
-                  </div>
-                  <strong title="Channels in this cluster">{cluster.size}</strong>
+      {clustersRequest.loading && !clustersRequest.data ? <LoadingState message="Loading clusters…" /> : null}
+      {clustersRequest.error ? <ErrorState message={clustersRequest.error} /> : null}
+      {!clustersRequest.loading && clusters.length === 0 ? (
+        <EmptyState message="No clusters yet. Ingest channels, then recompute the graph." />
+      ) : null}
+
+      {clusters.length > 0 ? (
+        <div className="cluster-grid">
+          {clusters.map((cluster) => (
+            <article className="cluster-card" key={cluster.id}>
+              <div className="cluster-card-top">
+                <div>
+                  <span className="muted">Cluster</span>
+                  <h4>{cluster.id}</h4>
                 </div>
-                <div className="chip-row">
-                  {cluster.members.slice(0, 10).map((member) => (
-                    <Link className="chip" key={`${cluster.id}-${member}`} onClick={() => rememberFocus(member)} to="/connections">
-                      {member}
-                    </Link>
-                  ))}
-                  {cluster.members.length > 10 ? (
-                    <span className="chip digest-more-chip">+{cluster.members.length - 10} more</span>
-                  ) : null}
-                </div>
-              </article>
-            ))}
-          </div>
-        ) : null}
-      </section>
+                <strong title="Channels in this cluster">{cluster.size}</strong>
+              </div>
+              <div className="chip-row">
+                {cluster.members.slice(0, 12).map((member) => (
+                  <span className="chip" key={`${cluster.id}-${member}`}>
+                    {member}
+                  </span>
+                ))}
+                {cluster.members.length > 12 ? (
+                  <span className="chip digest-more-chip">+{cluster.members.length - 12} more</span>
+                ) : null}
+              </div>
+              <div className="action-row">
+                <Link
+                  className="primary-button"
+                  onClick={() => rememberFocus(cluster.members)}
+                  to="/connections"
+                >
+                  Show connections
+                </Link>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : null}
     </AppShell>
   );
 }

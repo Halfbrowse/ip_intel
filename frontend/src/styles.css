@@ -1414,3 +1414,166 @@ button {
     animation: none;
   }
 }
+
+/* ── Pool / connections UI (pool-model refresh) ─────────────────────────── */
+
+.muted {
+  color: var(--muted);
+}
+
+.page-heading {
+  margin-bottom: 22px;
+}
+
+.page-heading h1 {
+  margin: 0;
+  font-family: "Space Grotesk", sans-serif;
+  letter-spacing: -0.03em;
+  font-size: clamp(1.8rem, 3vw, 2.4rem);
+}
+
+.page-heading p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  max-width: 60ch;
+}
+
+.page-heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+/* Segmented control (mode switch) */
+.segmented {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 22px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+}
+
+.segmented-item {
+  border: 0;
+  border-radius: 999px;
+  padding: 9px 18px;
+  font-weight: 700;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease;
+}
+
+.segmented-item.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: #fff;
+}
+
+/* Selection bar + token chips */
+.selection-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 18px;
+  position: sticky;
+  top: 12px;
+  z-index: 5;
+}
+
+.selection-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.selection-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1 1 280px;
+  min-height: 38px;
+  align-items: center;
+}
+
+.token {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.86rem;
+  color: var(--text);
+  background: var(--bg-accent-soft, var(--surface-muted));
+  border: 1px solid var(--accent);
+  cursor: pointer;
+}
+
+.token-x {
+  color: var(--muted);
+  font-size: 1.1em;
+  line-height: 1;
+}
+
+.token:hover .token-x {
+  color: var(--danger);
+}
+
+/* Type-to-add autocomplete */
+.autocomplete {
+  position: relative;
+}
+
+.autocomplete-input {
+  width: 100%;
+  padding: 13px 16px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font: inherit;
+}
+
+.autocomplete-input:focus {
+  outline: 2px solid var(--input-focus-ring);
+  outline-offset: 2px;
+}
+
+.autocomplete-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 20;
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--surface, var(--panel));
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.autocomplete-option {
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.autocomplete-option:hover {
+  background: var(--surface-muted);
+}
