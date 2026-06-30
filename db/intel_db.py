@@ -3473,6 +3473,128 @@ def list_pool_domains(*, search: str | None = None, limit: int = 1000) -> list[d
     return [dict(row) for row in rows]
 
 
+def _curate_intel(result: dict[str, Any]) -> dict[str, Any]:
+    """A safe, compact view of the raw gathered intel for one search result.
+
+    Tolerates the shape drift in historical payloads (fields that are lists where
+    a dict is expected) so it never throws on legacy data.
+    """
+    def as_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    return item
+        return {}
+
+    page = as_dict(result.get("page_metadata"))
+    tracking: dict[str, Any] = {}
+    for key in ("google_analytics", "ga_ids", "gtm_ids", "facebook_pixel", "tiktok_pixel",
+                "yandex_metrika", "adsense_publisher_ids", "fb_app_id"):
+        value = page.get(key)
+        if value:
+            tracking[key] = value
+
+    certs: list[dict[str, Any]] = []
+    raw_certs = list(result.get("non_cf_tls_certs") or [])
+    if isinstance(result.get("tls_cert"), dict):
+        raw_certs.append(result["tls_cert"])
+    for cert in raw_certs:
+        if isinstance(cert, dict):
+            certs.append({
+                "ip": cert.get("ip"),
+                "cn": cert.get("cn"),
+                "sans": cert.get("sans") or [],
+                "sha256": cert.get("sha256"),
+                "issuer": cert.get("issuer_cn") or cert.get("issuer") or cert.get("issuer_org"),
+                "not_before": cert.get("not_before"),
+                "not_after": cert.get("not_after"),
+            })
+
+    return {
+        "search_id": result.get("search_id"),
+        "timestamp": result.get("timestamp"),
+        "dns": as_dict(result.get("dns")),
+        "whois": as_dict(result.get("whois")),
+        "subdomains": _normalize_text_list(result.get("subdomains") or []),
+        "tls_certs": certs,
+        "tracking": tracking,
+        "favicon": page.get("favicon_mmh3") or page.get("favicon_md5"),
+        "email_security": as_dict(result.get("email_security")),
+        "resolved_ips": list(normalize_ip_details(result.get("ip_details")).keys()),
+    }
+
+
+def domain_profile(value: str) -> dict[str, Any] | None:
+    """Everything known about one channel: its hosts, the selectors we extracted,
+    the IPs it resolves to, and a compact view of the raw gathered intel —
+    independent of whether it has any connections."""
+    init_db()
+    side = _resolve_side(value)
+    if not side:
+        return None
+    mode, key, _ = side
+    with _conn() as c:
+        if mode == "rd":
+            host_filter = ("e.registrable_domain = %s", (key,))
+            hosts = [dict(r) for r in c.execute(
+                "SELECT value, kind, first_seen, last_seen FROM entities "
+                "WHERE registrable_domain = %s ORDER BY (kind='domain') DESC, value",
+                (key,),
+            ).fetchall()]
+            ips = [dict(r) for r in c.execute(
+                """SELECT ip.value AS ip,
+                          (SELECT count(DISTINCT e2.registrable_domain)
+                             FROM entity_edges x JOIN entities e2 ON e2.id = x.src_entity_id
+                             WHERE x.dst_entity_id = ip.id AND x.kind = 'resolves_to') AS degree
+                   FROM entity_edges ee
+                   JOIN entities ip ON ip.id = ee.dst_entity_id AND ip.kind = 'ip'
+                   JOIN entities src ON src.id = ee.src_entity_id
+                   WHERE ee.kind = 'resolves_to' AND src.registrable_domain = %s
+                   GROUP BY ip.id, ip.value ORDER BY ip.value""",
+                (key,),
+            ).fetchall()]
+        else:
+            host_filter = ("e.kind = 'ip' AND e.value = %s", (key,))
+            hosts = [dict(r) for r in c.execute(
+                "SELECT value, kind, first_seen, last_seen FROM entities WHERE kind = 'ip' AND value = %s",
+                (key,),
+            ).fetchall()]
+            ips = []
+
+        selectors = [dict(r) for r in c.execute(
+            f"""SELECT s.kind, s.value, s.entity_count AS degree, s.attributing
+                FROM selectors s
+                JOIN observations o ON o.selector_id = s.id
+                JOIN entities e ON e.id = o.entity_id
+                WHERE {host_filter[0]}
+                GROUP BY s.id, s.kind, s.value, s.entity_count, s.attributing
+                ORDER BY s.attributing DESC, s.kind, s.entity_count""",
+            host_filter[1],
+        ).fetchall()]
+
+    intel = None
+    sid = get_latest_search_id_for_target(key)
+    if sid is not None:
+        result = get_result(sid)
+        if result:
+            intel = _curate_intel(result)
+
+    if not hosts and intel is None:
+        return None
+    return {
+        "target": value,
+        "domain": key,
+        "kind": mode,
+        "hosts": hosts,
+        "host_count": len(hosts),
+        "ips": ips,
+        "selectors": selectors,
+        "intel": intel,
+    }
+
+
 def selector_kind_counts(*, min_domains: int = 2) -> list[dict[str, Any]]:
     """Edge types available for browsing: each selector kind (+ shared_ip) with
     the number of cross-domain groups it forms."""

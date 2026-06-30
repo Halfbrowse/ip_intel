@@ -73,6 +73,28 @@ def test_pool_endpoint(monkeypatch) -> None:
     assert body["domains"][0]["domain"] == "a.com"
 
 
+def test_domain_endpoint(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        case_app.intel_db,
+        "domain_profile",
+        lambda value: {"domain": value, "hosts": [{"value": value, "kind": "domain"}],
+                       "ips": [], "selectors": [], "intel": {"dns": {"A": ["1.2.3.4"]}}},
+    )
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/domain/lonely.com")
+    assert response.status_code == 200
+    assert response.json()["intel"]["dns"]["A"] == ["1.2.3.4"]
+
+
+def test_domain_endpoint_404(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(case_app.intel_db, "domain_profile", lambda value: None)
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/domain/nope.example")
+    assert response.status_code == 404
+
+
 def test_connections_among_endpoint(monkeypatch) -> None:
     _quiet(monkeypatch)
     captured: dict = {}

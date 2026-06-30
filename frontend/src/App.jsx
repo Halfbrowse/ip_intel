@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, NavLink, Route, Routes } from "./router.jsx";
+import { Link, NavLink, Route, Routes, useParams } from "./router.jsx";
 
 import {
   fetchJson,
@@ -33,6 +33,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<PoolPage />} />
+      <Route path="/domain/:value" element={<DomainPage />} />
       <Route path="/connections" element={<ConnectionsPage />} />
       <Route path="/clusters" element={<ClustersPage />} />
       <Route path="*" element={<NotFoundPage />} />
@@ -515,8 +516,12 @@ function PoolPage() {
               <article className="case-card" key={entry.domain}>
                 <div className="case-card-header">
                   <div>
-                    <p className="eyebrow">Channel</p>
-                    <h3>{entry.domain}</h3>
+                    <span className="muted">Channel</span>
+                    <h3>
+                      <Link className="card-title-link" to={`/domain/${encodeURIComponent(entry.domain)}`}>
+                        {entry.domain}
+                      </Link>
+                    </h3>
                   </div>
                   {entry.clusterId ? <span className="chip">cluster · {entry.clusterSize}</span> : null}
                 </div>
@@ -525,8 +530,11 @@ function PoolPage() {
                   <InlineMetric label="Last seen" value={entry.lastSeen ? formatDate(entry.lastSeen) : "—"} />
                 </div>
                 <div className="action-row">
-                  <Link className="primary-button" onClick={() => rememberFocus(entry.domain)} to="/connections">
-                    View connections
+                  <Link className="primary-button" to={`/domain/${encodeURIComponent(entry.domain)}`}>
+                    Open
+                  </Link>
+                  <Link className="text-link" onClick={() => rememberFocus(entry.domain)} to="/connections">
+                    Connections
                   </Link>
                 </div>
               </article>
@@ -1014,6 +1022,240 @@ function ClustersPage() {
             </article>
           ))}
         </div>
+      ) : null}
+    </AppShell>
+  );
+}
+
+/* ============================================================== */
+/* Domain detail page                                             */
+/* ============================================================== */
+
+function asText(value) {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+  if (Array.isArray(value)) {
+    return value.map(asText).join(", ");
+  }
+  if (typeof value === "object") {
+    return value.value || value.exchange || value.name || JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function DefRow({ label, children }) {
+  return (
+    <div className="def-row">
+      <span className="def-label">{label}</span>
+      <span className="def-value">{children}</span>
+    </div>
+  );
+}
+
+function DomainPage() {
+  const { value } = useParams();
+  const profileRequest = useApi(`/api/domain/${encodeURIComponent(value)}`);
+  const linksRequest = useApi(`/api/graph/links/${encodeURIComponent(value)}`);
+  const profile = profileRequest.data;
+  const links = useMemo(() => normalizeGraphLinks(linksRequest.data), [linksRequest.data]);
+  const [expanded, setExpanded] = useState(null);
+  const toggle = useCallback((key) => setExpanded((c) => (c === key ? null : key)), []);
+
+  const selectorsByKind = useMemo(() => {
+    const map = new Map();
+    for (const sel of profile?.selectors || []) {
+      if (!map.has(sel.kind)) {
+        map.set(sel.kind, []);
+      }
+      map.get(sel.kind).push(sel);
+    }
+    return [...map.entries()];
+  }, [profile]);
+
+  const intel = profile?.intel || null;
+  const dnsEntries = Object.entries(intel?.dns || {}).filter(([, v]) => v && (!Array.isArray(v) || v.length));
+  const whoisEntries = Object.entries(intel?.whois || {}).filter(([k, v]) => v && k !== "error" && k !== "raw");
+  const trackingEntries = Object.entries(intel?.tracking || {});
+
+  return (
+    <AppShell>
+      <div className="breadcrumb-row">
+        <Link className="text-link" to="/">
+          Pool
+        </Link>
+        <span>/</span>
+        <span>{value}</span>
+      </div>
+
+      <div className="page-heading">
+        <div className="page-heading-row">
+          <div>
+            <h1>{value}</h1>
+            <p>
+              {profile
+                ? `${profile.host_count || 0} host${profile.host_count === 1 ? "" : "s"} · ${(profile.ips || []).length} IP${(profile.ips || []).length === 1 ? "" : "s"} · ${links.length} connection${links.length === 1 ? "" : "s"}`
+                : "Everything gathered on this channel."}
+            </p>
+          </div>
+          <Link className="primary-button" onClick={() => rememberFocus(value)} to="/connections">
+            Compare with others
+          </Link>
+        </div>
+      </div>
+
+      {profileRequest.loading && !profile ? <LoadingState message="Loading channel…" /> : null}
+      {profileRequest.error ? <ErrorState message={profileRequest.error} /> : null}
+
+      {profile ? (
+        <>
+          {/* Connections (may be empty — the page still shows everything below) */}
+          <section className="panel section-stack">
+            <div className="panel-header">
+              <div>
+                <h2>Connections</h2>
+                <p className="section-copy">
+                  {links.length === 0 ? "No connections to other channels yet." : "Other channels this one is linked to."}
+                </p>
+              </div>
+            </div>
+            {links.length === 0 ? (
+              <EmptyState message="Nothing in the pool shares attributing evidence with this channel." />
+            ) : (
+              <div className="linkage-list">
+                {links.slice(0, 25).map((link) => (
+                  <ConnectionCard
+                    expanded={expanded === link.target}
+                    key={link.target}
+                    leftLabel={value}
+                    link={link}
+                    onToggle={() => toggle(link.target)}
+                    rightLabel={link.target}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* What we extracted (the observables) */}
+          <section className="panel section-stack">
+            <div className="panel-header">
+              <div>
+                <h2>What we found</h2>
+                <p className="section-copy">The observables extracted from this channel. A degree above 1 means it's shared.</p>
+              </div>
+            </div>
+            {selectorsByKind.length === 0 ? (
+              <EmptyState message="No selectors extracted yet." />
+            ) : (
+              selectorsByKind.map(([kind, items]) => (
+                <div className="section-stack tight" key={kind}>
+                  <div className="group-heading">
+                    <h4>{sharedNodeLabel(kind)}</h4>
+                    <span>{items.length}</span>
+                  </div>
+                  <div className="chip-row">
+                    {items.slice(0, 30).map((sel) => (
+                      <span className={`chip ${sel.degree > 1 ? "evidence-chip" : ""}`} key={sel.value} title={`shared by ${sel.degree}`}>
+                        {sel.value}
+                        {sel.degree > 1 ? ` · ${sel.degree}` : ""}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))
+            )}
+          </section>
+
+          {/* Raw gathered intel */}
+          <section className="panel section-stack">
+            <div className="panel-header">
+              <div>
+                <h2>Gathered intel</h2>
+                <p className="section-copy">
+                  {intel?.timestamp ? `From the latest scan (${formatDate(intel.timestamp)}).` : "From the latest scan."}
+                </p>
+              </div>
+            </div>
+
+            {(profile.ips || []).length > 0 ? (
+              <DefRow label="IPs">
+                <span className="chip-row">
+                  {profile.ips.map((entry) => (
+                    <span className="chip" key={entry.ip} title={`${entry.degree} domain(s) on this IP`}>
+                      {entry.ip}
+                      {entry.degree > 1 ? ` · ${entry.degree}` : ""}
+                    </span>
+                  ))}
+                </span>
+              </DefRow>
+            ) : null}
+
+            {dnsEntries.length > 0 ? (
+              <div className="section-stack tight">
+                <h4>DNS</h4>
+                {dnsEntries.map(([rtype, values]) => (
+                  <DefRow key={rtype} label={rtype}>
+                    {asText(values)}
+                  </DefRow>
+                ))}
+              </div>
+            ) : null}
+
+            {whoisEntries.length > 0 ? (
+              <div className="section-stack tight">
+                <h4>WHOIS</h4>
+                {whoisEntries.map(([k, v]) => (
+                  <DefRow key={k} label={formatLabel(k)}>
+                    {asText(v)}
+                  </DefRow>
+                ))}
+              </div>
+            ) : null}
+
+            {(intel?.tls_certs || []).length > 0 ? (
+              <div className="section-stack tight">
+                <h4>TLS certificates</h4>
+                {intel.tls_certs.map((cert, index) => (
+                  <DefRow key={`${cert.sha256}-${index}`} label={cert.cn || cert.ip || `cert ${index + 1}`}>
+                    {[cert.issuer, cert.sha256 ? `sha256 ${String(cert.sha256).slice(0, 16)}…` : null, (cert.sans || []).join(", ")]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </DefRow>
+                ))}
+              </div>
+            ) : null}
+
+            {trackingEntries.length > 0 ? (
+              <div className="section-stack tight">
+                <h4>Tracking & analytics</h4>
+                {trackingEntries.map(([k, v]) => (
+                  <DefRow key={k} label={formatLabel(k)}>
+                    {asText(v)}
+                  </DefRow>
+                ))}
+              </div>
+            ) : null}
+
+            {(intel?.subdomains || []).length > 0 ? (
+              <div className="section-stack tight">
+                <h4>Subdomains ({intel.subdomains.length})</h4>
+                <div className="chip-row">
+                  {intel.subdomains.slice(0, 40).map((sub) => (
+                    <span className="chip" key={sub}>
+                      {sub}
+                    </span>
+                  ))}
+                  {intel.subdomains.length > 40 ? (
+                    <span className="chip digest-more-chip">+{intel.subdomains.length - 40} more</span>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {!intel ? <EmptyState message="No raw scan stored for this channel yet." /> : null}
+          </section>
+        </>
       ) : null}
     </AppShell>
   );

@@ -1577,3 +1577,40 @@ button {
 .autocomplete-option:hover {
   background: var(--surface-muted);
 }
+
+/* ── Domain detail page ─────────────────────────────────────────────────── */
+
+.card-title-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.card-title-link:hover {
+  color: var(--link);
+}
+
+.def-row {
+  display: flex;
+  gap: 14px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-soft);
+  align-items: baseline;
+}
+
+.def-row:last-child {
+  border-bottom: 0;
+}
+
+.def-label {
+  flex: 0 0 160px;
+  font-weight: 700;
+  color: var(--muted);
+  font-size: 0.9rem;
+  word-break: break-word;
+}
+
+.def-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}

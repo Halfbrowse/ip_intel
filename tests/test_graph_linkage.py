@@ -223,6 +223,37 @@ class GraphLinkageDbTests(unittest.TestCase):
             [g for g in intel_db.domains_by_selector(kind="favicon_mmh3")], []
         )
 
+    def test_domain_profile_shows_intel_without_connections(self) -> None:
+        # A lone channel with no shared evidence still has a full profile.
+        intel_db.save_search({
+            "input": "lonely.com", "type": "domain", "timestamp": "2026-03-01T00:00:00+00:00",
+            "ip_details": {"203.0.113.7": {"sources": ["dns"], "asn_info": {"asn": "AS64600"}}},
+            "dns": {"A": ["203.0.113.7"], "NS": ["ns1.registrar.example"]},
+            "whois": {"registrar": "Reg Inc", "org": "Lonely Org"},
+            "subdomains": ["api.lonely.com"],
+            "non_cf_tls_certs": [{"ip": "203.0.113.7", "cn": "lonely.com", "sans": ["lonely.com"], "sha256": "uniquecert"}],
+            "page_metadata": {"google_analytics": ["UA-LONE"], "favicon_mmh3": "12345"},
+        })
+
+        profile = intel_db.domain_profile("lonely.com")
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["domain"], "lonely.com")
+        self.assertIn("lonely.com", {h["value"] for h in profile["hosts"]})
+        self.assertIn("203.0.113.7", {ip["ip"] for ip in profile["ips"]})
+        kinds = {s["kind"] for s in profile["selectors"]}
+        self.assertIn("tls_cert_sha256", kinds)
+        self.assertIn("tracking_id", kinds)
+        # Raw gathered intel is present even though the domain links to nothing.
+        self.assertEqual(profile["intel"]["whois"]["registrar"], "Reg Inc")
+        self.assertEqual(profile["intel"]["dns"]["A"], ["203.0.113.7"])
+        self.assertIn("api.lonely.com", profile["intel"]["subdomains"])
+        self.assertEqual(profile["intel"]["tls_certs"][0]["sha256"], "uniquecert")
+        # And it has no connections.
+        self.assertEqual(check.links_for("lonely.com"), [])
+
+    def test_domain_profile_unknown_returns_none(self) -> None:
+        self.assertIsNone(intel_db.domain_profile("never-seen.example"))
+
     def test_connections_among_selected_set(self) -> None:
         intel_db.save_search(self._apex_cert_scan("a.com", "203.0.113.1", "rarecert", "2026-03-01T00:00:00+00:00"))
         intel_db.save_search(self._apex_cert_scan("b.com", "203.0.113.2", "rarecert", "2026-03-02T00:00:00+00:00"))

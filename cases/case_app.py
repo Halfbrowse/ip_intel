@@ -206,6 +206,17 @@ def api_pool(request: Request, search: str | None = None, limit: int = 1000) -> 
     return _etag_json_response(request, {"total": len(domains), "domains": domains})
 
 
+@app.get("/api/domain/{value:path}")
+def api_domain(value: str, request: Request) -> Response:
+    """Everything gathered on one channel — hosts, extracted selectors, resolved
+    IPs, and the raw intel (DNS/WHOIS/TLS/subdomains/trackers) — whether or not
+    it has any connections."""
+    profile = intel_db.domain_profile(value)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Nothing in the pool for this channel yet.")
+    return _etag_json_response(request, profile)
+
+
 # ── Global correlation graph (case-free) ─────────────────────────────────────
 
 @app.post("/api/graph/connections")
