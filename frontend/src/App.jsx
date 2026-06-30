@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { Link, NavLink, Navigate, Route, Routes } from "./router.jsx";
+import { Link, NavLink, Route, Routes } from "./router.jsx";
 
 import {
   fetchJson,
@@ -35,7 +35,6 @@ export default function App() {
       <Route path="/" element={<PoolPage />} />
       <Route path="/connections" element={<ConnectionsPage />} />
       <Route path="/clusters" element={<ClustersPage />} />
-      <Route path="/cases/*" element={<Navigate replace to="/" />} />
       <Route path="*" element={<NotFoundPage />} />
     </Routes>
   );
@@ -528,7 +527,7 @@ function PoolPage() {
                   <InlineMetric label="Last seen" value={entry.lastSeen ? formatDate(entry.lastSeen) : "—"} />
                 </div>
                 <div className="action-row">
-                  <Link className="primary-button" to={`/connections?focus=${encodeURIComponent(entry.domain)}`}>
+                  <Link className="primary-button" onClick={() => rememberFocus(entry.domain)} to="/connections">
                     View connections
                   </Link>
                 </div>
@@ -545,9 +544,26 @@ function PoolPage() {
 /* Connections page                                               */
 /* ============================================================== */
 
-function readFocusParam() {
+// The custom router stores the full path (incl. any ?query) as the pathname, so
+// query strings break route matching. We pass a "focus" channel between pages
+// through sessionStorage instead and navigate to the bare /connections path.
+const FOCUS_KEY = "ipintel.focusDomain";
+
+function rememberFocus(domain) {
   try {
-    return new URLSearchParams(window.location.search).get("focus") || "";
+    window.sessionStorage.setItem(FOCUS_KEY, domain);
+  } catch {
+    // Best-effort; navigation still works without a pre-selected channel.
+  }
+}
+
+function takeFocus() {
+  try {
+    const value = window.sessionStorage.getItem(FOCUS_KEY);
+    if (value) {
+      window.sessionStorage.removeItem(FOCUS_KEY);
+    }
+    return value || "";
   } catch {
     return "";
   }
@@ -555,6 +571,19 @@ function readFocusParam() {
 
 function ConnectionsPage() {
   const [mode, setMode] = useState("domains");
+  // Selection is owned here so the by-edge view can add a channel and hand off
+  // to the by-domain view without a route change (same-path navigation is a
+  // no-op in this router). The cross-page "focus" arrives via sessionStorage.
+  const [selected, setSelected] = useState(() => {
+    const focus = takeFocus();
+    return focus ? [focus] : [];
+  });
+
+  const pickDomain = useCallback((domain) => {
+    setSelected((current) => (current.includes(domain) ? current : [...current, domain]));
+    setMode("domains");
+  }, []);
+
   return (
     <AppShell>
       <div className="breadcrumb-row">
@@ -593,19 +622,19 @@ function ConnectionsPage() {
         </button>
       </nav>
 
-      {mode === "domains" ? <ByDomainExplorer /> : <ByEdgeExplorer />}
+      {mode === "domains" ? (
+        <ByDomainExplorer selected={selected} setSelected={setSelected} />
+      ) : (
+        <ByEdgeExplorer onPickDomain={pickDomain} />
+      )}
     </AppShell>
   );
 }
 
-function ByDomainExplorer() {
+function ByDomainExplorer({ selected, setSelected }) {
   const poolRequest = useApi("/api/pool");
   const pool = useMemo(() => normalizePool(poolRequest.data).map((entry) => entry.domain), [poolRequest.data]);
 
-  const [selected, setSelected] = useState(() => {
-    const focus = readFocusParam();
-    return focus ? [focus] : [];
-  });
   const [filter, setFilter] = useState("");
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -776,7 +805,7 @@ function PoolLinksPanel({ poolLinks }) {
   );
 }
 
-function ByEdgeExplorer() {
+function ByEdgeExplorer({ onPickDomain }) {
   const kindsRequest = useApi("/api/graph/selector-kinds");
   const kinds = useMemo(() => normalizeSelectorKinds(kindsRequest.data), [kindsRequest.data]);
   const [kind, setKind] = useState("");
@@ -837,9 +866,15 @@ function ByEdgeExplorer() {
               </div>
               <div className="chip-row">
                 {group.domains.slice(0, 10).map((domain) => (
-                  <Link className="chip" key={`${group.id}-${domain}`} to={`/connections?focus=${encodeURIComponent(domain)}`}>
+                  <button
+                    className="chip"
+                    key={`${group.id}-${domain}`}
+                    onClick={() => onPickDomain(domain)}
+                    title="Add to the by-domain selection"
+                    type="button"
+                  >
                     {domain}
-                  </Link>
+                  </button>
                 ))}
                 {group.domains.length > 10 ? (
                   <span className="chip digest-more-chip">+{group.domains.length - 10} more</span>
@@ -929,7 +964,7 @@ function ClustersPage() {
                 </div>
                 <div className="chip-row">
                   {cluster.members.slice(0, 10).map((member) => (
-                    <Link className="chip" key={`${cluster.id}-${member}`} to={`/connections?focus=${encodeURIComponent(member)}`}>
+                    <Link className="chip" key={`${cluster.id}-${member}`} onClick={() => rememberFocus(member)} to="/connections">
                       {member}
                     </Link>
                   ))}
