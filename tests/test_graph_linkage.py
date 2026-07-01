@@ -166,12 +166,24 @@ class GraphLinkageDbTests(unittest.TestCase):
             intel_db.graph_cluster_for("a.com")["cluster_id"],
             intel_db.graph_cluster_for("b.com")["cluster_id"],
         )
+        # The cluster carries *what* connects it: the shared cert both members exhibit.
+        self.assertEqual(a_cluster["link_count"], len(a_cluster["links"]))
+        cert = next(l for l in a_cluster["links"] if l["kind"] == "tls_cert_sha256")
+        self.assertEqual(cert["node_type"], "selector")
+        self.assertEqual(cert["value"], "rarecert")
+        self.assertEqual(cert["member_count"], 2)
         # An unrelated domain sharing nothing is in no cluster.
         self.assertIsNone(intel_db.graph_cluster_for("c.com"))
 
         clusters = intel_db.list_graph_clusters()
         self.assertEqual(len(clusters), 1)
         self.assertEqual(clusters[0]["component_size"], 2)
+        # The list view previews the connectors too.
+        self.assertIn(("tls_cert_sha256", "rarecert"), [(l["kind"], l["value"]) for l in clusters[0]["links"]])
+        self.assertEqual(clusters[0]["link_count"], len(clusters[0]["links"]))
+        # Connectors are ordered strongest (most members) first.
+        counts = [l["member_count"] for l in clusters[0]["links"]]
+        self.assertEqual(counts, sorted(counts, reverse=True))
 
     def test_global_clustering_excludes_noise(self) -> None:
         for i in range(3):

@@ -399,6 +399,20 @@ CREATE TABLE IF NOT EXISTS graph_clusters (
 );
 CREATE INDEX IF NOT EXISTS idx_graph_clusters_cid ON graph_clusters(cluster_id);
 
+-- The shared nodes that actually tie each cluster together: for every attributing
+-- selector / non-noise shared IP that unioned two or more of a cluster's members,
+-- one row saying what it is and how many members it connects. This is the "why"
+-- behind a cluster — rebuilt alongside graph_clusters.
+CREATE TABLE IF NOT EXISTS graph_cluster_links (
+    cluster_id    TEXT    NOT NULL,   -- matches graph_clusters.cluster_id
+    node_type     TEXT    NOT NULL,   -- 'selector' | 'ip'
+    kind          TEXT    NOT NULL,   -- selector kind, or 'shared_ip'
+    value         TEXT    NOT NULL,
+    member_count  INTEGER NOT NULL,   -- cluster members that share this node
+    computed_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_graph_cluster_links_cid ON graph_cluster_links(cluster_id);
+
 """
 
 
@@ -662,7 +676,7 @@ _IDENTIFIER_HANDLE_TYPES = {
 # they are NOT append-only children of a single search — they are a global
 # projection rebuildable from the raw intel. Listed in _ALL_TABLES so schema
 # resets (tests) drop them too; ordered so dependents precede their referents.
-_CORRELATION_TABLES = ["graph_clusters", "entity_edges", "observations", "selectors", "entities"]
+_CORRELATION_TABLES = ["graph_cluster_links", "graph_clusters", "entity_edges", "observations", "selectors", "entities"]
 
 _ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", *_CORRELATION_TABLES]
 
@@ -3340,14 +3354,20 @@ def rebuild_clusters() -> dict[str, int]:
                 ra, rb = rb, ra
             parent[rb] = ra
 
-    def union_group(rds: list[str]) -> None:
+    # Every shared node that unioned ≥2 domains, kept so we can materialize *what*
+    # ties each cluster together once the components settle.
+    connectors: list[dict[str, Any]] = []
+
+    def union_group(rds: list[str], connector: dict[str, Any] | None = None) -> None:
         members = [rd for rd in rds if rd]
         for other in members[1:]:
             union(members[0], other)
+        if connector is not None and len(members) >= 2:
+            connectors.append({**connector, "members": members})
 
     with _conn() as c:
         for row in c.execute(
-            """SELECT array_agg(DISTINCT e.registrable_domain) AS rds
+            """SELECT sel.kind, sel.value, array_agg(DISTINCT e.registrable_domain) AS rds
                FROM selectors sel
                JOIN observations o ON o.selector_id = sel.id
                JOIN entities e ON e.id = o.entity_id
@@ -3356,10 +3376,10 @@ def rebuild_clusters() -> dict[str, int]:
                HAVING count(DISTINCT e.registrable_domain) BETWEEN 2 AND %s""",
             (fanout,),
         ).fetchall():
-            union_group(row["rds"])
+            union_group(row["rds"], {"node_type": "selector", "kind": row["kind"], "value": row["value"]})
 
         for row in c.execute(
-            """SELECT array_agg(DISTINCT e.registrable_domain) AS rds
+            """SELECT ip.value, array_agg(DISTINCT e.registrable_domain) AS rds
                FROM entities ip
                JOIN entity_edges ee ON ee.dst_entity_id = ip.id AND ee.kind = 'resolves_to'
                JOIN entities e ON e.id = ee.src_entity_id
@@ -3372,7 +3392,7 @@ def rebuild_clusters() -> dict[str, int]:
                HAVING count(DISTINCT e.registrable_domain) BETWEEN 2 AND %s""",
             (fanout,),
         ).fetchall():
-            union_group(row["rds"])
+            union_group(row["rds"], {"node_type": "ip", "kind": "shared_ip", "value": row["value"]})
 
         components: dict[str, list[str]] = defaultdict(list)
         for rd in list(parent):
@@ -3380,6 +3400,7 @@ def rebuild_clusters() -> dict[str, int]:
 
         now = datetime.now(timezone.utc).isoformat()
         c.execute("TRUNCATE graph_clusters")
+        c.execute("TRUNCATE graph_cluster_links")
         cluster_count = 0
         clustered = 0
         for members in components.values():
@@ -3400,11 +3421,53 @@ def rebuild_clusters() -> dict[str, int]:
                 )
                 clustered += 1
 
+        # Attribute each connector to its (single) cluster — all its members share a
+        # union-find root — and record how many members it ties together.
+        for connector in connectors:
+            members = connector["members"]
+            c.execute(
+                """INSERT INTO graph_cluster_links
+                       (cluster_id, node_type, kind, value, member_count, computed_at)
+                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                (find(members[0]), connector["node_type"], connector["kind"],
+                 connector["value"], len(members), now),
+            )
+
     return {"clusters": cluster_count, "clustered_domains": clustered}
 
 
+# Most connectors of interest per cluster in the list view; the detail lookup
+# returns all of them.
+_CLUSTER_LINKS_PREVIEW = 8
+
+
+def _cluster_links(c, cluster_ids: list[str], per_cluster: int | None) -> dict[str, list[dict[str, Any]]]:
+    """The shared nodes tying each of `cluster_ids` together, strongest first.
+
+    Strength here is how many members a node connects (member_count), so the node
+    holding the cluster together leads. `per_cluster` caps each cluster's list;
+    None returns all.
+    """
+    if not cluster_ids:
+        return {}
+    rows = c.execute(
+        """SELECT cluster_id, node_type, kind, value, member_count
+           FROM graph_cluster_links
+           WHERE cluster_id = ANY(%s)
+           ORDER BY member_count DESC, node_type, kind, value""",
+        (list(cluster_ids),),
+    ).fetchall()
+    out: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        bucket = out[row["cluster_id"]]
+        if per_cluster is None or len(bucket) < per_cluster:
+            bucket.append({k: row[k] for k in ("node_type", "kind", "value", "member_count")})
+    return out
+
+
 def list_graph_clusters(*, min_size: int = 2, limit: int = 100) -> list[dict[str, Any]]:
-    """Strongest clusters lake-wide (largest first)."""
+    """Strongest clusters lake-wide (largest first), each with the shared nodes
+    that tie it together (a preview of the strongest connectors)."""
     init_db()
     with _conn() as c:
         rows = c.execute(
@@ -3417,7 +3480,20 @@ def list_graph_clusters(*, min_size: int = 2, limit: int = 100) -> list[dict[str
                LIMIT %s""",
             (min_size, limit),
         ).fetchall()
-    return [dict(row) for row in rows]
+        clusters = [dict(row) for row in rows]
+        links = _cluster_links(c, [cl["cluster_id"] for cl in clusters], _CLUSTER_LINKS_PREVIEW)
+        counts = {
+            r["cluster_id"]: r["n"]
+            for r in c.execute(
+                """SELECT cluster_id, count(*) AS n FROM graph_cluster_links
+                   WHERE cluster_id = ANY(%s) GROUP BY cluster_id""",
+                ([cl["cluster_id"] for cl in clusters],),
+            ).fetchall()
+        } if clusters else {}
+    for cluster in clusters:
+        cluster["links"] = links.get(cluster["cluster_id"], [])
+        cluster["link_count"] = counts.get(cluster["cluster_id"], len(cluster["links"]))
+    return clusters
 
 
 def graph_cluster_for(value: str) -> dict[str, Any] | None:
@@ -3440,7 +3516,14 @@ def graph_cluster_for(value: str) -> dict[str, Any] | None:
                 (row["cluster_id"],),
             ).fetchall()
         ]
-    return {"cluster_id": row["cluster_id"], "component_size": row["component_size"], "members": members}
+        links = _cluster_links(c, [row["cluster_id"]], None).get(row["cluster_id"], [])
+    return {
+        "cluster_id": row["cluster_id"],
+        "component_size": row["component_size"],
+        "members": members,
+        "links": links,
+        "link_count": len(links),
+    }
 
 
 # ── Pool + by-edge browsing ─────────────────────────────────────────────────

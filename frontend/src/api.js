@@ -445,13 +445,32 @@ export function normalizeGraphClusters(payload) {
     const members = coerceArray(pickFirst(raw, ["members"], []))
       .map((entry) => readableValue(entry))
       .filter(Boolean);
+    const links = normalizeClusterLinks(raw);
     return {
       raw,
       id: pickFirst(raw, ["cluster_id", "clusterId", "id"], `cluster-${index}`),
       size: pickFirst(raw, ["component_size", "componentSize", "size"], members.length),
       members,
+      links,
+      linkCount: pickFirst(raw, ["link_count", "linkCount"], links.length),
     };
   });
+}
+
+// The shared nodes that tie a cluster together ("what connects it"), strongest
+// (most members) first.
+export function normalizeClusterLinks(payload) {
+  return coerceArray(payload?.links ?? payload)
+    .map((item) => {
+      const raw = item || {};
+      return {
+        nodeType: pickFirst(raw, ["node_type", "nodeType"], "selector"),
+        kind: pickFirst(raw, ["kind"], "unknown"),
+        value: readableValue(pickFirst(raw, ["value"])) || "—",
+        memberCount: pickFirst(raw, ["member_count", "memberCount"], null),
+      };
+    })
+    .filter((link) => link.value && link.value !== "—");
 }
 
 export function normalizePool(payload) {

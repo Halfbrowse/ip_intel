@@ -513,6 +513,32 @@ button {
   border: 1px solid var(--border-soft);
 }
 
+.cluster-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.connector-chip {
+  background: var(--info-soft, var(--surface-muted));
+  font-weight: 600;
+}
+
+.connector-chip .connector-value {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connector-chip .connector-count {
+  opacity: 0.7;
+  font-weight: 700;
+}
+
 .status-badge {
   border: 1px solid transparent;
 }

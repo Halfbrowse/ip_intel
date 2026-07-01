@@ -1010,6 +1010,29 @@ function ClustersPage() {
                   <span className="chip digest-more-chip">+{cluster.members.length - 12} more</span>
                 ) : null}
               </div>
+              {cluster.links.length > 0 ? (
+                <div className="cluster-links">
+                  <span className="muted">Connected by</span>
+                  <div className="chip-row">
+                    {cluster.links.map((link) => (
+                      <span
+                        className="chip connector-chip"
+                        key={`${cluster.id}-${link.kind}-${link.value}`}
+                        title={`${sharedNodeLabel(link.kind)}: ${link.value}`}
+                      >
+                        {sharedNodeLabel(link.kind)}
+                        <span className="connector-value">{link.value}</span>
+                        {link.memberCount ? <span className="connector-count">×{link.memberCount}</span> : null}
+                      </span>
+                    ))}
+                    {cluster.linkCount > cluster.links.length ? (
+                      <span className="chip digest-more-chip">
+                        +{cluster.linkCount - cluster.links.length} more
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
               <div className="action-row">
                 <Link
                   className="primary-button"
