@@ -932,16 +932,21 @@ def _score_selector_row(row: dict) -> tuple[dict, float]:
     from utils.evidence_meta import selector_base_weight
 
     kind = row["kind"]
+    value = row["value"]
     degree = int(row.get("entity_count") or 0)
-    base = selector_base_weight(kind)
+    base = selector_base_weight(kind, value)
     rarity = rarity_weight(degree)
     overlap = time_overlap_factor(row.get("a_first"), row.get("a_last"), row.get("b_first"), row.get("b_last"))
     weight = base * rarity * overlap
     sources = sorted({s for s in (list(row.get("a_sources") or []) + list(row.get("b_sources") or [])) if s})
+    # `tracking_id` values are "<provider>|<id>"; expose the provider so the
+    # deliverable distinguishes an AdSense account from a reused GTM container.
+    subkind = value.split("|", 1)[0] if kind == "tracking_id" and "|" in value else None
     evidence = {
         "node_type": "selector",
         "kind": kind,
-        "value": row["value"],
+        "subkind": subkind,
+        "value": value,
         "degree": degree,
         "attributing": True,
         "base_weight": round(base, 2),
@@ -958,8 +963,17 @@ def _score_selector_row(row: dict) -> tuple[dict, float]:
 def _score_ip_row(row: dict) -> tuple[dict, float]:
     from utils.evidence_meta import selector_base_weight
 
+    value = str(row.get("value") or "")
     degree = int(row.get("degree") or 0)
-    noisy = bool(row.get("noisy_net")) or degree > _IP_NOISE_DEGREE
+    # Split shared IPs by what kind of box they are. A Cloudflare/CDN or proxy
+    # edge address (flagged either by a denylisted ASN/CIDR on the IP, or by
+    # matching Cloudflare's published ranges even when no ASN was captured) tells
+    # you only that both sites front through the same CDN — never a link. A
+    # dedicated origin box two domains both sit on is the strong case; a big
+    # shared-hosting pool decays out through the degree-keyed rarity factor.
+    cdn = bool(row.get("noisy_net")) or _is_cloudflare_ip_local(value)
+    noisy = cdn or degree > _IP_NOISE_DEGREE
+    network = "cdn" if cdn else ("pool" if noisy else "origin")
     base = selector_base_weight("shared_ip")
     rarity = 0.0 if noisy else rarity_weight(degree)
     overlap = time_overlap_factor(row.get("a_first"), row.get("a_last"), row.get("b_first"), row.get("b_last"))
@@ -968,7 +982,8 @@ def _score_ip_row(row: dict) -> tuple[dict, float]:
     evidence = {
         "node_type": "ip",
         "kind": "shared_ip",
-        "value": row["value"],
+        "network": network,
+        "value": value,
         "degree": degree,
         "attributing": not noisy,
         "base_weight": round(base, 2),

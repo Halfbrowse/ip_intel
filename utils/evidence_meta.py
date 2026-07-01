@@ -476,7 +476,7 @@ SELECTOR_BASE_WEIGHTS: dict[str, float] = {
     "ssh_fp": 95.0,             # shared SSH host key — decisive
     "shared_ip": 85.0,          # dedicated shared origin IP — strong+
     "tls_spki": 80.0,           # shared public-key (SPKI) reuse — strong
-    "tracking_id": 70.0,        # GA/GTM/pixel/AdSense — strong (operator account)
+    "tracking_id": 70.0,        # GA/GTM/pixel/AdSense — see TRACKING_SUBKIND_WEIGHTS
     "html_hash": 45.0,          # identical homepage body — supporting+
     "favicon_mmh3": 45.0,       # favicon fingerprint — supporting
     "favicon_md5": 40.0,        # favicon md5 — supporting
@@ -486,12 +486,40 @@ SELECTOR_BASE_WEIGHTS: dict[str, float] = {
     "asn": 15.0,                # bare ASN — low-signal
 }
 
+# `tracking_id` is a single selector kind whose value is prefixed with the
+# provider (see _TRACKING_SELECTOR_MAP in db.intel_db), so we grade it per
+# provider rather than with one flat weight. The split turns on how tightly the
+# ID binds to a single operator account vs. how routinely it is reused across
+# unrelated sites:
+#   - AdSense publisher IDs bind to a Google *payment* account — near-identity.
+#   - GA properties / ad pixels bind to one analytics/ad account — strong.
+#   - GTM containers are routinely reused by agencies across unrelated clients,
+#     and a Facebook app ID rides along with shared themes/plugins — strong.
+TRACKING_SUBKIND_WEIGHTS: dict[str, float] = {
+    "adsense_publisher": 90.0,
+    "ga_property": 82.0,
+    "fb_pixel": 65.0,
+    "yandex_metrika": 74.0,
+    "tiktok_pixel": 55.0,
+    "gtm_container": 45.0,
+    "fb_app_id": 75.0,
+}
+
 _DEFAULT_SELECTOR_WEIGHT = 40.0
 
 
-def selector_base_weight(kind: str) -> float:
-    """Base (pre-rarity, pre-overlap) weight for a selector kind / shared node."""
-    return SELECTOR_BASE_WEIGHTS.get(str(kind or ""), _DEFAULT_SELECTOR_WEIGHT)
+def selector_base_weight(kind: str, value: str | None = None) -> float:
+    """Base (pre-rarity, pre-overlap) weight for a selector kind / shared node.
+
+    `tracking_id` selectors are graded by their provider prefix (the value is
+    stored as ``"<provider>|<id>"``); every other kind is a flat per-kind weight.
+    """
+    k = str(kind or "")
+    if k == "tracking_id" and value:
+        prefix = str(value).split("|", 1)[0]
+        if prefix in TRACKING_SUBKIND_WEIGHTS:
+            return TRACKING_SUBKIND_WEIGHTS[prefix]
+    return SELECTOR_BASE_WEIGHTS.get(k, _DEFAULT_SELECTOR_WEIGHT)
 
 
 def _label_from_path(path: str) -> str:
