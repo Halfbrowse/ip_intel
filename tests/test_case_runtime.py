@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
+from core import basic
 from core.analysis_service import AnalysisRun, _merge_page_metadata
 from cases.case_runtime import (
     CaseRuntime,
     build_job_response,
     parse_submission,
 )
+
+
+def test_basic_runtime_hooks_are_context_local() -> None:
+    def _run(label: str) -> list[tuple[str, str, object]]:
+        events: list[tuple[str, str, object]] = []
+
+        def _log(message: str, level: str = "*") -> None:
+            events.append((label, level, message))
+
+        def _save(results: dict) -> None:
+            events.append((label, "save", results["label"]))
+
+        with basic.runtime_hooks(log_hook=_log, save_hook=_save):
+            basic.log(f"log-{label}", "+")
+            basic.save_results({"label": label})
+        return events
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        left, right = executor.map(_run, ["left", "right"])
+
+    assert left == [("left", "+", "log-left"), ("left", "save", "left")]
+    assert right == [("right", "+", "log-right"), ("right", "save", "right")]
 
 
 def test_parse_submission_single_target() -> None:

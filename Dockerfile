@@ -7,7 +7,7 @@ COPY frontend/index.html frontend/vite.config.js ./
 COPY frontend/public ./public
 COPY frontend/src ./src
 
-RUN npm install
+RUN npm ci
 RUN npm run build
 
 

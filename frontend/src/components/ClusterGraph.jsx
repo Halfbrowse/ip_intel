@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { drag as d3Drag } from "d3-drag";
 import { zoom as d3Zoom, zoomIdentity } from "d3-zoom";
 import { select as d3Select } from "d3-selection";
@@ -60,10 +60,19 @@ const MEMBERSHIP_COLOR = "#cbd5e1";
 const SELECTION_RING_COLOR = "#f59e0b";
 
 const LABEL_MODES = {
-  all: { label: "All" },
+  auto: { label: "Auto" },
   hubs: { label: "Hubs only" },
+  all: { label: "All" },
   none: { label: "None" },
 };
+
+function edgeKey(edge) {
+  return `${edge.from}|${edge.to}`;
+}
+
+function isActivationKey(event) {
+  return event.key === "Enter" || event.key === " ";
+}
 
 function edgeKind(edge) {
   return edge.kind || "evidence";
@@ -95,6 +104,16 @@ function shortEvidenceLabel(label) {
   const text = String(label || "");
   const separator = text.indexOf(": ");
   return separator === -1 ? truncateLabel(text, 22) : truncateLabel(text.slice(0, separator), 22);
+}
+
+function evidenceLabels(edge) {
+  return edge.labels && edge.labels.length > 0 ? edge.labels : (edge.paths || []).map(formatPathFallback);
+}
+
+function edgeAccessibleLabel(edge) {
+  const labels = evidenceLabels(edge);
+  const score = Number.isFinite(edge.score) ? `, score ${edge.score}` : "";
+  return `${edge.from} to ${edge.to}${score}${labels.length > 0 ? `. ${labels.slice(0, 2).join(", ")}` : ""}`;
 }
 
 function escapeHtml(text) {
@@ -412,9 +431,10 @@ const ClusterGraph = memo(function ClusterGraph({
   otherRoleLabel = "Bridging subdomain",
   seedRoleLabel = "Channel in this cluster",
   title = "How this cluster's channels link together",
-  description = "Click a channel to isolate its connections, or a line to isolate just that pair — the map narrows to only what you clicked on. Click empty space (or \"Show whole cluster\" below) to see everything again. Line colour shows how strong a link is (score only, never what kind of evidence it is — click the line for that). Drag to rearrange, scroll to zoom.",
+  description = "Shared infrastructure and registration evidence, with warmer links carrying stronger scores.",
   exportFileName = "network-graph",
 }) {
+  const statusId = useId();
   const containerRef = useRef(null);
   const svgRef = useRef(null);
   const gRef = useRef(null);
@@ -432,14 +452,19 @@ const ClusterGraph = memo(function ClusterGraph({
 
   // Presentation controls — deliberately lean. The map only shows submitted
   // domains and their bridges, so there's no node-colour/size lens to pick.
-  const [labelMode, setLabelMode] = useState("all");
+  const [labelMode, setLabelMode] = useState("auto");
   const [tierFilter, setTierFilter] = useState({ strong: true, moderate: true, weak: true });
   const [minScore, setMinScore] = useState(0);
   const [spread, setSpread] = useState(1);
+  const [narrowSelection, setNarrowSelection] = useState(false);
 
   // Selection drives the detail panels below the map.
   const [selectedNode, setSelectedNode] = useState(null);
   const [selectedEdge, setSelectedEdge] = useState(null);
+  const [hoveredNode, setHoveredNode] = useState(null);
+  const [hoveredEdge, setHoveredEdge] = useState(null);
+  const selectedRef = useRef({ node: null, edge: null });
+  selectedRef.current = { node: selectedNode, edge: selectedEdge };
 
   // Track the rendered width so the layout adapts to the panel size.
   useEffect(() => {
@@ -542,43 +567,85 @@ const ClusterGraph = memo(function ClusterGraph({
     [visibleEvidence, visibleMembership],
   );
 
-  // A click focuses the map on just what was clicked: a node's own links, or
-  // one specific edge's two endpoints. `null` means no focus — show the whole
-  // (filtered) cluster. This is a real filter, not a dim/fade — the rest of
-  // the graph is removed from the map entirely, so what's on screen is always
-  // exactly "the graph you clicked for".
-  const focusIds = useMemo(() => {
+  const selectedScope = useMemo(() => {
     if (selectedNode) {
       const ids = new Set([selectedNode]);
+      const edgeKeys = new Set();
       visibleEdges.forEach((edge) => {
-        if (edge.from === selectedNode) ids.add(edge.to);
-        if (edge.to === selectedNode) ids.add(edge.from);
+        if (edge.from === selectedNode || edge.to === selectedNode) {
+          ids.add(edge.from);
+          ids.add(edge.to);
+          edgeKeys.add(edgeKey(edge));
+        }
       });
-      return ids;
+      return { ids, edgeKeys };
     }
     if (selectedEdge) {
-      const edge = visibleEvidence.find((e) => `${e.from}|${e.to}` === selectedEdge);
-      return edge ? new Set([edge.from, edge.to]) : null;
+      const edge = visibleEvidence.find((candidate) => edgeKey(candidate) === selectedEdge);
+      return edge ? { ids: new Set([edge.from, edge.to]), edgeKeys: new Set([selectedEdge]) } : null;
     }
     return null;
   }, [selectedNode, selectedEdge, visibleEdges, visibleEvidence]);
 
+  const hoverScope = useMemo(() => {
+    if (hoveredNode) {
+      const ids = new Set([hoveredNode]);
+      const edgeKeys = new Set();
+      visibleEdges.forEach((edge) => {
+        if (edge.from === hoveredNode || edge.to === hoveredNode) {
+          ids.add(edge.from);
+          ids.add(edge.to);
+          edgeKeys.add(edgeKey(edge));
+        }
+      });
+      return { ids, edgeKeys };
+    }
+    if (hoveredEdge) {
+      const edge = visibleEvidence.find((candidate) => edgeKey(candidate) === hoveredEdge);
+      return edge ? { ids: new Set([edge.from, edge.to]), edgeKeys: new Set([hoveredEdge]) } : null;
+    }
+    return null;
+  }, [hoveredNode, hoveredEdge, visibleEdges, visibleEvidence]);
+
+  const activeScope = useMemo(() => {
+    if (!hoverScope) return selectedScope;
+    if (!selectedScope) return hoverScope;
+    return {
+      ids: new Set([...selectedScope.ids, ...hoverScope.ids]),
+      edgeKeys: new Set([...selectedScope.edgeKeys, ...hoverScope.edgeKeys]),
+    };
+  }, [hoverScope, selectedScope]);
+
   const displayNodes = useMemo(
-    () => (focusIds ? visibleNodes.filter((node) => focusIds.has(node.id)) : visibleNodes),
-    [visibleNodes, focusIds],
+    () =>
+      narrowSelection && selectedScope
+        ? visibleNodes.filter((node) => selectedScope.ids.has(node.id))
+        : visibleNodes,
+    [visibleNodes, selectedScope, narrowSelection],
   );
   const displayEdges = useMemo(
     () =>
-      focusIds
-        ? visibleEdges.filter((edge) => focusIds.has(edge.from) && focusIds.has(edge.to))
+      narrowSelection && selectedScope
+        ? visibleEdges.filter((edge) => selectedScope.ids.has(edge.from) && selectedScope.ids.has(edge.to))
         : visibleEdges,
-    [visibleEdges, focusIds],
+    [visibleEdges, selectedScope, narrowSelection],
   );
 
   const clearFocus = useCallback(() => {
     setSelectedNode(null);
     setSelectedEdge(null);
+    setHoveredNode(null);
+    setHoveredEdge(null);
+    setNarrowSelection(false);
   }, []);
+
+  useEffect(() => {
+    const selectedNodeHidden = selectedNode && !visibleNodes.some((node) => node.id === selectedNode);
+    const selectedEdgeHidden = selectedEdge && !visibleEvidence.some((edge) => edgeKey(edge) === selectedEdge);
+    if (selectedNodeHidden || selectedEdgeHidden) {
+      clearFocus();
+    }
+  }, [clearFocus, selectedEdge, selectedNode, visibleEvidence, visibleNodes]);
 
   // Per-node connection count, from evidence links only (membership ties don't
   // count toward how "connected" a domain is).
@@ -613,28 +680,46 @@ const ClusterGraph = memo(function ClusterGraph({
   );
 
   const handleNodeClick = useCallback((nodeId) => {
+    const isSameSelection = selectedRef.current.node === nodeId;
     setSelectedEdge(null);
-    setSelectedNode((current) => (current === nodeId ? null : nodeId));
+    setSelectedNode(isSameSelection ? null : nodeId);
+    if (isSameSelection) {
+      setNarrowSelection(false);
+    }
   }, []);
 
   const handleEdgeClick = useCallback((edge) => {
+    const key = edgeKey(edge);
+    const isSameSelection = selectedRef.current.edge === key;
     setSelectedNode(null);
-    setSelectedEdge((current) => {
-      const key = `${edge.from}|${edge.to}`;
-      return current === key ? null : key;
-    });
+    setSelectedEdge(isSameSelection ? null : key);
+    if (isSameSelection) {
+      setNarrowSelection(false);
+    }
   }, []);
 
   // Latest presentation state, read by applyStyles at call-time. Keeping this in
   // a ref lets applyStyles stay referentially stable (empty deps) so the build
   // effect can call it without rebuilding the simulation on every recolour.
   const styleRef = useRef({});
-  styleRef.current = { colorFor, labelMode, selectedNode, selectedEdge, metrics, seedTargets };
+  styleRef.current = {
+    activeScope,
+    colorFor,
+    displayEdgeCount: displayEdges.filter((edge) => edgeKind(edge) === "evidence").length,
+    displayNodeCount: displayNodes.length,
+    hoveredNode,
+    hoveredEdge,
+    labelMode,
+    metrics,
+    seedTargets,
+    selectedNode,
+    selectedEdge,
+  };
 
   // Apply colour / label / highlight to the existing selections in place.
-  // Everything on screen already belongs to the current focus (see
-  // displayNodes/displayEdges above), so there's no separate "dim the rest"
-  // pass here — only the exact selected edge gets an extra highlight.
+  // Selection and hover are pure presentation now: the full filtered graph
+  // stays on screen unless the user explicitly narrows it, while unrelated
+  // nodes/edges dim out of the way.
   const applyStyles = useCallback(() => {
     const { node, link } = selectionsRef.current;
     if (!node || !link) {
@@ -645,22 +730,44 @@ const ClusterGraph = memo(function ClusterGraph({
       labelMode: labels,
       selectedNode: selNode,
       selectedEdge: selEdge,
+      hoveredNode: hoverNode,
+      hoveredEdge: hoverEdge,
       metrics: nodeMetrics,
       seedTargets: seeds,
+      activeScope: scope,
+      displayNodeCount,
+      displayEdgeCount,
     } = styleRef.current;
 
     const labelThreshold = Math.max(2, Math.ceil(nodeMetrics.maxDegree * 0.4));
+    const showAllAutoLabels = displayNodeCount <= 18 && displayEdgeCount <= 24;
+    const hasActiveScope = Boolean(scope);
+    node
+      .classed("is-dimmed", (d) => hasActiveScope && !scope.ids.has(d.id))
+      .classed("is-selected", (d) => selNode === d.id)
+      .classed("is-hovered", (d) => hoverNode === d.id)
+      .style("opacity", (d) => (hasActiveScope && !scope.ids.has(d.id) ? 0.22 : 1));
     node
       .select("circle.graph-marker")
       .attr("fill", (d) => color(d))
-      .attr("stroke", (d) => (selNode === d.id ? SELECTION_RING_COLOR : "var(--graph-node-ring, #fff)"))
-      .attr("stroke-width", (d) => (selNode === d.id ? 3 : 1.75));
+      .attr("stroke", (d) => {
+        if (selNode === d.id) return SELECTION_RING_COLOR;
+        if (hoverNode === d.id) return "var(--accent, #0a7ea4)";
+        return "var(--graph-node-ring, #fff)";
+      })
+      .attr("stroke-width", (d) => (selNode === d.id || hoverNode === d.id ? 3.25 : 1.75));
     node
       .select("text.graph-node-label")
       .attr("font-weight", (d) => (isSubmitted(d, seeds) ? 700 : 400))
       .style("display", (d) => {
         if (labels === "none") return "none";
+        if (hasActiveScope) return scope.ids.has(d.id) ? null : "none";
+        if (labels === "auto" && showAllAutoLabels) return null;
         if (labels === "hubs") {
+          const degree = nodeMetrics.degree.get(d.id) || 0;
+          return degree >= labelThreshold || isSubmitted(d, seeds) ? null : "none";
+        }
+        if (labels === "auto") {
           const degree = nodeMetrics.degree.get(d.id) || 0;
           return degree >= labelThreshold || isSubmitted(d, seeds) ? null : "none";
         }
@@ -668,17 +775,22 @@ const ClusterGraph = memo(function ClusterGraph({
       });
 
     link.each(function each(d) {
-      const key = `${d.from}|${d.to}`;
+      const key = edgeKey(d);
       const isSelected = selEdge === key;
+      const isHovered = hoverEdge === key;
       const membership = edgeKind(d) === "membership";
-      const dimmed = selEdge && !isSelected;
-      const base = membership ? 0.4 : 0.55;
+      const isActive = !hasActiveScope || scope.edgeKeys.has(key);
+      const dimmed = hasActiveScope && !isActive;
+      const base = membership ? 0.32 : 0.58;
+      const activeOpacity = membership ? 0.52 : 0.82;
+      const widthBoost = isSelected || isHovered ? 2 : hasActiveScope && isActive ? 0.8 : 0;
       const self = d3Select(this);
+      self.classed("is-dimmed", dimmed).classed("is-selected", isSelected).classed("is-hovered", isHovered);
       self
         .select(".graph-edge-stroke")
-        .attr("stroke-opacity", dimmed ? 0.08 : isSelected ? 0.95 : base)
-        .attr("stroke-width", isSelected ? (d.width || 1.5) + 1.5 : d.width || 1.5);
-      self.select(".graph-edge-label").attr("opacity", dimmed ? 0.08 : 1);
+        .attr("stroke-opacity", dimmed ? 0.08 : isSelected || isHovered ? 0.98 : hasActiveScope ? activeOpacity : base)
+        .attr("stroke-width", (d.width || 1.5) + widthBoost);
+      self.select(".graph-edge-label").attr("opacity", dimmed ? 0 : hasActiveScope && !isActive ? 0 : 1);
     });
   }, []);
 
@@ -687,13 +799,15 @@ const ClusterGraph = memo(function ClusterGraph({
   // canvas. Shared by the initial auto-fit below and the "Reset view" button,
   // so resetting never throws the user back into the un-fitted raw layout.
   const fitToView = useCallback(
-    (duration = 450) => {
-      const nodes = simNodesRef.current;
+    (duration = 450, ids = null) => {
+      const nodes = ids
+        ? simNodesRef.current.filter((node) => ids.has(node.id))
+        : simNodesRef.current;
       const handle = zoomRef.current;
       if (!handle || !nodes || nodes.length === 0) {
         return;
       }
-      const pad = 60;
+      const pad = ids ? 96 : 60;
       const xs = nodes.map((node) => node.x);
       const ys = nodes.map((node) => node.y);
       const minX = Math.min(...xs) - pad;
@@ -716,7 +830,19 @@ const ClusterGraph = memo(function ClusterGraph({
   // --- Build / rebuild the simulation and DOM ---------------------------------
   // Runs when the data, viewport, or any layout-affecting control changes.
   useEffect(() => {
-    if (!svgRef.current || !gRef.current || displayNodes.length === 0) {
+    if (!svgRef.current || !gRef.current) {
+      return undefined;
+    }
+
+    const g = d3Select(gRef.current);
+    if (displayNodes.length === 0) {
+      if (simulationRef.current) {
+        simulationRef.current.stop();
+        simulationRef.current = null;
+      }
+      g.selectAll("*").remove();
+      simNodesRef.current = [];
+      selectionsRef.current = { node: null, link: null, edgeLabel: null };
       return undefined;
     }
 
@@ -729,15 +855,19 @@ const ClusterGraph = memo(function ClusterGraph({
       .filter((edge) => byId.has(edge.from) && byId.has(edge.to))
       .map((edge) => ({ ...edge, source: edge.from, target: edge.to }));
 
-    const g = d3Select(gRef.current);
     g.selectAll("*").remove();
 
     const linkSel = g
       .append("g")
       .attr("class", "graph-links")
       .selectAll("g")
-      .data(simLinks, (d) => `${d.from}|${d.to}`)
-      .join("g");
+      .data(simLinks, edgeKey)
+      .join("g")
+      .attr("class", (d) => `graph-edge ${edgeKind(d) === "membership" ? "membership" : "evidence"}`);
+
+    linkSel
+      .append("title")
+      .text((d) => (edgeKind(d) === "membership" ? `${d.from} contains ${d.to}` : edgeAccessibleLabel(d)));
 
     // Wide transparent hit-line for easy clicking (evidence edges only), plus
     // the visible stroke. Straight lines, not curves — a technical knowledge
@@ -747,10 +877,25 @@ const ClusterGraph = memo(function ClusterGraph({
       .filter((d) => edgeKind(d) === "evidence")
       .append("line")
       .attr("class", "graph-edge-hit")
+      .attr("role", "button")
+      .attr("tabindex", 0)
+      .attr("aria-label", (d) => `Inspect evidence: ${edgeAccessibleLabel(d)}`)
       .attr("stroke", "transparent")
       .attr("stroke-width", 14)
       .style("cursor", "pointer")
+      .on("mouseenter", (_event, d) => setHoveredEdge(edgeKey(d)))
+      .on("mouseleave", () => setHoveredEdge(null))
+      .on("focus", (_event, d) => setHoveredEdge(edgeKey(d)))
+      .on("blur", () => setHoveredEdge(null))
       .on("click", (event, d) => {
+        event.stopPropagation();
+        handleEdgeClick(d);
+      })
+      .on("keydown", (event, d) => {
+        if (!isActivationKey(event)) {
+          return;
+        }
+        event.preventDefault();
         event.stopPropagation();
         handleEdgeClick(d);
       });
@@ -773,14 +918,21 @@ const ClusterGraph = memo(function ClusterGraph({
     // breaks the line behind it instead of the text sitting on top of it.
     //
     // Labels aren't collision-checked against each other (unlike nodes), so
-    // a busy hub with a dozen edges converging in one spot would just turn
-    // them into an unreadable pile-up — worse than not labelling at all.
-    // Past a density threshold, skip inline labels entirely and lean on
-    // click-for-detail instead, which stays available either way.
-    const evidenceLinkCount = simLinks.filter((edge) => edgeKind(edge) === "evidence").length;
-    const showInlineEdgeLabels = evidenceLinkCount <= 10;
+    // dense maps only label the strongest few evidence links and leave the
+    // full list one click away.
+    const evidenceLinks = simLinks.filter((edge) => edgeKind(edge) === "evidence");
+    const evidenceLinkCount = evidenceLinks.length;
+    const showInlineEdgeLabels = evidenceLinkCount <= 12;
+    const labelledEdgeKeys = new Set(
+      (showInlineEdgeLabels
+        ? evidenceLinks
+        : [...evidenceLinks]
+            .sort((a, b) => (b.score || 0) - (a.score || 0))
+            .slice(0, Math.min(8, Math.max(3, Math.ceil(evidenceLinkCount * 0.12)))))
+        .map(edgeKey),
+    );
     const edgeLabelSel = linkSel
-      .filter((d) => showInlineEdgeLabels && edgeKind(d) === "evidence" && (d.labels || []).length > 0)
+      .filter((d) => labelledEdgeKeys.has(edgeKey(d)) && evidenceLabels(d).length > 0)
       .append("g")
       .attr("class", "graph-edge-label");
     edgeLabelSel.append("rect").attr("class", "graph-edge-label-bg").attr("rx", 3);
@@ -789,7 +941,7 @@ const ClusterGraph = memo(function ClusterGraph({
       .attr("class", "graph-edge-label-text")
       .attr("text-anchor", "middle")
       .attr("dy", "0.32em")
-      .text((d) => shortEvidenceLabel(d.labels[0]));
+      .text((d) => shortEvidenceLabel(evidenceLabels(d)[0]));
     edgeLabelSel.each(function attachBackground() {
       const group = d3Select(this);
       const box = group.select("text").node().getBBox();
@@ -808,10 +960,36 @@ const ClusterGraph = memo(function ClusterGraph({
       .data(simNodes, (d) => d.id)
       .join("g")
       .attr("class", "cluster-node")
+      .attr("role", "button")
+      .attr("tabindex", 0)
+      .attr("aria-label", (d) => {
+        const degree = metrics.degree.get(d.id) || 0;
+        return `Inspect ${d.label}. ${degree} evidence ${degree === 1 ? "link" : "links"}.`;
+      })
       .style("cursor", "grab")
+      .on("mouseenter", (_event, d) => setHoveredNode(d.id))
+      .on("mouseleave", () => setHoveredNode(null))
+      .on("focus", (_event, d) => setHoveredNode(d.id))
+      .on("blur", () => setHoveredNode(null))
       .on("click", (event, d) => {
         event.stopPropagation();
         handleNodeClick(d.id);
+      })
+      .on("keydown", (event, d) => {
+        if (!isActivationKey(event)) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        handleNodeClick(d.id);
+      });
+
+    nodeSel
+      .append("title")
+      .text((d) => {
+        const degree = metrics.degree.get(d.id) || 0;
+        const tier = d.tier ? `, ${DOMAIN_TIER_LABELS[d.tier]}` : "";
+        return `${d.label}${tier}. ${degree} evidence ${degree === 1 ? "link" : "links"}.`;
       });
 
     // A second, wider ring (not a soft blurred halo) marks the domains the
@@ -920,7 +1098,8 @@ const ClusterGraph = memo(function ClusterGraph({
     simNodesRef.current = simNodes;
 
     const margin = 30;
-    simulation.on("tick", () => {
+    let tickFrame = 0;
+    const renderTick = () => {
       simNodes.forEach((node) => {
         node.x = Math.max(margin, Math.min(width - margin, node.x));
         node.y = Math.max(margin, Math.min(height - margin, node.y));
@@ -936,6 +1115,15 @@ const ClusterGraph = memo(function ClusterGraph({
         (d) => `translate(${(d.source.x + d.target.x) / 2}, ${(d.source.y + d.target.y) / 2})`,
       );
       nodeSel.attr("transform", (d) => `translate(${d.x}, ${d.y})`);
+    };
+    simulation.on("tick", () => {
+      if (tickFrame) {
+        return;
+      }
+      tickFrame = requestAnimationFrame(() => {
+        tickFrame = 0;
+        renderTick();
+      });
     });
 
     // Once the layout settles, frame it so the map fills the card instead of
@@ -978,6 +1166,9 @@ const ClusterGraph = memo(function ClusterGraph({
     nodeSel.call(dragger);
 
     return () => {
+      if (tickFrame) {
+        cancelAnimationFrame(tickFrame);
+      }
       simulation.stop();
       simulationRef.current = null;
       selectionsRef.current = { node: null, link: null, edgeLabel: null };
@@ -989,6 +1180,7 @@ const ClusterGraph = memo(function ClusterGraph({
     height,
     spread,
     radiusFor,
+    metrics,
     seedTargets,
     otherRoleColor,
     handleNodeClick,
@@ -1022,6 +1214,12 @@ const ClusterGraph = memo(function ClusterGraph({
   const resetView = useCallback(() => {
     fitToView(300);
   }, [fitToView]);
+
+  const fitSelection = useCallback(() => {
+    if (selectedScope) {
+      fitToView(300, selectedScope.ids);
+    }
+  }, [fitToView, selectedScope]);
 
   // Builds a standalone, presentation-ready copy of the current map — title,
   // generated date, and a full legend baked in as real SVG content — as a
@@ -1420,13 +1618,26 @@ const ClusterGraph = memo(function ClusterGraph({
   // and highlight are pure presentation, so they never restart the simulation.
   useEffect(() => {
     applyStyles();
-  }, [applyStyles, colorFor, labelMode, selectedNode, selectedEdge, metrics, seedTargets]);
+  }, [
+    activeScope,
+    applyStyles,
+    colorFor,
+    displayEdges,
+    displayNodes.length,
+    hoveredEdge,
+    hoveredNode,
+    labelMode,
+    metrics,
+    seedTargets,
+    selectedEdge,
+    selectedNode,
+  ]);
 
   const selectedEdgeData = useMemo(() => {
     if (!selectedEdge) {
       return null;
     }
-    return visibleEvidence.find((edge) => `${edge.from}|${edge.to}` === selectedEdge) || null;
+    return visibleEvidence.find((edge) => edgeKey(edge) === selectedEdge) || null;
   }, [selectedEdge, visibleEvidence]);
 
   const selectedNodeEdges = useMemo(() => {
@@ -1444,8 +1655,24 @@ const ClusterGraph = memo(function ClusterGraph({
 
   const submittedCount = displayNodes.filter((node) => isSubmitted(node, seedTargets)).length;
   const bridgeCount = displayNodes.length - submittedCount;
-  const focused = Boolean(selectedNode || selectedEdge);
+  const hasSelection = Boolean(selectedNode || selectedEdge);
+  const focusViewActive = Boolean(narrowSelection && selectedScope);
   const presentTiers = DOMAIN_TIER_ORDER.filter((tier) => displayNodes.some((node) => node.tier === tier));
+  const totalEvidenceCount = allEdges.filter((edge) => edgeKind(edge) === "evidence").length;
+  const shownEvidenceCount = displayEdges.filter((edge) => edgeKind(edge) === "evidence").length;
+  const visibleFiltered = visibleNodes.length < allNodes.length || visibleEvidence.length < totalEvidenceCount;
+  const denseMap = displayNodes.length > 32 || shownEvidenceCount > 48;
+  const selectedLabel = selectedNode || (selectedEdgeData ? `${selectedEdgeData.from} to ${selectedEdgeData.to}` : null);
+  const graphStatus =
+    displayNodes.length === 0
+      ? "No links match the current strength filters."
+      : hasSelection && focusViewActive
+        ? `Focused on ${displayNodes.length} domains and ${shownEvidenceCount} evidence links.`
+        : hasSelection
+          ? `Highlighting ${selectedLabel || "selection"}; ${displayNodes.length} domains remain in context.`
+          : visibleFiltered
+            ? `Showing ${displayNodes.length} of ${allNodes.length} domains and ${shownEvidenceCount} of ${totalEvidenceCount} evidence links.`
+            : `Showing ${displayNodes.length} domains and ${shownEvidenceCount} evidence links.`;
 
   return (
     <section className="cluster-graph-card" ref={containerRef}>
@@ -1460,7 +1687,12 @@ const ClusterGraph = memo(function ClusterGraph({
       <div className="graph-controls" aria-label="Map customisation">
         <label className="graph-control">
           <span>Labels</span>
-          <select value={labelMode} onChange={(e) => setLabelMode(e.target.value)}>
+          <select
+            aria-label="Node label density"
+            title="Node label density"
+            value={labelMode}
+            onChange={(e) => setLabelMode(e.target.value)}
+          >
             {Object.entries(LABEL_MODES).map(([key, mode]) => (
               <option key={key} value={key}>
                 {mode.label}
@@ -1472,6 +1704,8 @@ const ClusterGraph = memo(function ClusterGraph({
         <label className="graph-control">
           <span>Spread</span>
           <input
+            aria-label="Graph spread"
+            aria-valuetext={`${spread.toFixed(1)}x`}
             max="2"
             min="0.5"
             onChange={(e) => setSpread(Number(e.target.value))}
@@ -1485,6 +1719,8 @@ const ClusterGraph = memo(function ClusterGraph({
           <label className="graph-control">
             <span>Min. strength {minScore > 0 ? `(${minScore})` : ""}</span>
             <input
+              aria-label="Minimum link strength"
+              aria-valuetext={minScore > 0 ? `${minScore}` : "Any strength"}
               max={maxScore}
               min="0"
               onChange={(e) => setMinScore(Number(e.target.value))}
@@ -1501,6 +1737,7 @@ const ClusterGraph = memo(function ClusterGraph({
             {TIER_ORDER.map((tier) => (
               <label className="graph-tier-toggle" key={tier}>
                 <input
+                  aria-label={`Show ${tier} links`}
                   checked={tierFilter[tier]}
                   onChange={(e) =>
                     setTierFilter((prev) => ({ ...prev, [tier]: e.target.checked }))
@@ -1517,33 +1754,72 @@ const ClusterGraph = memo(function ClusterGraph({
           </div>
         </div>
 
-        {focused ? (
-          <button className="secondary-button small" onClick={clearFocus} type="button">
-            Show whole cluster
+        {hasSelection ? (
+          <button
+            aria-label={focusViewActive ? "Keep the selected neighborhood in context" : "Focus the graph on the selected neighborhood"}
+            className="secondary-button small"
+            onClick={() => setNarrowSelection((current) => !current)}
+            title={focusViewActive ? "Keep the selected neighborhood in context" : "Focus the graph on the selected neighborhood"}
+            type="button"
+          >
+            {focusViewActive ? "Keep context" : "Focus selection"}
           </button>
         ) : null}
 
-        <button className="secondary-button small" onClick={resetView} type="button">
-          Reset view
+        {hasSelection ? (
+          <button
+            aria-label="Fit the selected neighborhood"
+            className="secondary-button small"
+            onClick={fitSelection}
+            title="Fit the selected neighborhood"
+            type="button"
+          >
+            Fit selection
+          </button>
+        ) : null}
+
+        {hasSelection ? (
+          <button className="secondary-button small" onClick={clearFocus} title="Clear graph selection" type="button">
+            Clear selection
+          </button>
+        ) : null}
+
+        <button aria-label="Fit the whole graph" className="secondary-button small" onClick={resetView} title="Fit the whole graph" type="button">
+          Fit graph
         </button>
 
-        <button className="secondary-button small" onClick={downloadImage} type="button">
-          Download image
-        </button>
+        <div className="graph-actions" aria-label="Graph export actions">
+          <button className="secondary-button small" onClick={downloadImage} title="Download PNG image" type="button">
+            PNG
+          </button>
 
-        <button className="secondary-button small" onClick={downloadInteractive} type="button">
-          Download interactive report
-        </button>
+          <button
+            className="secondary-button small"
+            onClick={downloadInteractive}
+            title="Download offline interactive HTML report"
+            type="button"
+          >
+            HTML report
+          </button>
 
-        <button
-          className="primary-button small"
-          disabled={emailState.status === "sending"}
-          onClick={emailGraph}
-          type="button"
-        >
-          {emailState.status === "sending" ? "Sending…" : "Email graph"}
-        </button>
+          <button
+            className="primary-button small"
+            disabled={emailState.status === "sending"}
+            onClick={emailGraph}
+            title="Email the graph attachments"
+            type="button"
+          >
+            {emailState.status === "sending" ? "Sending..." : "Email"}
+          </button>
+        </div>
       </div>
+
+      <p className="graph-status" id={statusId} aria-live="polite">
+        <span>{graphStatus}</span>
+        {denseMap && labelMode === "auto" && displayNodes.length > 0 ? (
+          <span>Dense map: labels are limited to anchors and hubs.</span>
+        ) : null}
+      </p>
 
       {emailState.status === "sent" || emailState.status === "error" ? (
         <p
@@ -1581,16 +1857,25 @@ const ClusterGraph = memo(function ClusterGraph({
           : null}
       </div>
 
-      <svg
-        ref={svgRef}
-        className="cluster-graph"
-        viewBox={`0 0 ${width} ${height}`}
-        style={{ cursor: "grab", height }}
-        role="img"
-        aria-label="Network map of connected domains"
-      >
-        <g ref={gRef} />
-      </svg>
+      <div className="graph-stage">
+        <svg
+          ref={svgRef}
+          className="cluster-graph"
+          viewBox={`0 0 ${width} ${height}`}
+          style={{ cursor: "grab", height }}
+          role="img"
+          aria-label="Network map of connected domains"
+          aria-describedby={statusId}
+        >
+          <g ref={gRef} />
+        </svg>
+        {displayNodes.length === 0 ? (
+          <div className="graph-empty-state" role="status">
+            <strong>No visible links</strong>
+            <span>Relax the strength filters to bring nodes back into view.</span>
+          </div>
+        ) : null}
+      </div>
 
       {selectedEdgeData ? (
         <div className="graph-detail-panel">
@@ -1599,7 +1884,7 @@ const ClusterGraph = memo(function ClusterGraph({
               {selectedEdgeData.from} ↔ {selectedEdgeData.to}
             </strong>
             <button className="secondary-button small" onClick={clearFocus} type="button">
-              Show whole cluster
+              Clear selection
             </button>
           </div>
           <p className="card-copy">What these two have in common:</p>
@@ -1610,10 +1895,7 @@ const ClusterGraph = memo(function ClusterGraph({
             renderPairEvidence(selectedEdgeData.pairing_id)
           ) : (
             <ul className="simple-list">
-              {(selectedEdgeData.labels && selectedEdgeData.labels.length > 0
-                ? selectedEdgeData.labels
-                : (selectedEdgeData.paths || []).map(formatPathFallback)
-              ).map((label) => (
+              {evidenceLabels(selectedEdgeData).map((label) => (
                 <li key={label}>{label}</li>
               ))}
             </ul>
@@ -1626,7 +1908,7 @@ const ClusterGraph = memo(function ClusterGraph({
           <div className="graph-detail-panel-head">
             <strong>{selectedNode}</strong>
             <button className="secondary-button small" onClick={clearFocus} type="button">
-              Show whole cluster
+              Clear selection
             </button>
           </div>
           <p className="card-copy">
@@ -1636,12 +1918,9 @@ const ClusterGraph = memo(function ClusterGraph({
           <ul className="simple-list">
             {selectedNodeEdges.slice(0, 8).map((edge) => {
               const other = edge.from === selectedNode ? edge.to : edge.from;
-              const labels =
-                edge.labels && edge.labels.length > 0
-                  ? edge.labels
-                  : (edge.paths || []).map(formatPathFallback);
+              const labels = evidenceLabels(edge);
               return (
-                <li key={`${edge.from}|${edge.to}`}>
+                <li key={edgeKey(edge)}>
                   <strong>{other}</strong>
                   {labels.length > 0 ? ` — ${labels.slice(0, 3).join(", ")}` : ""}
                 </li>

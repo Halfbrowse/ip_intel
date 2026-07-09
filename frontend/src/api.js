@@ -247,6 +247,8 @@ export function normalizeJob(payload, fallbackId = null) {
     summary: summarizeText(
       pickFirst(raw, ["summary", "description", "message", "detail", "current_step"]),
     ),
+    stage: pickFirst(raw, ["stage", "job_stage", "phase"], null),
+    currentTarget: pickFirst(raw, ["current_target", "currentTarget"], null),
     currentStep: pickFirst(raw, ["current_step", "currentStep", "phase_name", "stage_name"]),
     completedSteps:
       pickFirst(raw, ["completed_steps", "completedSteps", "counts.completed"], null) ?? null,

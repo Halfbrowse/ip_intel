@@ -240,6 +240,9 @@ def api_pool(
     request: Request,
     search: str | None = None,
     limit: int = 1000,
+    offset: int = 0,
+    provenance: str | None = None,
+    sort: str = "recent",
     min_connections: int | None = None,
     max_connections: int | None = None,
     ingested_after: str | None = None,
@@ -248,18 +251,26 @@ def api_pool(
     discovered_before: str | None = None,
 ) -> Response:
     """Every channel (registrable domain) in the pool, with host count, recency,
-    pairwise connection count, and cluster membership."""
-    domains = intel_db.list_pool_domains(
+    pairwise connection count, and cluster membership.
+
+    ``total`` is the filtered total before pagination; ``domains`` is the
+    current page.
+    """
+    page = intel_db.list_pool_domains(
         search=search,
         limit=limit,
+        offset=offset,
+        provenance=provenance,
+        sort=sort,
         min_connections=min_connections,
         max_connections=max_connections,
         ingested_after=ingested_after,
         ingested_before=ingested_before,
         discovered_after=discovered_after,
         discovered_before=discovered_before,
+        include_total=True,
     )
-    return _etag_json_response(request, {"total": len(domains), "domains": domains})
+    return _etag_json_response(request, page)
 
 
 @app.get("/api/domain/{value:path}")

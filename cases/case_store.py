@@ -60,6 +60,16 @@ def init_db() -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS job_logs (
+            id BIGSERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            level TEXT NOT NULL,
+            message TEXT NOT NULL,
+            stage TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS case_inputs (
             id BIGSERIAL PRIMARY KEY,
             case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -160,6 +170,7 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)",
         "CREATE INDEX IF NOT EXISTS idx_jobs_case_id ON jobs(case_id)",
         "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+        "CREATE INDEX IF NOT EXISTS idx_job_logs_job_id_id ON job_logs(job_id, id)",
         "CREATE INDEX IF NOT EXISTS idx_search_runs_case_id ON search_runs(case_id)",
         "CREATE INDEX IF NOT EXISTS idx_search_runs_normalized_target ON search_runs(normalized_target)",
         "CREATE INDEX IF NOT EXISTS idx_pairings_case_scope ON pairings(case_id, scope)",
@@ -294,7 +305,34 @@ def get_case(case_id: str) -> dict[str, Any] | None:
 def get_job(job_id: str) -> dict[str, Any] | None:
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
+            cur.execute(
+                """
+                SELECT
+                    j.*,
+                    COALESCE(log_rows.logs, j.logs, '[]'::jsonb) AS logs
+                FROM jobs j
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'level', ordered.level,
+                            'message', ordered.message,
+                            'stage', ordered.stage,
+                            'created_at', ordered.created_at
+                        )
+                        ORDER BY ordered.id
+                    ) AS logs
+                    FROM (
+                        SELECT id, level, message, stage, created_at
+                        FROM job_logs
+                        WHERE job_id = j.id
+                        ORDER BY id DESC
+                        LIMIT 200
+                    ) ordered
+                ) log_rows ON TRUE
+                WHERE j.id = %s
+                """,
+                (job_id,),
+            )
             return cur.fetchone()
 
 
@@ -316,19 +354,39 @@ def load_case_inputs(case_id: str) -> list[dict[str, Any]]:
 def append_job_log(job_id: str, *, level: str, message: str, stage: str | None = None) -> None:
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT logs FROM jobs WHERE id = %s", (job_id,))
-            row = cur.fetchone()
-            logs = list((row or {}).get("logs") or [])
-            logs.append({"level": level, "message": message})
+            cur.execute(
+                """
+                INSERT INTO job_logs (job_id, level, message, stage)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (job_id, level, message, stage),
+            )
             cur.execute(
                 """
                 UPDATE jobs
-                SET logs = %s,
+                SET logs = COALESCE((
+                        SELECT jsonb_agg(
+                            jsonb_build_object(
+                                'level', ordered.level,
+                                'message', ordered.message,
+                                'stage', ordered.stage,
+                                'created_at', ordered.created_at
+                            )
+                            ORDER BY ordered.id
+                        )
+                        FROM (
+                            SELECT id, level, message, stage, created_at
+                            FROM job_logs
+                            WHERE job_id = jobs.id
+                            ORDER BY id DESC
+                            LIMIT 200
+                        ) ordered
+                    ), '[]'::jsonb),
                     stage = COALESCE(%s, stage),
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (Jsonb(logs[-200:]), stage, job_id),
+                (stage, job_id),
             )
         conn.commit()
 

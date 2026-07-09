@@ -111,7 +111,7 @@ The Docker setup:
 
 - builds the React frontend with Vite in a Node stage
 - runs the FastAPI backend with Uvicorn on container port `8000`, published as `9000`
-- runs a PostgreSQL 16 container for all storage (cases, jobs, and raw intel)
+- runs a PostgreSQL 16 container for all storage (jobs, legacy app tables, and raw intel)
 - mounts `./data` for downloaded artifacts and any other persistent files
 
 ## VPN / Outbound Proxy
@@ -125,7 +125,7 @@ origin-scan feature (masscan/async-TCP scanning of provider/GCP/country IP
 ranges for a matching TLS cert) — see the note in
 [What is and is not proxied](#what-is-and-is-not-proxied). That feature is
 **not enabled for the web app's ingest path** (`core/analysis_service.py`
-passes through with `"Targeted origin scan is not enabled for case mode"`);
+passes through with `"Targeted origin scan is not enabled for web ingest"`);
 it only runs when `core/ip_intel.py` is invoked directly as a CLI with
 `--scan`/`--scan-europe`/`--scan-providers`/`--scan-country`/`--scan-full`/`--scan-all`.
 
@@ -143,29 +143,32 @@ and are read from the environment at call time.
 
 ### Compose profile
 
-`docker-compose.yml` ships an optional `vpn` service ([gluetun](https://github.com/qdm12/gluetun))
-behind the `vpn` compose profile, so a plain `docker compose up` is unchanged.
+`docker-compose.yml` ships an optional `vpn` profile for the environment used by
+this project: an externally managed `protonvpn-cli` container already attached
+to the shared Docker network, plus a tinyproxy sidecar that joins that
+container's network namespace. A plain `docker compose up` is unchanged.
+
 To enable it:
 
-1. Add your VPN credentials to `.env` (passed through to gluetun), e.g.:
+1. Start the external ProtonVPN stack so the `protonvpn-cli` container exists on
+   the `shared_net` Docker network.
+2. Add proxy/rotation settings to `.env`:
 
    ```bash
-   VPN_SERVICE_PROVIDER=...
-   VPN_TYPE=wireguard
-   WIREGUARD_PRIVATE_KEY=...
-   WIREGUARD_ADDRESSES=...
-   SERVER_COUNTRIES=...
-   OUTBOUND_PROXY_URL=http://vpn:8888
+   OUTBOUND_PROXY_URL=http://protonvpn-cli:8888
+   VPN_API_BASE_URL=http://protonvpn-cli:8000
    ```
 
-2. Start with the profile active:
+3. Start the proxy profile:
 
    ```bash
    docker compose --profile vpn up -d --build
    ```
 
-Gluetun's built-in HTTP proxy (`HTTPPROXY=on`) listens on port `8888` on the
-compose network, so the `ip-intel` service reaches it as `http://vpn:8888`.
+The `protonvpn-proxy` service exposes tinyproxy through the VPN network
+namespace, so the `ip-intel` service reaches it as
+`http://protonvpn-cli:8888`. If `OUTBOUND_PROXY_URL` is unset, all outbound
+provider traffic connects directly.
 
 ### What is and is not proxied
 
@@ -185,7 +188,7 @@ Not proxied (always direct):
   lookups — these do not go through an HTTP proxy and bypass the VPN
 - the `masscan`/async-TCP port scanning used by the same opt-in origin-scan
   CLI feature
-- Censys / Shodan / Netlas SDK clients, which manage their own HTTP stacks
+- Censys SDK traffic, which manages its own HTTP stack
 
 `socks5://` proxy URLs are supported via the `requests[socks]` and `httpx[socks]`
 extras already declared in `pyproject.toml`.
@@ -221,6 +224,31 @@ There is no case API — everything is the global pool and its connections.
 - `GET /api/health` — health check
 
 > The analysis/job machinery still runs each ingest internally (under `cases/case_runtime.py`), but it is no longer surfaced as "cases" — there is no per-submission scope, and all correlation is global. Run `POST /api/graph/recompute` (or `uv run python -m scripts.backfill_correlation`) after changing extraction or weighting logic.
+
+## Pipeline Conformance Checklist
+
+Use this checklist when changing ingestion, providers, graph materialization, or
+the frontend:
+
+- Local dev still starts with `uv run uvicorn app:app --reload` and
+  `npm run dev`, with Vite proxying `/api` to FastAPI.
+- Docker still builds the React frontend first, serves `frontend/dist` through
+  FastAPI, and exposes the app on `http://127.0.0.1:9000`.
+- `POST /api/ingest` returns a job id, streams stage/percent/current-target/log
+  progress through `GET /api/jobs/{job_id}`, and writes every successful scan to
+  the append-only intel store.
+- All scanned domains/IPs join the global pool and the rebuildable correlation
+  graph; no user-facing case scope is reintroduced.
+- Active provider behavior remains Censys plus free/no-paid-credit sources.
+  Missing keys, provider tier failures, and source errors degrade per source
+  without aborting the run.
+- Censys/free-source hits that expose IPs, certificates, ASNs, or hostnames feed
+  the same persistence and correlation paths as DNS/TLS/SSH observations.
+- OpenCTI full sweeps process every website Channel, persist tier labels by
+  registrable domain, attach source labels to the scan result, and leave graph
+  materializations fresh or explicitly dirty for rebuild.
+- `POST /api/graph/recompute` rebuilds the derived graph from stored intel
+  without rescanning and does not delete durable OpenCTI domain tiers.
 
 ## Correlation Model
 
@@ -395,31 +423,40 @@ SANs are preserved in stored certificate records. The graph does not currently t
 
 ## Provider Behavior
 
-Censys, Shodan, and Netlas are gated identically in `core/basic.py` (`_PROVIDER_SERVICES`, `SERVICES`): each needs its own API key (Censys additionally needs `CENSYS_ORG_ID` and the `censys_platform` package installed), and all three run **only for the seed/apex domain a user submits** — `core/analysis_service.py` passes `run_providers = is_seed or is_apex`, so auto-discovered follow-up subdomains skip them even when a key is configured, to avoid burning a paid/rate-limited API call per discovered host. None of the three is unconditional.
+The active provider policy is **Censys plus free/no-paid-credit sources**.
+Free sources and direct probes include DNS, WHOIS/RDAP, TLS and SSH probes,
+crt.sh, CIRCL passive DNS, HackerTarget, urlscan.io, ViewDNS when
+`VIEW_DNS_API_KEY` is configured, and ipinfo Lite when `IP_INFO_KEY` is
+configured. Censys is the only paid-style certificate-search provider the web
+pipeline is expected to use.
+
+Censys runs **only for the seed/apex domain a user submits**:
+`core/analysis_service.py` passes `run_providers = is_seed or is_apex`, so
+auto-discovered follow-up subdomains skip Censys even when credentials are
+configured. Free sources still run on follow-ups unless their own
+key/configuration is missing. Shodan and Netlas helpers are retained only as
+dormant compatibility for older installations and are not part of the supported
+active provider set.
 
 ### Censys
 
 - **Tier requirement:** the cert→host search uses the Censys Platform **search API**, which is **not available on the free tier** (free API is lookup-only). A **Starter** tier or higher is required for any Censys results; the **Enterprise Adversary Investigation** entitlement is additionally required for certificate history.
-- Paginates the current-state host search up to `_CENSYS_SEARCH_MAX_PAGES` (10 × 100 hosts) instead of a single page.
-- When the entitlement is present, pivots each distinct leaf certificate through the threat-hunting host-observation endpoint to recover **historical origins** — IPs that served the cert in the past but no longer appear in the current snapshot (e.g. rotated infrastructure). Non-Cloudflare historical IPs not already in the current hits are folded into `origin_candidates` tagged `source: censys_history`.
-- Credit cost at Enterprise: ~1 credit per search call, +1 per extra results page, 5 per cert-history page.
-- Paid-only or entitlement failures are surfaced explicitly in results (per-cert history errors are recorded without aborting the run).
+- Current-state cert-to-host hits are normalized into the same durable
+  provider/origin path as free-source hits so they can enrich IP context and
+  correlation.
+- Missing credentials, missing package support, tier failures, or API errors
+  are surfaced as skipped/error metadata without aborting the rest of the run.
 
-### Shodan
+### Dormant compatibility providers
 
-- Checks `api.info()` first.
-- Uses result-returning searches only when the account is unlocked and query-credit access is available.
-- Falls back to count/facets-only mode when full result queries are not available.
-- Degraded mode is shown explicitly in the API/UI.
-
-### Netlas
-
-- Optional provider integration for current certificate-search style hits.
-- Results are normalized into the same downstream IP and connection flow.
+Shodan and Netlas code paths remain in the codebase for older deployments that
+may still have those keys configured, but they are not part of the supported
+active provider policy and should not be required for local development,
+Docker, tests, or README conformance.
 
 ### ViewDNS
 
-- Optional subdomain source (`VIEW_DNS_API_KEY`), gated the same way as the other keyed providers — unset key means `get_viewdns_subdomains` returns `{"skipped": True}` and the rest of the pipeline behaves as if it were never called.
+- Optional subdomain source (`VIEW_DNS_API_KEY`); unset key means `get_viewdns_subdomains` returns `{"skipped": True}` and the rest of the pipeline behaves as if it were never called.
 - Feeds `core/basic.py`'s `SERVICES` list, so it runs on every domain analysis alongside crt.sh/HackerTarget.
 - Its hits flow into the same places crt.sh's subdomains do: `pick_followup_subdomains()` merges the two lists so newly discovered hosts get a full recursive follow-up scan (not just recorded), and any IP on a hit feeds `collect_non_cf_ips()`.
 - Response shape from ViewDNS varies by plan/endpoint version (some return bare hostname strings, others `{"subdomain", "ip"}` objects) — `get_viewdns_subdomains` normalizes both into HackerTarget's `{"hits": [{"subdomain", "ip"}]}` shape so it composes with existing consumers without special-casing.
@@ -435,9 +472,9 @@ Censys, Shodan, and Netlas are gated identically in `core/basic.py` (`_PROVIDER_
 
 `integrations/opencti_ingest.py` pulls targets from OpenCTI (set `OPENCTI_URL` and `OPENCTI_TOKEN`). There are two live paths into the pool, plus one legacy worker retained but not currently triggered by anything:
 
-- **"Ingest website channels" button** (`POST /api/ingest/opencti-website`) — the newest 100 Channel SDOs with `channel_types` containing `website`, resolved to domains and submitted as a normal case (frontend-triggered).
+- **"Ingest website channels" button** (`POST /api/ingest/opencti-website`) — the newest 100 Channel SDOs with `channel_types` containing `website`, resolved to domains and submitted as a normal ingest job (frontend-triggered).
 - **`scripts/ingest_opencti_channels.py`** (below) — every matching Channel, no cap, run as a docker command instead of from the UI, with tier classification.
-- `_run()` / `restart_ingestion()` / `retry_source_errors()` in `integrations/opencti_ingest.py` — an older worker that separately pulled Domain-Name observables and Channel SDOs and ran them through `core/ip_intel.py`'s CLI engine rather than the case pipeline (`OPENCTI_INGEST_CHANNELS`, `OPENCTI_INGEST_WORKERS` control it). Nothing in the running app calls `start_background_ingestion()`/`restart_ingestion()` anymore — it's dead code, kept because `tests/test_opencti_ingest.py` still exercises it.
+- `_run()` / `restart_ingestion()` / `retry_source_errors()` in `integrations/opencti_ingest.py` — an older worker that separately pulled Domain-Name observables and Channel SDOs and ran them through `core/ip_intel.py`'s CLI engine rather than the current app ingest pipeline (`OPENCTI_INGEST_CHANNELS`, `OPENCTI_INGEST_WORKERS` control it). Nothing in the running app calls `start_background_ingestion()`/`restart_ingestion()` anymore — it's dead code, kept because `tests/test_opencti_ingest.py` still exercises it.
 
 Channel SDOs (STIX 2.1 extension) are resolved to domains the same way in both live paths (`_channel_candidate_domains`): the channel `name` and aliases are used when they parse as a domain/URL, plus any external reference URLs, normalized to bare registrable domains (scheme, path, port, and leading `www.` stripped). Social-media platform domains (facebook.com, x.com, youtube.com, t.me, vk.com, etc.) are skipped per the "non-social media channels" goal.
 
@@ -452,7 +489,7 @@ docker compose exec ip-intel python -m scripts.ingest_opencti_channels --dry-run
 `scripts/ingest_opencti_channels.py`:
 
 1. Fetches **every** OpenCTI Channel SDO with `channel_types` containing `website` (`fetch_all_website_channel_data()`, server-side filtered, fully paginated — no 100-item cap).
-2. Runs every resolved domain through the same full pipeline a case submission uses (`CaseRuntime.submit_case` → `analyze_target` → `core/basic.py`'s `analyze()` with parity enrichments, subdomain/sibling follow-ups, and `db/intel_db.py` correlation), blocking and printing job progress until it finishes — safe to run as a one-shot container command, unlike the fire-and-forget frontend button.
+2. Runs every resolved domain through the same full app ingest pipeline (`CaseRuntime.submit_case` → `analyze_target` → `core/basic.py`'s `analyze()` with parity enrichments, subdomain/sibling follow-ups, and `db/intel_db.py` correlation), blocking and printing job progress until it finishes — safe to run as a one-shot container command, unlike the fire-and-forget frontend button.
 3. Extracts a **tier-1..tier-5** classification from each channel's OpenCTI labels: `_extract_tier()` matches `tier` + a digit 1-5, case/space/dash/underscore-insensitive (`Tier 1`, `tier-2`, `TIER_3`, ... all match) — a channel's other labels (campaign names, platform tags, ...) are not tiers and are ignored. If a channel somehow carries more than one tier label, the lower number (higher priority) wins.
 4. Writes the tier to `db/intel_db.py`'s `domain_tiers` table (`set_domain_tier`) — keyed on the **registrable domain**, not a search_id, so it's a durable, curated attribute that survives rescans instead of living and dying with one scan result. Not part of the append-only raw substrate and explicitly excluded from `rebuild_clusters`/`rebuild_all_correlation`, so a correlation-graph rebuild never touches it.
 5. Attaches the full label list (not just the tier) to that ingestion's own scan result as `opencti_labels` (`save_search_fields`), informational only.
@@ -466,8 +503,6 @@ Create a `.env` file and add any provider keys you have:
 ```env
 DATABASE_URL=postgresql://ip_intel:ip_intel@localhost:5432/ip_intel
 CENSYS_API_KEY=<personal-access-token>
-SHODAN_API_KEY=<your-api-key>
-NETLAS_API_KEY=<your-api-key>
 VIEW_DNS_API_KEY=<your-api-key>
 IP_INFO_KEY=<your-ipinfo-lite-token>
 MATTERMOST_WEBHOOK_URL=<incoming-webhook-url>
@@ -483,8 +518,8 @@ ALERT_EMAIL_TO=<recipient-address>,<recipient-address>
 Notes:
 
 - `DATABASE_URL` is required. The default points to the Docker Compose Postgres service.
-- `INTEL_DATABASE_URL` is optional and only needed if the raw intel tables should live in a different PostgreSQL database than case storage.
-- All provider keys are optional. Missing keys degrade gracefully.
+- `INTEL_DATABASE_URL` is optional and only needed if the raw intel tables should live in a different PostgreSQL database than the app/job tables.
+- All provider/source keys are optional. Missing keys degrade gracefully.
 - `CENSYS_API_KEY` requires a **Starter tier or higher** Censys Platform account — the free tier's API is lookup-only and cannot run the cert→host search. Certificate history additionally needs the Enterprise Adversary Investigation entitlement.
 - `IP_INFO_KEY` enables [ipinfo.io Lite](https://ipinfo.io/lite) lookups (`utils/ipinfo_lite.py`), the **primary** ASN/org/country source for every associated IP — its values win over RDAP's whenever it succeeds, since RDAP errors/times out per-RIR fairly often and ipinfo Lite rarely does. RDAP (`get_ip_whois`) still always runs too, since ipinfo Lite's response doesn't include network name/CIDR, and both feed `detect_proxy_details` for edge-server/reverse-proxy classification. Missing key degrades gracefully to RDAP-only lookups.
 - `MATTERMOST_WEBHOOK_URL` is optional. When set, the backend sends non-blocking alerts for analysis completion and failure.

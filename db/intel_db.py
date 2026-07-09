@@ -49,6 +49,10 @@ def _conn() -> psycopg.Connection[Any]:
     return psycopg.connect(database_url(), row_factory=dict_row)
 
 
+_PROVIDER_ORIGIN_KEYS = ("censys", "shodan", "netlas")
+_GRAPH_REBUILD_LOCK_KEY = 882_417_310
+
+
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 _SCHEMA = """
@@ -489,6 +493,18 @@ CREATE TABLE IF NOT EXISTS graph_selector_groups (
 );
 CREATE INDEX IF NOT EXISTS idx_graph_selector_groups_kind ON graph_selector_groups(kind, degree DESC);
 
+CREATE TABLE IF NOT EXISTS graph_state (
+    id                  BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    dirty               BOOLEAN NOT NULL DEFAULT TRUE,
+    dirty_at            TIMESTAMPTZ,
+    clean_at            TIMESTAMPTZ,
+    rebuild_started_at  TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO graph_state (id, dirty, dirty_at)
+VALUES (TRUE, TRUE, NOW())
+ON CONFLICT (id) DO NOTHING;
+
 """
 
 
@@ -837,7 +853,7 @@ _IDENTIFIER_HANDLE_TYPES = {
 # they are NOT append-only children of a single search — they are a global
 # projection rebuildable from the raw intel. Listed in _ALL_TABLES so schema
 # resets (tests) drop them too; ordered so dependents precede their referents.
-_CORRELATION_TABLES = ["graph_links", "graph_connection_counts", "graph_selector_groups", "graph_cluster_links", "graph_clusters", "entity_edges", "observations", "selectors", "entities"]
+_CORRELATION_TABLES = ["graph_state", "graph_links", "graph_connection_counts", "graph_selector_groups", "graph_cluster_links", "graph_clusters", "entity_edges", "observations", "selectors", "entities"]
 
 _ALL_TABLES = ["searches", *_CHILD_TABLES, "identifiers", "search_fields", *_CORRELATION_TABLES]
 
@@ -1237,7 +1253,7 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
         for san in cert.get("sans", []) or []:
             add(san, "certificate_san", "ct_san")
 
-    origin = result.get("origin_candidates", {}) or {}
+    origin = _origin_candidates(result)
     for key, source_name, relation_name, subdomain_key in [
         ("subdomain_leaks", "subdomain_leak", "subdomain_leak", "subdomain"),
         ("mx_leaks", "mx_leak", "mx_leak", "subdomain"),
@@ -1580,9 +1596,25 @@ def _normalize_nameservers(values: Any) -> list[str]:
     return cleaned
 
 
+def _origin_candidates(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Return origin candidates, backfilling legacy top-level provider hits.
+
+    Live ingest promotes the active Censys result into ``origin_candidates``
+    before persistence. This fallback keeps older raw search rows replayable
+    during recompute without making dormant Shodan/Netlas paths active again.
+    """
+    raw_origin = result.get("origin_candidates")
+    origin = dict(raw_origin) if isinstance(raw_origin, Mapping) else {}
+    for provider in _PROVIDER_ORIGIN_KEYS:
+        provider_result = result.get(provider)
+        if provider not in origin and isinstance(provider_result, Mapping):
+            origin[provider] = dict(provider_result)
+    return origin
+
+
 def _extract_ip_port_map(result: dict[str, Any]) -> dict[tuple[str, str], int | None]:
     mapping: dict[tuple[str, str], int | None] = {}
-    origin = result.get("origin_candidates") or {}
+    origin = _origin_candidates(result)
 
     for provider in ("censys", "shodan", "netlas"):
         provider_result = origin.get(provider) or {}
@@ -2387,7 +2419,7 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
                 },
             )
 
-    origin = result.get("origin_candidates") or {}
+    origin = _origin_candidates(result)
     for key in ("subdomain_leaks", "mx_leaks", "wordlist_leaks", "hackertarget", "urlscan"):
         for entry in origin.get(key) or []:
             if meaningful_ip((entry or {}).get("ip"), fallback_sources=[key]):
@@ -2618,7 +2650,7 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
             ),
         )
 
-    origin = result.get("origin_candidates") or {}
+    origin = _origin_candidates(result)
     for scan_key, scan_label in [("scan", "gcp"), ("provider_scan", "asn"), ("country_scan", "country")]:
         scan_result = origin.get(scan_key) or {}
         if not isinstance(scan_result, dict) or scan_result.get("skipped"):
@@ -3190,7 +3222,7 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
             if cert.get("ip") and owner:
                 add_resolves(owner, cert.get("ip"), "tls", ts, ts)
 
-        origin = res.get("origin_candidates") or {}
+        origin = _origin_candidates(res)
         for scan_key, scan_src in [("scan", "self_scan"), ("provider_scan", "self_scan"), ("country_scan", "self_scan")]:
             scan_result = origin.get(scan_key) or {}
             if not isinstance(scan_result, Mapping):
@@ -3373,6 +3405,7 @@ def persist_correlation(
     if recount:
         for sel_id in touched:
             recompute_selector_degree(c, sel_id)
+        apply_denylist_for_selectors(c, touched)
     return touched
 
 
@@ -3380,20 +3413,36 @@ def _truncate_correlation(c: psycopg.Connection[Any]) -> None:
     c.execute("TRUNCATE entity_edges, observations, selectors, entities RESTART IDENTITY CASCADE")
 
 
-# Set whenever new intel is projected into the correlation graph, cleared once
-# graph_clusters/graph_cluster_links have been rebuilt to match. Lets the
-# background rebuild loop in case_app.py skip the work when nothing changed,
-# instead of re-clustering the whole lake on a fixed timer regardless of need.
-_clusters_dirty = True
-
-
 def clusters_dirty() -> bool:
-    return _clusters_dirty
+    init_db()
+    with _conn() as c:
+        row = c.execute("SELECT dirty FROM graph_state WHERE id = TRUE").fetchone()
+        return True if row is None else bool(row["dirty"])
 
 
 def _mark_clusters_dirty() -> None:
-    global _clusters_dirty
-    _clusters_dirty = True
+    init_db()
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO graph_state (id, dirty, dirty_at, updated_at)
+               VALUES (TRUE, TRUE, NOW(), NOW())
+               ON CONFLICT (id) DO UPDATE SET
+                   dirty = TRUE,
+                   dirty_at = NOW(),
+                   updated_at = NOW()"""
+        )
+
+
+def _mark_clusters_clean(c: psycopg.Connection[Any]) -> None:
+    c.execute(
+        """INSERT INTO graph_state (id, dirty, clean_at, rebuild_started_at, updated_at)
+           VALUES (TRUE, FALSE, NOW(), NULL, NOW())
+           ON CONFLICT (id) DO UPDATE SET
+               dirty = FALSE,
+               clean_at = NOW(),
+               rebuild_started_at = NULL,
+               updated_at = NOW()"""
+    )
 
 
 def rebuild_all_correlation() -> dict[str, int]:
@@ -3569,6 +3618,117 @@ def seed_denylist(c: psycopg.Connection[Any]) -> int:
             AND san_obs.last_seen = ce.last_seen
            JOIN selectors san_sel ON san_sel.id = san_obs.selector_id AND san_sel.kind = 'tls_san'
            GROUP BY ce.cert_selector_id"""
+    ).fetchall()
+    placeholder_cert_ids = [
+        row["cert_selector_id"]
+        for row in cert_san_values
+        if row["san_values"]
+        and all(
+            _is_low_signal_tls_identity(v) or _text_contains_any(v, _LOW_SIGNAL_HOSTING_PATTERNS)
+            for v in row["san_values"]
+        )
+    ]
+    if placeholder_cert_ids:
+        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (placeholder_cert_ids,))
+
+    return c.execute("SELECT count(*) AS n FROM selectors WHERE attributing = FALSE").fetchone()["n"]
+
+
+def apply_denylist_for_selectors(c: psycopg.Connection[Any], selector_ids: Iterable[int]) -> int:
+    """Apply denylist rules to selectors touched by live ingest.
+
+    Full recompute uses ``seed_denylist`` because it can reset every selector.
+    Live ingest only needs to reevaluate newly touched selectors plus any cert
+    bundle they participate in.
+    """
+    ids = sorted({int(sel_id) for sel_id in selector_ids if sel_id is not None})
+    if not ids:
+        return c.execute("SELECT count(*) AS n FROM selectors WHERE attributing = FALSE").fetchone()["n"]
+
+    c.execute("UPDATE selectors SET attributing = TRUE WHERE id = ANY(%s)", (ids,))
+
+    threshold = _degree_threshold()
+    c.execute(
+        "UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s) AND entity_count > %s",
+        (ids, threshold),
+    )
+
+    noise_asns = sorted(_CDN_PROXY_ASNS | _SHARED_HOSTING_ASNS | _MAIL_ASNS)
+    if noise_asns:
+        c.execute(
+            """UPDATE selectors
+               SET attributing = FALSE
+               WHERE id = ANY(%s) AND kind = 'asn' AND value = ANY(%s)""",
+            (ids, noise_asns),
+        )
+
+    for row in c.execute(
+        "SELECT id, value FROM selectors WHERE id = ANY(%s) AND kind = 'nameserver'",
+        (ids,),
+    ).fetchall():
+        if _is_boring_nameserver(row["value"]):
+            c.execute("UPDATE selectors SET attributing = FALSE WHERE id = %s", (row["id"],))
+
+    for row in c.execute(
+        "SELECT id, value FROM selectors WHERE id = ANY(%s) AND kind = 'tls_san'",
+        (ids,),
+    ).fetchall():
+        value = row["value"]
+        if _is_low_signal_tls_identity(value) or _text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS):
+            c.execute("UPDATE selectors SET attributing = FALSE WHERE id = %s", (row["id"],))
+
+    san_threshold = _san_bundle_threshold()
+    bundles = c.execute(
+        """WITH cert_events AS (
+               SELECT o.entity_id, o.first_seen, o.last_seen, s.id AS cert_selector_id
+               FROM observations o JOIN selectors s ON s.id = o.selector_id
+               WHERE s.kind = 'tls_cert_sha256'
+           ),
+           cert_sans AS (
+               SELECT ce.cert_selector_id, san_sel.id AS san_selector_id, san_sel.value AS san_value
+               FROM cert_events ce
+               JOIN observations san_obs
+                 ON san_obs.entity_id = ce.entity_id
+                AND san_obs.first_seen = ce.first_seen
+                AND san_obs.last_seen = ce.last_seen
+               JOIN selectors san_sel ON san_sel.id = san_obs.selector_id AND san_sel.kind = 'tls_san'
+           )
+           SELECT cert_selector_id,
+                  array_agg(DISTINCT san_selector_id) AS san_selector_ids,
+                  count(DISTINCT san_value) AS san_count
+           FROM cert_sans
+           GROUP BY cert_selector_id
+           HAVING count(DISTINCT san_value) > %s
+              AND (cert_selector_id = ANY(%s) OR bool_or(san_selector_id = ANY(%s)))""",
+        (san_threshold, ids, ids),
+    ).fetchall()
+    bundle_selector_ids: set[int] = set()
+    for row in bundles:
+        bundle_selector_ids.add(row["cert_selector_id"])
+        bundle_selector_ids.update(row["san_selector_ids"] or [])
+    if bundle_selector_ids:
+        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (list(bundle_selector_ids),))
+
+    cert_san_values = c.execute(
+        """WITH cert_events AS (
+               SELECT o.entity_id, o.first_seen, o.last_seen, s.id AS cert_selector_id
+               FROM observations o JOIN selectors s ON s.id = o.selector_id
+               WHERE s.kind = 'tls_cert_sha256'
+           ),
+           cert_sans AS (
+               SELECT ce.cert_selector_id, san_sel.id AS san_selector_id, san_sel.value AS san_value
+               FROM cert_events ce
+               JOIN observations san_obs
+                 ON san_obs.entity_id = ce.entity_id
+                AND san_obs.first_seen = ce.first_seen
+                AND san_obs.last_seen = ce.last_seen
+               JOIN selectors san_sel ON san_sel.id = san_obs.selector_id AND san_sel.kind = 'tls_san'
+           )
+           SELECT cert_selector_id, array_agg(DISTINCT san_value) AS san_values
+           FROM cert_sans
+           GROUP BY cert_selector_id
+           HAVING cert_selector_id = ANY(%s) OR bool_or(san_selector_id = ANY(%s))""",
+        (ids, ids),
     ).fetchall()
     placeholder_cert_ids = [
         row["cert_selector_id"]
@@ -3834,6 +3994,19 @@ def rebuild_clusters() -> dict[str, int]:
             connectors.append({**connector, "members": members})
 
     with _conn() as c:
+        lock_row = c.execute(
+            "SELECT pg_try_advisory_xact_lock(%s) AS locked",
+            (_GRAPH_REBUILD_LOCK_KEY,),
+        ).fetchone()
+        if not lock_row or not lock_row["locked"]:
+            return {"clusters": 0, "clustered_domains": 0, "connected_domains": 0, "skipped": 1}
+        c.execute(
+            """UPDATE graph_state
+               SET rebuild_started_at = NOW(),
+                   updated_at = NOW()
+               WHERE id = TRUE"""
+        )
+
         for row in c.execute(
             """SELECT sel.kind, sel.value, array_agg(DISTINCT e.registrable_domain) AS rds
                FROM selectors sel
@@ -3988,8 +4161,7 @@ def rebuild_clusters() -> dict[str, int]:
                 (row["kind"], row["value"], row["degree"], row["domains"], now),
             )
 
-    global _clusters_dirty
-    _clusters_dirty = False
+        _mark_clusters_clean(c)
     return {"clusters": cluster_count, "clustered_domains": clustered, "connected_domains": connected_domains}
 
 
@@ -4136,13 +4308,17 @@ def list_pool_domains(
     *,
     search: str | None = None,
     limit: int = 1000,
+    offset: int = 0,
+    provenance: str | None = None,
+    sort: str = "recent",
     min_connections: int | None = None,
     max_connections: int | None = None,
     ingested_after: str | None = None,
     ingested_before: str | None = None,
     discovered_after: str | None = None,
     discovered_before: str | None = None,
-) -> list[dict[str, Any]]:
+    include_total: bool = False,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """Every registrable domain in the pool with host count, recency, cluster,
     direct pairwise connection count, and whether it was directly submitted
     (`ingested`) vs. only ever surfaced as a scan follow-up (subdomain/sibling/
@@ -4165,59 +4341,84 @@ def list_pool_domains(
     """
     init_db()
     like = f"%{search.strip().lower()}%" if search and search.strip() else None
+    safe_limit = max(1, min(int(limit or 1000), 5000))
+    safe_offset = max(0, int(offset or 0))
+    provenance_key = provenance if provenance in {"ingested", "discovered"} else "all"
+    sort_key = sort if sort in {"recent", "connections", "domain"} else "recent"
+    order_by = {
+        "connections": "connection_count DESC NULLS LAST, last_seen DESC NULLS LAST, domain",
+        "domain": "domain ASC",
+        "recent": "last_seen DESC NULLS LAST, domain",
+    }[sort_key]
+
+    base_sql = """
+        WITH pool AS (
+            SELECT e.registrable_domain AS domain,
+                   count(DISTINCT e.id) AS host_count,
+                   max(e.last_seen) AS last_seen,
+                   min(e.first_seen) AS discovered_at,
+                   gc.cluster_id,
+                   gc.component_size AS cluster_size,
+                   COALESCE(gcc.connection_count, 0) AS connection_count,
+                   COALESCE(bool_or(sf.json_value = 'true'::jsonb), FALSE) AS ingested,
+                   min(s.timestamp) FILTER (WHERE sf.json_value = 'true'::jsonb) AS ingested_at,
+                   (SELECT sf2.json_value #>> '{}' FROM searches apex_s
+                      JOIN search_fields sf2 ON sf2.search_id = apex_s.id AND sf2.key = 'discovery_kind'
+                      WHERE apex_s.target = e.registrable_domain
+                      ORDER BY apex_s.timestamp DESC, apex_s.id DESC LIMIT 1) AS discovery_kind,
+                   (SELECT sf2.json_value #>> '{}' FROM searches apex_s
+                      JOIN search_fields sf2 ON sf2.search_id = apex_s.id AND sf2.key = 'discovery_reason'
+                      WHERE apex_s.target = e.registrable_domain
+                      ORDER BY apex_s.timestamp DESC, apex_s.id DESC LIMIT 1) AS discovery_reason,
+                   (SELECT sf2.json_value #>> '{}' FROM searches apex_s
+                      JOIN search_fields sf2 ON sf2.search_id = apex_s.id AND sf2.key = 'discovered_from'
+                      WHERE apex_s.target = e.registrable_domain
+                      ORDER BY apex_s.timestamp DESC, apex_s.id DESC LIMIT 1) AS discovered_from,
+                   dt.tier AS tier
+            FROM entities e
+            LEFT JOIN graph_clusters gc ON gc.registrable_domain = e.registrable_domain
+            LEFT JOIN graph_connection_counts gcc ON gcc.registrable_domain = e.registrable_domain
+            LEFT JOIN searches s ON s.target = e.value
+            LEFT JOIN search_fields sf ON sf.search_id = s.id AND sf.key = 'is_seed'
+            LEFT JOIN domain_tiers dt ON dt.registrable_domain = e.registrable_domain
+            WHERE e.registrable_domain IS NOT NULL
+              AND (%s::text IS NULL OR e.registrable_domain LIKE %s::text)
+            GROUP BY e.registrable_domain, gc.cluster_id, gc.component_size, gcc.connection_count, dt.tier
+            HAVING (%s::int IS NULL OR COALESCE(gcc.connection_count, 0) >= %s::int)
+               AND (%s::int IS NULL OR COALESCE(gcc.connection_count, 0) <= %s::int)
+               AND (%s::text IS NULL OR min(e.first_seen) >= %s::text)
+               AND (%s::text IS NULL OR min(e.first_seen) <= %s::text)
+               AND (%s::text IS NULL OR min(s.timestamp) FILTER (WHERE sf.json_value = 'true'::jsonb) >= %s::text)
+               AND (%s::text IS NULL OR min(s.timestamp) FILTER (WHERE sf.json_value = 'true'::jsonb) <= %s::text)
+        )
+        SELECT *
+        FROM pool
+        WHERE (%s::text = 'all')
+           OR (%s::text = 'ingested' AND ingested)
+           OR (%s::text = 'discovered' AND NOT ingested)
+    """
+    params = (
+        like, like,
+        min_connections, min_connections,
+        max_connections, max_connections,
+        discovered_after, discovered_after,
+        discovered_before, discovered_before,
+        ingested_after, ingested_after,
+        ingested_before, ingested_before,
+        provenance_key, provenance_key, provenance_key,
+    )
+
     with _conn() as c:
+        total = c.execute(f"SELECT count(*) AS n FROM ({base_sql}) filtered", params).fetchone()["n"]
         rows = c.execute(
-            """SELECT e.registrable_domain AS domain,
-                      count(DISTINCT e.id) AS host_count,
-                      max(e.last_seen) AS last_seen,
-                      min(e.first_seen) AS discovered_at,
-                      gc.cluster_id,
-                      gc.component_size AS cluster_size,
-                      COALESCE(gcc.connection_count, 0) AS connection_count,
-                      COALESCE(bool_or(sf.json_value = 'true'::jsonb), FALSE) AS ingested,
-                      min(s.timestamp) FILTER (WHERE sf.json_value = 'true'::jsonb) AS ingested_at,
-                      (SELECT sf2.json_value #>> '{}' FROM searches apex_s
-                         JOIN search_fields sf2 ON sf2.search_id = apex_s.id AND sf2.key = 'discovery_kind'
-                         WHERE apex_s.target = e.registrable_domain
-                         ORDER BY apex_s.timestamp DESC, apex_s.id DESC LIMIT 1) AS discovery_kind,
-                      (SELECT sf2.json_value #>> '{}' FROM searches apex_s
-                         JOIN search_fields sf2 ON sf2.search_id = apex_s.id AND sf2.key = 'discovery_reason'
-                         WHERE apex_s.target = e.registrable_domain
-                         ORDER BY apex_s.timestamp DESC, apex_s.id DESC LIMIT 1) AS discovery_reason,
-                      (SELECT sf2.json_value #>> '{}' FROM searches apex_s
-                         JOIN search_fields sf2 ON sf2.search_id = apex_s.id AND sf2.key = 'discovered_from'
-                         WHERE apex_s.target = e.registrable_domain
-                         ORDER BY apex_s.timestamp DESC, apex_s.id DESC LIMIT 1) AS discovered_from,
-                      dt.tier AS tier
-               FROM entities e
-               LEFT JOIN graph_clusters gc ON gc.registrable_domain = e.registrable_domain
-               LEFT JOIN graph_connection_counts gcc ON gcc.registrable_domain = e.registrable_domain
-               LEFT JOIN searches s ON s.target = e.value
-               LEFT JOIN search_fields sf ON sf.search_id = s.id AND sf.key = 'is_seed'
-               LEFT JOIN domain_tiers dt ON dt.registrable_domain = e.registrable_domain
-               WHERE e.registrable_domain IS NOT NULL
-                 AND (%s::text IS NULL OR e.registrable_domain LIKE %s::text)
-               GROUP BY e.registrable_domain, gc.cluster_id, gc.component_size, gcc.connection_count, dt.tier
-               HAVING (%s::int IS NULL OR COALESCE(gcc.connection_count, 0) >= %s::int)
-                  AND (%s::int IS NULL OR COALESCE(gcc.connection_count, 0) <= %s::int)
-                  AND (%s::text IS NULL OR min(e.first_seen) >= %s::text)
-                  AND (%s::text IS NULL OR min(e.first_seen) <= %s::text)
-                  AND (%s::text IS NULL OR min(s.timestamp) FILTER (WHERE sf.json_value = 'true'::jsonb) >= %s::text)
-                  AND (%s::text IS NULL OR min(s.timestamp) FILTER (WHERE sf.json_value = 'true'::jsonb) <= %s::text)
-               ORDER BY max(e.last_seen) DESC NULLS LAST, e.registrable_domain
-               LIMIT %s""",
-            (
-                like, like,
-                min_connections, min_connections,
-                max_connections, max_connections,
-                discovered_after, discovered_after,
-                discovered_before, discovered_before,
-                ingested_after, ingested_after,
-                ingested_before, ingested_before,
-                limit,
-            ),
+            f"{base_sql} ORDER BY {order_by} LIMIT %s OFFSET %s",
+            (*params, safe_limit, safe_offset),
         ).fetchall()
-    return [dict(row) for row in rows]
+
+    domains = [dict(row) for row in rows]
+    if include_total:
+        return {"total": int(total), "domains": domains, "offset": safe_offset, "limit": safe_limit}
+    return domains
 
 
 def _curate_intel(result: dict[str, Any]) -> dict[str, Any]:

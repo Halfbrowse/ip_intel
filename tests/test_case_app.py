@@ -61,9 +61,14 @@ def test_pool_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(
         case_app.intel_db,
         "list_pool_domains",
-        lambda *, search, limit: [
-            {"domain": "a.com", "host_count": 3, "last_seen": "2026-06-01", "cluster_id": "a.com", "cluster_size": 2}
-        ],
+        lambda **kwargs: {
+            "total": 1,
+            "offset": kwargs["offset"],
+            "limit": kwargs["limit"],
+            "domains": [
+                {"domain": "a.com", "host_count": 3, "last_seen": "2026-06-01", "cluster_id": "a.com", "cluster_size": 2}
+            ],
+        },
     )
     with TestClient(case_app.app) as client:
         response = client.get("/api/pool")
@@ -71,6 +76,45 @@ def test_pool_endpoint(monkeypatch) -> None:
     body = response.json()
     assert body["total"] == 1
     assert body["domains"][0]["domain"] == "a.com"
+
+
+def test_pool_endpoint_passes_server_side_filters(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    captured: dict = {}
+
+    def _pool(**kwargs):
+        captured.update(kwargs)
+        return {"total": 7, "offset": kwargs["offset"], "limit": kwargs["limit"], "domains": []}
+
+    monkeypatch.setattr(case_app.intel_db, "list_pool_domains", _pool)
+    with TestClient(case_app.app) as client:
+        response = client.get(
+            "/api/pool",
+            params={
+                "search": "alpha",
+                "provenance": "ingested",
+                "sort": "connections",
+                "offset": 24,
+                "limit": 12,
+                "min_connections": 2,
+                "max_connections": 20,
+                "discovered_after": "2026-01-01",
+                "ingested_before": "2026-06-01",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 7
+    assert captured["search"] == "alpha"
+    assert captured["provenance"] == "ingested"
+    assert captured["sort"] == "connections"
+    assert captured["offset"] == 24
+    assert captured["limit"] == 12
+    assert captured["min_connections"] == 2
+    assert captured["max_connections"] == 20
+    assert captured["discovered_after"] == "2026-01-01"
+    assert captured["ingested_before"] == "2026-06-01"
+    assert captured["include_total"] is True
 
 
 def test_domain_endpoint(monkeypatch) -> None:

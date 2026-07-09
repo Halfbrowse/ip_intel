@@ -76,9 +76,6 @@ def normalize_inputs(targets: list[str]) -> list[dict[str, Any]]:
 
 @contextmanager
 def _basic_runtime(logger: StageLogger | None):
-    original_log = basic.log
-    original_save = basic.save_results
-
     def _log(message: str, level: str = "*") -> None:
         if logger is not None:
             level_map = {"+": "success", "!": "warning", "*": "info"}
@@ -87,13 +84,8 @@ def _basic_runtime(logger: StageLogger | None):
     def _save(_results: dict[str, Any]) -> None:
         return
 
-    basic.log = _log
-    basic.save_results = _save
-    try:
+    with basic.runtime_hooks(log_hook=_log, save_hook=_save):
         yield
-    finally:
-        basic.log = original_log
-        basic.save_results = original_save
 
 
 def analyze_target(
@@ -238,6 +230,7 @@ def _analyze_domain(
         "hackertarget": (payload.get("hackertarget") or {}).get("hits", []),
         "viewdns": (payload.get("viewdns") or {}).get("hits", []),
         "urlscan": (payload.get("urlscan") or {}).get("hits", []),
+        "censys": _provider_origin_candidates(payload, "censys"),
         "scan": {"skipped": True, "reason": "Targeted origin scan is not enabled for case mode."},
         "provider_scan": {"skipped": True, "reason": "Provider scan is not enabled for case mode."},
         "country_scan": {"skipped": True, "reason": "Country scan is not enabled for case mode."},
@@ -249,6 +242,30 @@ def _analyze_domain(
         "display": domain,
     }
     return payload
+
+
+def _provider_origin_candidates(payload: dict[str, Any], provider: str) -> dict[str, Any]:
+    """Copy supported provider hits into the durable origin-candidate shape.
+
+    `core.basic` writes Censys results at the top level (`payload["censys"]`).
+    The persistence/correlation layer intentionally reads provider-origin hits
+    from `origin_candidates`, so normalize the active provider there before
+    saving. Shodan/Netlas remain dormant compatibility helpers and are not
+    promoted by the web pipeline.
+    """
+    result = payload.get(provider)
+    if not isinstance(result, dict):
+        return {"skipped": True, "reason": f"{provider} did not return a provider result"}
+    if result.get("skipped") or result.get("error"):
+        return result
+    hits = [hit for hit in result.get("hits", []) or [] if isinstance(hit, dict)]
+    return {
+        **result,
+        "hits": hits,
+        "status": result.get("status") or "ok",
+        "query_type": result.get("query_type") or "cert_search",
+        "total": result.get("total", len(hits)),
+    }
 
 
 def _analyze_ip(ip: str, *, logger: StageLogger | None = None) -> dict[str, Any]:

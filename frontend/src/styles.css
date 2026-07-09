@@ -91,8 +91,8 @@
   --state-muted-bg: rgba(15, 26, 36, 0.05);
   --state-error-border: rgba(186, 74, 61, 0.2);
   --tooltip-shadow: 0 2px 8px rgba(14, 22, 29, 0.1);
-  --radius-panel: 10px;
-  --radius-pill: 999px;
+  --radius-panel: 8px;
+  --radius-pill: 8px;
   --font-display: "IBM Plex Mono", "SFMono-Regular", "Space Grotesk", monospace;
   --font-mono: "IBM Plex Mono", "SFMono-Regular", monospace;
   font-family: "Manrope", sans-serif;
@@ -165,10 +165,7 @@ body {
   margin: 0;
   min-height: 100vh;
   color: var(--text);
-  background:
-    radial-gradient(circle at top left, var(--bg-accent), transparent 28%),
-    radial-gradient(circle at bottom right, var(--bg-accent-alt), transparent 30%),
-    linear-gradient(180deg, var(--bg-top) 0%, var(--bg) 100%);
+  background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg) 100%);
 }
 
 a {
@@ -198,7 +195,7 @@ button {
 .app-header,
 .hero-panel,
 .panel,
-.case-card,
+.pool-card,
 .cluster-card,
 .evidence-card,
 .subject-card,
@@ -215,7 +212,6 @@ button {
   border-radius: var(--radius-panel);
   background: var(--surface);
   box-shadow: var(--shadow);
-  backdrop-filter: blur(10px);
 }
 
 .app-header {
@@ -223,8 +219,30 @@ button {
   justify-content: space-between;
   gap: 16px;
   align-items: center;
-  padding: 18px 22px;
-  margin-bottom: 22px;
+  padding: 14px 18px;
+  margin-bottom: 18px;
+}
+
+.app-nav {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.app-nav-link {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 8px 12px;
+  background: var(--nav-link-bg);
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.app-nav-link.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
 }
 
 .brand-mark {
@@ -234,7 +252,7 @@ button {
   font-family: var(--font-display);
   font-size: 1.05rem;
   font-weight: 700;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
 }
 
 .brand-mark span {
@@ -244,7 +262,7 @@ button {
   width: 40px;
   height: 40px;
   border-radius: 6px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  background: var(--accent);
   color: white;
 }
 
@@ -268,7 +286,7 @@ button {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  background: var(--accent);
 }
 
 .header-copy,
@@ -300,7 +318,7 @@ button {
 /* The left side of a card-top row (label + heading) needs to be allowed to
    shrink and truncate — some headings here are raw values (a favicon hash, a
    tracking ID) with no natural break point, which otherwise overflow past
-   the card edge exactly like the chip case above. */
+   the card edge exactly like the chip wrapping issue above. */
 .cluster-card-top > div {
   min-width: 0;
   overflow: hidden;
@@ -334,7 +352,7 @@ button {
 
 .hero-panel,
 .panel {
-  padding: 24px;
+  padding: 20px;
 }
 
 .hero-panel {
@@ -346,9 +364,7 @@ button {
      scope trace would, tying the product's "find the signal" thesis to the
      one recurring structural device instead of decorating each page apart. */
   border-top: 2px solid var(--trace);
-  background:
-    radial-gradient(circle at top right, var(--hero-glow), transparent 36%),
-    linear-gradient(180deg, var(--hero-grad-top), var(--hero-grad-bottom));
+  background: var(--surface);
 }
 
 .hero-panel.compact {
@@ -359,17 +375,17 @@ button {
 .panel h1 {
   margin: 0;
   font-family: var(--font-display);
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 
 .panel h2,
 .panel h3,
-.case-card h3,
+.pool-card h3,
 .cluster-card h4,
 .pair-row h3 {
   margin: 0;
   font-family: "Space Grotesk", sans-serif;
-  letter-spacing: -0.03em;
+  letter-spacing: 0;
 }
 
 .hero-copy h1 {
@@ -391,7 +407,7 @@ button {
 
 .hero-stats,
 .metric-grid,
-.case-grid,
+.pool-grid,
 .page-grid,
 .description-grid,
 .evidence-grid,
@@ -414,9 +430,9 @@ button {
 
 .filter-grid select {
   width: 100%;
-  padding: 14px 16px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: var(--radius-panel);
   background: var(--surface-strong);
   color: var(--text);
 }
@@ -457,7 +473,7 @@ button {
 }
 
 .panel-header,
-.case-card-header,
+.pool-card-header,
 .progress-header,
 .cluster-card-top,
 .evidence-card-top,
@@ -465,7 +481,7 @@ button {
 .timeline-title-row,
 .pair-row,
 .breadcrumb-row,
-.case-nav,
+.app-subnav,
 .action-row,
 .inline-metrics {
   display: flex;
@@ -475,7 +491,7 @@ button {
 }
 
 .panel-header,
-.case-card-header,
+.pool-card-header,
 .progress-header,
 .cluster-card-top,
 .pair-row,
@@ -529,7 +545,7 @@ button {
 .search-field,
 .description-item,
 .inline-metric,
-.case-card,
+.pool-card,
 .cluster-card,
 .evidence-card,
 .subject-card,
@@ -548,9 +564,9 @@ button {
 
 .search-field input {
   width: 100%;
-  padding: 14px 16px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: var(--radius-panel);
   background: var(--surface-strong);
   color: var(--text);
 }
@@ -563,7 +579,7 @@ button {
 .secondary-button,
 .primary-button,
 .text-link,
-.case-nav-link {
+.app-subnav-link {
   transition:
     transform 0.18s ease,
     background 0.18s ease,
@@ -573,10 +589,10 @@ button {
 
 .secondary-button,
 .primary-button,
-.case-nav-link {
+.app-subnav-link {
   border: 1px solid var(--border);
   border-radius: var(--radius-pill);
-  padding: 10px 16px;
+  padding: 9px 14px;
 }
 
 .secondary-button {
@@ -585,7 +601,8 @@ button {
 }
 
 .primary-button {
-  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  background: var(--accent);
+  border-color: var(--accent);
   color: white;
 }
 
@@ -606,7 +623,7 @@ button.text-link {
 .secondary-button:hover,
 .primary-button:hover,
 .text-link:hover,
-.case-nav-link:hover {
+.app-subnav-link:hover {
   transform: translateY(-1px);
 }
 
@@ -634,7 +651,7 @@ button:disabled,
 .primary-button:focus-visible,
 .secondary-button:focus-visible,
 .text-link:focus-visible,
-.case-nav-link:focus-visible,
+.app-subnav-link:focus-visible,
 .chip:focus-visible,
 .token:focus-visible,
 .segmented-item:focus-visible,
@@ -643,27 +660,27 @@ a:focus-visible {
   outline-offset: 2px;
 }
 
-.case-nav {
+.app-subnav {
   margin-bottom: 22px;
 }
 
-.case-nav-link {
+.app-subnav-link {
   background: var(--nav-link-bg);
   color: var(--muted);
   font-weight: 700;
 }
 
-.case-nav-link.active {
-  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+.app-subnav-link.active {
+  background: var(--accent);
   color: white;
-  border-color: transparent;
+  border-color: var(--accent);
 }
 
-.case-grid {
+.pool-grid {
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
 }
 
-.case-card,
+.pool-card,
 .cluster-card,
 .evidence-card,
 .pair-row,
@@ -765,14 +782,32 @@ a:focus-visible {
   border-color: var(--border-soft);
 }
 
+.timeline-dot.completed {
+  background: var(--success);
+}
+
+.timeline-dot.running {
+  background: var(--accent);
+}
+
+.timeline-dot.failed,
+.timeline-dot.error {
+  background: var(--danger);
+}
+
+.timeline-dot.pending {
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+}
+
 .inline-metrics {
   align-items: stretch;
 }
 
 .inline-metric {
   min-width: 120px;
-  padding: 12px 14px;
-  border-radius: 18px;
+  padding: 10px 12px;
+  border-radius: var(--radius-panel);
   background: var(--surface-muted);
 }
 
@@ -823,7 +858,7 @@ a:focus-visible {
 
 .description-item {
   padding: 14px 16px;
-  border-radius: 18px;
+  border-radius: var(--radius-panel);
   background: var(--surface-muted);
 }
 
@@ -860,8 +895,8 @@ a:focus-visible {
 }
 
 .callout {
-  padding: 18px;
-  border-radius: 20px;
+  padding: 16px;
+  border-radius: var(--radius-panel);
   background: var(--callout-bg);
   border: 1px solid var(--callout-border);
 }
@@ -884,11 +919,68 @@ a:focus-visible {
 
 .log-shell {
   padding: 16px;
-  border-radius: 20px;
+  border-radius: var(--radius-panel);
   background: var(--log-bg);
   color: var(--log-text);
   max-height: 320px;
   overflow: auto;
+}
+
+.log-shell.compact {
+  max-height: 180px;
+  padding: 12px;
+}
+
+.job-status-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.job-status-grid div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-panel);
+  background: var(--surface-strong);
+}
+
+.job-status-grid span {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.job-status-grid strong {
+  overflow-wrap: anywhere;
+}
+
+.job-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.job-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.job-step small {
+  display: block;
+  color: var(--muted);
+}
+
+.danger-copy {
+  color: var(--danger);
 }
 
 .log-line {
@@ -910,7 +1002,13 @@ a:focus-visible {
 }
 
 .submission-card {
-  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-panel);
+  background: var(--surface-strong);
 }
 
 .cluster-graph-card {
@@ -918,7 +1016,7 @@ a:focus-visible {
   gap: 14px;
   padding: 18px;
   border: 1px solid var(--border);
-  border-radius: 20px;
+  border-radius: var(--radius-panel);
   background: var(--surface-strong);
 }
 
@@ -956,11 +1054,39 @@ a:focus-visible {
 
 .cluster-graph {
   width: 100%;
-  min-height: 500px;
-  border-radius: 20px;
-  background:
-    radial-gradient(circle at top, var(--graph-glow), transparent 32%),
-    var(--graph-bg);
+  min-height: 460px;
+  display: block;
+  background: var(--graph-bg);
+}
+
+.graph-stage {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--graph-bg);
+}
+
+.graph-empty-state {
+  position: absolute;
+  inset: 50% auto auto 50%;
+  width: min(320px, calc(100% - 32px));
+  transform: translate(-50%, -50%);
+  display: grid;
+  gap: 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface-strong);
+  color: var(--text);
+  text-align: center;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+}
+
+.graph-empty-state span {
+  color: var(--muted);
+  font-size: 0.84rem;
 }
 
 .graph-node-label {
@@ -1003,10 +1129,10 @@ a:focus-visible {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 14px 18px;
-  padding: 14px 16px;
+  gap: 10px 12px;
+  padding: 12px;
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   background: var(--surface);
 }
 
@@ -1023,7 +1149,7 @@ a:focus-visible {
 .graph-control select {
   padding: 7px 10px;
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--radius-panel);
   background: var(--surface-strong);
   color: var(--text);
   font-size: 0.84rem;
@@ -1037,6 +1163,13 @@ a:focus-visible {
   width: 140px;
   accent-color: var(--accent);
   cursor: pointer;
+}
+
+.graph-control select:focus-visible,
+.graph-control input:focus-visible,
+.graph-tier-toggle input:focus-visible {
+  outline: 2px solid var(--input-focus-ring);
+  outline-offset: 2px;
 }
 
 .graph-control.tiers {
@@ -1061,6 +1194,24 @@ a:focus-visible {
   cursor: pointer;
 }
 
+.graph-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.graph-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .secondary-button.small,
 .primary-button.small {
   padding: 8px 14px;
@@ -1073,12 +1224,15 @@ a:focus-visible {
   gap: 14px;
   font-size: 0.78rem;
   color: var(--text-muted, var(--text));
+  min-width: 0;
 }
 
 .graph-legend-item {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .graph-legend-swatch {
@@ -1098,13 +1252,20 @@ a:focus-visible {
   cursor: pointer;
 }
 
+.cluster-node:focus-visible,
+.graph-edge-hit:focus-visible {
+  outline: none;
+}
+
 .graph-detail-panel {
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   padding: 14px 16px;
   background: var(--surface);
   display: grid;
   gap: 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .graph-detail-panel .simple-list {
@@ -1116,6 +1277,12 @@ a:focus-visible {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
+}
+
+.graph-detail-panel-head strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* Network graph modal — deliberately its own fixed-position overlay (see the
@@ -1199,7 +1366,7 @@ a:focus-visible {
 }
 
 .domain-chip.active {
-  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  background: var(--accent);
   color: white;
   border-color: transparent;
 }
@@ -1351,7 +1518,7 @@ a:focus-visible {
 
 .linkage-card {
   border: 1px solid var(--border);
-  border-radius: 20px;
+  border-radius: var(--radius-panel);
   background: var(--surface-strong);
   overflow: hidden;
 }
@@ -1616,7 +1783,7 @@ a:focus-visible {
 .raw-disclosure pre {
   margin: 16px 0 0;
   padding: 16px;
-  border-radius: 18px;
+  border-radius: var(--radius-panel);
   background: var(--pre-bg);
   color: var(--pre-text);
   overflow: auto;
@@ -1734,7 +1901,7 @@ a:focus-visible {
 .page-heading h1 {
   margin: 0;
   font-family: var(--font-display);
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   font-size: clamp(1.8rem, 3vw, 2.4rem);
 }
 
@@ -1750,6 +1917,34 @@ a:focus-visible {
   justify-content: space-between;
   gap: 16px;
   flex-wrap: wrap;
+}
+
+.heading-badges,
+.opencti-labels {
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: 10px;
+  vertical-align: middle;
+}
+
+.opencti-labels {
+  margin: 8px 0 0;
+}
+
+.small-copy {
+  display: block;
+  font-size: 0.85em;
+  opacity: 0.85;
+}
+
+.pager-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 0;
 }
 
 /* Segmented control (mode switch) */
@@ -1775,7 +1970,7 @@ a:focus-visible {
 }
 
 .segmented-item.active {
-  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  background: var(--accent);
   color: #fff;
 }
 

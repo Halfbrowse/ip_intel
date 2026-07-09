@@ -32,7 +32,13 @@ import time
 from cases.case_runtime import CaseRuntime
 from cases.case_store import get_job
 from core.analysis_service import clean_target, normalize_inputs
-from db.intel_db import get_latest_search_id_for_target, registrable_domain, save_search_fields, set_domain_tier
+from db.intel_db import (
+    get_latest_search_id_for_target,
+    rebuild_clusters,
+    registrable_domain,
+    save_search_fields,
+    set_domain_tier,
+)
 from integrations.opencti_ingest import fetch_all_website_channel_data
 
 
@@ -149,6 +155,10 @@ def main() -> None:
 
     if status == "failed":
         sys.exit(1)
+
+    print("Rebuilding graph materializations...")
+    graph_counts = rebuild_clusters()
+    print(f"  graph rebuild: {graph_counts}")
 
 
 if __name__ == "__main__":

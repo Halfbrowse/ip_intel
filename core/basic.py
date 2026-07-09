@@ -21,8 +21,11 @@ import ssl
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 
 import dns.resolver
 import requests
@@ -48,8 +51,8 @@ logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 logging.getLogger("paramiko.transport").addHandler(logging.NullHandler())
 
 OUTPUT_FILE     = Path(__file__).parent / "results.json"
-# Follow-up scans never touch paid providers (Censys/Shodan/Netlas -- gated by
-# analysis_service.run_providers on is_seed/is_apex), so this can be generous:
+# Follow-up scans never touch Censys (the only active paid-style provider),
+# so this can be generous:
 # it only costs DNS/WHOIS/crt.sh/page-fetch time, not API credits.
 FOLLOWUP_LIMIT  = 20    # max subdomains to recurse into
 IP_PROBE_LIMIT  = 20    # max IPs to TLS/SSH probe per run
@@ -57,8 +60,35 @@ IP_PROBE_LIMIT  = 20    # max IPs to TLS/SSH probe per run
 
 # ── Logging helpers ───────────────────────────────────────────────────────────
 
+_LogHook = Callable[[str, str], None]
+_SaveHook = Callable[[dict[str, Any]], None]
+
+_LOG_HOOK: ContextVar[_LogHook | None] = ContextVar("ip_intel_basic_log_hook", default=None)
+_SAVE_HOOK: ContextVar[_SaveHook | None] = ContextVar("ip_intel_basic_save_hook", default=None)
+
+
+@contextmanager
+def runtime_hooks(
+    *,
+    log_hook: _LogHook | None = None,
+    save_hook: _SaveHook | None = None,
+):
+    """Route runtime side effects for this analysis context only."""
+    log_token = _LOG_HOOK.set(log_hook)
+    save_token = _SAVE_HOOK.set(save_hook)
+    try:
+        yield
+    finally:
+        _SAVE_HOOK.reset(save_token)
+        _LOG_HOOK.reset(log_token)
+
+
 def log(msg: str, level: str = "*") -> None:
     """Print a timestamped log line via tqdm.write so bars aren't clobbered."""
+    hook = _LOG_HOOK.get()
+    if hook is not None:
+        hook(str(msg), str(level))
+        return
     stamp = datetime.now().strftime("%H:%M:%S")
     tqdm.write(f"  [{level}] {stamp}  {msg}")
 
@@ -72,6 +102,10 @@ def log_warn(msg: str) -> None: log(msg, "!")
 
 def save_results(results: dict) -> None:
     """Write the running results dict to disk."""
+    hook = _SAVE_HOOK.get()
+    if hook is not None:
+        hook(results)
+        return
     with open(OUTPUT_FILE, "w") as f:
         json.dump(results, f, indent=2, default=str)
 

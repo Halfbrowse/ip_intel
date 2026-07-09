@@ -95,6 +95,38 @@ class IdentifierExtractionTests(unittest.TestCase):
             identifiers,
         )
 
+    def test_top_level_censys_hits_backfill_origin_candidates(self) -> None:
+        payload = {
+            "input": "example.com",
+            "type": "domain",
+            "timestamp": "2026-04-20T18:30:00+00:00",
+            "ip_details": {},
+            "censys": {
+                "hits": [
+                    {
+                        "ip": "93.184.216.34",
+                        "hostnames": ["edge.example.com"],
+                        "asn": "AS64577",
+                    }
+                ],
+                "mode": "basic",
+                "status": "ok",
+                "query_type": "host",
+                "total": 1,
+            },
+        }
+
+        identifiers = {
+            (item["id_type"], item["id_value"], item["source"])
+            for item in extract_search_identifiers(payload)
+        }
+
+        self.assertIn(("provider_ip", "93.184.216.34", "origin_candidates.censys"), identifiers)
+        self.assertIn(
+            ("provider_hostname", "edge.example.com", "origin_candidates.censys.hostnames"),
+            identifiers,
+        )
+
 
 class EntityClassificationTests(unittest.TestCase):
     """Pure classification logic for the correlation layer — no database."""
@@ -191,6 +223,16 @@ class IntelDbTests(unittest.TestCase):
                 conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         intel_db.reset_schema_cache()
         intel_db.init_db()
+
+    def test_graph_dirty_state_is_durable(self) -> None:
+        self.assertTrue(intel_db.clusters_dirty())
+
+        counts = intel_db.rebuild_clusters()
+        self.assertEqual(counts["skipped"] if "skipped" in counts else 0, 0)
+        self.assertFalse(intel_db.clusters_dirty())
+
+        intel_db._mark_clusters_dirty()
+        self.assertTrue(intel_db.clusters_dirty())
 
     def test_save_search_handles_policy_and_mail_client_mappings(self) -> None:
         payload = {
