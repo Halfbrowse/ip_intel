@@ -1056,15 +1056,26 @@ a:focus-visible {
   width: 100%;
   min-height: 460px;
   display: block;
-  background: var(--graph-bg);
+  background: #06111d;
+}
+
+.graph-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  gap: 12px;
+  min-width: 0;
 }
 
 .graph-stage {
   position: relative;
   overflow: hidden;
-  border: 1px solid var(--border);
+  border: 1px solid rgba(83, 144, 199, 0.24);
   border-radius: var(--radius-panel);
-  background: var(--graph-bg);
+  background: #06111d;
+  box-shadow: inset 0 0 0 1px rgba(12, 27, 45, 0.8);
+  --graph-label-halo: rgba(6, 17, 29, 0.92);
+  --graph-node-ring: #081525;
+  --graph-node-icon: rgba(255, 255, 255, 0.86);
 }
 
 .graph-empty-state {
@@ -1075,22 +1086,22 @@ a:focus-visible {
   display: grid;
   gap: 4px;
   padding: 14px 16px;
-  border: 1px solid var(--border);
+  border: 1px solid rgba(83, 144, 199, 0.24);
   border-radius: var(--radius-panel);
-  background: var(--surface-strong);
-  color: var(--text);
+  background: #0b1828;
+  color: #e5f2ff;
   text-align: center;
   box-shadow: var(--shadow);
   pointer-events: none;
 }
 
 .graph-empty-state span {
-  color: var(--muted);
+  color: #92a6bd;
   font-size: 0.84rem;
 }
 
 .graph-node-label {
-  fill: var(--text);
+  fill: #dbeafe;
   font-family: var(--font-display);
   font-size: 0.76rem;
   font-weight: 400;
@@ -1103,7 +1114,7 @@ a:focus-visible {
 }
 
 .graph-edge-label-text {
-  fill: var(--text-muted, var(--text));
+  fill: #bfd7ef;
   font-family: var(--font-display);
   font-size: 0.62rem;
   letter-spacing: 0.01em;
@@ -1111,7 +1122,7 @@ a:focus-visible {
 }
 
 .graph-edge-label-bg {
-  fill: var(--graph-bg);
+  fill: #06111d;
   opacity: 0.94;
 }
 
@@ -1131,9 +1142,10 @@ a:focus-visible {
   align-items: flex-end;
   gap: 10px 12px;
   padding: 12px;
-  border: 1px solid var(--border);
+  border: 1px solid rgba(83, 144, 199, 0.24);
   border-radius: var(--radius-panel);
-  background: var(--surface);
+  background: #071321;
+  color: #dbeafe;
 }
 
 .graph-control {
@@ -1143,15 +1155,33 @@ a:focus-visible {
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
-  color: var(--text-muted, var(--text));
+  color: #92a6bd;
 }
 
-.graph-control select {
+.graph-control.compact {
+  flex: 0 0 auto;
+}
+
+.graph-search-control {
+  flex: 1 1 220px;
+}
+
+.graph-filter-block {
+  min-width: 150px;
+}
+
+.graph-filter-block.wide {
+  flex: 1 1 260px;
+}
+
+.graph-control select,
+.graph-control input[type="search"] {
+  width: 100%;
   padding: 7px 10px;
-  border: 1px solid var(--border);
+  border: 1px solid rgba(83, 144, 199, 0.28);
   border-radius: var(--radius-panel);
-  background: var(--surface-strong);
-  color: var(--text);
+  background: #0b1828;
+  color: #e5f2ff;
   font-size: 0.84rem;
   font-weight: 500;
   text-transform: none;
@@ -1161,7 +1191,7 @@ a:focus-visible {
 
 .graph-control input[type="range"] {
   width: 140px;
-  accent-color: var(--accent);
+  accent-color: #35d0c8;
   cursor: pointer;
 }
 
@@ -1182,6 +1212,12 @@ a:focus-visible {
   gap: 12px;
 }
 
+.graph-tier-toggles.scrollable {
+  max-height: 76px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
 .graph-tier-toggle {
   display: inline-flex;
   align-items: center;
@@ -1190,8 +1226,10 @@ a:focus-visible {
   font-weight: 500;
   text-transform: capitalize;
   letter-spacing: normal;
-  color: var(--text);
+  color: #dbeafe;
   cursor: pointer;
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .graph-actions {
@@ -1199,6 +1237,17 @@ a:focus-visible {
   flex-wrap: wrap;
   gap: 8px;
   margin-left: auto;
+}
+
+.graph-controls .secondary-button {
+  background: #0b1828;
+  border-color: rgba(83, 144, 199, 0.32);
+  color: #dbeafe;
+}
+
+.graph-controls .primary-button {
+  background: #0a7ea4;
+  border-color: #0a7ea4;
 }
 
 .graph-status {
@@ -1237,6 +1286,7 @@ a:focus-visible {
 
 .graph-legend-swatch {
   display: inline-block;
+  flex: 0 0 auto;
   width: 16px;
   height: 4px;
   border-radius: 2px;
@@ -1246,6 +1296,10 @@ a:focus-visible {
   width: 11px;
   height: 11px;
   border-radius: 50%;
+}
+
+.graph-legend-swatch.muted-swatch {
+  background: #64748b;
 }
 
 .graph-edge-hit {
@@ -1283,6 +1337,76 @@ a:focus-visible {
 .graph-detail-panel-head strong {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.graph-inspector {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+  max-height: 100%;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(83, 144, 199, 0.24);
+  border-radius: var(--radius-panel);
+  background: #081525;
+  color: #e5f2ff;
+}
+
+.graph-inspector .muted,
+.graph-inspector .card-copy {
+  color: #92a6bd;
+}
+
+.graph-inspector-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.graph-inspector-head > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.graph-inspector-head strong {
+  overflow-wrap: anywhere;
+}
+
+.graph-inspector-meta {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.graph-inspector-meta div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.graph-inspector-meta dt {
+  color: #7f98b2;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.graph-inspector-meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.graph-inspector .simple-list {
+  margin: 0;
+}
+
+.graph-inspector-empty {
+  display: grid;
+  gap: 6px;
 }
 
 /* Network graph modal — deliberately its own fixed-position overlay (see the
@@ -1837,6 +1961,14 @@ a:focus-visible {
 
   .linkage-caret {
     display: none;
+  }
+
+  .graph-workbench {
+    grid-template-columns: 1fr;
+  }
+
+  .graph-inspector {
+    max-height: none;
   }
 }
 

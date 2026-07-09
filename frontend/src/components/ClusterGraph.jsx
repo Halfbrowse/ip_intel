@@ -65,6 +65,15 @@ const LABEL_MODES = {
   all: { label: "All" },
   none: { label: "None" },
 };
+const UNCLASSIFIED_TIER = "unclassified";
+const ROLE_FILTERS = {
+  submitted: "Anchors",
+  related: "Related",
+};
+
+function allTrue(items) {
+  return Object.fromEntries(items.map((item) => [item, true]));
+}
 
 function edgeKey(edge) {
   return `${edge.from}|${edge.to}`;
@@ -84,6 +93,24 @@ function edgeTier(edge) {
 
 function isSubmitted(node, seeds) {
   return node.role === "submitted" || seeds.has(node.id);
+}
+
+function nodeRole(node, seeds) {
+  return isSubmitted(node, seeds) ? "submitted" : "related";
+}
+
+function nodeTierKey(node) {
+  return DOMAIN_TIER_COLORS[node?.tier] ? String(node.tier) : UNCLASSIFIED_TIER;
+}
+
+function evidenceType(edge) {
+  const first = evidenceLabels(edge)[0] || "Relationship";
+  const separator = String(first).indexOf(": ");
+  return separator === -1 ? String(first) : String(first).slice(0, separator);
+}
+
+function includesNeedle(value, needle) {
+  return String(value || "").toLowerCase().includes(needle);
 }
 
 function todayLabel() {
@@ -457,6 +484,17 @@ const ClusterGraph = memo(function ClusterGraph({
   const [minScore, setMinScore] = useState(0);
   const [spread, setSpread] = useState(1);
   const [narrowSelection, setNarrowSelection] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [roleFilter, setRoleFilter] = useState({ submitted: true, related: true });
+  const [domainTierFilter, setDomainTierFilter] = useState({
+    1: true,
+    2: true,
+    3: true,
+    4: true,
+    5: true,
+    [UNCLASSIFIED_TIER]: true,
+  });
+  const [evidenceTypeFilter, setEvidenceTypeFilter] = useState({});
 
   // Selection drives the detail panels below the map.
   const [selectedNode, setSelectedNode] = useState(null);
@@ -506,6 +544,20 @@ const ClusterGraph = memo(function ClusterGraph({
     () => (Array.isArray(graph?.edges) ? graph.edges : []),
     [graph],
   );
+  const nodeById = useMemo(
+    () => new Map(allNodes.map((node) => [node.id, node])),
+    [allNodes],
+  );
+  const searchNeedle = searchQuery.trim().toLowerCase();
+  const evidenceTypes = useMemo(() => {
+    const labels = new Set();
+    allEdges.forEach((edge) => {
+      if (edgeKind(edge) === "evidence") {
+        labels.add(evidenceType(edge));
+      }
+    });
+    return [...labels].sort((a, b) => a.localeCompare(b));
+  }, [allEdges]);
   const maxScore = useMemo(
     () =>
       allEdges.reduce(
@@ -515,19 +567,53 @@ const ClusterGraph = memo(function ClusterGraph({
     [allEdges],
   );
 
-  // Evidence edges that survive the tier + minimum-strength filters. These are
-  // the actual links between domains; membership ties are handled separately.
+  const nodeCriteriaIds = useMemo(() => {
+    const ids = new Set();
+    allNodes.forEach((node) => {
+      const role = nodeRole(node, seedTargets);
+      if (!roleFilter[role]) {
+        return;
+      }
+      if (!domainTierFilter[nodeTierKey(node)]) {
+        return;
+      }
+      ids.add(node.id);
+    });
+    return ids;
+  }, [allNodes, seedTargets, roleFilter, domainTierFilter]);
+
+  const edgeMatchesSearch = useCallback(
+    (edge) => {
+      if (!searchNeedle) {
+        return true;
+      }
+      const from = nodeById.get(edge.from);
+      const to = nodeById.get(edge.to);
+      return (
+        includesNeedle(edge.from, searchNeedle) ||
+        includesNeedle(edge.to, searchNeedle) ||
+        includesNeedle(from?.label, searchNeedle) ||
+        includesNeedle(to?.label, searchNeedle) ||
+        evidenceLabels(edge).some((label) => includesNeedle(label, searchNeedle))
+      );
+    },
+    [nodeById, searchNeedle],
+  );
+
+  // Evidence edges that survive the knowledge filters. These are the actual
+  // relationships between domains; membership ties are handled separately.
   const visibleEvidence = useMemo(() => {
-    const ids = new Set(allNodes.map((node) => node.id));
     return allEdges.filter(
       (edge) =>
         edgeKind(edge) === "evidence" &&
-        ids.has(edge.from) &&
-        ids.has(edge.to) &&
+        nodeCriteriaIds.has(edge.from) &&
+        nodeCriteriaIds.has(edge.to) &&
         tierFilter[edgeTier(edge)] &&
-        (edge.score || 0) >= minScore,
+        (edge.score || 0) >= minScore &&
+        evidenceTypeFilter[evidenceType(edge)] !== false &&
+        edgeMatchesSearch(edge),
     );
-  }, [allNodes, allEdges, tierFilter, minScore]);
+  }, [allEdges, nodeCriteriaIds, tierFilter, minScore, evidenceTypeFilter, edgeMatchesSearch]);
 
   // A node earns its place on the map only if it takes part in a surviving
   // link — directly, or (for a submitted domain) through one of its bridges.
@@ -541,10 +627,10 @@ const ClusterGraph = memo(function ClusterGraph({
     allEdges.forEach((edge) => {
       if (edgeKind(edge) !== "membership") return;
       // edge.from = apex (submitted domain), edge.to = bridge subdomain.
-      if (ids.has(edge.to)) ids.add(edge.from);
+      if (ids.has(edge.to) && nodeCriteriaIds.has(edge.from)) ids.add(edge.from);
     });
     return ids;
-  }, [visibleEvidence, allEdges]);
+  }, [visibleEvidence, allEdges, nodeCriteriaIds]);
 
   const visibleNodes = useMemo(
     () => allNodes.filter((node) => liveIds.has(node.id)),
@@ -638,6 +724,23 @@ const ClusterGraph = memo(function ClusterGraph({
     setHoveredEdge(null);
     setNarrowSelection(false);
   }, []);
+
+  const resetKnowledgeFilters = useCallback(() => {
+    setSearchQuery("");
+    setRoleFilter({ submitted: true, related: true });
+    setDomainTierFilter({
+      1: true,
+      2: true,
+      3: true,
+      4: true,
+      5: true,
+      [UNCLASSIFIED_TIER]: true,
+    });
+    setEvidenceTypeFilter(allTrue(evidenceTypes));
+    setTierFilter({ strong: true, moderate: true, weak: true });
+    setMinScore(0);
+    clearFocus();
+  }, [clearFocus, evidenceTypes]);
 
   useEffect(() => {
     const selectedNodeHidden = selectedNode && !visibleNodes.some((node) => node.id === selectedNode);
@@ -1648,6 +1751,10 @@ const ClusterGraph = memo(function ClusterGraph({
       .filter((edge) => edge.from === selectedNode || edge.to === selectedNode)
       .sort((a, b) => (b.score || 0) - (a.score || 0));
   }, [selectedNode, visibleEvidence]);
+  const selectedNodeData = useMemo(
+    () => (selectedNode ? allNodes.find((node) => node.id === selectedNode) || null : null),
+    [allNodes, selectedNode],
+  );
 
   if (allNodes.length === 0) {
     return null;
@@ -1658,6 +1765,21 @@ const ClusterGraph = memo(function ClusterGraph({
   const hasSelection = Boolean(selectedNode || selectedEdge);
   const focusViewActive = Boolean(narrowSelection && selectedScope);
   const presentTiers = DOMAIN_TIER_ORDER.filter((tier) => displayNodes.some((node) => node.tier === tier));
+  const filterTierKeys = DOMAIN_TIER_ORDER.filter((tier) => allNodes.some((node) => node.tier === tier));
+  const hasUnclassifiedTier = allNodes.some((node) => !DOMAIN_TIER_COLORS[node.tier]);
+  const hiddenRoleCount = Object.keys(ROLE_FILTERS).filter((role) => !roleFilter[role]).length;
+  const hiddenTierCount =
+    filterTierKeys.filter((tier) => !domainTierFilter[String(tier)]).length +
+    (hasUnclassifiedTier && !domainTierFilter[UNCLASSIFIED_TIER] ? 1 : 0);
+  const hiddenEvidenceTypeCount = evidenceTypes.filter((type) => evidenceTypeFilter[type] === false).length;
+  const hiddenStrengthCount = TIER_ORDER.filter((tier) => !tierFilter[tier]).length;
+  const activeCriteriaCount =
+    (searchNeedle ? 1 : 0) +
+    hiddenRoleCount +
+    hiddenTierCount +
+    hiddenEvidenceTypeCount +
+    hiddenStrengthCount +
+    (minScore > 0 ? 1 : 0);
   const totalEvidenceCount = allEdges.filter((edge) => edgeKind(edge) === "evidence").length;
   const shownEvidenceCount = displayEdges.filter((edge) => edgeKind(edge) === "evidence").length;
   const visibleFiltered = visibleNodes.length < allNodes.length || visibleEvidence.length < totalEvidenceCount;
@@ -1668,10 +1790,12 @@ const ClusterGraph = memo(function ClusterGraph({
       ? "No links match the current strength filters."
       : hasSelection && focusViewActive
         ? `Focused on ${displayNodes.length} domains and ${shownEvidenceCount} evidence links.`
-        : hasSelection
-          ? `Highlighting ${selectedLabel || "selection"}; ${displayNodes.length} domains remain in context.`
-          : visibleFiltered
-            ? `Showing ${displayNodes.length} of ${allNodes.length} domains and ${shownEvidenceCount} of ${totalEvidenceCount} evidence links.`
+          : hasSelection
+            ? `Highlighting ${selectedLabel || "selection"}; ${displayNodes.length} domains remain in context.`
+          : visibleFiltered && activeCriteriaCount > 0
+            ? `Showing ${displayNodes.length} of ${allNodes.length} domains and ${shownEvidenceCount} of ${totalEvidenceCount} evidence links across ${activeCriteriaCount} active filter${activeCriteriaCount === 1 ? "" : "s"}.`
+            : visibleFiltered
+              ? `Showing ${displayNodes.length} of ${allNodes.length} domains and ${shownEvidenceCount} of ${totalEvidenceCount} evidence links.`
             : `Showing ${displayNodes.length} domains and ${shownEvidenceCount} evidence links.`;
 
   return (
@@ -1684,8 +1808,19 @@ const ClusterGraph = memo(function ClusterGraph({
         </div>
       </div>
 
-      <div className="graph-controls" aria-label="Map customisation">
-        <label className="graph-control">
+      <div className="graph-controls" aria-label="Knowledge graph controls">
+        <label className="graph-control graph-search-control">
+          <span>Search knowledge</span>
+          <input
+            aria-label="Search visible domains and evidence"
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="domain, IP, cert, ASN..."
+            type="search"
+            value={searchQuery}
+          />
+        </label>
+
+        <label className="graph-control compact">
           <span>Labels</span>
           <select
             aria-label="Node label density"
@@ -1701,7 +1836,7 @@ const ClusterGraph = memo(function ClusterGraph({
           </select>
         </label>
 
-        <label className="graph-control">
+        <label className="graph-control compact">
           <span>Spread</span>
           <input
             aria-label="Graph spread"
@@ -1716,7 +1851,7 @@ const ClusterGraph = memo(function ClusterGraph({
         </label>
 
         {maxScore > 0 ? (
-          <label className="graph-control">
+          <label className="graph-control compact">
             <span>Min. strength {minScore > 0 ? `(${minScore})` : ""}</span>
             <input
               aria-label="Minimum link strength"
@@ -1731,8 +1866,86 @@ const ClusterGraph = memo(function ClusterGraph({
           </label>
         ) : null}
 
-        <div className="graph-control tiers">
-          <span>Show links</span>
+        <div className="graph-control graph-filter-block">
+          <span>Objects</span>
+          <div className="graph-tier-toggles">
+            {Object.entries(ROLE_FILTERS).map(([role, label]) => (
+              <label className="graph-tier-toggle" key={role}>
+                <input
+                  aria-label={`Show ${label.toLowerCase()} objects`}
+                  checked={roleFilter[role]}
+                  onChange={(e) => setRoleFilter((prev) => ({ ...prev, [role]: e.target.checked }))}
+                  type="checkbox"
+                />
+                <span
+                  className="graph-legend-swatch round"
+                  style={{ background: role === "submitted" ? SUBMITTED_COLOR : otherRoleColor }}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {(filterTierKeys.length > 0 || hasUnclassifiedTier) ? (
+          <div className="graph-control graph-filter-block">
+            <span>OpenCTI tier</span>
+            <div className="graph-tier-toggles">
+              {filterTierKeys.map((tier) => (
+                <label className="graph-tier-toggle" key={`filter-tier-${tier}`}>
+                  <input
+                    aria-label={`Show ${DOMAIN_TIER_LABELS[tier]} domains`}
+                    checked={domainTierFilter[String(tier)]}
+                    onChange={(e) =>
+                      setDomainTierFilter((prev) => ({ ...prev, [String(tier)]: e.target.checked }))
+                    }
+                    type="checkbox"
+                  />
+                  <span className="graph-legend-swatch round" style={{ background: DOMAIN_TIER_COLORS[tier] }} />
+                  {DOMAIN_TIER_LABELS[tier].replace("Tier ", "T")}
+                </label>
+              ))}
+              {hasUnclassifiedTier ? (
+                <label className="graph-tier-toggle">
+                  <input
+                    aria-label="Show unclassified domains"
+                    checked={domainTierFilter[UNCLASSIFIED_TIER]}
+                    onChange={(e) =>
+                      setDomainTierFilter((prev) => ({ ...prev, [UNCLASSIFIED_TIER]: e.target.checked }))
+                    }
+                    type="checkbox"
+                  />
+                  <span className="graph-legend-swatch round muted-swatch" />
+                  Unclassified
+                </label>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
+        {evidenceTypes.length > 0 ? (
+          <div className="graph-control graph-filter-block wide">
+            <span>Relationship type</span>
+            <div className="graph-tier-toggles scrollable">
+              {evidenceTypes.map((type) => (
+                <label className="graph-tier-toggle" key={type} title={type}>
+                  <input
+                    aria-label={`Show ${type} relationships`}
+                    checked={evidenceTypeFilter[type] !== false}
+                    onChange={(e) =>
+                      setEvidenceTypeFilter((prev) => ({ ...prev, [type]: e.target.checked }))
+                    }
+                    type="checkbox"
+                  />
+                  {truncateLabel(type, 18)}
+                </label>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        <div className="graph-control graph-filter-block">
+          <span>Strength</span>
           <div className="graph-tier-toggles">
             {TIER_ORDER.map((tier) => (
               <label className="graph-tier-toggle" key={tier}>
@@ -1753,6 +1966,12 @@ const ClusterGraph = memo(function ClusterGraph({
             ))}
           </div>
         </div>
+
+        {activeCriteriaCount > 0 ? (
+          <button className="secondary-button small" onClick={resetKnowledgeFilters} title="Reset all graph filters" type="button">
+            Reset filters
+          </button>
+        ) : null}
 
         {hasSelection ? (
           <button
@@ -1857,81 +2076,122 @@ const ClusterGraph = memo(function ClusterGraph({
           : null}
       </div>
 
-      <div className="graph-stage">
-        <svg
-          ref={svgRef}
-          className="cluster-graph"
-          viewBox={`0 0 ${width} ${height}`}
-          style={{ cursor: "grab", height }}
-          role="img"
-          aria-label="Network map of connected domains"
-          aria-describedby={statusId}
-        >
-          <g ref={gRef} />
-        </svg>
-        {displayNodes.length === 0 ? (
-          <div className="graph-empty-state" role="status">
-            <strong>No visible links</strong>
-            <span>Relax the strength filters to bring nodes back into view.</span>
-          </div>
-        ) : null}
-      </div>
+      <div className="graph-workbench">
+        <div className="graph-stage">
+          <svg
+            ref={svgRef}
+            className="cluster-graph"
+            viewBox={`0 0 ${width} ${height}`}
+            style={{ cursor: "grab", height }}
+            role="img"
+            aria-label="Network map of connected domains"
+            aria-describedby={statusId}
+          >
+            <g ref={gRef} />
+          </svg>
+          {displayNodes.length === 0 ? (
+            <div className="graph-empty-state" role="status">
+              <strong>No visible links</strong>
+              <span>Relax the knowledge filters to bring relationships back into view.</span>
+            </div>
+          ) : null}
+        </div>
 
-      {selectedEdgeData ? (
-        <div className="graph-detail-panel">
-          <div className="graph-detail-panel-head">
-            <strong>
-              {selectedEdgeData.from} ↔ {selectedEdgeData.to}
-            </strong>
-            <button className="secondary-button small" onClick={clearFocus} type="button">
-              Clear selection
-            </button>
-          </div>
-          <p className="card-copy">What these two have in common:</p>
-          {/* Render the exact same evidence packet the summary page shows for
-              these two entities, sourced from the shared pair endpoint. Falls
-              back to the edge's own labels for links with no backing pair. */}
-          {renderPairEvidence && selectedEdgeData.pairing_id ? (
-            renderPairEvidence(selectedEdgeData.pairing_id)
+        <aside className="graph-inspector" aria-label="Knowledge selection details">
+          {selectedEdgeData ? (
+            <>
+              <div className="graph-inspector-head">
+                <div>
+                  <span className="muted">Relationship</span>
+                  <strong>{evidenceType(selectedEdgeData)}</strong>
+                </div>
+                <button className="secondary-button small" onClick={clearFocus} type="button">
+                  Clear
+                </button>
+              </div>
+              <dl className="graph-inspector-meta">
+                <div>
+                  <dt>Source</dt>
+                  <dd>{selectedEdgeData.from}</dd>
+                </div>
+                <div>
+                  <dt>Target</dt>
+                  <dd>{selectedEdgeData.to}</dd>
+                </div>
+                <div>
+                  <dt>Strength</dt>
+                  <dd>{EDGE_TIERS[edgeTier(selectedEdgeData)].label}</dd>
+                </div>
+                <div>
+                  <dt>Score</dt>
+                  <dd>{selectedEdgeData.score ?? "-"}</dd>
+                </div>
+              </dl>
+              <p className="card-copy">Evidence:</p>
+              {renderPairEvidence && selectedEdgeData.pairing_id ? (
+                renderPairEvidence(selectedEdgeData.pairing_id)
+              ) : (
+                <ul className="simple-list">
+                  {evidenceLabels(selectedEdgeData).map((label) => (
+                    <li key={label}>{label}</li>
+                  ))}
+                </ul>
+              )}
+            </>
+          ) : selectedNodeData ? (
+            <>
+              <div className="graph-inspector-head">
+                <div>
+                  <span className="muted">Entity</span>
+                  <strong>{selectedNodeData.label || selectedNode}</strong>
+                </div>
+                <button className="secondary-button small" onClick={clearFocus} type="button">
+                  Clear
+                </button>
+              </div>
+              <dl className="graph-inspector-meta">
+                <div>
+                  <dt>Type</dt>
+                  <dd>{nodeRole(selectedNodeData, seedTargets) === "submitted" ? "Anchor channel" : "Related channel"}</dd>
+                </div>
+                <div>
+                  <dt>Tier</dt>
+                  <dd>{selectedNodeData.tier ? DOMAIN_TIER_LABELS[selectedNodeData.tier] : "Unclassified"}</dd>
+                </div>
+                <div>
+                  <dt>Relationships</dt>
+                  <dd>{selectedNodeEdges.length}</dd>
+                </div>
+              </dl>
+              <p className="card-copy">
+                Connected to {selectedNodeEdges.length} other
+                {selectedNodeEdges.length === 1 ? " node" : " nodes"}:
+              </p>
+              <ul className="simple-list">
+                {selectedNodeEdges.slice(0, 8).map((edge) => {
+                  const other = edge.from === selectedNode ? edge.to : edge.from;
+                  const labels = evidenceLabels(edge);
+                  return (
+                    <li key={edgeKey(edge)}>
+                      <strong>{other}</strong>
+                      {labels.length > 0 ? ` - ${labels.slice(0, 3).join(", ")}` : ""}
+                    </li>
+                  );
+                })}
+                {selectedNodeEdges.length > 8 ? (
+                  <li>...and {selectedNodeEdges.length - 8} more relationships.</li>
+                ) : null}
+              </ul>
+            </>
           ) : (
-            <ul className="simple-list">
-              {evidenceLabels(selectedEdgeData).map((label) => (
-                <li key={label}>{label}</li>
-              ))}
-            </ul>
+            <div className="graph-inspector-empty">
+              <span className="muted">Inspector</span>
+              <strong>Select a node or relationship</strong>
+              <p className="card-copy">Details, evidence, score, tier, and direct neighbors appear here.</p>
+            </div>
           )}
-        </div>
-      ) : null}
-
-      {selectedNode && selectedNodeEdges.length > 0 ? (
-        <div className="graph-detail-panel">
-          <div className="graph-detail-panel-head">
-            <strong>{selectedNode}</strong>
-            <button className="secondary-button small" onClick={clearFocus} type="button">
-              Clear selection
-            </button>
-          </div>
-          <p className="card-copy">
-            Connected to {selectedNodeEdges.length} other
-            {selectedNodeEdges.length === 1 ? " node" : " nodes"}:
-          </p>
-          <ul className="simple-list">
-            {selectedNodeEdges.slice(0, 8).map((edge) => {
-              const other = edge.from === selectedNode ? edge.to : edge.from;
-              const labels = evidenceLabels(edge);
-              return (
-                <li key={edgeKey(edge)}>
-                  <strong>{other}</strong>
-                  {labels.length > 0 ? ` — ${labels.slice(0, 3).join(", ")}` : ""}
-                </li>
-              );
-            })}
-            {selectedNodeEdges.length > 8 ? (
-              <li>…and {selectedNodeEdges.length - 8} more connections.</li>
-            ) : null}
-          </ul>
-        </div>
-      ) : null}
+        </aside>
+      </div>
     </section>
   );
 });

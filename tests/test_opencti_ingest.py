@@ -166,6 +166,27 @@ class OpenCtiIngestTests(unittest.TestCase):
 
         self.assertEqual(opencti_ingest._get_channel_domains(set()), ["russiaherald.com"])
 
+    def test_channel_labels_accept_multiple_dict_shapes(self) -> None:
+        channel = {
+            "objectLabel": [
+                {"value": "Tier 3"},
+                {"value": "campaign-alpha"},
+                {"node": {"value": "platform-news"}},
+            ],
+            "labels": {
+                "edges": [
+                    {"node": {"value": "tier-2"}},
+                    {"node": {"name": "source-opencti"}},
+                    {"node": {"value": "campaign-alpha"}},
+                ]
+            },
+        }
+
+        labels = opencti_ingest._channel_labels(channel)
+
+        self.assertEqual(labels, ["Tier 3", "campaign-alpha", "platform-news", "tier-2", "source-opencti"])
+        self.assertEqual(opencti_ingest._extract_tier(labels), 2)
+
     def test_channel_social_media_domains_are_skipped(self) -> None:
         self._set_opencti_env()
         channels = [

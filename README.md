@@ -200,7 +200,6 @@ There is no case API — everything is the global pool and its connections.
 ### Ingestion
 
 - `POST /api/ingest` — add a domain / IP / CSV to the pool. JSON `{"target": "...", "label": "..."}` or multipart with a CSV `file`. `label` is an optional free-text tag on the ingest; it scopes nothing. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
-- `POST /api/ingest/opencti-website` — add the domains from OpenCTI's 100 most recent website-type Channel SDOs.
 - `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs).
 
 ### The pool
@@ -470,9 +469,8 @@ Docker, tests, or README conformance.
 
 ## OpenCTI Ingestion
 
-`integrations/opencti_ingest.py` pulls targets from OpenCTI (set `OPENCTI_URL` and `OPENCTI_TOKEN`). There are two live paths into the pool, plus one legacy worker retained but not currently triggered by anything:
+`integrations/opencti_ingest.py` pulls targets from OpenCTI (set `OPENCTI_URL` and `OPENCTI_TOKEN`). OpenCTI website-channel ingestion is intentionally operator-triggered from Docker, not exposed in the web UI:
 
-- **"Ingest website channels" button** (`POST /api/ingest/opencti-website`) — the newest 100 Channel SDOs with `channel_types` containing `website`, resolved to domains and submitted as a normal ingest job (frontend-triggered).
 - **`scripts/ingest_opencti_channels.py`** (below) — every matching Channel, no cap, run as a docker command instead of from the UI, with tier classification.
 - `_run()` / `restart_ingestion()` / `retry_source_errors()` in `integrations/opencti_ingest.py` — an older worker that separately pulled Domain-Name observables and Channel SDOs and ran them through `core/ip_intel.py`'s CLI engine rather than the current app ingest pipeline (`OPENCTI_INGEST_CHANNELS`, `OPENCTI_INGEST_WORKERS` control it). Nothing in the running app calls `start_background_ingestion()`/`restart_ingestion()` anymore — it's dead code, kept because `tests/test_opencti_ingest.py` still exercises it.
 

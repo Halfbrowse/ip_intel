@@ -2,7 +2,7 @@
 opencti_ingest.py - Pull Domain-Name observables and Channel SDOs from
 OpenCTI and run basic ip-intel analysis on each derived domain.
 
-This worker is triggered manually through the API/UI. Configuration via env vars:
+This worker is triggered manually through Docker/scripts. Configuration via env vars:
   OPENCTI_URL              - e.g. https://opencti.example.com
   OPENCTI_TOKEN            - API token with read access to observables
   OPENCTI_INGEST_CHANNELS  - set to false/0/no/off to skip Channel SDOs (default: true)
@@ -319,19 +319,45 @@ def _channel_is_website(channel: dict) -> bool:
     return any(str(t).strip().lower() == "website" for t in types)
 
 
+def _label_items(raw: object) -> list[object]:
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        if isinstance(raw.get("edges"), list):
+            return [edge.get("node", edge) for edge in raw.get("edges") or [] if isinstance(edge, dict)]
+        if "node" in raw:
+            return [raw.get("node")]
+        return [raw]
+    if isinstance(raw, (list, tuple, set)):
+        return list(raw)
+    return [raw]
+
+
+def _label_value(item: object) -> str:
+    if isinstance(item, dict):
+        node = item.get("node")
+        if isinstance(node, dict):
+            item = node
+        value = item.get("value") or item.get("name") or item.get("label")
+    else:
+        value = item
+    return str(value or "").strip()
+
+
 def _channel_labels(channel: dict) -> list[str]:
-    """Extract label values (objectLabel[].value) from a Channel SDO.
-    pycti's default Channel query already includes objectLabel, so no extra
-    request is needed to get these."""
-    raw = channel.get("objectLabel") or []
-    if isinstance(raw, dict):  # raw GraphQL edges shape, just in case
-        raw = [edge.get("node", edge) for edge in raw.get("edges") or [] if isinstance(edge, dict)]
+    """Extract label values from a Channel SDO.
+
+    pycti normally returns `objectLabel` as a list of dicts like
+    [{"value": "tier-1"}, ...]. Some OpenCTI/client shapes use `labels`, a
+    GraphQL `edges[].node` wrapper, or nested `node` dicts, so tolerate all of
+    those and keep unique labels in first-seen order.
+    """
     labels: list[str] = []
-    for item in raw:
-        value = item.get("value") if isinstance(item, dict) else item
-        value = str(value or "").strip()
-        if value and value not in labels:
-            labels.append(value)
+    for raw in (channel.get("objectLabel"), channel.get("labels")):
+        for item in _label_items(raw):
+            value = _label_value(item)
+            if value and value not in labels:
+                labels.append(value)
     return labels
 
 

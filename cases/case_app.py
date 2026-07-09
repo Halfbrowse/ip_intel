@@ -178,27 +178,6 @@ def _ingest_response(identifiers: dict[str, str], *, label: str | None, count: i
     )
 
 
-@app.post("/api/ingest/opencti-website")
-async def api_ingest_opencti_website() -> JSONResponse:
-    """Add the domains from OpenCTI's 100 most recently created website-type
-    Channel SDOs to the pool."""
-    # Imported lazily so the app starts even when pycti / OpenCTI config is
-    # absent; the dependency is only needed when this button is used.
-    from integrations.opencti_ingest import fetch_website_channel_domains
-
-    try:
-        domains = await asyncio.to_thread(fetch_website_channel_domains, 100)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"OpenCTI fetch failed: {exc}")
-
-    inputs = normalize_inputs(domains)
-    if not inputs:
-        raise HTTPException(status_code=404, detail="No website-channel domains found on OpenCTI.")
-
-    identifiers = runtime.submit_case(inputs, input_mode="opencti_website")
-    return _ingest_response(identifiers, label="opencti_website", count=len(inputs))
-
-
 @app.post("/api/ingest")
 async def api_ingest(request: Request) -> JSONResponse:
     """Add a domain / IP / CSV to the global pool. Runs the analysis pipeline;

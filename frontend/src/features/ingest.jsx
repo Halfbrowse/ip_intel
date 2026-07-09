@@ -160,24 +160,6 @@ export default function IngestPanel({ onIngested }) {
     }
   };
 
-  const ingestOpenCti = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const response = await fetch("/api/ingest/opencti-website", {
-        method: "POST",
-        headers: { Accept: "application/json" },
-      });
-      const payload = await finishIngest(response);
-      setJobId(payload?.job_id || payload?.job?.id || null);
-      onIngested?.();
-    } catch (err) {
-      setError(err.message || "OpenCTI ingest failed.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <section className="panel section-stack">
       <div className="panel-header">
@@ -233,15 +215,6 @@ export default function IngestPanel({ onIngested }) {
           </button>
         </div>
 
-        <div className="submission-card">
-          <div className="search-field">
-            <span>OpenCTI website channels</span>
-            <p className="card-copy">Pull the latest website channels into the shared pool.</p>
-          </div>
-          <button className="secondary-button" disabled={busy} onClick={ingestOpenCti} type="button">
-            {busy ? "Submitting..." : "Ingest OpenCTI"}
-          </button>
-        </div>
       </div>
 
       {error ? <ErrorState message={error} /> : null}
