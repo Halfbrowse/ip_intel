@@ -1,13 +1,17 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link, NavLink, Route, Routes, useParams } from "./router.jsx";
 
 import {
   fetchJson,
   formatDate,
   formatLabel,
+  formatNumber,
   formatPercent,
   isTerminalStatus,
   normalizeConnectionPairs,
+  normalizeConnectionsGraph,
+  normalizeExplorerGraph,
   normalizeGraphClusters,
   normalizeGraphLinks,
   normalizeJob,
@@ -24,6 +28,7 @@ import {
   MetricCard,
   ProgressBar,
 } from "./components/primitives.jsx";
+import ClusterGraph from "./components/ClusterGraph.jsx";
 
 /* ============================================================== */
 /* Routing                                                         */
@@ -151,6 +156,8 @@ const SELECTOR_KIND_LABELS = {
   shared_ip: "Shared IP address",
   ssh_fp: "SSH host key",
   tracking_id: "Tracking / analytics ID",
+  site_verification: "Site verification code",
+  social_handle: "Social media handle",
   favicon_mmh3: "Favicon fingerprint",
   favicon_md5: "Favicon hash",
   html_hash: "Homepage content hash",
@@ -161,6 +168,88 @@ const SELECTOR_KIND_LABELS = {
 
 function sharedNodeLabel(kind) {
   return SELECTOR_KIND_LABELS[kind] || formatLabel(kind);
+}
+
+// What kind of box a shared IP is — badge tone + label for the "cdn / pool /
+// origin" classification the backend computes (utils/check.describe_ip_network).
+const IP_NETWORK_BADGES = {
+  cdn: { label: "CDN / proxy edge", tone: "neutral" },
+  pool: { label: "Shared hosting pool", tone: "warning" },
+  origin: { label: "Likely origin server", tone: "success" },
+};
+
+function ipNetworkBadge(network) {
+  return IP_NETWORK_BADGES[network] || null;
+}
+
+// OpenCTI tier-1..tier-5 domain classification (durable, keyed on the
+// registrable domain — see db.intel_db.domain_tiers). Same hot-to-cool
+// palette as ClusterGraph.jsx's node colouring, so a domain reads the same
+// way here and on the network map. Unrelated to STRENGTH_TIERS above (that's
+// link strength, this is a per-domain attribute).
+const DOMAIN_TIER_COLORS = {
+  1: "#b91c1c",
+  2: "#ea580c",
+  3: "#ca8a04",
+  4: "#2563eb",
+  5: "#64748b",
+};
+
+function TierBadge({ tier }) {
+  if (!DOMAIN_TIER_COLORS[tier]) {
+    return null;
+  }
+  return (
+    <span
+      className="chip"
+      style={{ background: DOMAIN_TIER_COLORS[tier], color: "#fff", borderColor: "transparent" }}
+      title={`OpenCTI tier ${tier} (1 = highest priority)`}
+    >
+      Tier {tier}
+    </span>
+  );
+}
+
+// "<provider>|<id>"-shaped selector values (tracking_id, site_verification,
+// social_handle) carry a `subkind` — fold it into the label ("Site
+// verification code · Google") and strip it back off the displayed value so
+// the chip shows just the code/handle, not the raw stored key.
+function sharedNodeDisplay(node) {
+  const label = node.subkind ? `${sharedNodeLabel(node.kind)} · ${formatLabel(node.subkind)}` : sharedNodeLabel(node.kind);
+  const prefix = node.subkind ? `${node.subkind}|` : null;
+  const value = prefix && node.value.startsWith(prefix) ? node.value.slice(prefix.length) : node.value;
+  return { label, value };
+}
+
+// We never store favicon bytes, only the hash, so there's nothing to render
+// straight from data — this hits /api/favicon/<kind>/<value>, which the
+// backend serves by re-fetching the icon live from a domain that shares the
+// hash (see cases/case_app.py:api_favicon_image). Silently renders nothing if
+// that 404s (hash predates any live match) so the raw hash text next to it
+// remains the fallback.
+const FAVICON_KINDS = new Set(["favicon_mmh3", "favicon_md5"]);
+
+const FaviconThumb = memo(function FaviconThumb({ kind, value }) {
+  const [failed, setFailed] = useState(false);
+  if (!FAVICON_KINDS.has(kind) || !value || failed) {
+    return null;
+  }
+  return (
+    <img
+      alt=""
+      className="favicon-thumb"
+      loading="lazy"
+      onError={() => setFailed(true)}
+      src={`/api/favicon/${encodeURIComponent(kind)}/${encodeURIComponent(value)}`}
+    />
+  );
+});
+
+// When a shared node was actually exhibited by a subdomain rather than the
+// apex being compared (transitive, subdomain-mediated linkage), surface which
+// host(s) — instead of silently implying the apex itself carried the evidence.
+function extraHosts(label, hosts) {
+  return (hosts || []).filter((host) => host && host !== label);
 }
 
 function formatWindow(range) {
@@ -180,42 +269,100 @@ const SharedNodeList = memo(function SharedNodeList({ evidence, leftLabel, right
   }
   return (
     <ul className="digest-items">
-      {evidence.map((node) => (
-        <li className="digest-item" key={node.id}>
-          <span className="digest-item-label">
-            {sharedNodeLabel(node.kind)}
-            {node.attributing === false ? (
-              <span className="chip digest-more-chip" style={{ marginLeft: 8 }}>
-                noise
-              </span>
-            ) : null}
-          </span>
-          <span className="chip-row digest-item-values">
-            <span className="chip evidence-chip" title={node.value}>
-              {node.value}
+      {evidence.map((node) => {
+        const badge = node.kind === "shared_ip" ? ipNetworkBadge(node.network) : null;
+        const { label, value } = sharedNodeDisplay(node);
+        const extraA = extraHosts(leftLabel, node.hostsA);
+        const extraB = extraHosts(rightLabel, node.hostsB);
+        return (
+          <li className="digest-item" key={node.id}>
+            <span className="digest-item-label">
+              {label}
+              {badge ? (
+                <span className={`status-badge compact ${badge.tone}`} style={{ marginLeft: 8 }}>
+                  {badge.label}
+                </span>
+              ) : null}
+              {node.attributing === false ? (
+                <span className="chip digest-more-chip" style={{ marginLeft: 8 }}>
+                  noise
+                </span>
+              ) : null}
             </span>
-            {node.degree !== null && node.degree !== undefined ? (
-              <span className="chip" title="Entities that share this node (lower is rarer)">
-                degree {node.degree}
+            <span className="chip-row digest-item-values">
+              <FaviconThumb kind={node.kind} value={node.value} />
+              <span className="chip evidence-chip" title={node.value}>
+                {value}
+              </span>
+              {node.degree !== null && node.degree !== undefined ? (
+                <span className="chip" title="Entities that share this node (lower is rarer)">
+                  degree {node.degree}
+                </span>
+              ) : null}
+              {node.weight !== null && node.weight !== undefined ? (
+                <span className="chip" title="base × rarity × time-overlap">
+                  weight {Math.round(node.weight)}
+                </span>
+              ) : null}
+              {node.timeOverlap !== null && node.timeOverlap !== undefined ? (
+                <span className="chip" title="Time-window overlap factor">
+                  overlap {node.timeOverlap}
+                </span>
+              ) : null}
+              {node.asnDesc ? <span className="chip" title="Network operator">{node.asnDesc}</span> : null}
+              {node.networkName ? (
+                <span className="chip" title="RDAP network name — often reveals a CDN/hosting brand degree alone won't">
+                  {node.networkName}
+                </span>
+              ) : null}
+              {node.proxyFamily ? (
+                <span className="chip" title="Detected reverse-proxy family">
+                  {node.proxyFamily}
+                </span>
+              ) : null}
+            </span>
+            {node.explanation ? (
+              <span className="card-copy" style={{ fontSize: "0.85em" }}>
+                {node.explanation}
               </span>
             ) : null}
-            {node.weight !== null && node.weight !== undefined ? (
-              <span className="chip" title="base × rarity × time-overlap">
-                weight {Math.round(node.weight)}
-              </span>
+            {extraA.length > 0 || extraB.length > 0 ? (
+              <div className="host-attribution">
+                {extraA.length > 0 ? (
+                  <div className="host-attribution-row">
+                    <span className="host-attribution-tag">Actually via</span>
+                    <strong>{leftLabel}</strong>
+                    <span className="chip-row">
+                      {extraA.map((host) => (
+                        <span className="chip host-chip" key={host}>
+                          {host}
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                ) : null}
+                {extraB.length > 0 ? (
+                  <div className="host-attribution-row">
+                    <span className="host-attribution-tag">Actually via</span>
+                    <strong>{rightLabel}</strong>
+                    <span className="chip-row">
+                      {extraB.map((host) => (
+                        <span className="chip host-chip" key={host}>
+                          {host}
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                ) : null}
+              </div>
             ) : null}
-            {node.timeOverlap !== null && node.timeOverlap !== undefined ? (
-              <span className="chip" title="Time-window overlap factor">
-                overlap {node.timeOverlap}
-              </span>
-            ) : null}
-          </span>
-          <span className="card-copy" style={{ fontSize: "0.85em", opacity: 0.8 }}>
-            {leftLabel || "A"}: {formatWindow(node.windowA)} · {rightLabel || "B"}: {formatWindow(node.windowB)}
-            {node.sources?.length ? ` · via ${node.sources.join(", ")}` : " · source unknown"}
-          </span>
-        </li>
-      ))}
+            <span className="card-copy" style={{ fontSize: "0.85em", opacity: 0.8 }}>
+              {leftLabel || "A"}: {formatWindow(node.windowA)} · {rightLabel || "B"}: {formatWindow(node.windowB)}
+              {node.sources?.length ? ` · via ${node.sources.join(", ")}` : " · source unknown"}
+            </span>
+          </li>
+        );
+      })}
     </ul>
   );
 });
@@ -318,13 +465,23 @@ async function finishIngest(response) {
   return payload;
 }
 
-function JobProgress({ jobId }) {
+function JobProgress({ jobId, onComplete }) {
   const jobRequest = useApi(jobId ? `/api/jobs/${jobId}` : null, { pollInterval: 4000 });
   const job = useMemo(() => normalizeJob(jobRequest.data, jobId), [jobRequest.data, jobId]);
+  const done = isTerminalStatus(job.status);
+  // Fires once per job: as soon as the poll sees a terminal status, pull the
+  // newly-ingested channels into the pool without the user clicking Refresh.
+  const notifiedRef = useRef(null);
+  useEffect(() => {
+    if (done && jobId && notifiedRef.current !== jobId) {
+      notifiedRef.current = jobId;
+      onComplete?.();
+    }
+  }, [done, jobId, onComplete]);
+
   if (!jobId) {
     return null;
   }
-  const done = isTerminalStatus(job.status);
   return (
     <div className="callout">
       <div className="mini-progress-top">
@@ -334,7 +491,7 @@ function JobProgress({ jobId }) {
       <ProgressBar value={job.percent ?? 0} />
       <p className="card-copy">
         {done
-          ? "Scan complete — the channels are in the pool. Refresh to see them and their connections."
+          ? "Scan complete — the channels are in the pool."
           : job.summary || job.currentStep || "Scanning… results join the pool as they finish."}
       </p>
     </div>
@@ -424,12 +581,12 @@ function IngestPanel({ onIngested }) {
         </div>
       </div>
 
-      <label className="search-field">
+      {/* <label className="search-field">
         <span>Optional label (free-text tag, scopes nothing)</span>
         <input name="label" onChange={(event) => setLabel(event.target.value)} placeholder="e.g. campaign-x" type="text" value={label} />
-      </label>
+      </label> */}
 
-      <div className="submission-card">
+      {/* <div className="submission-card">
         <div>
           <p className="eyebrow">OpenCTI website channels</p>
           <p className="section-copy">Add the domains from the 100 most recently created website-type channels.</p>
@@ -437,10 +594,10 @@ function IngestPanel({ onIngested }) {
         <button className="secondary-button" disabled={busy} onClick={ingestOpenCti} type="button">
           {busy ? "Submitting…" : "Ingest last 100 website channels"}
         </button>
-      </div>
+      </div> */}
 
       {error ? <ErrorState message={error} /> : null}
-      {jobId ? <JobProgress jobId={jobId} /> : null}
+      {jobId ? <JobProgress jobId={jobId} onComplete={onIngested} /> : null}
     </section>
   );
 }
@@ -449,17 +606,114 @@ function IngestPanel({ onIngested }) {
 /* Pool page                                                      */
 /* ============================================================== */
 
+// How a channel entered the pool: directly submitted by a user/OpenCTI/CSV
+// ingest ("ingested"), or only ever surfaced by following a scan — subdomain
+// enumeration, sibling-domain discovery, or a wordlist hit ("discovered").
+const PROVENANCE_FILTERS = [
+  { key: "all", label: "All" },
+  { key: "ingested", label: "Ingested" },
+  { key: "discovered", label: "Discovered" },
+];
+
+const POOL_SORTS = [
+  { key: "recent", label: "Most recent" },
+  { key: "connections", label: "Most connections" },
+];
+
+function ProvenanceBadge({ ingested }) {
+  return (
+    <span className={`status-badge compact ${ingested ? "success" : "info"}`} title={
+      ingested
+        ? "Directly submitted (or a subdomain of it was)"
+        : "Never submitted directly — only surfaced by following a scan (subdomain, sibling, or wordlist discovery)"
+    }>
+      {ingested ? "Ingested" : "Discovered"}
+    </span>
+  );
+}
+
+// The date-only (YYYY-MM-DD) prefix of an ISO timestamp, so it can be compared
+// against <input type="date"> values without pulling in a date library.
+function dateOnly(value) {
+  return value ? String(value).slice(0, 10) : null;
+}
+
+// The number of channels this one directly connects to — pair-to-pair evidence
+// links only. This is deliberately not cluster size: a cluster is the wider
+// transitive group those connections chain into, shown on its own page.
+function ConnectionStat({ count }) {
+  return (
+    <div className="connection-stat">
+      <strong>{formatNumber(count)}</strong>
+      <span>{count === 1 ? "connection" : "connections"}</span>
+    </div>
+  );
+}
+
 function PoolPage() {
   const poolRequest = useApi("/api/pool");
   const [search, setSearch] = useState("");
+  const [provenance, setProvenance] = useState("all");
+  const [sort, setSort] = useState("recent");
+  const [minConnections, setMinConnections] = useState("");
+  const [maxConnections, setMaxConnections] = useState("");
+  const [discoveredAfter, setDiscoveredAfter] = useState("");
+  const [discoveredBefore, setDiscoveredBefore] = useState("");
+  const [ingestedAfter, setIngestedAfter] = useState("");
+  const [ingestedBefore, setIngestedBefore] = useState("");
+
   const domains = useMemo(() => normalizePool(poolRequest.data), [poolRequest.data]);
   const clustered = useMemo(() => new Set(domains.filter((d) => d.clusterId).map((d) => d.clusterId)).size, [domains]);
+  const ingestedCount = useMemo(() => domains.filter((d) => d.ingested).length, [domains]);
+  const connectedCount = useMemo(() => domains.filter((d) => d.connectionCount > 0).length, [domains]);
 
   const query = search.trim().toLowerCase();
-  const visible = useMemo(
-    () => (query ? domains.filter((d) => d.domain.toLowerCase().includes(query)) : domains),
-    [domains, query],
-  );
+  const minConn = minConnections === "" ? null : Number(minConnections);
+  const maxConn = maxConnections === "" ? null : Number(maxConnections);
+
+  // Whether any filter differs from its default — used to show/hide the
+  // "Clear filters" action so it isn't cluttering the panel on a fresh visit.
+  const filtersActive =
+    Boolean(search) ||
+    provenance !== "all" ||
+    sort !== "recent" ||
+    Boolean(minConnections) ||
+    Boolean(maxConnections) ||
+    Boolean(discoveredAfter) ||
+    Boolean(discoveredBefore) ||
+    Boolean(ingestedAfter) ||
+    Boolean(ingestedBefore);
+
+  const clearFilters = useCallback(() => {
+    setSearch("");
+    setProvenance("all");
+    setSort("recent");
+    setMinConnections("");
+    setMaxConnections("");
+    setDiscoveredAfter("");
+    setDiscoveredBefore("");
+    setIngestedAfter("");
+    setIngestedBefore("");
+  }, []);
+
+  const visible = useMemo(() => {
+    const filtered = domains
+      .filter((d) => !query || d.domain.toLowerCase().includes(query))
+      .filter((d) => provenance === "all" || (provenance === "ingested" ? d.ingested : !d.ingested))
+      .filter((d) => minConn === null || d.connectionCount >= minConn)
+      .filter((d) => maxConn === null || d.connectionCount <= maxConn)
+      .filter((d) => !discoveredAfter || (dateOnly(d.discoveredAt) ?? "") >= discoveredAfter)
+      .filter((d) => !discoveredBefore || (dateOnly(d.discoveredAt) ?? "9999-99-99") <= discoveredBefore)
+      .filter((d) => !ingestedAfter || (dateOnly(d.ingestedAt) ?? "") >= ingestedAfter)
+      .filter((d) => !ingestedBefore || (dateOnly(d.ingestedAt) ?? "9999-99-99") <= ingestedBefore);
+
+    return sort === "connections"
+      ? [...filtered].sort((a, b) => b.connectionCount - a.connectionCount)
+      : filtered;
+  }, [
+    domains, query, provenance, sort, minConn, maxConn,
+    discoveredAfter, discoveredBefore, ingestedAfter, ingestedBefore,
+  ]);
 
   return (
     <AppShell>
@@ -473,6 +727,8 @@ function PoolPage() {
         </div>
         <div className="hero-stats">
           <MetricCard label="Channels" value={domains.length} />
+          <MetricCard label="Connected" value={connectedCount} />
+          <MetricCard label="Ingested" value={ingestedCount} />
           <MetricCard label="Clusters" value={clustered} />
           <Link className="primary-button" to="/connections">
             Compare channels
@@ -486,11 +742,36 @@ function PoolPage() {
         <div className="panel-header">
           <div>
             <h2>Channels</h2>
-            <p className="section-copy">Most recently scanned first.</p>
+            <p className="section-copy">
+              Led by <strong>connections</strong> — how many other channels each one directly shares
+              attributing evidence with (a cert, IP, nameserver, tracking ID...). The wider transitive
+              groups those connections chain into are on the{" "}
+              <Link className="text-link" to="/clusters">clusters page</Link>.
+            </p>
           </div>
-          <button className="secondary-button" onClick={poolRequest.refresh} type="button">
-            Refresh
-          </button>
+          <div className="action-row">
+            {filtersActive ? (
+              <button className="text-link" onClick={clearFilters} type="button">
+                Clear filters
+              </button>
+            ) : null}
+            <button className="secondary-button" onClick={poolRequest.refresh} type="button">
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        <div className="chip-row">
+          {PROVENANCE_FILTERS.map((entry) => (
+            <button
+              className={`chip ${provenance === entry.key ? "evidence-chip" : ""}`}
+              key={entry.key}
+              onClick={() => setProvenance(entry.key)}
+              type="button"
+            >
+              {entry.label}
+            </button>
+          ))}
         </div>
 
         <label className="search-field">
@@ -504,10 +785,59 @@ function PoolPage() {
           />
         </label>
 
+        <div className="filter-grid">
+          <label className="search-field">
+            <span>Min connections</span>
+            <input
+              min="0"
+              onChange={(event) => setMinConnections(event.target.value)}
+              placeholder="0"
+              type="number"
+              value={minConnections}
+            />
+          </label>
+          <label className="search-field">
+            <span>Max connections</span>
+            <input
+              min="0"
+              onChange={(event) => setMaxConnections(event.target.value)}
+              placeholder="Any"
+              type="number"
+              value={maxConnections}
+            />
+          </label>
+          <label className="search-field">
+            <span>Discovered after</span>
+            <input onChange={(event) => setDiscoveredAfter(event.target.value)} type="date" value={discoveredAfter} />
+          </label>
+          <label className="search-field">
+            <span>Discovered before</span>
+            <input onChange={(event) => setDiscoveredBefore(event.target.value)} type="date" value={discoveredBefore} />
+          </label>
+          <label className="search-field">
+            <span>Ingested after</span>
+            <input onChange={(event) => setIngestedAfter(event.target.value)} type="date" value={ingestedAfter} />
+          </label>
+          <label className="search-field">
+            <span>Ingested before</span>
+            <input onChange={(event) => setIngestedBefore(event.target.value)} type="date" value={ingestedBefore} />
+          </label>
+          <label className="search-field">
+            <span>Sort</span>
+            <select onChange={(event) => setSort(event.target.value)} value={sort}>
+              {POOL_SORTS.map((entry) => (
+                <option key={entry.key} value={entry.key}>
+                  {entry.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
         {poolRequest.loading && !poolRequest.data ? <LoadingState message="Loading the pool…" /> : null}
         {poolRequest.error ? <ErrorState message={poolRequest.error} /> : null}
         {!poolRequest.loading && visible.length === 0 ? (
-          <EmptyState message={domains.length === 0 ? "The pool is empty — ingest a domain to begin." : "No channels match the search."} />
+          <EmptyState message={domains.length === 0 ? "The pool is empty — ingest a domain to begin." : "No channels match the filters."} />
         ) : null}
 
         {visible.length > 0 ? (
@@ -515,20 +845,37 @@ function PoolPage() {
             {visible.slice(0, 300).map((entry) => (
               <article className="case-card" key={entry.domain}>
                 <div className="case-card-header">
-                  <div>
-                    <span className="muted">Channel</span>
-                    <h3>
-                      <Link className="card-title-link" to={`/domain/${encodeURIComponent(entry.domain)}`}>
-                        {entry.domain}
-                      </Link>
-                    </h3>
-                  </div>
-                  {entry.clusterId ? <span className="chip">cluster · {entry.clusterSize}</span> : null}
+                  <ConnectionStat count={entry.connectionCount} />
+                  <span className="chip-row" style={{ justifyContent: "flex-end" }}>
+                    {entry.clusterId ? <span className="chip">cluster · {entry.clusterSize}</span> : null}
+                    <ProvenanceBadge ingested={entry.ingested} />
+                  </span>
                 </div>
+                <h3>
+                  <Link className="card-title-link" to={`/domain/${encodeURIComponent(entry.domain)}`}>
+                    {entry.domain}
+                  </Link>
+                  {entry.tier ? <TierBadge tier={entry.tier} /> : null}
+                </h3>
                 <div className="inline-metrics">
                   <InlineMetric label="Hosts" value={entry.hostCount ?? "—"} />
-                  <InlineMetric label="Last seen" value={entry.lastSeen ? formatDate(entry.lastSeen) : "—"} />
+                  <InlineMetric label="Discovered" value={entry.discoveredAt ? formatDate(entry.discoveredAt) : "—"} />
+                  <InlineMetric label="Ingested" value={entry.ingestedAt ? formatDate(entry.ingestedAt) : "—"} />
                 </div>
+                {!entry.ingested && entry.discoveryKind ? (
+                  <p className="card-copy discovery-note">
+                    Found via {formatLabel(entry.discoveryKind)}
+                    {entry.discoveredFrom ? (
+                      <>
+                        {" from "}
+                        <Link className="text-link" to={`/domain/${encodeURIComponent(entry.discoveredFrom)}`}>
+                          {entry.discoveredFrom}
+                        </Link>
+                      </>
+                    ) : null}
+                    {entry.discoveryReason ? ` (${entry.discoveryReason})` : ""}.
+                  </p>
+                ) : null}
                 <div className="action-row">
                   <Link className="primary-button" to={`/domain/${encodeURIComponent(entry.domain)}`}>
                     Open
@@ -592,6 +939,19 @@ function ConnectionsPage() {
     setMode("domains");
   }, []);
 
+  const pickDomains = useCallback((domains) => {
+    setSelected((current) => {
+      const merged = [...current];
+      domains.forEach((domain) => {
+        if (domain && !merged.includes(domain)) {
+          merged.push(domain);
+        }
+      });
+      return merged;
+    });
+    setMode("domains");
+  }, []);
+
   return (
     <AppShell>
       <div className="breadcrumb-row">
@@ -627,11 +987,18 @@ function ConnectionsPage() {
       {mode === "domains" ? (
         <ByDomainExplorer selected={selected} setSelected={setSelected} />
       ) : (
-        <ByEdgeExplorer onPickDomain={pickDomain} />
+        <ByEdgeExplorer onPickAll={pickDomains} onPickDomain={pickDomain} />
       )}
     </AppShell>
   );
 }
+
+// Cap on how many domains the one-hop expansion (see run() below) will send
+// back to /api/graph/connections in its second round-trip — matches the
+// server's own connections_among(max_domains=30) so the cap is never a
+// surprise, just applied earlier so the user's own picks are never the ones
+// dropped when a pick has a lot of pool links.
+const EXPANSION_MAX_DOMAINS = 30;
 
 function ByDomainExplorer({ selected, setSelected }) {
   const poolRequest = useApi("/api/pool");
@@ -639,6 +1006,11 @@ function ByDomainExplorer({ selected, setSelected }) {
 
   const [filter, setFilter] = useState("");
   const [result, setResult] = useState(null);
+  // The user's own picks, resolved to registrable-domain form by the first
+  // round-trip — kept separate from `result.domains` because that list grows
+  // to include whatever the expansion round pulled in, and ClusterGraph
+  // needs to know which nodes are actual seeds vs. discovered along the way.
+  const [seedDomains, setSeedDomains] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(null);
@@ -659,6 +1031,15 @@ function ByDomainExplorer({ selected, setSelected }) {
     return pool.filter((d) => d.toLowerCase().includes(needle) && !selected.includes(d)).slice(0, 10);
   }, [pool, filter, selected]);
 
+  const fetchConnections = useCallback(async (domains) => {
+    const response = await fetch("/api/graph/connections", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ domains, pool_links: true }),
+    });
+    return finishIngest(response);
+  }, []);
+
   const run = useCallback(async () => {
     if (selected.length < 1) {
       return;
@@ -666,20 +1047,39 @@ function ByDomainExplorer({ selected, setSelected }) {
     setBusy(true);
     setError(null);
     try {
-      const response = await fetch("/api/graph/connections", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ domains: selected, pool_links: true }),
+      const first = await fetchConnections(selected);
+      const seedList = first.domains || [];
+      setSeedDomains(seedList);
+
+      // One-hop expansion: rescoring just the picks only ever shows "pick ->
+      // pool link", never whether those pool links relate to each other or
+      // pull in yet more domains. Re-run the same scoring over picks + every
+      // domain any of them linked to, so the map and the pair/pool-link lists
+      // below all show that fuller picture in one go.
+      const seedSet = new Set(seedList);
+      const relatedTargets = new Set();
+      Object.values(first.pool_links || {}).forEach((rawLinks) => {
+        normalizeGraphLinks({ links: rawLinks }).forEach((link) => {
+          if (link.target && !seedSet.has(link.target)) {
+            relatedTargets.add(link.target);
+          }
+        });
       });
-      const payload = await finishIngest(response);
-      setResult(payload);
+
+      let finalResult = first;
+      if (relatedTargets.size > 0) {
+        const expandedDomains = [...seedList, ...relatedTargets].slice(0, EXPANSION_MAX_DOMAINS);
+        finalResult = await fetchConnections(expandedDomains);
+      }
+
+      setResult(finalResult);
       setExpanded(null);
     } catch (err) {
       setError(err.message || "Couldn't load connections.");
     } finally {
       setBusy(false);
     }
-  }, [selected]);
+  }, [selected, fetchConnections]);
 
   // Arriving with channels already chosen (from the Pool or a cluster) shows
   // their connections straight away — no extra click.
@@ -695,6 +1095,8 @@ function ByDomainExplorer({ selected, setSelected }) {
     setExpanded((current) => (current === key ? null : key));
   }, []);
   const scoredCount = (result?.domains || []).length;
+  const explorerGraph = useMemo(() => normalizeExplorerGraph(result), [result]);
+  const explorerSeeds = useMemo(() => new Set(seedDomains), [seedDomains]);
 
   return (
     <>
@@ -750,6 +1152,25 @@ function ByDomainExplorer({ selected, setSelected }) {
 
       {result ? (
         <>
+          {explorerGraph.nodes.length > 0 ? (
+            <ClusterGraph
+              description={
+                "A shareable map of how your selected domains connect — to each other and to other " +
+                "domains that share hosting or registration evidence. Drag to rearrange, scroll to " +
+                "zoom, click a domain or line for details. \"Download image\" saves a static picture; " +
+                "\"Download interactive report\" saves a clickable version anyone can open in a " +
+                "browser, no account needed; \"Email graph\" sends both to the configured recipients."
+              }
+              exportFileName="domain-network"
+              graph={explorerGraph}
+              otherRoleColor="#64748b"
+              otherRoleLabel="Other domain (not selected)"
+              seedRoleLabel="Selected domain"
+              seedTargets={explorerSeeds}
+              title="Network map"
+            />
+          ) : null}
+
           {scoredCount >= 2 ? (
             <section className="panel section-stack">
               <div className="panel-header">
@@ -758,7 +1179,11 @@ function ByDomainExplorer({ selected, setSelected }) {
                     {result.connected_pair_count ?? pairs.filter((p) => p.connected).length} of {pairs.length}{" "}
                     pair{pairs.length === 1 ? "" : "s"} connected
                   </h2>
-                  <p className="section-copy">Within your selection. Click a pair to see the shared certificates, IPs and other evidence.</p>
+                  <p className="section-copy">
+                    Among your picks and the domains they're linked to elsewhere in the pool — so you can
+                    see whether those domains are related to each other too, not just back to your picks.
+                    Click a pair to see the shared certificates, IPs and other evidence.
+                  </p>
                 </div>
               </div>
               {pairs.length === 0 ? (
@@ -785,7 +1210,11 @@ function ByDomainExplorer({ selected, setSelected }) {
               <div className="panel-header">
                 <div>
                   <h2>Connections to the rest of the pool</h2>
-                  <p className="section-copy">The strongest links each selected channel has across everything you've scanned.</p>
+                  <p className="section-copy">
+                    The strongest links each channel above has across everything you've scanned — your
+                    own picks and the domains pulled in because they linked to one of your picks, so this
+                    also surfaces a further ring of domains beyond your original selection.
+                  </p>
                 </div>
               </div>
               <PoolLinksPanel poolLinks={result.pool_links} />
@@ -837,7 +1266,7 @@ function PoolLinksPanel({ poolLinks }) {
   );
 }
 
-function ByEdgeExplorer({ onPickDomain }) {
+function ByEdgeExplorer({ onPickAll, onPickDomain }) {
   const kindsRequest = useApi("/api/graph/selector-kinds");
   const kinds = useMemo(() => normalizeSelectorKinds(kindsRequest.data), [kindsRequest.data]);
   const [kind, setKind] = useState("");
@@ -891,7 +1320,10 @@ function ByEdgeExplorer({ onPickDomain }) {
               <div className="cluster-card-top">
                 <div>
                   <span className="muted">{sharedNodeLabel(group.kind)}</span>
-                  <h4 title={group.value}>{group.value}</h4>
+                  <div className="card-heading-row">
+                    <FaviconThumb kind={group.kind} value={group.value} />
+                    <h4 title={group.value}>{group.value}</h4>
+                  </div>
                 </div>
                 <strong title="Channels sharing this edge">{group.degree ?? group.domains.length}</strong>
               </div>
@@ -912,13 +1344,13 @@ function ByEdgeExplorer({ onPickDomain }) {
                 ) : null}
               </div>
               <div className="action-row">
-                <Link
+                <button
                   className="text-link"
-                  onClick={() => rememberFocus(group.domains)}
-                  to="/connections"
+                  onClick={() => onPickAll(group.domains)}
+                  type="button"
                 >
                   Compare all {group.domains.length} →
-                </Link>
+                </button>
               </div>
             </article>
           ))}
@@ -986,67 +1418,161 @@ function ClustersPage() {
       {clustersRequest.loading && !clustersRequest.data ? <LoadingState message="Loading clusters…" /> : null}
       {clustersRequest.error ? <ErrorState message={clustersRequest.error} /> : null}
       {!clustersRequest.loading && clusters.length === 0 ? (
-        <EmptyState message="No clusters yet. Ingest channels, then recompute the graph." />
+        <EmptyState message="No clusters yet. Ingest channels — clusters build up automatically in the background." />
       ) : null}
 
       {clusters.length > 0 ? (
         <div className="cluster-grid">
           {clusters.map((cluster) => (
-            <article className="cluster-card" key={cluster.id}>
-              <div className="cluster-card-top">
-                <div>
-                  <span className="muted">Cluster</span>
-                  <h4>{cluster.id}</h4>
-                </div>
-                <strong title="Channels in this cluster">{cluster.size}</strong>
-              </div>
-              <div className="chip-row">
-                {cluster.members.slice(0, 12).map((member) => (
-                  <span className="chip" key={`${cluster.id}-${member}`}>
-                    {member}
-                  </span>
-                ))}
-                {cluster.members.length > 12 ? (
-                  <span className="chip digest-more-chip">+{cluster.members.length - 12} more</span>
-                ) : null}
-              </div>
-              {cluster.links.length > 0 ? (
-                <div className="cluster-links">
-                  <span className="muted">Connected by</span>
-                  <div className="chip-row">
-                    {cluster.links.map((link) => (
-                      <span
-                        className="chip connector-chip"
-                        key={`${cluster.id}-${link.kind}-${link.value}`}
-                        title={`${sharedNodeLabel(link.kind)}: ${link.value}`}
-                      >
-                        {sharedNodeLabel(link.kind)}
-                        <span className="connector-value">{link.value}</span>
-                        {link.memberCount ? <span className="connector-count">×{link.memberCount}</span> : null}
-                      </span>
-                    ))}
-                    {cluster.linkCount > cluster.links.length ? (
-                      <span className="chip digest-more-chip">
-                        +{cluster.linkCount - cluster.links.length} more
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-              ) : null}
-              <div className="action-row">
-                <Link
-                  className="primary-button"
-                  onClick={() => rememberFocus(cluster.members)}
-                  to="/connections"
-                >
-                  Show connections
-                </Link>
-              </div>
-            </article>
+            <ClusterCard cluster={cluster} key={cluster.id} />
           ))}
         </div>
       ) : null}
     </AppShell>
+  );
+}
+
+function ClusterCard({ cluster }) {
+  const [modalOpen, setModalOpen] = useState(false);
+  const [graphState, setGraphState] = useState({ loading: false, error: null, data: null });
+
+  const loadGraph = useCallback(async () => {
+    setGraphState({ loading: true, error: null, data: null });
+    try {
+      const response = await fetch("/api/graph/connections", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ domains: cluster.members, pool_links: false }),
+      });
+      const payload = await finishIngest(response);
+      setGraphState({ loading: false, error: null, data: payload });
+    } catch (err) {
+      setGraphState({ loading: false, error: err.message || "Couldn't load the network graph.", data: null });
+    }
+  }, [cluster.members]);
+
+  const openGraph = useCallback(() => {
+    setModalOpen(true);
+    if (!graphState.data && !graphState.loading) {
+      loadGraph();
+    }
+  }, [graphState.data, graphState.loading, loadGraph]);
+
+  const closeGraph = useCallback(() => setModalOpen(false), []);
+
+  const scoredDomains = graphState.data?.domains;
+  const graph = useMemo(
+    () => (graphState.data ? normalizeConnectionsGraph(graphState.data, scoredDomains || cluster.members) : null),
+    [graphState.data, scoredDomains, cluster.members],
+  );
+  const seedTargets = useMemo(() => new Set(cluster.members), [cluster.members]);
+  const truncated = Array.isArray(scoredDomains) && scoredDomains.length < cluster.members.length;
+
+  return (
+    <article className="cluster-card">
+      <div className="cluster-card-top">
+        <div>
+          <span className="muted">Cluster</span>
+          <h4>{cluster.id}</h4>
+        </div>
+        <strong title="Channels in this cluster">{cluster.size}</strong>
+      </div>
+      <div className="chip-row">
+        {cluster.members.slice(0, 12).map((member) => (
+          <span className="chip" key={`${cluster.id}-${member}`}>
+            {member}
+          </span>
+        ))}
+        {cluster.members.length > 12 ? (
+          <span className="chip digest-more-chip">+{cluster.members.length - 12} more</span>
+        ) : null}
+      </div>
+      {cluster.links.length > 0 ? (
+        <div className="cluster-links">
+          <span className="muted">Connected by</span>
+          <div className="chip-row">
+            {cluster.links.map((link) => (
+              <span
+                className="chip connector-chip"
+                key={`${cluster.id}-${link.kind}-${link.value}`}
+                title={`${sharedNodeLabel(link.kind)}: ${link.value}`}
+              >
+                <FaviconThumb kind={link.kind} value={link.value} />
+                {sharedNodeLabel(link.kind)}
+                <span className="connector-value">{link.value}</span>
+                {link.memberCount ? <span className="connector-count">×{link.memberCount}</span> : null}
+              </span>
+            ))}
+            {cluster.linkCount > cluster.links.length ? (
+              <span className="chip digest-more-chip">
+                +{cluster.linkCount - cluster.links.length} more
+              </span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      <div className="action-row">
+        <button className="secondary-button" onClick={openGraph} type="button">
+          View network graph
+        </button>
+        <Link className="primary-button" onClick={() => rememberFocus(cluster.members)} to="/connections">
+          Show connections
+        </Link>
+      </div>
+      {modalOpen ? (
+        <GraphModal onClose={closeGraph} title={`Cluster ${cluster.id}`}>
+          {graphState.loading ? <LoadingState message="Scoring connections…" /> : null}
+          {graphState.error ? <ErrorState message={graphState.error} /> : null}
+          {truncated ? (
+            <p className="muted">
+              Showing the first {scoredDomains.length} of {cluster.members.length} channels.
+            </p>
+          ) : null}
+          {graph ? <ClusterGraph graph={graph} seedTargets={seedTargets} /> : null}
+        </GraphModal>
+      ) : null}
+    </article>
+  );
+}
+
+// Rendered via a portal straight onto <body> — a cluster card can sit inside
+// a backdrop-filter'd panel, which (like a CSS filter/transform) creates its
+// own containing block for `position: fixed` descendants. Left in place, a
+// fixed-position modal would anchor to that card instead of the viewport and
+// show up clipped to whichever card happened to be clicked, not centered on
+// screen. The portal renders outside that subtree so it's never at the mercy
+// of an ancestor's layout, and always opens the same way regardless of which
+// cluster card (or where in the grid) triggered it.
+function GraphModal({ title, onClose, children }) {
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return createPortal(
+    <div className="graph-modal-backdrop" onClick={onClose}>
+      <div
+        aria-label={title}
+        aria-modal="true"
+        className="graph-modal"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="graph-modal-head">
+          <strong>{title}</strong>
+          <button className="secondary-button small" onClick={onClose} type="button">
+            Close
+          </button>
+        </div>
+        <div className="graph-modal-body">{children}</div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -1100,6 +1626,10 @@ function DomainPage() {
   const dnsEntries = Object.entries(intel?.dns || {}).filter(([, v]) => v && (!Array.isArray(v) || v.length));
   const whoisEntries = Object.entries(intel?.whois || {}).filter(([k, v]) => v && k !== "error" && k !== "raw");
   const trackingEntries = Object.entries(intel?.tracking || {});
+  const socialHandleEntries = Object.entries(intel?.social_handles || {}).filter(([, v]) => v && v.length);
+  const socialLinkEntries = Object.entries(intel?.social_links || {}).filter(([, v]) => v && v.length);
+  const siteVerificationEntries = Object.entries(intel?.site_verifications || {}).filter(([, v]) => v && v.length);
+  const otherHosts = (profile?.hosts || []).filter((host) => host.value !== profile?.domain);
 
   return (
     <AppShell>
@@ -1114,12 +1644,36 @@ function DomainPage() {
       <div className="page-heading">
         <div className="page-heading-row">
           <div>
-            <h1>{value}</h1>
+            <h1>
+              {value}
+              {profile ? (
+                <span style={{ marginLeft: 10, verticalAlign: "middle" }}>
+                  <ProvenanceBadge ingested={profile.ingested} />
+                  {profile.tier ? <TierBadge tier={profile.tier} /> : null}
+                </span>
+              ) : null}
+            </h1>
             <p>
               {profile
                 ? `${profile.host_count || 0} host${profile.host_count === 1 ? "" : "s"} · ${(profile.ips || []).length} IP${(profile.ips || []).length === 1 ? "" : "s"} · ${links.length} connection${links.length === 1 ? "" : "s"}`
                 : "Everything gathered on this channel."}
             </p>
+            {profile && !profile.ingested && intel?.discovery_kind ? (
+              <p className="card-copy" style={{ fontSize: "0.85em" }}>
+                Never submitted directly — found via {formatLabel(intel.discovery_kind)}
+                {intel.discovered_from ? ` from ${intel.discovered_from}` : ""}
+                {intel.discovery_reason ? ` (${intel.discovery_reason})` : ""}.
+              </p>
+            ) : null}
+            {(intel?.opencti_labels || []).length > 0 ? (
+              <span className="chip-row" style={{ marginTop: 6 }}>
+                {intel.opencti_labels.map((label) => (
+                  <span className="chip evidence-chip" key={label} title="OpenCTI label">
+                    {label}
+                  </span>
+                ))}
+              </span>
+            ) : null}
           </div>
           <Link className="primary-button" onClick={() => rememberFocus(value)} to="/connections">
             Compare with others
@@ -1180,6 +1734,7 @@ function DomainPage() {
                   <div className="chip-row">
                     {items.slice(0, 30).map((sel) => (
                       <span className={`chip ${sel.degree > 1 ? "evidence-chip" : ""}`} key={sel.value} title={`shared by ${sel.degree}`}>
+                        <FaviconThumb kind={kind} value={sel.value} />
                         {sel.value}
                         {sel.degree > 1 ? ` · ${sel.degree}` : ""}
                       </span>
@@ -1202,16 +1757,32 @@ function DomainPage() {
             </div>
 
             {(profile.ips || []).length > 0 ? (
-              <DefRow label="IPs">
-                <span className="chip-row">
-                  {profile.ips.map((entry) => (
-                    <span className="chip" key={entry.ip} title={`${entry.degree} domain(s) on this IP`}>
-                      {entry.ip}
-                      {entry.degree > 1 ? ` · ${entry.degree}` : ""}
-                    </span>
-                  ))}
-                </span>
-              </DefRow>
+              <div className="section-stack tight">
+                <h4>IPs ({profile.ips.length})</h4>
+                {profile.ips.map((entry) => {
+                  const badge = ipNetworkBadge(entry.network);
+                  const context = [entry.asn_desc, entry.network_name, entry.proxy_family, entry.country]
+                    .filter(Boolean)
+                    .join(" · ");
+                  return (
+                    <DefRow key={entry.ip} label={entry.ip}>
+                      <span className="chip-row" style={{ marginBottom: context ? 4 : 0 }}>
+                        {badge ? <span className={`status-badge compact ${badge.tone}`}>{badge.label}</span> : null}
+                        {entry.degree > 1 ? (
+                          <span className="chip" title="Other domains on this IP">
+                            {entry.degree} domains
+                          </span>
+                        ) : null}
+                      </span>
+                      {context ? (
+                        <span className="card-copy" style={{ fontSize: "0.85em", opacity: 0.85, display: "block" }}>
+                          {context}
+                        </span>
+                      ) : null}
+                    </DefRow>
+                  );
+                })}
+              </div>
             ) : null}
 
             {dnsEntries.length > 0 ? (
@@ -1260,23 +1831,85 @@ function DomainPage() {
               </div>
             ) : null}
 
-            {(intel?.subdomains || []).length > 0 ? (
+            {siteVerificationEntries.length > 0 || socialHandleEntries.length > 0 || socialLinkEntries.length > 0 ? (
               <div className="section-stack tight">
-                <h4>Subdomains ({intel.subdomains.length})</h4>
-                <div className="chip-row">
-                  {intel.subdomains.slice(0, 40).map((sub) => (
-                    <span className="chip" key={sub}>
-                      {sub}
-                    </span>
-                  ))}
-                  {intel.subdomains.length > 40 ? (
-                    <span className="chip digest-more-chip">+{intel.subdomains.length - 40} more</span>
-                  ) : null}
-                </div>
+                <h4>Social & verification</h4>
+                {siteVerificationEntries.map(([provider, codes]) => (
+                  <DefRow key={`verify-${provider}`} label={`${formatLabel(provider)} verification`}>
+                    {asText(codes)}
+                  </DefRow>
+                ))}
+                {socialHandleEntries.map(([platform, handles]) => (
+                  <DefRow key={`handle-${platform}`} label={formatLabel(platform)}>
+                    {asText(handles)}
+                  </DefRow>
+                ))}
+                {socialLinkEntries.map(([platform, urls]) => (
+                  <DefRow key={`link-${platform}`} label={`${formatLabel(platform)} link`}>
+                    {asText(urls)}
+                  </DefRow>
+                ))}
               </div>
             ) : null}
 
             {!intel ? <EmptyState message="No raw scan stored for this channel yet." /> : null}
+          </section>
+
+          {/* Hosts under this apex — subdomains, each with what it resolves to */}
+          <section className="panel section-stack">
+            <div className="panel-header">
+              <div>
+                <h2>Hosts</h2>
+                <p className="section-copy">
+                  {otherHosts.length === 0
+                    ? "No subdomains discovered for this channel yet."
+                    : `${otherHosts.length} subdomain${otherHosts.length === 1 ? "" : "s"} discovered, each linking to its own detail page.`}
+                </p>
+              </div>
+            </div>
+            {otherHosts.length === 0 ? (
+              <EmptyState message="Nothing beyond the apex domain on record." />
+            ) : (
+              <div className="linkage-list">
+                {otherHosts.slice(0, 60).map((host) => (
+                  <div className="def-row" key={host.value}>
+                    <span className="def-label">
+                      <Link className="text-link" to={`/domain/${encodeURIComponent(host.value)}`}>
+                        {host.value}
+                      </Link>
+                    </span>
+                    <span className="def-value">
+                      <span className="chip-row">
+                        <span
+                          className="status-badge compact info"
+                          title="A subdomain discovered while investigating this channel — not a separate direct submission"
+                        >
+                          Found subdomain
+                        </span>
+                        {(host.ips || []).length > 0 ? (
+                          host.ips.map((ip) => (
+                            <span className="chip" key={ip}>
+                              {ip}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="muted">no resolved IP on record</span>
+                        )}
+                      </span>
+                      {host.discovery_kind ? (
+                        <span className="card-copy" style={{ fontSize: "0.8em", opacity: 0.8, display: "block" }}>
+                          via {formatLabel(host.discovery_kind)}
+                          {host.discovered_from ? ` from ${host.discovered_from}` : ""}
+                        </span>
+                      ) : null}
+                    </span>
+                  </div>
+                ))}
+                {otherHosts.length > 60 ? (
+                  <span className="chip digest-more-chip">+{otherHosts.length - 60} more</span>
+                ) : null}
+              </div>
+            )}
           </section>
         </>
       ) : null}

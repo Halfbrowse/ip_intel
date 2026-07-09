@@ -48,7 +48,8 @@
         "AS31898",
         "AS47583",
         "AS199524",
-        "AS60626"
+        "AS60626",
+        "AS200325"
       ]
     },
     "edge_and_cdn_noise": {
@@ -59,7 +60,7 @@
         "AS16625",
         "AS20940",
         "AS199524",
-        "AS60626"
+        "AS200325"
       ]
     }
   },
@@ -422,13 +423,24 @@
       "notes": "CDN and edge network that can also front direct hosting."
     },
     "AS60626": {
+      "name": "LeaseWeb Network",
+      "category": "hosting",
+      "regions": [
+        "NL",
+        "EU",
+        "GLOBAL"
+      ],
+      "focus": "global_baseline",
+      "notes": "RIPEstat holder is 'LeaseWeb Network B.V.' — real dedicated/cloud hosting, not a CDN. Previously mislabeled 'Bunny CDN' here; corrected after an ASN audit (see README). Distinct from AS60781 (Leaseweb Netherlands)."
+    },
+    "AS200325": {
       "name": "Bunny CDN",
       "category": "edge",
       "regions": [
         "GLOBAL"
       ],
       "focus": "edge_and_cdn_noise",
-      "notes": "Smaller CDN with distinct PTR and certificate patterns."
+      "notes": "Smaller CDN with distinct PTR and certificate patterns. RIPEstat holder 'BunnyCDN BUNNYWAY' — the actual Bunny CDN ASN (AS60626 was mislabeled as this)."
     }
   }
 }

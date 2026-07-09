@@ -84,7 +84,7 @@ MAIL_CLIENT_CONFIG_PATHS = {
     ),
 }
 
-_SOCIAL_NOISE = {"", "home", "login", "signup", "help", "support", "about", "contact"}
+_SOCIAL_NOISE = {"", "home", "login", "signup", "help", "support", "about", "contact", "profile.php", "pages"}
 _SOCIAL_PATTERNS = (
     ("telegram", re.compile(r"https?://t\.me/([A-Za-z0-9_]{3,60})", re.I)),
     ("vkontakte", re.compile(r"https?://(?:www\.)?vk\.com/([^\s\"'<>/?]{2,80})", re.I)),
@@ -93,13 +93,52 @@ _SOCIAL_PATTERNS = (
     ("twitter_x", re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com/(?!search|share|intent|home)([^\s\"'<>/?]{2,60})", re.I)),
     ("tiktok", re.compile(r"https?://(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]{2,60})", re.I)),
     ("instagram", re.compile(r"https?://(?:www\.)?instagram\.com/([^\s\"'<>/?]{2,60})", re.I)),
-    ("facebook", re.compile(r"https?://(?:www\.)?facebook\.com/(?!sharer|share|dialog|tr\b)([^\s\"'<>/?]{2,80})", re.I)),
+    # profile.php is Facebook's un-vanitized profile URL (facebook.com/profile.php?id=…);
+    # the real identifier lives in the query string, which this pattern never
+    # captures, so every site linking to any numeric-id profile would otherwise
+    # extract the literal, identical "profile.php" — a false-positive shared
+    # handle linking unrelated sites. Same problem for /pages/<Name>/<id> (the
+    # legacy Facebook Page URL): the pattern stops at the first "/", so it
+    # captures the literal directory segment "pages" rather than the name or
+    # id that would actually distinguish one page from another.
+    ("facebook", re.compile(r"https?://(?:www\.)?facebook\.com/(?!sharer|share|dialog|tr\b|profile\.php\b|pages\b)([^\s\"'<>/?]{2,80})", re.I)),
     ("youtube", re.compile(r"https?://(?:www\.)?youtube\.com/(?:channel/|@)([^\s\"'<>/?]{2,80})", re.I)),
     ("linkedin", re.compile(r"https?://(?:www\.)?linkedin\.com/(?:company|in)/([^\s\"'<>/?]{2,80})", re.I)),
     ("pinterest", re.compile(r"https?://(?:www\.)?pinterest\.(?:com|[a-z]{2})/([^\s\"'<>/?]{2,80})", re.I)),
-    ("github", re.compile(r"https?://(?:www\.)?github\.com/([^\s\"'<>/?]{2,80})", re.I)),
+    # No "github" entry: unlike the consumer/messaging platforms above, a
+    # github.com/<org> link on a page is overwhelmingly a reference to some
+    # third-party OSS project it depends on or credits (react, wordpress,
+    # tailwindcss, ...) rather than the site's own account — e.g.
+    # github.com/facebook shows up on hundreds of unrelated sites crediting
+    # React. That makes it a reliable false-positive generator rather than an
+    # ownership signal, so it's excluded instead of denylisted after the fact.
     ("mastodon", re.compile(r"https?://([A-Za-z0-9.-]+)/@([A-Za-z0-9_]{2,80})", re.I)),
 )
+
+# Site-ownership-proof meta tags: webmaster-tools verification codes are minted
+# per account, so the same code on two domains is near-decisive shared-control
+# evidence (see utils/evidence_meta.SELECTOR_BASE_WEIGHTS["site_verification"]).
+SITE_VERIFICATION_META_KEYS = {
+    "google-site-verification": "google",
+    "msvalidate.01": "bing",
+    "yandex-verification": "yandex",
+    "p:domain_verify": "pinterest",
+    "facebook-domain-verification": "facebook",
+    "norton-safeweb-site-verification": "norton",
+    "alexaverifyid": "alexa",
+    "baidu-site-verification": "baidu",
+    "naver-site-verification": "naver",
+    "ahrefs-site-verification": "ahrefs",
+    "shopify-verification": "shopify",
+    "verify-v1": "yahoo",
+    "wot-verification": "wot",
+}
+
+# Meta tags that carry a handle for a platform not covered by a t.me/vk.com/…
+# URL pattern above — e.g. Telegram's own widget meta only exposes "@handle".
+SOCIAL_HANDLE_META_KEYS = {
+    "telegram:channel": "telegram",
+}
 
 _BUNDLER_PATTERNS = {
     "webpack": (
@@ -594,6 +633,7 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
         "social_links": {},
         "social_handles": {},
         "social_meta": {},
+        "site_verifications": {},
         "meta_tags": {},
         "rel_me_links": [],
         "canonical_url": None,
@@ -653,6 +693,27 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
             if handle and handle not in social_handles["twitter_x"]:
                 social_handles["twitter_x"].append(handle)
 
+    for meta_key, platform in SOCIAL_HANDLE_META_KEYS.items():
+        handle_value = _first(meta_tags.get(meta_key))
+        if not handle_value:
+            continue
+        handle = handle_value.lstrip("@").strip()
+        if not handle:
+            continue
+        social_handles.setdefault(platform, [])
+        if handle not in social_handles[platform]:
+            social_handles[platform].append(handle)
+
+    site_verifications: dict[str, list[str]] = {}
+    for meta_key, values in meta_tags.items():
+        provider = SITE_VERIFICATION_META_KEYS.get(meta_key)
+        if not provider:
+            continue
+        for value in values:
+            site_verifications.setdefault(provider, [])
+            if value not in site_verifications[provider]:
+                site_verifications[provider].append(value)
+
     out.update(
         {
             "title": _clean_candidate("".join(parser.title_parts)) or None,
@@ -671,6 +732,7 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
             "twitter_creator": twitter_creator,
             "social_links": social_links,
             "social_handles": social_handles,
+            "site_verifications": site_verifications,
             "social_meta": {
                 key: values
                 for key, values in meta_tags.items()
@@ -2141,6 +2203,7 @@ def fetch_page_metadata(
         "cms_generator": None,
         "social_links": {},
         "social_handles": {},
+        "site_verifications": {},
         "favicon_md5": None,
         "favicon_murmurhash3": None,
         "favicon_saved": None,
@@ -2221,6 +2284,7 @@ async def afetch_homepage_profile(
             "cms_generator": page_metadata.get("cms_generator"),
             "social_links": page_metadata.get("social_links") or {},
             "social_handles": page_metadata.get("social_handles") or {},
+            "site_verifications": page_metadata.get("site_verifications") or {},
             "adsense_publisher_ids": [value[3:] if value.startswith("ca-") else value for value in (page_metadata.get("adsense_ids") or [])],
             "fb_app_id": [page_metadata["fb_app_id"]] if page_metadata.get("fb_app_id") else [],
             "twitter_site": [page_metadata["twitter_site"]] if page_metadata.get("twitter_site") else [],

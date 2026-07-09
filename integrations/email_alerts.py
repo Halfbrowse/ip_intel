@@ -213,24 +213,30 @@ def send_analysis_email(job: Mapping[str, Any]) -> bool:
 
 
 def send_case_email(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
+    """
+    Alert for a completed ingest. See send_case_notification's docstring in
+    mattermost_alerts.py -- connections are read from the shared pool summary
+    (case_runtime._build_pool_summary), not a per-ingest comparison.
+    """
     case_id = str(case.get("id") or "")
     status = str(case.get("status") or job.get("status") or "unknown")
     summary = _safe_dict(case.get("summary"))
-    top_findings = _safe_list(summary.get("top_findings"))[:3]
-    target_count = case.get("total_targets") or summary.get("target_count")
+    top_findings = _safe_list(summary.get("top_findings"))[:5]
+    targets = _safe_list(case.get("targets"))
+    target_count = case.get("total_targets") or summary.get("target_count") or len(targets)
     successful = case.get("successful_targets")
     failed = case.get("failed_targets")
-    overlap_count = int(summary.get("within_case_pair_count", 0)) + int(summary.get("historical_pair_count", 0))
 
     base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
-    summary_url = f"{base_url}/cases/{case_id}/summary" if base_url and case_id else None
+    first_target = str(targets[0]) if targets else None
+    summary_url = f"{base_url}/domain/{first_target}" if base_url and first_target else None
 
     highlights = []
     for item in top_findings:
-        left = str(item.get("left_target") or "").strip()
-        right = str(item.get("right_target") or "").strip()
+        target = str(item.get("target") or "").strip()
+        linked_target = str(item.get("linked_target") or "").strip()
         score = item.get("score")
-        line = f"{left} vs {right}".strip()
+        line = f"{target} ↔ {linked_target}".strip()
         if score is not None:
             line = f"{line} ({score})"
         if line:
@@ -240,7 +246,7 @@ def send_case_email(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
         "Submitted": target_count or 0,
         "Succeeded": successful or 0,
         "Failed": failed or 0,
-        "Overlaps": overlap_count,
+        "Pool connections found": len(top_findings),
         "Top findings": highlights,
         "Summary": summary_url,
     }
@@ -258,6 +264,59 @@ def send_case_email(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
         started_at=case.get("started_at") or job.get("started_at"),
         finished_at=case.get("finished_at") or job.get("finished_at"),
     )
+
+
+def send_network_graph_email(
+    png_bytes: bytes, *, domains: list[str] | None = None, html_bytes: bytes | None = None
+) -> bool:
+    """Email an exported network-graph PNG (from the domain comparison page) to
+    the configured alert recipients. User-triggered (someone clicked "Email
+    graph"), not an automatic job-completion alert like the senders above --
+    but it reuses the same SMTP plumbing and the same ALERT_EMAIL_TO recipient
+    list, so no separate configuration is needed.
+
+    A PNG is a flat picture -- nothing in it can be clicked once it lands in
+    an inbox. When the caller also has the self-contained interactive HTML
+    report (inline SVG + vanilla JS, no server needed), attach that too: the
+    PNG guarantees a preview renders even in clients that block HTML
+    attachments, and the HTML file is what the recipient actually opens to
+    click a line and see the evidence behind it.
+    """
+    if not email_enabled():
+        LOGGER.debug("Network graph email skipped because SMTP_HOST or ALERT_EMAIL_TO is not set")
+        return False
+
+    names = [str(d).strip() for d in (domains or []) if str(d).strip()]
+    preview = ", ".join(names[:5]) + (f" +{len(names) - 5} more" if len(names) > 5 else "")
+    subject_target = preview or "selected domains"
+
+    recipients = _recipients()
+    message = EmailMessage()
+    message["Subject"] = f"{_SUBJECT_PREFIX} Network graph: {subject_target}"
+    message["From"] = _sender()
+    message["To"] = ", ".join(recipients)
+    body_lines = [f"Network graph for: {subject_target}", "See the attached image for a quick preview."]
+    if html_bytes:
+        body_lines.append(
+            "Open the attached network-graph-interactive.html file in a browser for a clickable "
+            "version -- click a line or a domain to see the evidence behind it."
+        )
+    message.set_content("\n".join(body_lines))
+    message.add_attachment(png_bytes, maintype="image", subtype="png", filename="network-graph.png")
+    if html_bytes:
+        message.add_attachment(
+            html_bytes, maintype="text", subtype="html", filename="network-graph-interactive.html"
+        )
+
+    LOGGER.info("Queueing network graph email for %d recipient(s)", len(recipients))
+    thread = threading.Thread(
+        target=_deliver_email,
+        args=(message, recipients),
+        name="email-network-graph",
+        daemon=True,
+    )
+    thread.start()
+    return True
 
 
 def send_opencti_email(status: str, details: Mapping[str, Any] | None = None) -> bool:

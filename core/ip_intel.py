@@ -22,7 +22,7 @@ Sources (all free, no API keys required by default):
     - Shodan      : Searches indexed banners for ssl:"domain" hits
                     (optional — set SHODAN_API_KEY in .env)
     - Netlas      : Searches indexed TLS banners by cert CN — free tier available
-                    (optional — set NETLAS_API_KEY in .env)
+                    (optional — set NETLAS_KEY in .env)
     - Origin scan : Two-phase TCP+TLS scan of targeted IP ranges (e.g. GCP) to
                     find the cert CN directly. Opt-in via --scan flag.
 """
@@ -73,6 +73,7 @@ from sources.signal_dns import (
     probe_microsoft_tenant_sync,
 )
 from sources.signal_transport import fetch_ssh_host_key, fetch_tls_certificate, parse_certificate_der
+from utils.ipinfo_lite import merge_ipinfo_lite
 from utils.outbound import httpx_kwargs, requests_kwargs
 from utils.vpn import vpn_rotation_batch
 from sources.signal_web import (
@@ -244,9 +245,10 @@ def _load_lines(path: Path) -> list[str]:
 
 
 def _load_proxy_rules() -> list[dict[str, object]]:
-    raw = _load_json(CONFIG_DIR / "proxy_rules.json", [])
+    raw = _load_json(CONFIG_DIR / "proxy_rules.json", {})
+    rule_list = raw.get("rules") if isinstance(raw, dict) else raw
     rules: list[dict[str, object]] = []
-    for entry in raw if isinstance(raw, list) else []:
+    for entry in rule_list if isinstance(rule_list, list) else []:
         rules.append(
             {
                 "family": str(entry.get("family") or ""),
@@ -302,10 +304,13 @@ def detect_proxy_details(
     asn_info = asn_info or {}
     cert = cert or {}
     norm_asn = _normalize_asn(asn_info.get("asn"))
+    ipinfo_norm_asn = _normalize_asn(asn_info.get("ipinfo_asn"))
     text_fields = [
         ptr,
         asn_info.get("asn_description"),
         asn_info.get("network_name"),
+        asn_info.get("ipinfo_as_name"),
+        asn_info.get("ipinfo_as_domain"),
         cert.get("cn"),
         cert.get("issuer_cn"),
         cert.get("issuer_org"),
@@ -316,7 +321,12 @@ def detect_proxy_details(
     ptr_text = str(ptr or "").lower()
     network_text = " ".join(
         str(value).lower()
-        for value in (asn_info.get("asn_description"), asn_info.get("network_name"))
+        for value in (
+            asn_info.get("asn_description"),
+            asn_info.get("network_name"),
+            asn_info.get("ipinfo_as_name"),
+            asn_info.get("ipinfo_as_domain"),
+        )
         if value
     )
     cert_text = " ".join(
@@ -329,7 +339,10 @@ def detect_proxy_details(
     best_score = 0.0
     for rule in _PROXY_FAMILY_RULES:
         score = 0.0
-        asn_hit = bool(norm_asn and norm_asn in rule["asns"])
+        asn_hit = bool(
+            (norm_asn and norm_asn in rule["asns"])
+            or (ipinfo_norm_asn and ipinfo_norm_asn in rule["asns"])
+        )
         ptr_hit = any(pattern in ptr_text for pattern in rule["patterns"])
         cert_hit = any(pattern in cert_text for pattern in rule["patterns"])
         network_hit = any(pattern in network_text for pattern in rule["patterns"])
@@ -1162,11 +1175,11 @@ def netlas_cert_search(domain: str) -> dict:
     domain as the CN. Netlas has a free tier (~50 queries/day, no credit card).
 
     Requires a free Netlas account — add to .env:
-        NETLAS_API_KEY=<your-api-key>
+        NETLAS_KEY=<your-api-key>
     """
-    api_key = os.environ.get("NETLAS_API_KEY")
+    api_key = os.environ.get("NETLAS_KEY") or os.environ.get("NETLAS_API_KEY")
     if not api_key:
-        return {"skipped": True, "reason": "NETLAS_API_KEY not set in .env"}
+        return {"skipped": True, "reason": "NETLAS_KEY not set in .env"}
 
     import netlas
 
@@ -1778,6 +1791,16 @@ def hackertarget_reverse_ip(ip: str) -> list[str]:
 # ── WHOIS ─────────────────────────────────────────────────────────────────────
 
 def get_domain_whois(domain: str) -> dict:
+    """Domain WHOIS lookup.
+
+    Captures every field the TLD-specific parser extracted -- registrant/
+    admin/tech name, org, address, city, state, postal code, phone/email
+    when the registry exposes them, not just the handful of summary fields
+    kept previously -- plus the full raw response text under "raw".
+    db/intel_db.py's whois_data table and identifier extraction read a few
+    of these by their historical names (expiry_date, nameservers), so those
+    stay aliased for backward compatibility.
+    """
     try:
         w = whois.whois(domain)
 
@@ -1793,27 +1816,25 @@ def get_domain_whois(domain: str) -> dict:
                 return seen
             return str(v)
 
-        return {
-            "registrar":     _fmt(w.registrar),
-            "creation_date": _fmt(w.creation_date),
-            "expiry_date":   _fmt(w.expiration_date),
-            "updated_date":  _fmt(w.updated_date),
-            "nameservers":   _fmt(w.name_servers),
-            "status":        _fmt(w.status),
-            "emails":        _fmt(w.emails),
-            "org":           _fmt(w.org),
-            "country":       _fmt(w.country),
-        }
+        result = {key: _fmt(value) for key, value in dict(w).items()}
+        result["expiry_date"] = _fmt(w.expiration_date)
+        result["nameservers"] = _fmt(w.name_servers)
+        result["raw"] = getattr(w, "text", None)
+        return result
     except Exception as exc:
         return {"error": str(exc)}
 
 
 def get_ip_whois(ip: str) -> dict:
+    """ASN/network lookup for a bare IP: RDAP via ipwhois for network_name/
+    network_cidr/asn_cidr, with ipinfo Lite as the primary source for
+    asn/asn_description/asn_country (see merge_ipinfo_lite) — RDAP remains
+    the sole source for those fields only when ipinfo Lite is unavailable."""
     try:
         obj = IPWhois(ip)
         result = obj.lookup_rdap(depth=1)
         net = result.get("network", {})
-        return {
+        asn_info = {
             "asn":             result.get("asn"),
             "asn_description": result.get("asn_description"),
             "asn_country":     result.get("asn_country_code"),
@@ -1826,7 +1847,8 @@ def get_ip_whois(ip: str) -> dict:
     except IPDefinedError:
         return {"error": "Private/reserved IP address — no public WHOIS"}
     except Exception as exc:
-        return {"error": str(exc)}
+        asn_info = {"error": str(exc)}
+    return merge_ipinfo_lite(asn_info, ip)
 
 
 # ── Per-IP enrichment (used for IPs resolved from a domain) ───────────────────
@@ -2269,7 +2291,7 @@ async def _afetch_page_metadata(domain: str, client: httpx.AsyncClient, save_fav
     result: dict = {
         "google_analytics": [], "gtm_ids": [], "facebook_pixel": [], "tiktok_pixel": [],
         "yandex_metrika": [], "html_lang": None, "cms_generator": None,
-        "social_links": {}, "social_handles": {}, "favicon_md5": None,
+        "social_links": {}, "social_handles": {}, "site_verifications": {}, "favicon_md5": None,
         "favicon_mmh3": None, "favicon_saved": None, "error": None,
         "adsense_publisher_ids": [], "fb_app_id": [], "twitter_site": [],
         "twitter_creator": [], "authors": [], "rel_me": [],
@@ -2307,6 +2329,8 @@ async def _analyze_domain_async(
     enable_wordlist_probe: bool = True,
     enable_wordlist_followups: bool = True,
     enable_urlscan: bool = True,
+    enable_censys: bool = True,
+    enable_netlas: bool = True,
 ) -> dict:
     result: dict = {
         "input":             domain,
@@ -2455,9 +2479,9 @@ async def _analyze_domain_async(
                 _oc_task("urlscan",         _run_serial_urlscan(_aurlscan_historical_ips(domain, client)) if enable_urlscan else _empty_list()),
                 _task("urlscan_analytics",  _run_serial_urlscan(_aurlscan_fetch_analytics(domain, client)) if enable_urlscan else _empty_dict()),
                 _task("spf_details_tmp",    acollect_spf_details(domain, _spf_txt)),
-                _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain)),
+                _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain) if enable_censys else _empty_dict()),
+                _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain) if enable_netlas else _empty_dict()),
                 # _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
-                # _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain)),
             )
 
     _spf_details = result.pop("spf_details_tmp", {}) or {}
@@ -2740,6 +2764,8 @@ async def _analyze_domain_async(
                     enable_wordlist_probe=False,
                     enable_wordlist_followups=False,
                     enable_urlscan=False,
+                    enable_censys=False,
+                    enable_netlas=False,
                 )
                 followups.append(
                     {

@@ -474,9 +474,11 @@ IMPORTANCE_TIER_WEIGHTS: dict[str, float] = {
 SELECTOR_BASE_WEIGHTS: dict[str, float] = {
     "tls_cert_sha256": 100.0,   # exact current leaf cert — decisive
     "ssh_fp": 95.0,             # shared SSH host key — decisive
+    "site_verification": 92.0,  # webmaster-tools verification code — near-decisive
     "shared_ip": 85.0,          # dedicated shared origin IP — strong+
     "tls_spki": 80.0,           # shared public-key (SPKI) reuse — strong
     "tracking_id": 70.0,        # GA/GTM/pixel/AdSense — see TRACKING_SUBKIND_WEIGHTS
+    "social_handle": 55.0,      # same social handle (Telegram/VK/Instagram/…) — strong-
     "html_hash": 45.0,          # identical homepage body — supporting+
     "favicon_mmh3": 45.0,       # favicon fingerprint — supporting
     "favicon_md5": 40.0,        # favicon md5 — supporting

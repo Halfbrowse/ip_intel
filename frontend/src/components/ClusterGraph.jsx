@@ -12,13 +12,41 @@ import {
   forceY,
 } from "d3-force";
 
-// Evidence-edge tiers — how strong the link between two domains is.
+// Evidence-edge tiers — colour encodes connection STRENGTH only (the score),
+// never the kind of evidence behind it (a strong link can be a cert match, a
+// shared IP, or several weaker signals stacked together). What actually ties
+// two nodes together is shown in the detail panel on click, not by colour.
 const EDGE_TIERS = {
-  strong: { color: "#dc2626", label: "Certificate or SSH key match" },
-  infra: { color: "#f97316", label: "Shared hosting or IP address" },
-  weak: { color: "#94a3b8", label: "Weaker shared signals" },
+  strong: { color: "#dc2626", label: "Strong (score 65+)" },
+  moderate: { color: "#f97316", label: "Moderate (score 30–64)" },
+  weak: { color: "#94a3b8", label: "Weak (score below 30)" },
 };
-const TIER_ORDER = ["strong", "infra", "weak"];
+const TIER_ORDER = ["strong", "moderate", "weak"];
+
+// Domain classification tiers (1-5, from OpenCTI channel labels — see
+// integrations/opencti_ingest.py). Unrelated to EDGE_TIERS above (that's
+// link strength; this is a per-domain attribute) — kept as a hot-to-cool
+// severity scale so tier 1 (highest confidence/priority) reads as the most
+// alarming colour and tier 5 the least, same convention as SIEM severity.
+const DOMAIN_TIER_COLORS = {
+  1: "#b91c1c",
+  2: "#ea580c",
+  3: "#ca8a04",
+  4: "#2563eb",
+  5: "#64748b",
+};
+const DOMAIN_TIER_LABELS = {
+  1: "Tier 1",
+  2: "Tier 2",
+  3: "Tier 3",
+  4: "Tier 4",
+  5: "Tier 5",
+};
+const DOMAIN_TIER_ORDER = [1, 2, 3, 4, 5];
+
+function domainTierColor(node) {
+  return DOMAIN_TIER_COLORS[node?.tier] || null;
+}
 
 // Node roles. The graph now only ever contains two kinds of node:
 //   submitted — a domain the user asked about (the anchors of the map)
@@ -27,6 +55,9 @@ const SUBMITTED_COLOR = "#2752d6";
 const BRIDGE_COLOR = "#0ea5e9";
 // Faint tie connecting a bridge subdomain back to the domain it belongs to.
 const MEMBERSHIP_COLOR = "#cbd5e1";
+// Selection ring — deliberately outside both role colours (blue/slate) so
+// "this is the node you clicked" never gets mistaken for its role colour.
+const SELECTION_RING_COLOR = "#f59e0b";
 
 const LABEL_MODES = {
   all: { label: "All" },
@@ -46,24 +77,355 @@ function isSubmitted(node, seeds) {
   return node.role === "submitted" || seeds.has(node.id);
 }
 
+function todayLabel() {
+  return new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
+
 function truncateLabel(text, max = 28) {
   const value = String(text || "");
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
+// The line label only ever names the strongest/first piece of evidence
+// (e.g. "TLS certificate: sha256:8f2c..." -> "TLS certificate") — a domain
+// pair can share several selectors at once, but naming all of them on the
+// line the way OpenCTI names a single STIX relationship type would just
+// turn into a wall of text; the full list is still one click away.
+function shortEvidenceLabel(label) {
+  const text = String(label || "");
+  const separator = text.indexOf(": ");
+  return separator === -1 ? truncateLabel(text, 22) : truncateLabel(text.slice(0, separator), 22);
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Vanilla-JS renderer embedded verbatim into the exported interactive report
+// (buildInteractiveHtml below) — no external dependencies, so the file still
+// works when a recipient just double-clicks it, offline, with no server and
+// no build step. Every piece of graph data (labels, evidence text) is written
+// to the DOM via textContent/createElement, never innerHTML, so a hostile
+// domain name or evidence value in the underlying data can't inject markup
+// into a report someone else opens later.
+const INTERACTIVE_RENDERER_JS = `
+(function () {
+  var DATA = window.__GRAPH_DATA__;
+  var ns = "http://www.w3.org/2000/svg";
+  var svg = document.getElementById("stage");
+  var detail = document.getElementById("detail");
+
+  document.getElementById("doc-title").textContent = DATA.title;
+  document.getElementById("doc-generated").textContent =
+    "Generated " + DATA.generated + " \\u00b7 lines show shared hosting/registration evidence between domains, not guesses";
+  var captionEl = document.getElementById("doc-caption");
+  captionEl.textContent = DATA.caption;
+  if (DATA.filtered) captionEl.classList.add("warn");
+
+  var legend = document.getElementById("legend");
+  function legendItem(swatchClass, color, label) {
+    var item = document.createElement("span");
+    item.className = "item";
+    var sw = document.createElement("span");
+    sw.className = "swatch " + swatchClass;
+    sw.style.background = color;
+    var text = document.createElement("span");
+    text.textContent = label;
+    item.appendChild(sw);
+    item.appendChild(text);
+    legend.appendChild(item);
+  }
+  var seedCount = DATA.nodes.filter(function (n) { return n.seed; }).length;
+  var otherCount = DATA.nodes.length - seedCount;
+  legendItem("", DATA.seedColor, DATA.seedLabel + " (" + seedCount + ")");
+  if (otherCount > 0) legendItem("", DATA.otherColor, DATA.otherLabel + " (" + otherCount + ")");
+  ["strong", "moderate", "weak"].forEach(function (tier) {
+    legendItem("bar", DATA.tierColors[tier], DATA.tierLabels[tier]);
+  });
+  var presentDomainTiers = [];
+  DATA.nodes.forEach(function (n) {
+    if (n.tier && presentDomainTiers.indexOf(n.tier) === -1) presentDomainTiers.push(n.tier);
+  });
+  presentDomainTiers.sort();
+  presentDomainTiers.forEach(function (tier) {
+    legendItem("", DATA.domainTierColors[tier], DATA.domainTierLabels[tier]);
+  });
+
+  svg.setAttribute("viewBox", "0 0 " + DATA.width + " " + DATA.height);
+
+  var view = document.createElementNS(ns, "g");
+  svg.appendChild(view);
+
+  var byId = {};
+  DATA.nodes.forEach(function (n) { byId[n.id] = n; });
+
+  function midpoint(from, to) {
+    return { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+  }
+
+  function shortEvidenceLabel(label) {
+    var text = String(label || "");
+    var sep = text.indexOf(": ");
+    var name = sep === -1 ? text : text.slice(0, sep);
+    return name.length > 22 ? name.slice(0, 21) + "\\u2026" : name;
+  }
+
+  // Matches the live app: past this many edges, inline labels would just
+  // pile up unreadably on a busy hub, so skip them and lean on click-for-
+  // detail (still available either way) instead.
+  var showInlineEdgeLabels = DATA.edges.length <= 10;
+
+  var edgeLines = [];
+  DATA.edges.forEach(function (e) {
+    var from = byId[e.from], to = byId[e.to];
+    if (!from || !to) return;
+    var group = document.createElementNS(ns, "g");
+    var stroke = document.createElementNS(ns, "line");
+    stroke.setAttribute("stroke", DATA.tierColors[e.tier] || "#94a3b8");
+    stroke.setAttribute("stroke-width", String(e.width || 1.5));
+    stroke.setAttribute("stroke-opacity", "0.55");
+    var hit = document.createElementNS(ns, "line");
+    hit.setAttribute("class", "edge-hit");
+    hit.setAttribute("stroke", "transparent");
+    hit.setAttribute("stroke-width", "14");
+    [stroke, hit].forEach(function (line) {
+      line.setAttribute("x1", from.x); line.setAttribute("y1", from.y);
+      line.setAttribute("x2", to.x); line.setAttribute("y2", to.y);
+    });
+    group.appendChild(stroke);
+    group.appendChild(hit);
+
+    // Names the strongest piece of evidence right on the line (e.g. "TLS
+    // certificate"), same idea as a labelled relationship in a knowledge
+    // graph, so the kind of link is visible without clicking.
+    var labelGroup = null;
+    var labelBg = null;
+    if (showInlineEdgeLabels && e.labels && e.labels.length > 0) {
+      labelGroup = document.createElementNS(ns, "g");
+      labelBg = document.createElementNS(ns, "rect");
+      labelBg.setAttribute("rx", "3");
+      labelBg.setAttribute("fill", "#f8fafc");
+      var labelText = document.createElementNS(ns, "text");
+      labelText.setAttribute("text-anchor", "middle");
+      labelText.setAttribute("dy", "0.32em");
+      labelText.setAttribute("font-size", "10");
+      labelText.setAttribute("fill", "#475569");
+      labelText.textContent = shortEvidenceLabel(e.labels[0]);
+      labelGroup.appendChild(labelBg);
+      labelGroup.appendChild(labelText);
+      view.appendChild(labelGroup);
+      var mid = midpoint(from, to);
+      labelGroup.setAttribute("transform", "translate(" + mid.x + "," + mid.y + ")");
+      var box = labelText.getBBox();
+      labelBg.setAttribute("x", box.x - 4);
+      labelBg.setAttribute("y", box.y - 1.5);
+      labelBg.setAttribute("width", box.width + 8);
+      labelBg.setAttribute("height", box.height + 3);
+    }
+
+    hit.addEventListener("click", function (ev) { ev.stopPropagation(); showEdge(e); });
+    view.appendChild(group);
+    edgeLines.push({ edge: e, from: from, to: to, hit: hit, stroke: stroke, labelGroup: labelGroup });
+  });
+
+  function makeDraggable(g, n) {
+    var dragging = false, startX = 0, startY = 0;
+    g.addEventListener("mousedown", function (ev) {
+      dragging = true; startX = ev.clientX; startY = ev.clientY;
+      ev.stopPropagation(); ev.preventDefault();
+    });
+    window.addEventListener("mousemove", function (ev) {
+      if (!dragging) return;
+      var dx = (ev.clientX - startX) / scale, dy = (ev.clientY - startY) / scale;
+      startX = ev.clientX; startY = ev.clientY;
+      n.x += dx; n.y += dy;
+      g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+      edgeLines.forEach(function (el) {
+        if (el.from === n || el.to === n) {
+          el.hit.setAttribute("x1", el.from.x); el.hit.setAttribute("y1", el.from.y);
+          el.hit.setAttribute("x2", el.to.x); el.hit.setAttribute("y2", el.to.y);
+          el.stroke.setAttribute("x1", el.from.x); el.stroke.setAttribute("y1", el.from.y);
+          el.stroke.setAttribute("x2", el.to.x); el.stroke.setAttribute("y2", el.to.y);
+          if (el.labelGroup) {
+            var mid = midpoint(el.from, el.to);
+            el.labelGroup.setAttribute("transform", "translate(" + mid.x + "," + mid.y + ")");
+          }
+        }
+      });
+    });
+    window.addEventListener("mouseup", function () { dragging = false; });
+  }
+
+  DATA.nodes.forEach(function (n) {
+    var g = document.createElementNS(ns, "g");
+    g.setAttribute("class", "node");
+    g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+    if (n.seed) {
+      var ring = document.createElementNS(ns, "circle");
+      ring.setAttribute("r", n.radius + 5);
+      ring.setAttribute("fill", "none");
+      ring.setAttribute("stroke", DATA.seedColor);
+      ring.setAttribute("stroke-opacity", "0.45");
+      ring.setAttribute("stroke-width", "2");
+      g.appendChild(ring);
+    }
+    var circle = document.createElementNS(ns, "circle");
+    circle.setAttribute("r", n.radius);
+    circle.setAttribute(
+      "fill",
+      (n.tier && DATA.domainTierColors[n.tier]) || (n.seed ? DATA.seedColor : DATA.otherColor),
+    );
+    circle.setAttribute("stroke", "#fff");
+    circle.setAttribute("stroke-width", "1.5");
+    g.appendChild(circle);
+
+    // Every node is a domain, so every node gets the same minimal "globe"
+    // glyph rather than a flat dot -- an icon-in-a-circle reads as a
+    // knowledge-graph entity, not a bubble-chart point.
+    var iconR = Math.max(3, n.radius * 0.52);
+    var iconStroke = Math.max(0.75, iconR * 0.12);
+    var meridian = document.createElementNS(ns, "circle");
+    meridian.setAttribute("r", iconR);
+    meridian.setAttribute("fill", "none");
+    meridian.setAttribute("stroke", "rgba(255,255,255,0.85)");
+    meridian.setAttribute("stroke-width", String(iconStroke));
+    g.appendChild(meridian);
+    var equator = document.createElementNS(ns, "ellipse");
+    equator.setAttribute("rx", iconR);
+    equator.setAttribute("ry", iconR * 0.42);
+    equator.setAttribute("fill", "none");
+    equator.setAttribute("stroke", "rgba(255,255,255,0.85)");
+    equator.setAttribute("stroke-width", String(iconStroke));
+    g.appendChild(equator);
+    var axis = document.createElementNS(ns, "line");
+    axis.setAttribute("y1", String(-iconR));
+    axis.setAttribute("y2", String(iconR));
+    axis.setAttribute("stroke", "rgba(255,255,255,0.85)");
+    axis.setAttribute("stroke-width", String(iconStroke));
+    g.appendChild(axis);
+
+    var text = document.createElementNS(ns, "text");
+    text.setAttribute("text-anchor", "middle");
+    text.setAttribute("y", n.radius + 14);
+    text.setAttribute("font-weight", n.seed ? "700" : "400");
+    text.textContent = n.label;
+    g.appendChild(text);
+    g.addEventListener("click", function (ev) { ev.stopPropagation(); showNode(n); });
+    makeDraggable(g, n);
+    view.appendChild(g);
+  });
+
+  var scale = 1, panX = 0, panY = 0;
+  function applyView() {
+    view.setAttribute("transform", "translate(" + panX + "," + panY + ") scale(" + scale + ")");
+  }
+  svg.addEventListener("wheel", function (ev) {
+    ev.preventDefault();
+    var factor = ev.deltaY < 0 ? 1.1 : 0.9;
+    scale = Math.min(4, Math.max(0.3, scale * factor));
+    applyView();
+  }, { passive: false });
+
+  var panning = false, panStartX = 0, panStartY = 0;
+  svg.addEventListener("mousedown", function (ev) {
+    if (ev.target !== svg) return;
+    panning = true; panStartX = ev.clientX - panX; panStartY = ev.clientY - panY;
+    svg.classList.add("grabbing");
+  });
+  window.addEventListener("mousemove", function (ev) {
+    if (!panning) return;
+    panX = ev.clientX - panStartX; panY = ev.clientY - panStartY;
+    applyView();
+  });
+  window.addEventListener("mouseup", function () { panning = false; svg.classList.remove("grabbing"); });
+
+  function clearDetail() { detail.style.display = "none"; detail.textContent = ""; }
+  svg.addEventListener("click", clearDetail);
+
+  function detailHeader(titleText) {
+    detail.textContent = "";
+    var close = document.createElement("button");
+    close.className = "close";
+    close.type = "button";
+    close.textContent = "Close";
+    close.addEventListener("click", clearDetail);
+    detail.appendChild(close);
+    var h3 = document.createElement("h3");
+    h3.textContent = titleText;
+    detail.appendChild(h3);
+    detail.style.display = "block";
+  }
+
+  function showEdge(e) {
+    detailHeader(e.from + " \\u2194 " + e.to);
+    var p = document.createElement("p");
+    p.textContent = "What these two have in common:";
+    detail.appendChild(p);
+    var ul = document.createElement("ul");
+    (e.labels.length ? e.labels : ["No evidence details recorded."]).forEach(function (label) {
+      var li = document.createElement("li");
+      li.textContent = label;
+      ul.appendChild(li);
+    });
+    detail.appendChild(ul);
+  }
+
+  function showNode(n) {
+    var related = DATA.edges
+      .filter(function (e) { return e.from === n.id || e.to === n.id; })
+      .sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
+    detailHeader(n.label);
+    var p = document.createElement("p");
+    p.textContent = "Connected to " + related.length + (related.length === 1 ? " other domain:" : " other domains:");
+    detail.appendChild(p);
+    var ul = document.createElement("ul");
+    related.slice(0, 8).forEach(function (e) {
+      var other = e.from === n.id ? e.to : e.from;
+      var li = document.createElement("li");
+      var strong = document.createElement("strong");
+      strong.textContent = other;
+      li.appendChild(strong);
+      if (e.labels.length) {
+        li.appendChild(document.createTextNode(" \\u2014 " + e.labels.slice(0, 3).join(", ")));
+      }
+      ul.appendChild(li);
+    });
+    if (related.length > 8) {
+      var li = document.createElement("li");
+      li.textContent = "...and " + (related.length - 8) + " more connections.";
+      ul.appendChild(li);
+    }
+    detail.appendChild(ul);
+  }
+})();
+`;
+
 const ClusterGraph = memo(function ClusterGraph({
   graph,
   seedTargets = new Set(),
   renderPairEvidence = null,
+  otherRoleColor = BRIDGE_COLOR,
+  otherRoleLabel = "Bridging subdomain",
+  seedRoleLabel = "Channel in this cluster",
+  title = "How this cluster's channels link together",
+  description = "Click a channel to isolate its connections, or a line to isolate just that pair — the map narrows to only what you clicked on. Click empty space (or \"Show whole cluster\" below) to see everything again. Line colour shows how strong a link is (score only, never what kind of evidence it is — click the line for that). Drag to rearrange, scroll to zoom.",
+  exportFileName = "network-graph",
 }) {
   const containerRef = useRef(null);
   const svgRef = useRef(null);
   const gRef = useRef(null);
   const simulationRef = useRef(null);
+  // Latest simulation node array (with live x/y) so export can bake in the
+  // exact on-screen layout rather than recomputing/guessing positions.
+  const simNodesRef = useRef([]);
   const zoomRef = useRef(null);
   // Live references to the rendered D3 selections so the styling effect can
   // restyle without tearing down and restarting the force simulation.
-  const selectionsRef = useRef({ node: null, link: null });
+  const selectionsRef = useRef({ node: null, link: null, edgeLabel: null });
 
   const [width, setWidth] = useState(960);
   const height = Math.max(460, Math.min(680, Math.round(width * 0.58)));
@@ -71,7 +433,7 @@ const ClusterGraph = memo(function ClusterGraph({
   // Presentation controls — deliberately lean. The map only shows submitted
   // domains and their bridges, so there's no node-colour/size lens to pick.
   const [labelMode, setLabelMode] = useState("all");
-  const [tierFilter, setTierFilter] = useState({ strong: true, infra: true, weak: true });
+  const [tierFilter, setTierFilter] = useState({ strong: true, moderate: true, weak: true });
   const [minScore, setMinScore] = useState(0);
   const [spread, setSpread] = useState(1);
 
@@ -180,6 +542,44 @@ const ClusterGraph = memo(function ClusterGraph({
     [visibleEvidence, visibleMembership],
   );
 
+  // A click focuses the map on just what was clicked: a node's own links, or
+  // one specific edge's two endpoints. `null` means no focus — show the whole
+  // (filtered) cluster. This is a real filter, not a dim/fade — the rest of
+  // the graph is removed from the map entirely, so what's on screen is always
+  // exactly "the graph you clicked for".
+  const focusIds = useMemo(() => {
+    if (selectedNode) {
+      const ids = new Set([selectedNode]);
+      visibleEdges.forEach((edge) => {
+        if (edge.from === selectedNode) ids.add(edge.to);
+        if (edge.to === selectedNode) ids.add(edge.from);
+      });
+      return ids;
+    }
+    if (selectedEdge) {
+      const edge = visibleEvidence.find((e) => `${e.from}|${e.to}` === selectedEdge);
+      return edge ? new Set([edge.from, edge.to]) : null;
+    }
+    return null;
+  }, [selectedNode, selectedEdge, visibleEdges, visibleEvidence]);
+
+  const displayNodes = useMemo(
+    () => (focusIds ? visibleNodes.filter((node) => focusIds.has(node.id)) : visibleNodes),
+    [visibleNodes, focusIds],
+  );
+  const displayEdges = useMemo(
+    () =>
+      focusIds
+        ? visibleEdges.filter((edge) => focusIds.has(edge.from) && focusIds.has(edge.to))
+        : visibleEdges,
+    [visibleEdges, focusIds],
+  );
+
+  const clearFocus = useCallback(() => {
+    setSelectedNode(null);
+    setSelectedEdge(null);
+  }, []);
+
   // Per-node connection count, from evidence links only (membership ties don't
   // count toward how "connected" a domain is).
   const metrics = useMemo(() => {
@@ -208,8 +608,8 @@ const ClusterGraph = memo(function ClusterGraph({
   );
 
   const colorFor = useCallback(
-    (node) => (isSubmitted(node, seedTargets) ? SUBMITTED_COLOR : BRIDGE_COLOR),
-    [seedTargets],
+    (node) => domainTierColor(node) || (isSubmitted(node, seedTargets) ? SUBMITTED_COLOR : otherRoleColor),
+    [seedTargets, otherRoleColor],
   );
 
   const handleNodeClick = useCallback((nodeId) => {
@@ -225,26 +625,16 @@ const ClusterGraph = memo(function ClusterGraph({
     });
   }, []);
 
-  // The set of nodes adjacent to the current selection (used to dim the rest).
-  const neighborIds = useMemo(() => {
-    if (!selectedNode) {
-      return null;
-    }
-    const ids = new Set([selectedNode]);
-    visibleEdges.forEach((edge) => {
-      if (edge.from === selectedNode) ids.add(edge.to);
-      if (edge.to === selectedNode) ids.add(edge.from);
-    });
-    return ids;
-  }, [selectedNode, visibleEdges]);
-
   // Latest presentation state, read by applyStyles at call-time. Keeping this in
   // a ref lets applyStyles stay referentially stable (empty deps) so the build
   // effect can call it without rebuilding the simulation on every recolour.
   const styleRef = useRef({});
-  styleRef.current = { colorFor, labelMode, selectedNode, selectedEdge, neighborIds, metrics, seedTargets };
+  styleRef.current = { colorFor, labelMode, selectedNode, selectedEdge, metrics, seedTargets };
 
   // Apply colour / label / highlight to the existing selections in place.
+  // Everything on screen already belongs to the current focus (see
+  // displayNodes/displayEdges above), so there's no separate "dim the rest"
+  // pass here — only the exact selected edge gets an extra highlight.
   const applyStyles = useCallback(() => {
     const { node, link } = selectionsRef.current;
     if (!node || !link) {
@@ -255,7 +645,6 @@ const ClusterGraph = memo(function ClusterGraph({
       labelMode: labels,
       selectedNode: selNode,
       selectedEdge: selEdge,
-      neighborIds: neighbors,
       metrics: nodeMetrics,
       seedTargets: seeds,
     } = styleRef.current;
@@ -264,8 +653,8 @@ const ClusterGraph = memo(function ClusterGraph({
     node
       .select("circle.graph-marker")
       .attr("fill", (d) => color(d))
-      .attr("stroke", (d) => (selNode === d.id ? "var(--text)" : "transparent"));
-    node.attr("opacity", (d) => (neighbors && !neighbors.has(d.id) ? 0.2 : 1));
+      .attr("stroke", (d) => (selNode === d.id ? SELECTION_RING_COLOR : "var(--graph-node-ring, #fff)"))
+      .attr("stroke-width", (d) => (selNode === d.id ? 3 : 1.75));
     node
       .select("text.graph-node-label")
       .attr("font-weight", (d) => (isSubmitted(d, seeds) ? 700 : 400))
@@ -282,30 +671,61 @@ const ClusterGraph = memo(function ClusterGraph({
       const key = `${d.from}|${d.to}`;
       const isSelected = selEdge === key;
       const membership = edgeKind(d) === "membership";
-      const dimmed =
-        (neighbors && d.from !== selNode && d.to !== selNode) ||
-        (selEdge && !isSelected);
+      const dimmed = selEdge && !isSelected;
       const base = membership ? 0.4 : 0.55;
-      d3Select(this)
+      const self = d3Select(this);
+      self
         .select(".graph-edge-stroke")
         .attr("stroke-opacity", dimmed ? 0.08 : isSelected ? 0.95 : base)
         .attr("stroke-width", isSelected ? (d.width || 1.5) + 1.5 : d.width || 1.5);
+      self.select(".graph-edge-label").attr("opacity", dimmed ? 0.08 : 1);
     });
   }, []);
+
+  // Frames the current layout (from simNodesRef's live x/y) so the map fills
+  // the card instead of sitting as a small clump inside a lot of empty
+  // canvas. Shared by the initial auto-fit below and the "Reset view" button,
+  // so resetting never throws the user back into the un-fitted raw layout.
+  const fitToView = useCallback(
+    (duration = 450) => {
+      const nodes = simNodesRef.current;
+      const handle = zoomRef.current;
+      if (!handle || !nodes || nodes.length === 0) {
+        return;
+      }
+      const pad = 60;
+      const xs = nodes.map((node) => node.x);
+      const ys = nodes.map((node) => node.y);
+      const minX = Math.min(...xs) - pad;
+      const maxX = Math.max(...xs) + pad;
+      const minY = Math.min(...ys) - pad;
+      const maxY = Math.max(...ys) + pad;
+      const boxWidth = Math.max(1, maxX - minX);
+      const boxHeight = Math.max(1, maxY - minY);
+      const scale = Math.min(1.8, Math.max(0.4, Math.min(width / boxWidth, height / boxHeight)));
+      const translateX = width / 2 - (scale * (minX + maxX)) / 2;
+      const translateY = height / 2 - (scale * (minY + maxY)) / 2;
+      handle.svg
+        .transition()
+        .duration(duration)
+        .call(handle.zoomer.transform, zoomIdentity.translate(translateX, translateY).scale(scale));
+    },
+    [width, height],
+  );
 
   // --- Build / rebuild the simulation and DOM ---------------------------------
   // Runs when the data, viewport, or any layout-affecting control changes.
   useEffect(() => {
-    if (!svgRef.current || !gRef.current || visibleNodes.length === 0) {
+    if (!svgRef.current || !gRef.current || displayNodes.length === 0) {
       return undefined;
     }
 
-    const simNodes = visibleNodes.map((node) => ({
+    const simNodes = displayNodes.map((node) => ({
       ...node,
       radius: radiusFor(node),
     }));
     const byId = new Map(simNodes.map((node) => [node.id, node]));
-    const simLinks = visibleEdges
+    const simLinks = displayEdges
       .filter((edge) => byId.has(edge.from) && byId.has(edge.to))
       .map((edge) => ({ ...edge, source: edge.from, target: edge.to }));
 
@@ -320,7 +740,9 @@ const ClusterGraph = memo(function ClusterGraph({
       .join("g");
 
     // Wide transparent hit-line for easy clicking (evidence edges only), plus
-    // the visible stroke.
+    // the visible stroke. Straight lines, not curves — a technical knowledge
+    // graph (this is deliberately modelled on OpenCTI's investigation graph)
+    // reads as schematic/precise, not a decorative "bubble map".
     linkSel
       .filter((d) => edgeKind(d) === "evidence")
       .append("line")
@@ -342,6 +764,43 @@ const ClusterGraph = memo(function ClusterGraph({
       .attr("stroke-dasharray", (d) => (edgeKind(d) === "membership" ? "3 4" : null))
       .attr("stroke-width", (d) => d.width || 1.5);
 
+    // Relationship-type label sat directly on the line (e.g. "TLS
+    // certificate", "Shared IP") — same idea as OpenCTI showing the STIX
+    // relationship name on its edges, so the kind of evidence is visible
+    // without a click. Only the strongest/first piece of evidence is named
+    // here; the full breakdown is still one click away. A background chip
+    // behind the text (sized from the rendered text's own bounding box)
+    // breaks the line behind it instead of the text sitting on top of it.
+    //
+    // Labels aren't collision-checked against each other (unlike nodes), so
+    // a busy hub with a dozen edges converging in one spot would just turn
+    // them into an unreadable pile-up — worse than not labelling at all.
+    // Past a density threshold, skip inline labels entirely and lean on
+    // click-for-detail instead, which stays available either way.
+    const evidenceLinkCount = simLinks.filter((edge) => edgeKind(edge) === "evidence").length;
+    const showInlineEdgeLabels = evidenceLinkCount <= 10;
+    const edgeLabelSel = linkSel
+      .filter((d) => showInlineEdgeLabels && edgeKind(d) === "evidence" && (d.labels || []).length > 0)
+      .append("g")
+      .attr("class", "graph-edge-label");
+    edgeLabelSel.append("rect").attr("class", "graph-edge-label-bg").attr("rx", 3);
+    edgeLabelSel
+      .append("text")
+      .attr("class", "graph-edge-label-text")
+      .attr("text-anchor", "middle")
+      .attr("dy", "0.32em")
+      .text((d) => shortEvidenceLabel(d.labels[0]));
+    edgeLabelSel.each(function attachBackground() {
+      const group = d3Select(this);
+      const box = group.select("text").node().getBBox();
+      group
+        .select("rect")
+        .attr("x", box.x - 4)
+        .attr("y", box.y - 1.5)
+        .attr("width", box.width + 8)
+        .attr("height", box.height + 3);
+    });
+
     const nodeSel = g
       .append("g")
       .attr("class", "graph-nodes")
@@ -355,34 +814,80 @@ const ClusterGraph = memo(function ClusterGraph({
         handleNodeClick(d.id);
       });
 
-    // Halo behind each submitted domain to set the anchors apart.
+    // A second, wider ring (not a soft blurred halo) marks the domains the
+    // user actually picked — flatter and crisper than a glow, in keeping
+    // with a technical/schematic graph rather than a glossy consumer one.
     nodeSel
       .filter((d) => isSubmitted(d, seedTargets))
       .append("circle")
-      .attr("class", "graph-seed-halo")
-      .attr("fill", "rgba(39, 82, 214, 0.16)")
-      .attr("r", (d) => d.radius + 7);
+      .attr("class", "graph-seed-ring")
+      .attr("fill", "none")
+      .attr("stroke", SUBMITTED_COLOR)
+      .attr("stroke-opacity", 0.45)
+      .attr("stroke-width", 2)
+      .attr("r", (d) => d.radius + 5);
 
     nodeSel
       .append("circle")
       .attr("class", "graph-marker")
       .attr("r", (d) => d.radius)
-      .attr("stroke-width", 2);
+      .attr("stroke", "var(--graph-node-ring, #fff)")
+      .attr("stroke-width", 1.5);
+
+    // Every node is a domain, so every node gets the same minimal "globe"
+    // glyph (three arcs over a circle) rather than a flat dot — the
+    // icon-in-a-circle look is the other half of what reads as a knowledge
+    // graph instead of a bubble chart. Scales down gracefully for the
+    // smaller "related" nodes.
+    const iconGroup = nodeSel.append("g").attr("class", "graph-node-icon").style("pointer-events", "none");
+    iconGroup.each(function drawGlobe(d) {
+      const iconR = Math.max(3, d.radius * 0.52);
+      const group = d3Select(this);
+      group
+        .append("circle")
+        .attr("r", iconR)
+        .attr("fill", "none")
+        .attr("stroke", "var(--graph-node-icon, rgba(255,255,255,0.85))")
+        .attr("stroke-width", Math.max(0.75, iconR * 0.12));
+      group
+        .append("ellipse")
+        .attr("rx", iconR)
+        .attr("ry", iconR * 0.42)
+        .attr("fill", "none")
+        .attr("stroke", "var(--graph-node-icon, rgba(255,255,255,0.85))")
+        .attr("stroke-width", Math.max(0.75, iconR * 0.12));
+      group
+        .append("line")
+        .attr("y1", -iconR)
+        .attr("y2", iconR)
+        .attr("stroke", "var(--graph-node-icon, rgba(255,255,255,0.85))")
+        .attr("stroke-width", Math.max(0.75, iconR * 0.12));
+    });
 
     nodeSel
       .append("text")
       .attr("class", "graph-node-label")
       .attr("text-anchor", "middle")
-      .attr("y", (d) => d.radius + 14)
+      .attr("y", (d) => d.radius + 15)
+      // A stroke behind the fill in the background colour acts as a soft
+      // halo/cutout, so a label stays legible where it crosses a link or
+      // sits close to a neighbour instead of turning into visual noise.
+      .attr("paint-order", "stroke")
+      .attr("stroke", "var(--graph-label-halo, #fff)")
+      .attr("stroke-width", 3)
+      .attr("stroke-linejoin", "round")
       .text((d) => truncateLabel(d.label));
 
-    selectionsRef.current = { node: nodeSel, link: linkSel };
+    selectionsRef.current = { node: nodeSel, link: linkSel, edgeLabel: edgeLabelSel };
     // Apply the current colour / label / highlight to the freshly-built DOM.
     applyStyles();
 
     // Link distance / charge scale with the "spread" control so the user can
     // pull dense clusters apart or pack them tight. Membership ties stay short
-    // so a bridge hugs the domain it belongs to.
+    // so a bridge hugs the domain it belongs to. Distances and charge are
+    // deliberately generous — a tight, overlapping clump reads as clutter,
+    // and the auto-fit-to-view pass below means going wider never leaves the
+    // map looking empty either.
     const simulation = forceSimulation(simNodes)
       .force(
         "link",
@@ -391,7 +896,7 @@ const ClusterGraph = memo(function ClusterGraph({
           .distance((edge) => {
             if (edgeKind(edge) === "membership") return 48 * spread;
             return (
-              (edgeTier(edge) === "strong" ? 80 : edgeTier(edge) === "infra" ? 120 : 160) *
+              (edgeTier(edge) === "strong" ? 100 : edgeTier(edge) === "moderate" ? 150 : 195) *
               spread
             );
           })
@@ -399,13 +904,20 @@ const ClusterGraph = memo(function ClusterGraph({
             edgeKind(edge) === "membership" ? 0.9 : edgeTier(edge) === "weak" ? 0.25 : 0.6,
           ),
       )
-      .force("charge", forceManyBody().strength(-260 * spread))
+      .force("charge", forceManyBody().strength(-420 * spread))
       .force("center", forceCenter(width / 2, height / 2))
-      .force("collide", forceCollide().radius((node) => node.radius + 16))
-      .force("x", forceX(width / 2).strength(0.06))
-      .force("y", forceY(height / 2).strength(0.08));
+      .force(
+        "collide",
+        forceCollide().radius((node) => node.radius + 22 + Math.min(46, truncateLabel(node.label).length * 1.8)),
+      )
+      .force("x", forceX(width / 2).strength(0.05))
+      .force("y", forceY(height / 2).strength(0.07));
 
     simulationRef.current = simulation;
+    // Same array objects the simulation mutates in place, so reading this
+    // ref later (e.g. on export) always sees the latest x/y without needing
+    // a per-tick copy.
+    simNodesRef.current = simNodes;
 
     const margin = 30;
     simulation.on("tick", () => {
@@ -419,7 +931,26 @@ const ClusterGraph = memo(function ClusterGraph({
         .attr("y1", (d) => d.source.y)
         .attr("x2", (d) => d.target.x)
         .attr("y2", (d) => d.target.y);
+      edgeLabelSel.attr(
+        "transform",
+        (d) => `translate(${(d.source.x + d.target.x) / 2}, ${(d.source.y + d.target.y) / 2})`,
+      );
       nodeSel.attr("transform", (d) => `translate(${d.x}, ${d.y})`);
+    });
+
+    // Once the layout settles, frame it so the map fills the card instead of
+    // sitting as a small clump inside a lot of empty canvas (or, for a large
+    // graph, spilling past the edges). Only on the *first* settle after a
+    // fresh build — dragging a node re-heats/cools the same simulation and
+    // firing this again on every drag release would yank the view out from
+    // under whoever's mid-drag.
+    let hasFitToView = false;
+    simulation.on("end", () => {
+      if (hasFitToView) {
+        return;
+      }
+      hasFitToView = true;
+      fitToView();
     });
 
     // Drag: pin a node while held, then release it back to the simulation.
@@ -449,19 +980,21 @@ const ClusterGraph = memo(function ClusterGraph({
     return () => {
       simulation.stop();
       simulationRef.current = null;
-      selectionsRef.current = { node: null, link: null };
+      selectionsRef.current = { node: null, link: null, edgeLabel: null };
     };
   }, [
-    visibleNodes,
-    visibleEdges,
+    displayNodes,
+    displayEdges,
     width,
     height,
     spread,
     radiusFor,
     seedTargets,
+    otherRoleColor,
     handleNodeClick,
     handleEdgeClick,
     applyStyles,
+    fitToView,
   ]);
 
   // --- Zoom / pan (set up once) ----------------------------------------------
@@ -478,29 +1011,416 @@ const ClusterGraph = memo(function ClusterGraph({
       });
     zoomRef.current = { svg, zoomer };
     svg.call(zoomer);
-    // Clear selection when clicking empty canvas.
-    svg.on("click", () => {
-      setSelectedNode(null);
-      setSelectedEdge(null);
-    });
+    // Clicking empty canvas drops the focus and shows the whole cluster again.
+    svg.on("click", clearFocus);
     return () => {
       svg.on(".zoom", null);
       svg.on("click", null);
     };
-  }, []);
+  }, [clearFocus]);
 
   const resetView = useCallback(() => {
-    const handle = zoomRef.current;
-    if (handle) {
-      handle.svg.transition().duration(300).call(handle.zoomer.transform, zoomIdentity);
+    fitToView(300);
+  }, [fitToView]);
+
+  // Builds a standalone, presentation-ready copy of the current map — title,
+  // generated date, and a full legend baked in as real SVG content — as a
+  // detached XML document rather than relying on the page's stylesheet: an
+  // <img> loaded from a serialised SVG blob is its own document and can't see
+  // var(--text)/var(--graph-bg) or any other page CSS, so every colour that
+  // matters is written out explicitly here. Shared by both the download and
+  // email actions so the picture they produce is always identical.
+  const buildPresentationSvg = useCallback(() => {
+    const liveG = gRef.current;
+    if (!liveG || displayNodes.length === 0) {
+      return null;
     }
-  }, []);
+
+    const headerH = 76;
+    const footerH = 96;
+    const pad = 24;
+    const totalW = Math.max(width, 480);
+    const totalH = height + headerH + footerH;
+
+    const ns = "http://www.w3.org/2000/svg";
+    const doc = document.implementation.createDocument(ns, "svg", null);
+    const out = doc.documentElement;
+    out.setAttribute("width", totalW);
+    out.setAttribute("height", totalH);
+    out.setAttribute("viewBox", `0 0 ${totalW} ${totalH}`);
+    out.setAttribute("font-family", "-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif");
+
+    const style = doc.createElementNS(ns, "style");
+    style.textContent = `
+      :root { --text: #111827; }
+      text { font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+      .graph-node-label { fill: #111827; }
+    `;
+    out.appendChild(style);
+
+    const bg = doc.createElementNS(ns, "rect");
+    bg.setAttribute("width", totalW);
+    bg.setAttribute("height", totalH);
+    bg.setAttribute("fill", "#ffffff");
+    out.appendChild(bg);
+
+    // Header: title derived from the domains actually anchoring this map, so
+    // it can never drift from what the picture shows.
+    const seedNames = displayNodes.filter((node) => isSubmitted(node, seedTargets)).map((node) => node.label);
+    const preview = seedNames.slice(0, 3).join(", ") + (seedNames.length > 3 ? ` +${seedNames.length - 3} more` : "");
+    const header = doc.createElementNS(ns, "g");
+    const headTitle = doc.createElementNS(ns, "text");
+    headTitle.setAttribute("x", pad);
+    headTitle.setAttribute("y", 30);
+    headTitle.setAttribute("font-size", "19");
+    headTitle.setAttribute("font-weight", "700");
+    headTitle.setAttribute("fill", "#0f172a");
+    headTitle.textContent = `Network map — ${preview || "no domains"}`;
+    header.appendChild(headTitle);
+
+    const headSub = doc.createElementNS(ns, "text");
+    headSub.setAttribute("x", pad);
+    headSub.setAttribute("y", 52);
+    headSub.setAttribute("font-size", "12.5");
+    headSub.setAttribute("fill", "#64748b");
+    headSub.textContent = `Generated ${todayLabel()} · lines show shared hosting/registration evidence between domains, not guesses`;
+    header.appendChild(headSub);
+
+    // Disclosure line — if any tier/strength filter or a click-to-focus is
+    // hiding part of the underlying data, say so on the image itself. The
+    // exported picture should never imply completeness it doesn't have.
+    const totalEvidence = allEdges.filter((edge) => edgeKind(edge) === "evidence").length;
+    const shownEvidence = displayEdges.filter((edge) => edgeKind(edge) === "evidence").length;
+    const filtered = displayNodes.length < allNodes.length || shownEvidence < totalEvidence;
+    const headCaption = doc.createElementNS(ns, "text");
+    headCaption.setAttribute("x", pad);
+    headCaption.setAttribute("y", 70);
+    headCaption.setAttribute("font-size", "12");
+    headCaption.setAttribute("fill", filtered ? "#b45309" : "#64748b");
+    headCaption.textContent = filtered
+      ? `Filtered view: showing ${displayNodes.length} of ${allNodes.length} domains and ${shownEvidence} of ${totalEvidence} links — clear the filters above to export everything.`
+      : `Showing all ${displayNodes.length} domains and ${shownEvidence} evidence-backed links currently loaded.`;
+    header.appendChild(headCaption);
+    out.appendChild(header);
+
+    // The graph itself, re-fit to the export canvas rather than carrying over
+    // whatever the live view happens to be panned/zoomed to (a mid-pan export
+    // would otherwise crop content, and a never-touched view would reproduce
+    // the same "small clump in a big empty canvas" look the on-screen
+    // auto-fit exists to avoid). Uses the same settled simulation coordinates
+    // (simNodesRef) the on-screen fit-to-view reads, just recomputed against
+    // the export canvas's own dimensions.
+    const boundsSource = simNodesRef.current.length > 0 ? simNodesRef.current : displayNodes;
+    const fitPad = 44;
+    const xs = boundsSource.map((node) => node.x ?? width / 2);
+    const ys = boundsSource.map((node) => node.y ?? height / 2);
+    const minX = Math.min(...xs) - fitPad;
+    const maxX = Math.max(...xs) + fitPad;
+    const minY = Math.min(...ys) - fitPad;
+    const maxY = Math.max(...ys) + fitPad;
+    const boxWidth = Math.max(1, maxX - minX);
+    const boxHeight = Math.max(1, maxY - minY);
+    const fitScale = Math.min(1.6, Math.max(0.3, Math.min(totalW / boxWidth, height / boxHeight)));
+    const fitTx = totalW / 2 - (fitScale * (minX + maxX)) / 2;
+    const fitTy = height / 2 - (fitScale * (minY + maxY)) / 2;
+
+    const graphClone = liveG.cloneNode(true);
+    graphClone.removeAttribute("transform");
+    const graphGroup = doc.createElementNS(ns, "g");
+    graphGroup.setAttribute(
+      "transform",
+      `translate(0, ${headerH}) translate(${fitTx}, ${fitTy}) scale(${fitScale})`,
+    );
+    Array.from(graphClone.childNodes).forEach((child) => graphGroup.appendChild(doc.importNode(child, true)));
+    out.appendChild(graphGroup);
+
+    // Footer legend — the same roles/tiers shown on-page, restated as real
+    // SVG so the exported image is self-explanatory outside the app.
+    const legend = doc.createElementNS(ns, "g");
+    legend.setAttribute("transform", `translate(${pad}, ${headerH + height + 30})`);
+    const svgPresentTiers = DOMAIN_TIER_ORDER.filter((tier) => displayNodes.some((node) => node.tier === tier));
+    const legendItems = [
+      { swatch: "circle", color: SUBMITTED_COLOR, label: `${seedRoleLabel} (${seedNames.length})` },
+      { swatch: "circle", color: otherRoleColor, label: otherRoleLabel },
+      ...TIER_ORDER.map((tier) => ({ swatch: "line", color: EDGE_TIERS[tier].color, label: EDGE_TIERS[tier].label })),
+      ...svgPresentTiers.map((tier) => ({ swatch: "circle", color: DOMAIN_TIER_COLORS[tier], label: DOMAIN_TIER_LABELS[tier] })),
+    ];
+    let lx = 0;
+    let ly = 0;
+    const maxLegendW = totalW - pad * 2;
+    legendItems.forEach((item) => {
+      const itemW = item.label.length * 6.6 + 34;
+      if (lx + itemW > maxLegendW) {
+        lx = 0;
+        ly += 24;
+      }
+      const g = doc.createElementNS(ns, "g");
+      g.setAttribute("transform", `translate(${lx}, ${ly})`);
+      if (item.swatch === "circle") {
+        const c = doc.createElementNS(ns, "circle");
+        c.setAttribute("cx", 6);
+        c.setAttribute("cy", -4);
+        c.setAttribute("r", 6);
+        c.setAttribute("fill", item.color);
+        g.appendChild(c);
+      } else {
+        const l = doc.createElementNS(ns, "rect");
+        l.setAttribute("x", 0);
+        l.setAttribute("y", -8);
+        l.setAttribute("width", 16);
+        l.setAttribute("height", 4);
+        l.setAttribute("rx", 2);
+        l.setAttribute("fill", item.color);
+        g.appendChild(l);
+      }
+      const t = doc.createElementNS(ns, "text");
+      t.setAttribute("x", 22);
+      t.setAttribute("y", 0);
+      t.setAttribute("font-size", "12.5");
+      t.setAttribute("fill", "#1e293b");
+      t.textContent = item.label;
+      g.appendChild(t);
+      legend.appendChild(g);
+      lx += itemW;
+    });
+    out.appendChild(legend);
+
+    return { svgElement: out, totalW, totalH, seedNames };
+  }, [
+    allEdges,
+    allNodes,
+    displayEdges,
+    displayNodes,
+    height,
+    otherRoleColor,
+    otherRoleLabel,
+    seedRoleLabel,
+    seedTargets,
+    width,
+  ]);
+
+  // Builds a self-contained, clickable HTML report — inline SVG plus vanilla
+  // JS (INTERACTIVE_RENDERER_JS above), no external scripts or fonts — so a
+  // non-technical recipient can open the file straight from their downloads
+  // folder or an email attachment and get the same click-a-line-for-evidence
+  // interaction as the live app, without needing an account or network access
+  // to this tool. Node positions are baked in from the live simulation
+  // (simNodesRef) so the exported layout matches what's on screen.
+  const buildInteractiveHtml = useCallback(() => {
+    if (displayNodes.length === 0) {
+      return null;
+    }
+    const simById = new Map((simNodesRef.current || []).map((node) => [node.id, node]));
+    const seedNames = displayNodes.filter((node) => isSubmitted(node, seedTargets)).map((node) => node.label);
+    const preview = seedNames.slice(0, 3).join(", ") + (seedNames.length > 3 ? ` +${seedNames.length - 3} more` : "");
+
+    const totalEvidence = allEdges.filter((edge) => edgeKind(edge) === "evidence").length;
+    const shownEvidence = displayEdges.filter((edge) => edgeKind(edge) === "evidence").length;
+    const filtered = displayNodes.length < allNodes.length || shownEvidence < totalEvidence;
+
+    const nodes = displayNodes.map((node) => {
+      const sim = simById.get(node.id);
+      const seed = isSubmitted(node, seedTargets);
+      return {
+        id: node.id,
+        label: node.label,
+        seed,
+        tier: DOMAIN_TIER_COLORS[node.tier] ? node.tier : null,
+        radius: sim ? sim.radius : seed ? 16 : 8,
+        x: sim ? Math.round(sim.x) : width / 2,
+        y: sim ? Math.round(sim.y) : height / 2,
+      };
+    });
+
+    const edges = displayEdges
+      .filter((edge) => edgeKind(edge) === "evidence")
+      .map((edge) => ({
+        from: edge.from,
+        to: edge.to,
+        score: edge.score || 0,
+        tier: edgeTier(edge),
+        width: edge.width || 1.5,
+        labels:
+          edge.labels && edge.labels.length > 0 ? edge.labels : (edge.paths || []).map(formatPathFallback),
+      }));
+
+    const data = {
+      title: `Network map — ${preview || "no domains"}`,
+      generated: todayLabel(),
+      caption: filtered
+        ? `Filtered view: showing ${displayNodes.length} of ${allNodes.length} domains and ${shownEvidence} of ${totalEvidence} links.`
+        : `Showing all ${displayNodes.length} domains and ${shownEvidence} evidence-backed links currently loaded.`,
+      filtered,
+      width: Math.max(width, 480),
+      height,
+      seedColor: SUBMITTED_COLOR,
+      otherColor: otherRoleColor,
+      seedLabel: seedRoleLabel,
+      otherLabel: otherRoleLabel,
+      tierColors: { strong: EDGE_TIERS.strong.color, moderate: EDGE_TIERS.moderate.color, weak: EDGE_TIERS.weak.color },
+      tierLabels: { strong: EDGE_TIERS.strong.label, moderate: EDGE_TIERS.moderate.label, weak: EDGE_TIERS.weak.label },
+      domainTierColors: DOMAIN_TIER_COLORS,
+      domainTierLabels: DOMAIN_TIER_LABELS,
+      nodes,
+      edges,
+    };
+
+    // Escape `<` so the JSON blob can't prematurely close the <script> tag
+    // it's embedded in (or smuggle a `<!--`) if a domain/evidence value ever
+    // contains one — JSON.stringify already handles quoting/escaping.
+    const dataJson = JSON.stringify(data).replace(/</g, "\\u003c");
+
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>${escapeHtml(data.title)}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #f8fafc; color: #111827; }
+  header { padding: 20px 24px 4px; }
+  h1 { font-size: 19px; margin: 0 0 4px; color: #0f172a; }
+  .meta { font-size: 12.5px; color: #64748b; margin: 2px 0; }
+  .meta.warn { color: #b45309; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 10px 24px; font-size: 12.5px; color: #334155; }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .swatch.bar { width: 16px; height: 4px; border-radius: 2px; }
+  #stage-wrap { margin: 0 24px; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden; background: #fff; }
+  #stage { width: 100%; height: 640px; display: block; cursor: grab; }
+  #stage.grabbing { cursor: grabbing; }
+  .node { cursor: pointer; }
+  .node text { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 11px; fill: #111827; user-select: none; }
+  .edge-hit { cursor: pointer; }
+  .hint { padding: 10px 24px 4px; font-size: 12px; color: #94a3b8; }
+  #detail { margin: 12px 24px 24px; padding: 14px 16px; border: 1px solid #e2e8f0; border-radius: 12px; background: #fff; display: none; font-size: 13px; }
+  #detail h3 { margin: 0 0 8px; font-size: 14px; }
+  #detail ul { margin: 8px 0 0; padding-left: 18px; }
+  #detail .close { float: right; border: 1px solid #e2e8f0; background: #f8fafc; border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="doc-title"></h1>
+  <p class="meta" id="doc-generated"></p>
+  <p class="meta" id="doc-caption"></p>
+</header>
+<div class="legend" id="legend"></div>
+<div id="stage-wrap"><svg id="stage"></svg></div>
+<p class="hint">Click a domain or a line to see the evidence behind it. Drag a domain to move it, scroll to zoom, drag empty space to pan.</p>
+<div id="detail"></div>
+<script>window.__GRAPH_DATA__ = ${dataJson};</script>
+<script>${INTERACTIVE_RENDERER_JS}</script>
+</body>
+</html>`;
+
+    return new Blob([html], { type: "text/html;charset=utf-8" });
+  }, [
+    allEdges,
+    allNodes,
+    displayEdges,
+    displayNodes,
+    height,
+    otherRoleColor,
+    otherRoleLabel,
+    seedRoleLabel,
+    seedTargets,
+    width,
+  ]);
+
+  // Rasterises a built presentation SVG to a PNG Blob at 2x scale (crisp when
+  // dropped into a slide or email). Returns null if there's nothing to draw.
+  const renderPresentationPng = useCallback(() => {
+    const built = buildPresentationSvg();
+    if (!built) {
+      return Promise.resolve(null);
+    }
+    const { svgElement, totalW, totalH, seedNames } = built;
+    const svgString = new XMLSerializer().serializeToString(svgElement);
+    const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+    const svgUrl = URL.createObjectURL(svgBlob);
+
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = 2;
+        const canvas = document.createElement("canvas");
+        canvas.width = totalW * scale;
+        canvas.height = totalH * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.scale(scale, scale);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, totalW, totalH);
+        ctx.drawImage(img, 0, 0, totalW, totalH);
+        URL.revokeObjectURL(svgUrl);
+        canvas.toBlob((blob) => resolve(blob ? { blob, seedNames } : null), "image/png");
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(svgUrl);
+        resolve(null);
+      };
+      img.src = svgUrl;
+    });
+  }, [buildPresentationSvg]);
+
+  const downloadImage = useCallback(() => {
+    renderPresentationPng().then((result) => {
+      if (!result) return;
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(result.blob);
+      link.download = `${exportFileName}-${Date.now()}.png`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    });
+  }, [renderPresentationPng, exportFileName]);
+
+  const downloadInteractive = useCallback(() => {
+    const blob = buildInteractiveHtml();
+    if (!blob) return;
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${exportFileName}-${Date.now()}.html`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }, [buildInteractiveHtml, exportFileName]);
+
+  const [emailState, setEmailState] = useState({ status: "idle", message: "" });
+
+  // Sends both the static PNG (a safe preview that renders in any mail
+  // client) and the clickable HTML report (the actual "dynamic" artifact) as
+  // two attachments on one message, so recipients get real interactivity
+  // even though a raw image attachment never could be.
+  const emailGraph = useCallback(async () => {
+    setEmailState({ status: "sending", message: "" });
+    try {
+      const result = await renderPresentationPng();
+      if (!result) {
+        setEmailState({ status: "error", message: "Nothing to export yet." });
+        return;
+      }
+      const htmlBlob = buildInteractiveHtml();
+      const form = new FormData();
+      form.append("image", result.blob, "network-graph.png");
+      if (htmlBlob) {
+        form.append("report", htmlBlob, "network-graph-interactive.html");
+      }
+      form.append("domains", JSON.stringify(result.seedNames));
+      const response = await fetch("/api/graph/email", { method: "POST", body: form });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || "Couldn't send the email.");
+      }
+      setEmailState({ status: "sent", message: "Emailed to the configured recipients." });
+    } catch (err) {
+      setEmailState({ status: "error", message: err.message || "Couldn't send the email." });
+    }
+  }, [renderPresentationPng, buildInteractiveHtml]);
 
   // Restyle in place whenever a presentation control changes — colour, labels
   // and highlight are pure presentation, so they never restart the simulation.
   useEffect(() => {
     applyStyles();
-  }, [applyStyles, colorFor, labelMode, selectedNode, selectedEdge, neighborIds, metrics, seedTargets]);
+  }, [applyStyles, colorFor, labelMode, selectedNode, selectedEdge, metrics, seedTargets]);
 
   const selectedEdgeData = useMemo(() => {
     if (!selectedEdge) {
@@ -522,23 +1442,18 @@ const ClusterGraph = memo(function ClusterGraph({
     return null;
   }
 
-  const submittedCount = visibleNodes.filter((node) => isSubmitted(node, seedTargets)).length;
-  const bridgeCount = visibleNodes.length - submittedCount;
+  const submittedCount = displayNodes.filter((node) => isSubmitted(node, seedTargets)).length;
+  const bridgeCount = displayNodes.length - submittedCount;
+  const focused = Boolean(selectedNode || selectedEdge);
+  const presentTiers = DOMAIN_TIER_ORDER.filter((tier) => displayNodes.some((node) => node.tier === tier));
 
   return (
     <section className="cluster-graph-card" ref={containerRef}>
       <div className="panel-header">
         <div>
           <p className="eyebrow">Connection map</p>
-          <h3>How your submitted domains link together</h3>
-          <p className="section-copy">
-            Big circles are the domains you submitted. A small circle only appears when one
-            domain&apos;s subdomain is the thing that bridges it to another submitted domain —
-            everything else is left off to keep the picture clean. Lines show shared evidence;
-            faint dashed lines tie a bridge back to the domain it belongs to. Click a line to
-            see what two domains share, click a domain to highlight its connections, drag to
-            rearrange, scroll to zoom.
-          </p>
+          <h3>{title}</h3>
+          <p className="section-copy">{description}</p>
         </div>
       </div>
 
@@ -602,26 +1517,68 @@ const ClusterGraph = memo(function ClusterGraph({
           </div>
         </div>
 
+        {focused ? (
+          <button className="secondary-button small" onClick={clearFocus} type="button">
+            Show whole cluster
+          </button>
+        ) : null}
+
         <button className="secondary-button small" onClick={resetView} type="button">
           Reset view
         </button>
+
+        <button className="secondary-button small" onClick={downloadImage} type="button">
+          Download image
+        </button>
+
+        <button className="secondary-button small" onClick={downloadInteractive} type="button">
+          Download interactive report
+        </button>
+
+        <button
+          className="primary-button small"
+          disabled={emailState.status === "sending"}
+          onClick={emailGraph}
+          type="button"
+        >
+          {emailState.status === "sending" ? "Sending…" : "Email graph"}
+        </button>
       </div>
+
+      {emailState.status === "sent" || emailState.status === "error" ? (
+        <p
+          className={emailState.status === "error" ? undefined : "muted"}
+          style={emailState.status === "error" ? { color: "var(--danger)" } : undefined}
+        >
+          {emailState.message}
+        </p>
+      ) : null}
 
       <div className="graph-legend" aria-label="Map legend">
         <span className="graph-legend-item">
           <span className="graph-legend-swatch round" style={{ background: SUBMITTED_COLOR }} />
-          Domain you submitted ({submittedCount})
+          {seedRoleLabel} ({submittedCount})
         </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-swatch round" style={{ background: BRIDGE_COLOR }} />
-          Bridging subdomain ({bridgeCount})
-        </span>
+        {bridgeCount > 0 ? (
+          <span className="graph-legend-item">
+            <span className="graph-legend-swatch round" style={{ background: otherRoleColor }} />
+            {otherRoleLabel} ({bridgeCount})
+          </span>
+        ) : null}
         {TIER_ORDER.map((tier) => (
           <span className="graph-legend-item" key={tier}>
             <span className="graph-legend-swatch" style={{ background: EDGE_TIERS[tier].color }} />
             {EDGE_TIERS[tier].label}
           </span>
         ))}
+        {presentTiers.length > 0
+          ? presentTiers.map((tier) => (
+              <span className="graph-legend-item" key={`domain-tier-${tier}`}>
+                <span className="graph-legend-swatch round" style={{ background: DOMAIN_TIER_COLORS[tier] }} />
+                {DOMAIN_TIER_LABELS[tier]}
+              </span>
+            ))
+          : null}
       </div>
 
       <svg
@@ -637,9 +1594,14 @@ const ClusterGraph = memo(function ClusterGraph({
 
       {selectedEdgeData ? (
         <div className="graph-detail-panel">
-          <strong>
-            {selectedEdgeData.from} ↔ {selectedEdgeData.to}
-          </strong>
+          <div className="graph-detail-panel-head">
+            <strong>
+              {selectedEdgeData.from} ↔ {selectedEdgeData.to}
+            </strong>
+            <button className="secondary-button small" onClick={clearFocus} type="button">
+              Show whole cluster
+            </button>
+          </div>
           <p className="card-copy">What these two have in common:</p>
           {/* Render the exact same evidence packet the summary page shows for
               these two entities, sourced from the shared pair endpoint. Falls
@@ -661,7 +1623,12 @@ const ClusterGraph = memo(function ClusterGraph({
 
       {selectedNode && selectedNodeEdges.length > 0 ? (
         <div className="graph-detail-panel">
-          <strong>{selectedNode}</strong>
+          <div className="graph-detail-panel-head">
+            <strong>{selectedNode}</strong>
+            <button className="secondary-button small" onClick={clearFocus} type="button">
+              Show whole cluster
+            </button>
+          </div>
           <p className="card-copy">
             Connected to {selectedNodeEdges.length} other
             {selectedNodeEdges.length === 1 ? " node" : " nodes"}:

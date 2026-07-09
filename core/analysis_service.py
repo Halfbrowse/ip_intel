@@ -236,6 +236,7 @@ def _analyze_domain(
         "mx_leaks": ip_intel.probe_mx_origins(mx_records),
         "wordlist_leaks": ip_intel.probe_wordlist_subdomains(domain),
         "hackertarget": (payload.get("hackertarget") or {}).get("hits", []),
+        "viewdns": (payload.get("viewdns") or {}).get("hits", []),
         "urlscan": (payload.get("urlscan") or {}).get("hits", []),
         "scan": {"skipped": True, "reason": "Targeted origin scan is not enabled for case mode."},
         "provider_scan": {"skipped": True, "reason": "Provider scan is not enabled for case mode."},
@@ -370,6 +371,7 @@ def _observed_ips(payload: dict[str, Any]) -> list[dict[str, str]]:
         add(str(ip), "non_cf")
     for path, source in (
         ("hackertarget", "hackertarget"),
+        ("viewdns", "viewdns"),
         ("urlscan", "urlscan"),
         ("censys", "censys"),
         ("shodan", "shodan"),
@@ -637,6 +639,7 @@ def _collect_source_errors(payload: dict[str, Any]) -> list[str]:
         "crt_sh",
         "circl_pdns",
         "hackertarget",
+        "viewdns",
         "urlscan",
         "censys",
         "shodan",

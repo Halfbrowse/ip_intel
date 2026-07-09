@@ -5,12 +5,15 @@ from contextlib import asynccontextmanager
 import hashlib
 import json
 import logging
+import mimetypes
 import os
+import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -23,12 +26,22 @@ from cases.case_store import get_job, healthcheck, init_db
 from utils.evidence_meta import evidence_catalog
 from utils import check
 from db import intel_db
+from sources import signal_web
 
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 runtime = CaseRuntime()
 LOGGER = logging.getLogger("ip_intel.case_app")
+
+# We only ever store the favicon *hash*, never the icon bytes, so there's
+# nothing to serve straight from the DB. This re-fetches the icon live from
+# one of the domains sharing the hash, verifies it still hashes to the same
+# value, and caches it on disk keyed by hash — works retroactively for every
+# favicon hash already in the pool, no ingestion/schema changes needed.
+FAVICON_KINDS = {"favicon_md5": "md5", "favicon_mmh3": "murmurhash3"}
+FAVICON_CACHE_DIR = BASE_DIR.parent / "results" / "favicon_cache"
+FAVICON_MISS_TTL_SECONDS = 3600  # don't re-hit dead domains on every card render
 
 
 def _configure_logging() -> None:
@@ -78,13 +91,37 @@ async def _crt_sh_retry_loop() -> None:
             LOGGER.warning("crt.sh retry sweep failed: %s", exc)
 
 
+_CLUSTER_REBUILD_INTERVAL = 20  # seconds between dirty-cluster checks
+
+
+async def _cluster_rebuild_loop() -> None:
+    """Keep graph_clusters materialized without the user waiting on it.
+
+    New intel marks the clusters "dirty" (see intel_db._mark_clusters_dirty);
+    this sweep rebuilds them shortly after, so the Clusters page always shows
+    an up-to-date graph without anyone clicking "Recompute graph" and waiting.
+    Skips the work entirely when nothing changed since the last rebuild.
+    """
+    while True:
+        await asyncio.sleep(_CLUSTER_REBUILD_INTERVAL)
+        if not intel_db.clusters_dirty():
+            continue
+        try:
+            counts = await asyncio.to_thread(intel_db.rebuild_clusters)
+            LOGGER.info("Cluster rebuild: %s", counts)
+        except Exception as exc:
+            LOGGER.warning("Cluster rebuild sweep failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
     runtime.recover()
     retry_task = asyncio.create_task(_crt_sh_retry_loop())
+    cluster_task = asyncio.create_task(_cluster_rebuild_loop())
     yield
     retry_task.cancel()
+    cluster_task.cancel()
 
 
 app = FastAPI(title="IP Intel", lifespan=lifespan)
@@ -199,10 +236,29 @@ async def api_ingest(request: Request) -> JSONResponse:
 # ── The pool ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/pool")
-def api_pool(request: Request, search: str | None = None, limit: int = 1000) -> Response:
+def api_pool(
+    request: Request,
+    search: str | None = None,
+    limit: int = 1000,
+    min_connections: int | None = None,
+    max_connections: int | None = None,
+    ingested_after: str | None = None,
+    ingested_before: str | None = None,
+    discovered_after: str | None = None,
+    discovered_before: str | None = None,
+) -> Response:
     """Every channel (registrable domain) in the pool, with host count, recency,
-    and cluster membership."""
-    domains = intel_db.list_pool_domains(search=search, limit=limit)
+    pairwise connection count, and cluster membership."""
+    domains = intel_db.list_pool_domains(
+        search=search,
+        limit=limit,
+        min_connections=min_connections,
+        max_connections=max_connections,
+        ingested_after=ingested_after,
+        ingested_before=ingested_before,
+        discovered_after=discovered_after,
+        discovered_before=discovered_before,
+    )
     return _etag_json_response(request, {"total": len(domains), "domains": domains})
 
 
@@ -234,6 +290,41 @@ async def api_graph_connections(request: Request) -> dict[str, Any]:
     return check.connections_among(domains, pool_links=pool_links)
 
 
+@app.post("/api/graph/email")
+async def api_graph_email(
+    image: UploadFile = File(...),
+    report: UploadFile | None = File(None),
+    domains: str = Form("[]"),
+) -> dict[str, Any]:
+    """Email an exported network-graph PNG (plus, if provided, the clickable
+    HTML report) to the configured alert recipients (SMTP_HOST / ALERT_EMAIL_TO
+    in .env -- see integrations.email_alerts)."""
+    from integrations.email_alerts import email_enabled, send_network_graph_email
+
+    if not email_enabled():
+        raise HTTPException(
+            status_code=409,
+            detail="Email alerts aren't configured. Set SMTP_HOST and ALERT_EMAIL_TO in .env.",
+        )
+
+    try:
+        domain_list = json.loads(domains)
+        if not isinstance(domain_list, list):
+            domain_list = []
+    except (TypeError, ValueError):
+        domain_list = []
+
+    png_bytes = await image.read()
+    if not png_bytes:
+        raise HTTPException(status_code=400, detail="No image data received.")
+    html_bytes = await report.read() if report is not None else None
+
+    sent = send_network_graph_email(
+        png_bytes, domains=[str(d) for d in domain_list], html_bytes=html_bytes or None
+    )
+    return {"status": "sent" if sent else "failed"}
+
+
 @app.get("/api/graph/selector-kinds")
 def api_graph_selector_kinds(request: Request, min_domains: int = 2) -> Response:
     """Edge types available for browsing (selector kind / shared_ip) + group counts."""
@@ -248,6 +339,55 @@ def api_graph_by_selector(
     (or any kind), e.g. all domain sets sharing a TLS cert / SSH key / IP."""
     groups = intel_db.domains_by_selector(kind=kind, min_domains=min_domains, limit=limit)
     return _etag_json_response(request, {"kind": kind, "total": len(groups), "groups": groups})
+
+
+def _favicon_cache_key(kind: str, value: str) -> str:
+    safe_value = re.sub(r"[^a-zA-Z0-9_-]", "_", value)[:128]
+    return f"{kind}__{safe_value}"
+
+
+@app.get("/api/favicon/{kind}/{value:path}")
+async def api_favicon_image(kind: str, value: str) -> Response:
+    """Best-effort favicon image for a shared favicon_md5/favicon_mmh3 group.
+    404s (frontend falls back to showing the hash) if no member domain
+    currently serves a matching icon."""
+    hash_field = FAVICON_KINDS.get(kind)
+    if hash_field is None:
+        raise HTTPException(status_code=400, detail="Unsupported favicon kind.")
+
+    FAVICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = _favicon_cache_key(kind, value)
+    matches = list(FAVICON_CACHE_DIR.glob(f"{key}.*"))
+    hit = next((p for p in matches if p.suffix != ".miss"), None)
+    if hit is not None:
+        return FileResponse(
+            hit,
+            media_type=mimetypes.guess_type(hit.name)[0] or "image/x-icon",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    miss = next((p for p in matches if p.suffix == ".miss"), None)
+    if miss is not None and time.time() - miss.stat().st_mtime < FAVICON_MISS_TTL_SECONDS:
+        raise HTTPException(status_code=404, detail="No live favicon found for this hash.")
+
+    for domain in intel_db.domains_for_selector_value(kind, value):
+        try:
+            result = await signal_web.async_fetch_favicons(domain, include_content=True)
+        except Exception:
+            continue
+        for icon in result.get("icons", []):
+            content = icon.get("content")
+            if not content or str(icon.get(hash_field)) != value:
+                continue
+            content_type = (icon.get("content_type") or "image/x-icon").split(";")[0].strip()
+            ext = mimetypes.guess_extension(content_type) or ".ico"
+            cache_path = FAVICON_CACHE_DIR / f"{key}{ext}"
+            cache_path.write_bytes(content)
+            return Response(
+                content=content, media_type=content_type, headers={"Cache-Control": "public, max-age=86400"}
+            )
+
+    (FAVICON_CACHE_DIR / f"{key}.miss").write_bytes(b"")
+    raise HTTPException(status_code=404, detail="No live favicon found for this hash.")
 
 
 @app.get("/api/graph/links/{value:path}")

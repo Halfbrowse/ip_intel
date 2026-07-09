@@ -1,60 +1,29 @@
 services:
   # ── VPN egress with on-demand IP rotation (rate-limit bypass) ──────────────
-  # ProtonVPN via the protonvpn-cli-community control API, matching the
-  # tiktok_tool setup on the shared `shared_net` network. Started with:
-  #   docker compose --profile vpn up
+  # The ProtonVPN container itself is NOT managed here — it's the shared
+  # `protonvpn-cli` container from the separate protonvpn-cli-community stack
+  # at /srv/protonvpn-cli-community (docker compose up there), already on
+  # `shared_net`. Defining it again in this file would collide on
+  # `container_name: protonvpn-cli`, so this compose only adds the piece that
+  # stack is missing: a forward HTTP proxy.
   #
   # protonvpn-cli exposes a control API (connect/disconnect/reconnect/status)
   # on :8000 — utils/vpn.py calls it (VPN_API_BASE_URL) to rotate the exit IP.
-  # It is NOT an HTTP proxy, so a tinyproxy sidecar shares its network
-  # namespace to give the app a forward proxy (OUTBOUND_PROXY_URL) whose exit
-  # IP rotates with the VPN. Only provider traffic is proxied; DB/DNS/raw
-  # socket probes stay direct (see utils/outbound.py).
-  protonvpn-cli:
-    image: ghcr.io/jonasjancarik/protonvpn-cli-community:latest
-    container_name: protonvpn-cli
-    profiles: ["vpn"]
-    privileged: true
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    volumes:
-      - protonvpn-config:/root/.pvpn-cli
-    env_file:
-      - .env
-    environment:
-      - PROTONVPN_USERNAME=${PROTONVPN_USERNAME:-}
-      - PROTONVPN_PASSWORD=${PROTONVPN_PASSWORD:-}
-      - OPENVPN_USERNAME=${OPENVPN_USERNAME:-}
-      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
-      - PROTONVPN_TIER=${PROTONVPN_TIER:-1}
-      - PROTONVPN_PROTOCOL=${PROTONVPN_PROTOCOL:-udp}
-      - VPN_ENABLE_KILLSWITCH=true
-      # Expose the control API to other containers on shared_net.
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-    healthcheck:
-      test: ["CMD-SHELL", "protonvpn status | grep -q Connected"]
-      interval: 10s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-    networks:
-      - shared_net
-    restart: unless-stopped
-
-  # Forward HTTP proxy living inside the VPN container's network namespace, so
-  # its egress IP is always the current ProtonVPN exit IP. The app reaches it
-  # on shared_net via the protonvpn-cli container (shared netns) at :8888.
+  # It is NOT an HTTP proxy though, so provider traffic needs a separate proxy
+  # sharing its network namespace to actually egress via the VPN tunnel
+  # (OUTBOUND_PROXY_URL). Only provider traffic is proxied; DB/DNS/raw socket
+  # probes stay direct (see utils/outbound.py). Started with:
+  #   docker compose --profile vpn up protonvpn-proxy
   protonvpn-proxy:
     image: vimagick/tinyproxy
     container_name: protonvpn-proxy
     profiles: ["vpn"]
-    depends_on:
-      protonvpn-cli:
-        condition: service_healthy
-    network_mode: "service:protonvpn-cli"
+    # Attaches to the externally-managed protonvpn-cli container's network
+    # namespace by name (works across compose projects, unlike
+    # `service:protonvpn-cli` which only resolves within this same file) —
+    # so its egress IP is always the current ProtonVPN exit IP. The app
+    # reaches it on shared_net as http://protonvpn-cli:8888.
+    network_mode: "container:protonvpn-cli"
     volumes:
       # Default image config only allows 127.0.0.1; this opens the proxy to the
       # docker private ranges so the app (on shared_net) can reach it. Verify
@@ -123,4 +92,3 @@ networks:
 
 volumes:
   postgres_data:
-  protonvpn-config:

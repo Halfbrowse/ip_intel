@@ -224,63 +224,6 @@ async function parsePayload(response) {
   }
 }
 
-export function normalizeCases(payload) {
-  return coerceArray(payload?.cases ?? payload?.items ?? payload?.results ?? payload).map(
-    (item, index) => normalizeCaseItem(item, index),
-  );
-}
-
-export function normalizeCaseDetail(payload, fallbackId = null) {
-  const raw = unwrapEntity(payload, ["case", "data", "item", "result"]);
-  const title =
-    pickFirst(raw, ["title", "name", "label", "target", "subject"]) ||
-    (fallbackId ? `Case ${fallbackId}` : "Untitled case");
-  const targets = coerceArray(
-    pickFirst(raw, ["targets", "subjects", "entities", "members", "domains"]) || [],
-  )
-    .map((item) => readableValue(item))
-    .filter(Boolean);
-
-  return {
-    raw,
-    id: pickFirst(raw, ["id", "case_id", "caseId", "uuid"], fallbackId),
-    title,
-    summaryText: summarizeText(
-      pickFirst(raw, ["summary", "overview", "description", "case_summary", "synopsis"]),
-    ),
-    status: normalizeStatus(
-      pickFirst(raw, ["status", "state", "job_status", "job.state"], "unknown"),
-    ),
-    progress: resolvePercent(
-      pickFirst(raw, [
-        "progress",
-        "percent_complete",
-        "progress_percent",
-        "completion",
-        "job.progress",
-        "job.percent_complete",
-      ]),
-    ),
-    jobId: pickFirst(raw, [
-      "job_id",
-      "jobId",
-      "current_job_id",
-      "currentJobId",
-      "latest_job.id",
-      "latestJob.id",
-      "job.id",
-    ]),
-    pairCount:
-      pickFirst(raw, ["pair_count", "pairCount", "counts.pairs", "metrics.pairs"], null) ?? null,
-    clusterCount:
-      pickFirst(raw, ["cluster_count", "clusterCount", "counts.clusters", "metrics.clusters"], null) ??
-      null,
-    updatedAt: pickFirst(raw, ["updated_at", "updatedAt", "modified_at", "modifiedAt"]),
-    metrics: raw?.metrics || raw?.counts || {},
-    targets,
-  };
-}
-
 export function normalizeJob(payload, fallbackId = null) {
   const raw = unwrapEntity(payload, ["job", "data", "item", "result"]);
   const steps = coerceArray(
@@ -326,74 +269,6 @@ export function confidenceFromScore(score) {
   return Math.round((100 * value) / (value + 65));
 }
 
-function naiveApex(host) {
-  const text = String(host || "").toLowerCase();
-  if (!text || /^[\d.:]+$/.test(text)) {
-    return text;
-  }
-  const parts = text.split(".");
-  return parts.length <= 2 ? text : parts.slice(-2).join(".");
-}
-
-// True when both sides of a pair live under the same registrable domain.
-// Comparing a domain against its own subdomains always "matches", so these
-// pairs are noise; new cases no longer produce them, and this hides them
-// for cases analyzed before that fix.
-export function isSameSitePair(pair) {
-  if (!pair?.left || !pair?.right) {
-    return false;
-  }
-  return naiveApex(pair.left) === naiveApex(pair.right);
-}
-
-export function normalizePairs(payload) {
-  return coerceArray(payload?.pairs ?? payload?.items ?? payload?.results ?? payload)
-    .map((item, index) => normalizePairItem(item, index))
-    .filter((pair) => !isSameSitePair(pair))
-    // Subdomain pairs whose weight has been rolled up onto an apex pairing are
-    // folded away here so the case view compares main domains; the underlying
-    // subdomain link stays visible on the connection map when expanded.
-    .filter((pair) => !pair.foldedIntoApex);
-}
-
-export function normalizePairDetail(payload, fallbackId = null) {
-  const pair = normalizePairItem(
-    unwrapEntity(payload, ["pair", "data", "item", "result"]),
-    fallbackId ?? 0,
-  );
-
-  return {
-    ...pair,
-    id: pair.id || fallbackId,
-  };
-}
-
-export function normalizeClusterGroups(payload) {
-  const clustersValue = payload?.clusters ?? payload;
-
-  if (Array.isArray(clustersValue)) {
-    return [
-      {
-        key: "clusters",
-        label: "Clusters",
-        clusters: clustersValue.map((item, index) => normalizeClusterItem(item, index, "clusters")),
-      },
-    ];
-  }
-
-  if (!clustersValue || typeof clustersValue !== "object") {
-    return [];
-  }
-
-  return Object.entries(clustersValue)
-    .filter(([, value]) => Array.isArray(value))
-    .map(([key, value]) => ({
-      key,
-      label: formatLabel(key),
-      clusters: value.map((item, index) => normalizeClusterItem(item, index, key)),
-    }));
-}
-
 // ── Global correlation graph ────────────────────────────────────────────────
 // Shapes the /api/graph/links response into ranked connections, each carrying
 // its shared-node evidence breakdown (the deliverable — never a bare score).
@@ -426,6 +301,9 @@ function normalizeSharedNode(node, index) {
     id: `${raw.kind || "node"}-${raw.value || index}`,
     nodeType: pickFirst(raw, ["node_type", "nodeType"], "selector"),
     kind: pickFirst(raw, ["kind"], "unknown"),
+    // Provider prefix for "<provider>|<id>"-shaped values (tracking_id,
+    // site_verification, social_handle) — e.g. "google" out of "google|abc123".
+    subkind: pickFirst(raw, ["subkind"], null),
     value: readableValue(pickFirst(raw, ["value"])) || "—",
     degree: pickFirst(raw, ["degree"], null),
     attributing: raw.attributing !== false,
@@ -436,6 +314,21 @@ function normalizeSharedNode(node, index) {
     sources: coerceArray(raw.sources).map((entry) => readableValue(entry)).filter(Boolean),
     windowA: window(pickFirst(raw, ["window_a", "windowA"])),
     windowB: window(pickFirst(raw, ["window_b", "windowB"])),
+    // The specific host(s) that exhibited this node on each side — may be a
+    // subdomain of the compared apex, not the apex itself (transitive,
+    // subdomain-mediated linkage). Empty when the backend didn't supply it.
+    hostsA: coerceArray(raw.hosts_a ?? raw.hostsA).map((entry) => readableValue(entry)).filter(Boolean),
+    hostsB: coerceArray(raw.hosts_b ?? raw.hostsB).map((entry) => readableValue(entry)).filter(Boolean),
+    // Only populated on `shared_ip` nodes — what kind of box the IP is
+    // (CDN/proxy edge, shared-hosting pool, or likely dedicated origin) and a
+    // plain-language explanation, so a shared IP reads as more than a bare hit.
+    network: pickFirst(raw, ["network"], null),
+    explanation: pickFirst(raw, ["explanation"], null),
+    asnDesc: pickFirst(raw, ["asn_desc", "asnDesc"], null),
+    networkName: pickFirst(raw, ["network_name", "networkName"], null),
+    proxyFamily: pickFirst(raw, ["proxy_family", "proxyFamily"], null),
+    cloudflare: raw.cloudflare === true,
+    country: pickFirst(raw, ["country"], null),
   };
 }
 
@@ -481,8 +374,26 @@ export function normalizePool(payload) {
         domain: readableValue(pickFirst(raw, ["domain"])),
         hostCount: pickFirst(raw, ["host_count", "hostCount"], null),
         lastSeen: pickFirst(raw, ["last_seen", "lastSeen"], null),
+        // Direct pairwise connections — distinct other domains this one shares
+        // attributing evidence with. Not the same as cluster size, which is a
+        // transitive component shown only on the clusters page.
+        connectionCount: pickFirst(raw, ["connection_count", "connectionCount"], 0) ?? 0,
         clusterId: pickFirst(raw, ["cluster_id", "clusterId"], null),
         clusterSize: pickFirst(raw, ["cluster_size", "clusterSize"], null),
+        // True if this channel (or a subdomain of it) was directly submitted
+        // at some point; false if it only ever surfaced as a scan follow-up
+        // (subdomain enumeration, sibling discovery, wordlist hit).
+        ingested: raw.ingested === true,
+        ingestedAt: pickFirst(raw, ["ingested_at", "ingestedAt"], null),
+        discoveredAt: pickFirst(raw, ["discovered_at", "discoveredAt"], null),
+        // How/where a never-ingested channel was found — only meaningful when
+        // ingested is false (an ingested channel was directly submitted).
+        discoveryKind: pickFirst(raw, ["discovery_kind", "discoveryKind"], null),
+        discoveryReason: pickFirst(raw, ["discovery_reason", "discoveryReason"], null),
+        discoveredFrom: pickFirst(raw, ["discovered_from", "discoveredFrom"], null),
+        // OpenCTI tier-1..tier-5 classification (see domain_tiers /
+        // integrations/opencti_ingest.py) — null when unclassified.
+        tier: pickFirst(raw, ["tier"], null),
       };
     })
     .filter((entry) => entry.domain);
@@ -498,6 +409,99 @@ export function normalizeConnectionPairs(payload) {
       connected: Boolean(pair?.connected),
     };
   });
+}
+
+// Shapes /api/graph/connections (pairwise scored links among a domain set)
+// into the {nodes, edges} structure ClusterGraph.jsx renders. Every domain is
+// treated as a "submitted" anchor node — there's no bridge/membership concept
+// here, just the direct evidence-backed links between cluster members.
+//
+// `visual` carries the tier ClusterGraph colours the edge by — strength only
+// (matches backend strength labels "strong"/"moderate"/"weak" one-to-one).
+// The evidence *type* behind a link (cert, IP, nameserver, ...) is never
+// color-coded — it only shows up in `labels`, in the click-through detail
+// panel — so strength and type never fight over the same colour.
+export function normalizeConnectionsGraph(payload, members) {
+  const pairs = normalizeConnectionPairs(payload);
+  const tiers = payload?.tiers || {};
+  const nodes = coerceArray(members)
+    .map((domain) => readableValue(domain))
+    .filter(Boolean)
+    .map((domain) => ({ id: domain, label: domain, role: "submitted", tier: tiers[domain] ?? null }));
+  const edges = pairs
+    .filter((pair) => pair.connected && pair.a && pair.b)
+    .map((pair) => ({
+      from: pair.a,
+      to: pair.b,
+      kind: "evidence",
+      score: pair.score,
+      visual: pair.strength || "weak",
+      width: Math.min(8, Math.max(1, Math.round((pair.score || 0) / 15))),
+      labels: pair.evidence.map((node) => `${formatLabel(node.kind)}: ${node.value}`),
+      paths: [],
+    }));
+  return { nodes, edges };
+}
+
+// Shapes /api/graph/connections (called with pool_links:true) into a combined
+// {nodes, edges} graph for the domain-comparison page. `payload.domains` may
+// itself already be an expanded set (see ByDomainExplorer.run(), which does
+// an extra round-trip to pull in whatever the initial pick's pool links
+// surfaced) -- this function doesn't care which domains were the user's own
+// picks vs. discovered along the way, it just draws every evidence-backed
+// link in the payload: pairwise links among all of `payload.domains` (so two
+// domains that both showed up via pool links can turn out to be linked to
+// each other too), plus each domain's own pool links, which is how a domain
+// that's neither an original pick nor already in `payload.domains` still
+// earns a node on the map. Every node defaults to role:"related" -- the
+// caller marks true seeds via ClusterGraph's `seedTargets` prop, not via
+// anything computed in here.
+export function normalizeExplorerGraph(payload) {
+  const tiers = payload?.tiers || {};
+  const known = coerceArray(payload?.domains).map((domain) => readableValue(domain)).filter(Boolean);
+  const nodes = new Map(
+    known.map((domain) => [domain, { id: domain, label: domain, role: "related", tier: tiers[domain] ?? null }]),
+  );
+  const edges = [];
+  const seenPairs = new Set();
+
+  const addEdge = (from, to, score, strength, evidence) => {
+    const key = from < to ? `${from}|${to}` : `${to}|${from}`;
+    if (seenPairs.has(key)) {
+      return;
+    }
+    seenPairs.add(key);
+    edges.push({
+      from,
+      to,
+      kind: "evidence",
+      score,
+      visual: strength || "weak",
+      width: Math.min(8, Math.max(1, Math.round((score || 0) / 15))),
+      labels: (evidence || []).map((node) => `${formatLabel(node.kind)}: ${node.value}`),
+      paths: [],
+    });
+  };
+
+  normalizeConnectionPairs(payload)
+    .filter((pair) => pair.connected && pair.a && pair.b)
+    .forEach((pair) => addEdge(pair.a, pair.b, pair.score, pair.strength, pair.evidence));
+
+  const poolLinks = payload?.pool_links || {};
+  Object.entries(poolLinks).forEach(([domain, rawLinks]) => {
+    normalizeGraphLinks({ links: rawLinks }).forEach((link) => {
+      const target = link.target;
+      if (!target || target === domain) {
+        return;
+      }
+      if (!nodes.has(target)) {
+        nodes.set(target, { id: target, label: target, role: "related", tier: tiers[target] ?? null });
+      }
+      addEdge(domain, target, link.score, link.strength, link.evidence);
+    });
+  });
+
+  return { nodes: Array.from(nodes.values()), edges };
 }
 
 export function normalizeSelectorGroups(payload) {
@@ -520,229 +524,6 @@ export function normalizeSelectorKinds(payload) {
       groups: pickFirst(item || {}, ["groups"], null),
     }))
     .filter((entry) => entry.kind && entry.kind !== "unknown");
-}
-
-export function normalizeEvidenceMeta(payload) {
-  const collection = payload?.evidence ?? payload?.evidence_types ?? payload?.items ?? payload;
-
-  if (Array.isArray(collection)) {
-    return collection.map((item, index) => normalizeEvidenceMetaItem(item, index));
-  }
-
-  if (!collection || typeof collection !== "object") {
-    return [];
-  }
-
-  return Object.entries(collection).map(([key, value], index) =>
-    normalizeEvidenceMetaItem(
-      value && typeof value === "object" ? { ...value, type: value.type || key } : { type: key, description: value },
-      index,
-    ),
-  );
-}
-
-export function normalizeEvidenceItems(payload) {
-  return coerceArray(payload).map((item, index) => {
-    if (typeof item === "string") {
-      return {
-        id: `evidence-${index}`,
-        level: "info",
-        message: item,
-      };
-    }
-
-    const raw = item || {};
-    return {
-      id: pickFirst(raw, ["id", "timestamp", "time"], `evidence-${index}`),
-      level: normalizeStatus(pickFirst(raw, ["level", "severity", "type"], "info")),
-      message: pickFirst(raw, ["message", "summary", "detail", "description"], JSON.stringify(raw)),
-    };
-  });
-}
-
-function normalizeCaseItem(item, index) {
-  const raw = item || {};
-  return {
-    raw,
-    id: pickFirst(raw, ["id", "case_id", "caseId", "uuid"], index + 1),
-    title:
-      pickFirst(raw, ["title", "name", "label", "target", "subject"]) || `Case ${index + 1}`,
-    summaryText: summarizeText(
-      pickFirst(raw, ["summary", "overview", "description", "case_summary"]),
-    ),
-    status: normalizeStatus(pickFirst(raw, ["status", "state", "job_status"], "unknown")),
-    progress: resolvePercent(
-      pickFirst(raw, ["progress", "percent_complete", "progress_percent", "completion"]),
-    ),
-    pairCount:
-      pickFirst(raw, ["pair_count", "pairCount", "counts.pairs", "metrics.pairs"], null) ?? null,
-    clusterCount:
-      pickFirst(raw, ["cluster_count", "clusterCount", "counts.clusters", "metrics.clusters"], null) ??
-      null,
-    updatedAt: pickFirst(raw, ["updated_at", "updatedAt", "modified_at", "modifiedAt"]),
-    jobId: pickFirst(raw, [
-      "job_id",
-      "jobId",
-      "current_job_id",
-      "currentJobId",
-      "latest_job.id",
-      "latestJob.id",
-    ]),
-    targets: coerceArray(
-      pickFirst(raw, ["targets", "subjects", "entities", "members", "domains"]) || [],
-    )
-      .map((entry) => readableValue(entry))
-      .filter(Boolean),
-  };
-}
-
-function normalizePairItem(item, index) {
-  const raw = item || {};
-  const entities = coerceArray(pickFirst(raw, ["entities", "subjects", "members"], []));
-  const evidence = normalizePairEvidence(
-    pickFirst(raw, ["evidence", "evidence_items", "evidenceItems", "signals", "matches"], []),
-  );
-
-  let left = readableValue(pickFirst(raw, ["left", "lhs", "source", "domain_a", "a"]));
-  let right = readableValue(pickFirst(raw, ["right", "rhs", "target", "domain_b", "b"]));
-
-  if ((!left || !right) && entities.length >= 2) {
-    left ||= readableValue(entities[0]);
-    right ||= readableValue(entities[1]);
-  }
-
-  const rawConfidence = pickFirst(raw, ["confidence"]);
-  const rawScore = pickFirst(raw, ["score"]);
-
-  return {
-    raw,
-    id: pickFirst(raw, ["id", "pair_id", "pairId", "uuid"], index + 1),
-    scope: pickFirst(raw, ["scope", "group", "type"], "pair"),
-    left,
-    right,
-    score:
-      rawConfidence !== null
-        ? resolvePercent(rawConfidence)
-        : confidenceFromScore(rawScore),
-    strength: pickFirst(raw, ["strength"]) || null,
-    status: normalizeStatus(pickFirst(raw, ["status", "classification", "verdict"], "unknown")),
-    summary: summarizeText(
-      pickFirst(raw, ["summary", "description", "explanation", "rationale"]),
-    ),
-    updatedAt: pickFirst(raw, ["updated_at", "updatedAt", "modified_at", "modifiedAt"]),
-    evidence,
-    evidenceCount:
-      pickFirst(raw, ["evidence_count", "evidenceCount"], null) ?? evidence.length,
-    evidenceCounts: raw.evidence_counts || raw.evidenceCounts || null,
-    isSeedPair: Boolean(raw.is_seed_pair),
-    foldedIntoApex: raw.folded_into_apex || raw.foldedIntoApex || null,
-    derived: Boolean(raw.derived),
-  };
-}
-
-function normalizeClusterItem(item, index, fallbackType) {
-  const raw = item || {};
-  const members = coerceArray(
-    pickFirst(raw, ["members", "entities", "subjects", "domains", "items", "nodes"], []),
-  )
-    .map((entry) => readableValue(entry))
-    .filter(Boolean);
-
-  // max_edge_score is a raw additive evidence score, not a percentage —
-  // run it through the same saturating curve as pair confidences.
-  const rawEdgeScore = pickFirst(raw, ["max_edge_score", "maxEdgeScore"]);
-  const rawConfidence = pickFirst(raw, ["confidence"]);
-  const score =
-    rawConfidence !== null
-      ? resolvePercent(rawConfidence)
-      : rawEdgeScore !== null
-        ? confidenceFromScore(rawEdgeScore)
-        : resolvePercent(pickFirst(raw, ["score", "strength"]));
-
-  const topEvidence = coerceArray(pickFirst(raw, ["top_evidence", "topEvidence"], []))
-    .map((entry) =>
-      typeof entry === "string"
-        ? entry
-        : entry?.label || (entry?.path ? formatLabel(String(entry.path).split(".").pop()) : null),
-    )
-    .filter(Boolean);
-
-  return {
-    raw,
-    id: pickFirst(raw, ["id", "cluster_id", "clusterId", "key"], `${fallbackType}-${index + 1}`),
-    label:
-      pickFirst(raw, ["label", "name", "title", "summary_key", "key"]) ||
-      `${formatLabel(fallbackType)} ${index + 1}`,
-    type: pickFirst(raw, ["type", "cluster_type", "kind", "signal"], fallbackType),
-    score,
-    summary: summarizeText(pickFirst(raw, ["summary", "description", "note"])),
-    memberCount:
-      pickFirst(raw, ["member_count", "memberCount", "count", "size"], null) ?? members.length,
-    targetCount: pickFirst(raw, ["target_count", "targetCount"], null),
-    topEvidence,
-    members,
-  };
-}
-
-function normalizeEvidenceMetaItem(item, index) {
-  const raw = item || {};
-  const type = pickFirst(raw, ["type", "id", "key"], `type_${index + 1}`);
-  return {
-    raw,
-    type,
-    label: pickFirst(raw, ["label", "name", "title"], formatLabel(type)),
-    category: pickFirst(raw, ["category", "group"], "Other"),
-    importance: pickFirst(raw, ["importance", "severity"], "supporting"),
-    description: summarizeText(
-      pickFirst(raw, ["description", "summary", "detail", "help_text", "helpText"]),
-    ),
-    whyItMatters: summarizeText(
-      pickFirst(raw, ["why_it_matters", "whyItMatters", "reason"]),
-    ),
-    caveat: summarizeText(
-      pickFirst(raw, ["caveat", "why_it_may_not_matter", "whyItMayNotMatter"]),
-    ),
-  };
-}
-
-function normalizePairEvidence(payload) {
-  return coerceArray(payload).map((item, index) => {
-    if (typeof item === "string") {
-      return {
-        id: `signal-${index}`,
-        type: item,
-        title: formatLabel(item),
-        value: item,
-        summary: null,
-        score: null,
-      };
-    }
-
-    const raw = item || {};
-    const type = pickFirst(raw, ["type", "kind", "signal", "category"], `signal_${index + 1}`);
-    return {
-      raw,
-      id: pickFirst(raw, ["id", "key", "value"], `signal-${index}`),
-      type,
-      title: pickFirst(raw, ["title", "label", "name"], formatLabel(type)),
-      importance: pickFirst(raw, ["importance", "severity"], "supporting"),
-      category: pickFirst(raw, ["category", "group"], "Other"),
-      value: readableValue(
-        pickFirst(raw, ["value", "match", "shared_value", "identifier", "matched_values"]),
-      ),
-      matchedValues: coerceArray(
-        pickFirst(raw, ["matched_values", "matchedValues", "values"], []),
-      ).map((entry) => readableValue(entry)).filter(Boolean),
-      summary: summarizeText(
-        pickFirst(raw, ["summary", "description", "reason", "explanation"]),
-      ),
-      whyItMatters: summarizeText(pickFirst(raw, ["why_it_matters", "whyItMatters"])),
-      caveat: summarizeText(
-        pickFirst(raw, ["caveat", "why_it_may_not_matter", "whyItMayNotMatter"]),
-      ),
-      score: resolvePercent(pickFirst(raw, ["score", "confidence", "strength"])),
-    };
-  });
 }
 
 function normalizeLogLines(payload) {

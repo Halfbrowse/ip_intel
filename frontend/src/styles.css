@@ -39,90 +39,104 @@
 }
 
 :root {
+  /* "Wire & Trace" — light mode ("Paper"): cool paper-and-ink instrument
+     panel, not the warm-cream/blue SaaS default. The teal --trace accent is
+     kept out of the red/orange/gray evidence-strength scale used in the
+     network graph, so UI color and data color never mean two things at once. */
   color-scheme: light;
-  --bg: #f3efe8;
-  --bg-top: #f9f6f1;
-  --bg-accent: rgba(62, 102, 255, 0.16);
-  --bg-accent-soft: rgba(27, 63, 161, 0.08);
-  --bg-accent-alt: rgba(64, 143, 128, 0.1);
-  --surface: rgba(255, 252, 247, 0.92);
-  --surface-strong: #fffdf9;
-  --surface-muted: #f7f2e8;
+  --bg: #e7ebee;
+  --bg-top: #f4f6f8;
+  --bg-accent: rgba(10, 126, 164, 0.14);
+  --bg-accent-soft: rgba(10, 126, 164, 0.07);
+  --bg-accent-alt: rgba(28, 138, 93, 0.07);
+  --surface: rgba(255, 255, 255, 0.96);
+  --surface-strong: #ffffff;
+  --surface-muted: #e9edf0;
   --panel: var(--surface);
   --panel-strong: var(--surface-strong);
-  --border: rgba(38, 48, 71, 0.12);
-  --border-soft: rgba(24, 32, 51, 0.08);
-  --text: #182033;
-  --muted: #65708a;
-  --accent: #2752d6;
-  --accent-strong: #18338c;
-  --link: #18338c;
+  --border: rgba(15, 26, 36, 0.14);
+  --border-soft: rgba(15, 26, 36, 0.09);
+  --text: #0e161d;
+  --muted: #57646f;
+  --accent: #0a7ea4;
+  --accent-strong: #075c79;
+  --trace: #0a7ea4;
+  --link: #075c79;
   --success: #1c8a5d;
   --warning: #b6751e;
   --danger: #ba4a3d;
-  --info-soft: rgba(39, 82, 214, 0.12);
+  --info-soft: rgba(10, 126, 164, 0.12);
   --success-soft: rgba(28, 138, 93, 0.12);
   --warning-soft: rgba(182, 117, 30, 0.12);
   --danger-soft: rgba(186, 74, 61, 0.12);
-  --shadow: 0 20px 45px rgba(27, 37, 65, 0.08);
-  --hero-glow: rgba(39, 82, 214, 0.14);
-  --hero-grad-top: rgba(255, 255, 255, 0.95);
-  --hero-grad-bottom: rgba(255, 252, 247, 0.9);
+  --shadow: 0 1px 2px rgba(14, 22, 29, 0.06);
+  --hero-glow: rgba(10, 126, 164, 0.12);
+  --hero-grad-top: rgba(255, 255, 255, 0.98);
+  --hero-grad-bottom: rgba(232, 236, 239, 0.92);
   --nav-link-bg: rgba(255, 255, 255, 0.7);
-  --input-focus-ring: rgba(39, 82, 214, 0.18);
-  --callout-bg: rgba(39, 82, 214, 0.08);
-  --callout-border: rgba(39, 82, 214, 0.12);
-  --callout-subtle-bg: rgba(24, 51, 140, 0.04);
-  --callout-subtle-border: rgba(24, 51, 140, 0.08);
-  --log-bg: #172034;
-  --log-text: #f7fbff;
+  --input-focus-ring: rgba(10, 126, 164, 0.22);
+  --callout-bg: rgba(10, 126, 164, 0.08);
+  --callout-border: rgba(10, 126, 164, 0.16);
+  --callout-subtle-bg: rgba(7, 92, 121, 0.05);
+  --callout-subtle-border: rgba(7, 92, 121, 0.1);
+  --log-bg: #101820;
+  --log-text: #edf3f6;
   --log-level: rgba(255, 255, 255, 0.65);
-  --pre-bg: #132033;
-  --pre-text: #e8f0ff;
-  --graph-glow: rgba(39, 82, 214, 0.08);
-  --graph-bg: rgba(255, 255, 255, 0.92);
-  --state-muted-bg: rgba(255, 255, 255, 0.6);
+  --pre-bg: #0f1720;
+  --pre-text: #e6eef3;
+  --graph-glow: rgba(10, 126, 164, 0.08);
+  --graph-bg: rgba(255, 255, 255, 0.96);
+  --graph-node-ring: #ffffff;
+  --graph-label-halo: rgba(255, 255, 255, 0.92);
+  --state-muted-bg: rgba(15, 26, 36, 0.05);
   --state-error-border: rgba(186, 74, 61, 0.2);
-  --tooltip-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  --tooltip-shadow: 0 2px 8px rgba(14, 22, 29, 0.1);
+  --radius-panel: 10px;
+  --radius-pill: 999px;
+  --font-display: "IBM Plex Mono", "SFMono-Regular", "Space Grotesk", monospace;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", monospace;
   font-family: "Manrope", sans-serif;
   line-height: 1.5;
   font-weight: 400;
 }
 
 :root[data-theme="dark"] {
+  /* "Wire & Trace" — dark mode ("Scope"): the console the light theme is
+     modeled after. Phosphor-teal accent doubles as the trace-line signature. */
   color-scheme: dark;
-  --bg: #060d18;
-  --bg-top: #0a1322;
-  --bg-accent: rgba(59, 130, 246, 0.16);
-  --bg-accent-soft: rgba(59, 130, 246, 0.08);
-  --bg-accent-alt: rgba(45, 212, 191, 0.07);
-  --surface: rgba(12, 20, 33, 0.92);
-  --surface-strong: #0c1624;
-  --surface-muted: #111d2f;
-  --panel: rgba(12, 20, 32, 0.96);
-  --panel-strong: #0a1220;
-  --border: rgba(148, 163, 184, 0.18);
-  --border-soft: rgba(148, 163, 184, 0.12);
-  --text: #f8fbff;
-  --muted: #b3c4da;
-  --accent: #3b82f6;
-  --accent-strong: #1d4ed8;
-  --link: #93c5fd;
+  --bg: #070b10;
+  --bg-top: #0a0f16;
+  --bg-accent: rgba(53, 208, 200, 0.14);
+  --bg-accent-soft: rgba(53, 208, 200, 0.07);
+  --bg-accent-alt: rgba(134, 239, 172, 0.06);
+  --surface: rgba(13, 19, 26, 0.92);
+  --surface-strong: #0c131a;
+  --surface-muted: #101922;
+  --panel: rgba(12, 18, 25, 0.96);
+  --panel-strong: #0a0f15;
+  --border: rgba(148, 163, 184, 0.16);
+  --border-soft: rgba(148, 163, 184, 0.1);
+  --text: #eaf2f5;
+  --muted: #8da0ac;
+  --accent: #35d0c8;
+  --accent-strong: #1fa79d;
+  --trace: #35d0c8;
+  --link: #7fe3db;
   --success: #86efac;
   --warning: #fdba74;
   --danger: #fca5a5;
-  --info-soft: rgba(37, 99, 235, 0.18);
+  --info-soft: rgba(53, 208, 200, 0.16);
   --success-soft: rgba(22, 163, 74, 0.16);
   --warning-soft: rgba(217, 119, 6, 0.18);
   --danger-soft: rgba(220, 38, 38, 0.16);
-  --shadow: 0 24px 56px rgba(0, 0, 0, 0.32);
-  --hero-glow: rgba(59, 130, 246, 0.16);
-  --hero-grad-top: rgba(13, 22, 36, 0.95);
-  --hero-grad-bottom: rgba(9, 16, 27, 0.9);
-  --nav-link-bg: rgba(12, 20, 33, 0.7);
-  --input-focus-ring: rgba(96, 165, 250, 0.3);
-  --callout-bg: rgba(59, 130, 246, 0.12);
-  --callout-border: rgba(96, 165, 250, 0.2);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --hero-glow: rgba(53, 208, 200, 0.16);
+  --hero-grad-top: rgba(10, 15, 22, 0.96);
+  --hero-grad-bottom: rgba(7, 11, 16, 0.92);
+  --nav-link-bg: rgba(12, 18, 25, 0.7);
+  --input-focus-ring: rgba(53, 208, 200, 0.32);
+  --callout-bg: rgba(53, 208, 200, 0.12);
+  --callout-border: rgba(53, 208, 200, 0.22);
   --callout-subtle-bg: rgba(148, 163, 184, 0.06);
   --callout-subtle-border: rgba(148, 163, 184, 0.12);
   --log-bg: rgba(3, 10, 19, 0.9);
@@ -130,8 +144,10 @@
   --log-level: rgba(226, 232, 240, 0.65);
   --pre-bg: rgba(3, 10, 19, 0.9);
   --pre-text: #e8f0ff;
-  --graph-glow: rgba(59, 130, 246, 0.1);
-  --graph-bg: #04101c;
+  --graph-glow: rgba(53, 208, 200, 0.1);
+  --graph-bg: #050b10;
+  --graph-node-ring: rgba(8, 15, 23, 0.9);
+  --graph-label-halo: rgba(5, 11, 16, 0.88);
   --state-muted-bg: rgba(148, 163, 184, 0.06);
   --state-error-border: rgba(248, 113, 113, 0.3);
   --tooltip-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
@@ -190,11 +206,16 @@ button {
 .pair-row,
 .state-card,
 .raw-disclosure {
+  /* Grid/flex items default to min-width: auto, i.e. never smaller than their
+     widest unbreakable child. Without this, one oversized chip (a long hash
+     or nameserver value) forces the whole card wider than its grid track
+     instead of wrapping/truncating, blowing the card out into its neighbours. */
+  min-width: 0;
   border: 1px solid var(--border);
-  border-radius: 24px;
+  border-radius: var(--radius-panel);
   background: var(--surface);
   box-shadow: var(--shadow);
-  backdrop-filter: blur(18px);
+  backdrop-filter: blur(10px);
 }
 
 .app-header {
@@ -210,9 +231,10 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 12px;
-  font-family: "Space Grotesk", sans-serif;
+  font-family: var(--font-display);
   font-size: 1.05rem;
   font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
 .brand-mark span {
@@ -221,7 +243,7 @@ button {
   justify-content: center;
   width: 40px;
   height: 40px;
-  border-radius: 14px;
+  border-radius: 6px;
   background: linear-gradient(135deg, var(--accent), var(--accent-strong));
   color: white;
 }
@@ -265,6 +287,51 @@ button {
   color: var(--muted);
 }
 
+/* .cluster-card-top is itself a grid item (.cluster-card is `display: grid`),
+   so like any grid/flex item it defaults to min-width: auto — sized to fit
+   its content's min-content instead of the track. A favicon hash or tracking
+   ID heading inside has no break point, so that min-content is the whole raw
+   string, and without this override the row (and everything in it) blows out
+   past the card's edge instead of shrinking to it. */
+.cluster-card-top {
+  min-width: 0;
+}
+
+/* The left side of a card-top row (label + heading) needs to be allowed to
+   shrink and truncate — some headings here are raw values (a favicon hash, a
+   tracking ID) with no natural break point, which otherwise overflow past
+   the card edge exactly like the chip case above. */
+.cluster-card-top > div {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.cluster-card-top h4 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-heading-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Re-fetched live from a member domain and cached by hash (there's no stored
+   favicon image, only the hash) — see /api/favicon/<kind>/<value>. Sized as a
+   small inline glyph next to the hash text, which stays as the fallback if
+   the fetch 404s (img renders nothing in that case, see FaviconThumb). */
+.favicon-thumb {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  border-radius: 3px;
+  object-fit: contain;
+  background: var(--surface-strong, #fff);
+}
+
 .hero-panel,
 .panel {
   padding: 24px;
@@ -275,6 +342,10 @@ button {
   gap: 20px;
   grid-template-columns: minmax(0, 1.6fr) minmax(280px, 0.9fr);
   margin-bottom: 22px;
+  /* The trace-line signature: every hero opens on the same accent rule a
+     scope trace would, tying the product's "find the signal" thesis to the
+     one recurring structural device instead of decorating each page apart. */
+  border-top: 2px solid var(--trace);
   background:
     radial-gradient(circle at top right, var(--hero-glow), transparent 36%),
     linear-gradient(180deg, var(--hero-grad-top), var(--hero-grad-bottom));
@@ -285,7 +356,12 @@ button {
 }
 
 .hero-copy h1,
-.panel h1,
+.panel h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
 .panel h2,
 .panel h3,
 .case-card h3,
@@ -308,6 +384,11 @@ button {
   margin: 0;
 }
 
+.discovery-note {
+  font-size: 0.85em;
+  margin-top: 4px;
+}
+
 .hero-stats,
 .metric-grid,
 .case-grid,
@@ -323,6 +404,45 @@ button {
 .hero-stats {
   align-content: start;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.filter-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.filter-grid select {
+  width: 100%;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface-strong);
+  color: var(--text);
+}
+
+/* The pool card's headline stat — connection count leads every card, well
+   ahead of the domain name, so "how connected is this channel" is legible
+   before anything else on the card is read. */
+.connection-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.connection-stat strong {
+  font-size: 2rem;
+  line-height: 1;
+  font-family: var(--font-display);
+  color: var(--accent-strong);
+}
+
+.connection-stat span {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
 .hero-side-stack,
@@ -376,6 +496,23 @@ button {
   text-transform: uppercase;
 }
 
+/* Section eyebrows read like a system tag, not a marketing label — bracketed,
+   monospace, in the trace colour, so every section is labelled the way the
+   tool itself labels evidence. */
+.eyebrow {
+  color: var(--trace);
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+}
+
+.eyebrow::before {
+  content: "[ ";
+}
+
+.eyebrow::after {
+  content: " ]";
+}
+
 .metric-card,
 .subject-card {
   padding: 18px;
@@ -386,6 +523,7 @@ button {
 .progress-figure strong {
   font-size: 1.8rem;
   line-height: 1.1;
+  font-family: var(--font-display);
 }
 
 .search-field,
@@ -437,7 +575,7 @@ button {
 .primary-button,
 .case-nav-link {
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   padding: 10px 16px;
 }
 
@@ -456,11 +594,53 @@ button {
   font-weight: 700;
 }
 
+button.text-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
 .secondary-button:hover,
 .primary-button:hover,
 .text-link:hover,
 .case-nav-link:hover {
   transform: translateY(-1px);
+}
+
+/* `button { cursor: pointer }` above is a blanket rule and does not stop
+   applying just because the button is disabled — without this override a
+   disabled action still shows a clickable hand cursor, which reads as "you
+   can click this" right up until nothing happens. */
+button:disabled,
+.primary-button:disabled,
+.secondary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
+.secondary-button:disabled:hover,
+.primary-button:disabled:hover {
+  transform: none;
+}
+
+/* Keyboard-focus ring. Only on :focus-visible (not plain :focus) so a mouse
+   click never shows a ring — it only appears for keyboard/assistive-tech
+   navigation, which previously had no visible indicator at all on any
+   button, chip, or link in the app. */
+.primary-button:focus-visible,
+.secondary-button:focus-visible,
+.text-link:focus-visible,
+.case-nav-link:focus-visible,
+.chip:focus-visible,
+.token:focus-visible,
+.segmented-item:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--input-focus-ring);
+  outline-offset: 2px;
 }
 
 .case-nav {
@@ -503,7 +683,7 @@ button {
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-size: 0.84rem;
   font-weight: 700;
 }
@@ -511,6 +691,13 @@ button {
 .chip {
   background: var(--surface-muted);
   border: 1px solid var(--border-soft);
+  /* Raw values (hashes, tracking IDs, ...) have no natural break point, so
+     without a cap a single chip can render wider than its panel and spill
+     past the edge — every chip needs this, not just ones flagged "shared". */
+  max-width: min(240px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cluster-links {
@@ -528,7 +715,7 @@ button {
 .connector-chip .connector-value {
   font-family: var(--font-mono, monospace);
   font-weight: 700;
-  max-width: 220px;
+  max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -722,7 +909,10 @@ button {
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
 }
 
-.submission-card,
+.submission-card {
+  grid-column: 1 / -1;
+}
+
 .cluster-graph-card {
   display: grid;
   gap: 14px;
@@ -764,13 +954,6 @@ button {
   overflow-wrap: break-word;
 }
 
-.chip.evidence-chip {
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .cluster-graph {
   width: 100%;
   min-height: 500px;
@@ -782,7 +965,8 @@ button {
 
 .graph-node-label {
   fill: var(--text);
-  font-size: 0.8rem;
+  font-family: var(--font-display);
+  font-size: 0.76rem;
   font-weight: 400;
   user-select: none;
 }
@@ -790,6 +974,19 @@ button {
 .graph-node-label.ip {
   font-size: 0.66rem;
   opacity: 0.75;
+}
+
+.graph-edge-label-text {
+  fill: var(--text-muted, var(--text));
+  font-family: var(--font-display);
+  font-size: 0.62rem;
+  letter-spacing: 0.01em;
+  user-select: none;
+}
+
+.graph-edge-label-bg {
+  fill: var(--graph-bg);
+  opacity: 0.94;
 }
 
 .graph-toggle {
@@ -864,7 +1061,8 @@ button {
   cursor: pointer;
 }
 
-.secondary-button.small {
+.secondary-button.small,
+.primary-button.small {
   padding: 8px 14px;
   font-size: 0.8rem;
 }
@@ -913,6 +1111,48 @@ button {
   margin: 0;
 }
 
+.graph-detail-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* Network graph modal — deliberately its own fixed-position overlay (see the
+   GraphModal comment in App.jsx) rather than expanding inline in the cluster
+   grid, so it always opens centered on screen instead of wherever its
+   triggering card happens to sit in the grid. */
+.graph-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(5, 9, 13, 0.6);
+}
+
+.graph-modal {
+  width: min(1100px, 100%);
+  max-height: min(880px, 100%);
+  overflow: auto;
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface-strong);
+  box-shadow: 0 24px 56px rgba(0, 0, 0, 0.4);
+}
+
+.graph-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .linkage-signal-chips {
   margin-top: 2px;
 }
@@ -942,7 +1182,7 @@ button {
 .domain-chip {
   padding: 9px 16px;
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: var(--surface-strong);
   color: var(--text);
   font-weight: 700;
@@ -1146,7 +1386,7 @@ button {
 .linkage-percent strong {
   font-size: 1.7rem;
   line-height: 1;
-  font-family: "Space Grotesk", sans-serif;
+  font-family: var(--font-display);
 }
 
 .linkage-headline {
@@ -1290,6 +1530,44 @@ button {
 
 .digest-more-chip {
   color: var(--muted);
+}
+
+/* Called out when a shared node was actually exhibited by a subdomain, not
+   the apex being compared — deliberately louder than the muted timestamp
+   line so "this evidence is really about cdn.rt.com, not rt.com" can't be
+   missed while skimming a connection card. */
+.host-attribution {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius-panel);
+  background: var(--info-soft);
+  border-left: 3px solid var(--accent);
+}
+
+.host-attribution-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+}
+
+.host-attribution-tag {
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: var(--accent-strong);
+}
+
+.host-chip {
+  background: var(--surface-strong);
+  border: 1px solid var(--accent);
+  color: var(--accent-strong);
+  font-weight: 700;
 }
 
 .show-all-button {
@@ -1449,12 +1727,14 @@ button {
 
 .page-heading {
   margin-bottom: 22px;
+  border-top: 2px solid var(--trace);
+  padding-top: 14px;
 }
 
 .page-heading h1 {
   margin: 0;
-  font-family: "Space Grotesk", sans-serif;
-  letter-spacing: -0.03em;
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
   font-size: clamp(1.8rem, 3vw, 2.4rem);
 }
 
@@ -1480,12 +1760,12 @@ button {
   margin-bottom: 22px;
   background: var(--surface-muted);
   border: 1px solid var(--border-soft);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
 }
 
 .segmented-item {
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   padding: 9px 18px;
   font-weight: 700;
   color: var(--muted);
@@ -1532,7 +1812,7 @@ button {
   align-items: center;
   gap: 8px;
   padding: 7px 12px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-weight: 700;
   font-size: 0.86rem;
   color: var(--text);

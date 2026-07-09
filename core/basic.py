@@ -33,6 +33,8 @@ from cryptography.x509.oid import NameOID
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from core.ip_intel import detect_proxy_details
+from utils.ipinfo_lite import merge_ipinfo_lite
 from utils.outbound import requests_kwargs
 
 load_dotenv()
@@ -46,7 +48,10 @@ logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 logging.getLogger("paramiko.transport").addHandler(logging.NullHandler())
 
 OUTPUT_FILE     = Path(__file__).parent / "results.json"
-FOLLOWUP_LIMIT  = 5     # max subdomains to recurse into
+# Follow-up scans never touch paid providers (Censys/Shodan/Netlas -- gated by
+# analysis_service.run_providers on is_seed/is_apex), so this can be generous:
+# it only costs DNS/WHOIS/crt.sh/page-fetch time, not API credits.
+FOLLOWUP_LIMIT  = 20    # max subdomains to recurse into
 IP_PROBE_LIMIT  = 20    # max IPs to TLS/SSH probe per run
 
 
@@ -148,7 +153,16 @@ def get_dns(domain: str) -> dict:
 
 
 def get_whois(domain: str) -> dict:
-    """Domain WHOIS lookup."""
+    """Domain WHOIS lookup.
+
+    Captures every field the TLD-specific parser extracted -- registrant/
+    admin/tech name, org, address, city, state, postal code, phone/email
+    when the registry exposes them, not just the handful of summary fields
+    kept previously -- plus the full raw response text under "raw".
+    db/intel_db.py's whois_data table and identifier extraction read a few
+    of these by their historical names (expiry_date, nameservers), so those
+    stay aliased for backward compatibility.
+    """
     try:
         w = whois.whois(domain)
 
@@ -159,18 +173,11 @@ def get_whois(domain: str) -> dict:
                 return [str(x) for x in v]
             return str(v)
 
-        result = {
-            "registrar":     _fmt(w.registrar),
-            "creation_date": _fmt(w.creation_date),
-            "expiry_date":   _fmt(w.expiration_date),
-            "updated_date":  _fmt(w.updated_date),
-            "nameservers":   _fmt(w.name_servers),
-            "status":        _fmt(w.status),
-            "emails":        _fmt(w.emails),
-            "org":           _fmt(w.org),
-            "country":       _fmt(w.country),
-        }
-        log_ok(f"WHOIS: registrar={result['registrar']} created={result['creation_date']}")
+        result = {key: _fmt(value) for key, value in dict(w).items()}
+        result["expiry_date"] = _fmt(w.expiration_date)
+        result["nameservers"] = _fmt(w.name_servers)
+        result["raw"] = getattr(w, "text", None)
+        log_ok(f"WHOIS: registrar={result.get('registrar')} created={result.get('creation_date')}")
         return result
     except Exception as exc:
         log_warn(f"WHOIS failed: {exc}")
@@ -391,31 +398,105 @@ def get_circl_pdns(domain: str) -> dict:
         return {"error": str(exc)}
 
 
+def _rotate_vpn_after_rate_limit(provider: str) -> None:
+    """Best-effort: rotate the VPN exit IP after a provider rate-limits us, so
+    an immediate retry lands from a fresh source IP. No-op when rotation
+    isn't configured (VPN_API_BASE_URL unset/VPN_ROTATE_DISABLE=1) or when
+    another concurrently-scanning domain already rotated moments ago — the
+    retry below still fires either way, just against whatever IP is current."""
+    try:
+        from utils.vpn import rotate_vpn_ip_sync
+        new_ip = rotate_vpn_ip_sync()
+        if new_ip:
+            log_warn(f"{provider}: rate-limited — rotated VPN exit IP to {new_ip}, retrying")
+        else:
+            log_warn(f"{provider}: rate-limited — retrying (VPN rotation unavailable or on cooldown)")
+    except Exception as exc:
+        log_warn(f"{provider}: rate-limited — retrying (VPN rotation failed: {exc})")
+
+
 def get_hackertarget(domain: str) -> dict:
     """Subdomains + IPs from HackerTarget hostsearch."""
+    for attempt in (1, 2):
+        try:
+            resp = requests.get(
+                "https://api.hackertarget.com/hostsearch/",
+                params={"q": domain},
+                timeout=15,
+                **requests_kwargs(),
+            )
+            if resp.status_code != 200:
+                return {"hits": [], "error": f"HTTP {resp.status_code}"}
+            text = resp.text.strip()
+            if "error" in text.lower() or "API count" in text:
+                if attempt == 1:
+                    _rotate_vpn_after_rate_limit("HackerTarget")
+                    continue
+                log_warn(f"HackerTarget: {text[:80]}")
+                return {"hits": [], "error": text}
+
+            hits = []
+            for line in text.splitlines():
+                parts = line.strip().split(",")
+                if len(parts) == 2:
+                    hits.append({"subdomain": parts[0].strip(), "ip": parts[1].strip()})
+            log_ok(f"HackerTarget: {len(hits)} subdomain/IP pairs")
+            return {"hits": hits}
+        except Exception as exc:
+            log_warn(f"HackerTarget failed: {exc}")
+            return {"error": str(exc)}
+
+
+def get_viewdns_subdomains(domain: str) -> dict:
+    """Subdomains from ViewDNS's Subdomain Finder (needs VIEW_DNS_API_KEY).
+
+    Feeds the same `{"hits": [{"subdomain", "ip"}, ...]}` shape as
+    get_hackertarget so it composes with the same downstream consumers
+    (collect_non_cf_ips, pick_followup_subdomains). ViewDNS's own response
+    puts each hit under response.subdomains, as either a bare hostname string
+    or a {"subdomain", "ip"} object depending on plan/endpoint version, so
+    both shapes are handled defensively.
+    """
+    api_key = os.environ.get("VIEW_DNS_API_KEY", "").strip()
+    if not api_key:
+        return {"hits": [], "skipped": True, "reason": "VIEW_DNS_API_KEY not set"}
     try:
         resp = requests.get(
-            "https://api.hackertarget.com/hostsearch/",
-            params={"q": domain},
-            timeout=15,
+            "https://api.viewdns.info/subdomains/",
+            params={"domain": domain, "apikey": api_key, "output": "json"},
+            timeout=20,
             **requests_kwargs(),
         )
         if resp.status_code != 200:
             return {"hits": [], "error": f"HTTP {resp.status_code}"}
-        text = resp.text.strip()
-        if "error" in text.lower() or "API count" in text:
-            log_warn(f"HackerTarget: {text[:80]}")
-            return {"hits": [], "error": text}
+        payload = resp.json()
+        if payload.get("success") is False or "error" in payload:
+            message = (payload.get("error") or {}).get("message") or payload.get("error") or "unknown error"
+            log_warn(f"ViewDNS: {message}")
+            return {"hits": [], "error": str(message)}
 
+        raw = ((payload.get("response") or {}).get("subdomains")) or []
         hits = []
-        for line in text.splitlines():
-            parts = line.strip().split(",")
-            if len(parts) == 2:
-                hits.append({"subdomain": parts[0].strip(), "ip": parts[1].strip()})
-        log_ok(f"HackerTarget: {len(hits)} subdomain/IP pairs")
+        for entry in raw:
+            if isinstance(entry, dict):
+                sub = str(
+                    entry.get("subdomain") or entry.get("domain") or entry.get("name") or ""
+                ).strip()
+                ips = entry.get("ips")
+                if isinstance(ips, list):
+                    ip = str(ips[0]) if ips else ""
+                else:
+                    ip = str(entry.get("ip") or "").strip()
+            else:
+                sub = str(entry or "").strip()
+                ip = ""
+            if sub:
+                hits.append({"subdomain": sub, "ip": ip})
+
+        log_ok(f"ViewDNS: {len(hits)} subdomains")
         return {"hits": hits}
     except Exception as exc:
-        log_warn(f"HackerTarget failed: {exc}")
+        log_warn(f"ViewDNS failed: {exc}")
         return {"error": str(exc)}
 
 
@@ -472,13 +553,19 @@ def _fetch_urlscan_referrers(uuid: str, domain: str, timeout: float = 15.0) -> d
 def get_urlscan(domain: str) -> dict:
     """Historical scan results from urlscan.io, with referrer enrichment."""
     try:
-        resp = requests.get(
-            "https://urlscan.io/api/v1/search/",
-            params={"q": f"domain:{domain}", "size": "100"},
-            headers={"User-Agent": "ip-intel/1.0"},
-            timeout=15,
-            **requests_kwargs(),
-        )
+        resp = None
+        for attempt in (1, 2):
+            resp = requests.get(
+                "https://urlscan.io/api/v1/search/",
+                params={"q": f"domain:{domain}", "size": "100"},
+                headers={"User-Agent": "ip-intel/1.0"},
+                timeout=15,
+                **requests_kwargs(),
+            )
+            if resp.status_code == 429 and attempt == 1:
+                _rotate_vpn_after_rate_limit("urlscan")
+                continue
+            break
         if resp.status_code != 200:
             return {"hits": [], "error": f"HTTP {resp.status_code}"}
 
@@ -598,10 +685,10 @@ def get_shodan(domain: str) -> dict:
 
 
 def get_netlas(domain: str) -> dict:
-    """Netlas hosts with TLS cert matching domain (needs NETLAS_API_KEY)."""
-    api_key = os.environ.get("NETLAS_API_KEY")
+    """Netlas hosts with TLS cert matching domain (needs NETLAS_KEY)."""
+    api_key = os.environ.get("NETLAS_KEY") or os.environ.get("NETLAS_API_KEY")
     if not api_key:
-        return {"skipped": True, "reason": "NETLAS_API_KEY not set"}
+        return {"skipped": True, "reason": "NETLAS_KEY not set"}
     try:
         import netlas
     except ImportError:
@@ -852,40 +939,94 @@ def get_ssh_host_keys(ips: list[str]) -> dict:
 
 # ── Post-service helpers ──────────────────────────────────────────────────────
 
-def collect_non_cf_ips(results: dict, limit: int = IP_PROBE_LIMIT) -> list[str]:
-    """Pull every non-Cloudflare IP surfaced across all services."""
+def collect_non_cf_ips(
+    results: dict, limit: int = IP_PROBE_LIMIT, *, with_sources: bool = False,
+) -> list[str] | tuple[list[str], dict[str, list[str]]]:
+    """Pull every non-Cloudflare IP surfaced across all services.
+
+    With `with_sources=True`, also returns a {ip: [source, ...]} map of which
+    service(s) reported each IP, used to populate ip_details.sources.
+    """
     ips: list[str] = []
     seen: set[str] = set()
+    sources: dict[str, list[str]] = {}
 
-    def _add(ip: str) -> None:
-        if ip and ip not in seen and not is_cloudflare_ip(ip):
+    def _add(ip: str, source: str) -> None:
+        if not ip or is_cloudflare_ip(ip):
+            return
+        if ip not in seen:
             seen.add(ip)
             ips.append(ip)
+        source_list = sources.setdefault(ip, [])
+        if source not in source_list:
+            source_list.append(source)
 
     dns_results = results.get("dns", {}) or {}
     for rtype in ("A", "AAAA"):
         for ip in dns_results.get(rtype, []) or []:
-            _add(ip)
+            _add(ip, "dns")
 
     for hit in (results.get("hackertarget", {}) or {}).get("hits", []) or []:
-        _add(hit.get("ip", ""))
+        _add(hit.get("ip", ""), "hackertarget")
+    for hit in (results.get("viewdns", {}) or {}).get("hits", []) or []:
+        _add(hit.get("ip", ""), "viewdns")
     for hit in (results.get("urlscan", {}) or {}).get("hits", []) or []:
-        _add(hit.get("ip", ""))
+        _add(hit.get("ip", ""), "urlscan")
     for rec in (results.get("circl_pdns", {}) or {}).get("records", []) or []:
         if rec.get("rrtype") in ("A", "AAAA"):
-            _add(rec.get("rdata", ""))
+            _add(rec.get("rdata", ""), "circl_pdns")
     for src in ("censys", "shodan", "netlas"):
         for hit in (results.get(src, {}) or {}).get("hits", []) or []:
-            _add(hit.get("ip", ""))
+            _add(hit.get("ip", ""), src)
 
-    return ips[:limit]
+    limited = ips[:limit]
+    if with_sources:
+        return limited, {ip: sources[ip] for ip in limited}
+    return limited
+
+
+_FOLLOWUP_PROBE_CAP = 50  # how many subdomains we'll DNS-screen before ranking
+
+# Guaranteed slots for subdomains that *don't* match a leak-hunting priority
+# keyword below, even when admin/mail-type hosts are plentiful. Those keywords
+# target likely-unproxied backend panels (origin-leak hunting); they say
+# nothing about which host actually serves unique page content. Without this
+# floor, a domain with several admin-ish subdomains (admin-contacts,
+# admin-school, adminst-school, ...) can fill every follow-up slot before a
+# `cdn.`/`www.`/`shop.`-style host -- the one actually likely to carry its own
+# tracking IDs/favicon -- ever gets probed.
+_MIN_CONTENT_FOLLOWUPS = 5
 
 
 def pick_followup_subdomains(results: dict, limit: int = FOLLOWUP_LIMIT) -> list[str]:
-    """Pick subdomains from crt.sh that resolve to at least one non-CF IP."""
-    subs = (results.get("crt_sh", {}) or {}).get("subdomains", []) or []
+    """
+    Pick subdomains from crt.sh and ViewDNS worth a full follow-up scan.
+
+    Previously this required a non-Cloudflare IP (an "origin leak" signal),
+    which meant any subdomain that's legitimately CDN-fronted -- exactly the
+    kind of host (`cdn.`, `www.`, ...) that actually serves page content and
+    carries its own tracking IDs -- was silently never scanned on its own, so
+    content-level matches on it (shared analytics/pixel IDs, etc.) could never
+    surface. We only require that the subdomain actually resolves (skip
+    dead/parked entries); origin-leak detection itself still lives separately
+    in ip_intel.probe_subdomain_origins. Follow-up scans skip paid providers
+    (Censys/Shodan/Netlas -- see analysis_service.run_providers) regardless of
+    what's picked here, so widening this selection doesn't touch paid-provider
+    usage -- only DNS/WHOIS/crt.sh/page-fetch time.
+    """
+    crt_subs = (results.get("crt_sh", {}) or {}).get("subdomains", []) or []
+    viewdns_subs = [
+        hit.get("subdomain", "")
+        for hit in (results.get("viewdns", {}) or {}).get("hits", []) or []
+        if hit.get("subdomain")
+    ]
+    subs = sorted({*crt_subs, *viewdns_subs})
     priority = ("mail", "api", "dev", "staging", "admin", "portal", "vpn",
                 "cpanel", "webmail", "ftp", "smtp", "ns", "autodiscover")
+
+    def is_priority(name: str) -> bool:
+        low = name.lower()
+        return any(p in low for p in priority)
 
     def score(name: str) -> int:
         low = name.lower()
@@ -894,9 +1035,9 @@ def pick_followup_subdomains(results: dict, limit: int = FOLLOWUP_LIMIT) -> list
     ordered = sorted(subs, key=score)
     if not ordered:
         return []
-    to_probe = ordered[:30]
-    log_info(f"screening {len(to_probe)} subdomain(s) for origin leaks")
-    hits: set[str] = set()
+    to_probe = ordered[:_FOLLOWUP_PROBE_CAP]
+    log_info(f"screening {len(to_probe)} subdomain(s) for follow-up")
+    live: set[str] = set()
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(resolve_ips, sub): sub for sub in to_probe}
         for fut in as_completed(futures):
@@ -905,10 +1046,18 @@ def pick_followup_subdomains(results: dict, limit: int = FOLLOWUP_LIMIT) -> list
                 ips = fut.result()
             except Exception:
                 ips = []
-            if any(not is_cloudflare_ip(ip) for ip in ips):
-                hits.add(sub)
-    candidates = [s for s in to_probe if s in hits]
-    return candidates[:limit]
+            if ips:
+                live.add(sub)
+    candidates = [s for s in to_probe if s in live]
+    if not candidates:
+        return []
+
+    # Reserve content-likely slots first, then fill the rest in priority order.
+    reserved = [s for s in candidates if not is_priority(s)][:_MIN_CONTENT_FOLLOWUPS]
+    reserved_set = set(reserved)
+    fill_budget = max(limit - len(reserved), 0)
+    fill = [s for s in candidates if s not in reserved_set][:fill_budget]
+    return reserved + fill
 
 
 def _apex(hostname: str) -> str:
@@ -1266,6 +1415,7 @@ SERVICES = [
     ("crt_sh",        get_crt_sh),
     ("circl_pdns",    get_circl_pdns),
     ("hackertarget",  get_hackertarget),
+    ("viewdns",       get_viewdns_subdomains),
     ("urlscan",       get_urlscan),
     ("censys",        get_censys),
     ("shodan",        get_shodan),
@@ -1279,8 +1429,8 @@ SERVICES = [
 _PROVIDER_SERVICES = {"censys", "shodan", "netlas"}
 
 
-# steps per analyze() call: one per service + TLS probe + SSH probe
-STEPS_PER_DOMAIN = len(SERVICES) + 2
+# steps per analyze() call: one per service + TLS probe + SSH probe + IP enrich
+STEPS_PER_DOMAIN = len(SERVICES) + 3
 
 # Global record of every domain we've already scanned in this process. Shared
 # across analyze() calls to prevent duplicate work when a batch run turns up
@@ -1354,7 +1504,7 @@ def analyze(domain: str, *, is_followup: bool = False,
         _bump(overall_bar, name, domain)
 
     # ── 2. TLS + SSH probing on non-CF IPs ────────────────────────────────────
-    non_cf_ips = collect_non_cf_ips(results)
+    non_cf_ips, non_cf_ip_sources = collect_non_cf_ips(results, with_sources=True)
     log_info(f"non-CF IPs found: {len(non_cf_ips)}")
     results["non_cf_ips"] = non_cf_ips
 
@@ -1367,6 +1517,34 @@ def analyze(domain: str, *, is_followup: bool = False,
     if all_results is not None:
         save_results(all_results)
     _bump(overall_bar, "ssh_probe", domain)
+
+    # ── 2b. Per-IP ASN + edge/reverse-proxy classification ────────────────────
+    # Same IPs we just TLS/SSH-probed, so this rides on the IP_PROBE_LIMIT cap.
+    # Feeds db/intel_db.py's ip_details storage (asn_desc, proxy_family, ...)
+    # used for cross-domain clustering and the frontend's provider labels.
+    tls_probes_by_ip = {
+        probe.get("ip"): probe
+        for probe in results["tls_certs"].get("probes", [])
+        if probe.get("ip") and "error" not in probe
+    }
+    ip_details: dict[str, dict] = {}
+    for ip in non_cf_ips:
+        ptr = get_ptr(ip)
+        asn_info = get_ip_whois(ip)
+        proxy_details = detect_proxy_details(ip, ptr, asn_info, tls_probes_by_ip.get(ip))
+        ip_details[ip] = {
+            "sources":             non_cf_ip_sources.get(ip, []),
+            "ptr":                 ptr,
+            "cloudflare":          False,
+            "asn_info":            asn_info,
+            "other_domains_on_ip": hackertarget_reverse_ip(ip),
+            "proxy_family":        proxy_details.get("proxy_family"),
+            "proxy_confidence":    proxy_details.get("proxy_confidence"),
+        }
+    results["ip_details"] = ip_details
+    if all_results is not None:
+        save_results(all_results)
+    _bump(overall_bar, "ip_enrich", domain)
 
     # ── Freshness annotation: mark each observed IP as current vs historical ──
     # Runs after every service + probe completes, so the result has both the
@@ -1681,11 +1859,11 @@ def run_batch(csv_path: Path, out_dir: Path, *,
     print()
     log_info("running pairwise comparison across all scans...")
     try:
-        from utils.check import compare_directory
+        from utils.pairwise import compare_directory
         compare_directory(scans_dir, out_dir / "overlaps")
     except ImportError:
-        log_warn("check.py not importable — run it manually with:")
-        print(f"      python check.py --dir {scans_dir} {out_dir / 'overlaps'}")
+        log_warn("utils/pairwise.py not importable — run it manually with:")
+        print(f"      python -m utils.pairwise --dir {scans_dir} {out_dir / 'overlaps'}")
         return
 
     return scans_dir
@@ -1889,10 +2067,10 @@ def run_dive_round(scans_dir: Path, out_dir: Path, *,
     print()
     log_info("dive done — re-running pairwise comparison with dive results included...")
     try:
-        from utils.check import compare_directory
+        from utils.pairwise import compare_directory
         compare_directory(scans_dir, overlap_dir)
     except ImportError:
-        log_warn("check.py not importable — run it manually")
+        log_warn("utils/pairwise.py not importable — run it manually")
 
 
 def is_ip(target: str) -> bool:
@@ -1905,16 +2083,19 @@ def is_ip(target: str) -> bool:
 
 
 def get_ip_whois(ip: str) -> dict:
-    """RDAP / ASN lookup for a bare IP via ipwhois."""
+    """ASN/network lookup for a bare IP: RDAP via ipwhois for network_name/
+    network_cidr/asn_cidr, with ipinfo Lite as the primary source for
+    asn/asn_description/asn_country (see merge_ipinfo_lite) — RDAP remains
+    the sole source for those fields only when ipinfo Lite is unavailable."""
     try:
         from ipwhois import IPWhois
     except ImportError:
-        return {"error": "ipwhois not installed (pip install ipwhois)"}
+        return merge_ipinfo_lite({"error": "ipwhois not installed (pip install ipwhois)"}, ip)
     try:
         obj = IPWhois(ip)
         result = obj.lookup_rdap(depth=1)
         net = result.get("network", {}) or {}
-        return {
+        asn_info = {
             "asn":             result.get("asn"),
             "asn_description": result.get("asn_description"),
             "asn_country":     result.get("asn_country_code"),
@@ -1925,7 +2106,8 @@ def get_ip_whois(ip: str) -> dict:
             "network_country": net.get("country"),
         }
     except Exception as exc:
-        return {"error": str(exc)}
+        asn_info = {"error": str(exc)}
+    return merge_ipinfo_lite(asn_info, ip)
 
 
 def get_ptr(ip: str) -> str | None:
@@ -2010,6 +2192,15 @@ def analyze_ip(ip: str) -> dict:
                    f"key={ssh.get('fingerprint_sha256', '')[:16]}…")
     else:
         result["ssh_host_key"] = None
+
+    proxy_details = detect_proxy_details(
+        ip, result.get("ptr"), asn_info, tls if tls and "error" not in tls else None
+    )
+    result["proxy_family"]     = proxy_details.get("proxy_family")
+    result["proxy_confidence"] = proxy_details.get("proxy_confidence")
+    if result["proxy_family"]:
+        log_ok(f"proxy family: {result['proxy_family']} "
+               f"(confidence={result['proxy_confidence']})")
 
     return result
 

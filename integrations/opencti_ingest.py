@@ -319,6 +319,109 @@ def _channel_is_website(channel: dict) -> bool:
     return any(str(t).strip().lower() == "website" for t in types)
 
 
+def _channel_labels(channel: dict) -> list[str]:
+    """Extract label values (objectLabel[].value) from a Channel SDO.
+    pycti's default Channel query already includes objectLabel, so no extra
+    request is needed to get these."""
+    raw = channel.get("objectLabel") or []
+    if isinstance(raw, dict):  # raw GraphQL edges shape, just in case
+        raw = [edge.get("node", edge) for edge in raw.get("edges") or [] if isinstance(edge, dict)]
+    labels: list[str] = []
+    for item in raw:
+        value = item.get("value") if isinstance(item, dict) else item
+        value = str(value or "").strip()
+        if value and value not in labels:
+            labels.append(value)
+    return labels
+
+
+# The only labels that matter for classification are the 5 tier labels; a
+# channel typically carries other, unrelated labels too (campaign names,
+# platform tags, ...) which are not tiers and are ignored here. Matching is
+# "tier" + a digit 1-5, case/space/dash/underscore-insensitive, so "Tier 1",
+# "tier-2", "TIER_3", "tier   4" all resolve — the rest of a label's text
+# (there's more to each one than just the tier marker) doesn't matter.
+_TIER_LABEL_RE = re.compile(r"tier[\s_-]*([1-5])\b", re.IGNORECASE)
+
+
+def _extract_tier(labels: list[str]) -> int | None:
+    """Pick the tier (1-5, 1 = highest priority) out of a channel's labels.
+    If more than one tier label is somehow present, the lowest number (the
+    higher-priority tier) wins."""
+    best: int | None = None
+    for label in labels:
+        match = _TIER_LABEL_RE.search(label)
+        if not match:
+            continue
+        tier = int(match.group(1))
+        if best is None or tier < best:
+            best = tier
+    return best
+
+
+def fetch_all_website_channel_data() -> dict[str, dict]:
+    """
+    Fetch every OpenCTI Channel SDO of channel_type 'website' -- no cap,
+    unlike fetch_website_channel_domains's newest-100 -- and return a
+    {domain: {"labels": [...], "tier": int | None}} map, merging labels
+    across any channels that resolve to the same domain. Social-media
+    platform domains are dropped. `tier` is the domain's tier-1..tier-5
+    classification (see _extract_tier), or None if no tier label is present.
+
+    Raises RuntimeError on configuration/connection problems.
+    """
+    url = os.getenv("OPENCTI_URL", "").strip()
+    token = os.getenv("OPENCTI_TOKEN", "").strip()
+    if not url or not token:
+        raise RuntimeError("OPENCTI_URL or OPENCTI_TOKEN not set")
+
+    api = OpenCTIApiClient(url, token, log_level="error")
+    list_channels = getattr(getattr(api, "channel", None), "list", None)
+    if not callable(list_channels):
+        raise RuntimeError("pycti channel API is not available in this client version")
+
+    # Same server-side channel_types filter as fetch_website_channel_domains,
+    # but with getAll=True (pycti auto-paginates through every page) instead
+    # of a first=limit cap, since this is meant to sweep the whole corpus.
+    website_filter = {
+        "mode": "and",
+        "filters": [{"key": "channel_types", "values": ["website"], "operator": "eq", "mode": "or"}],
+        "filterGroups": [],
+    }
+    channels = list_channels(filters=website_filter, getAll=True) or []
+
+    domain_labels: dict[str, set[str]] = {}
+    skipped_social = 0
+    for channel in channels:
+        if not isinstance(channel, dict):
+            continue
+        # Backstop only: drop a channel that *explicitly* declares a non-website
+        # type (the server filter above should already guarantee this).
+        has_type = channel.get("channel_types") is not None or channel.get("channel_type") is not None
+        if has_type and not _channel_is_website(channel):
+            continue
+        labels = _channel_labels(channel)
+        for domain in _channel_candidate_domains(channel):
+            if _is_social_media_domain(domain):
+                skipped_social += 1
+                continue
+            domain_labels.setdefault(domain, set()).update(labels)
+
+    tiered = 0
+    result: dict[str, dict] = {}
+    for domain, labels in domain_labels.items():
+        tier = _extract_tier(labels)
+        if tier is not None:
+            tiered += 1
+        result[domain] = {"labels": sorted(labels), "tier": tier}
+
+    log.info(
+        "Fetched %d website channel(s) from OpenCTI -> %d domain(s) (%d social-media skipped, %d tiered)",
+        len(channels), len(result), skipped_social, tiered,
+    )
+    return result
+
+
 def fetch_website_channel_domains(limit: int = 100) -> list[str]:
     """
     Return the bare domains carried by the most recently created Channel SDOs

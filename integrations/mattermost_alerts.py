@@ -345,7 +345,13 @@ def _interesting_findings(result: Mapping[str, Any]) -> list[str]:
 
 def _deliver_message(webhook_url: str, payload: dict[str, Any]) -> None:
     try:
-        response = requests.post(webhook_url, json=payload, timeout=_WEBHOOK_TIMEOUT_SECONDS)
+        # MATTERMOST_WEBHOOK_URL points at an internal-only host whose cert
+        # chain isn't in the container's trust store — verification is
+        # disabled for this internal call only (see core/basic.py's
+        # page_metadata fetch for the same pattern).
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        response = requests.post(webhook_url, json=payload, timeout=_WEBHOOK_TIMEOUT_SECONDS, verify=False)
         response.raise_for_status()
         LOGGER.info("Mattermost alert delivered successfully")
     except requests.HTTPError as exc:
@@ -449,6 +455,13 @@ def send_analysis_notification(job: Mapping[str, Any]) -> bool:
 
 
 def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
+    """
+    Alert for a completed ingest. The submission joins the one global pool
+    (no per-ingest scope), so "what did this connect to" is read from the
+    same cross-corpus pool linkage the /api/graph/* endpoints expose
+    (case_runtime._build_pool_summary -> utils.check.links_for), not a
+    per-ingest pairwise comparison.
+    """
     webhook_url = _webhook_url()
     if not webhook_url:
         LOGGER.warning("Mattermost alert skipped because MATTERMOST_WEBHOOK_URL is not set")
@@ -457,29 +470,30 @@ def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> b
     case_id = str(case.get("id") or "")
     status = str(case.get("status") or job.get("status") or "unknown")
     summary = _safe_dict(case.get("summary"))
-    top_findings = _safe_list(summary.get("top_findings"))[:3]
-    target_count = case.get("total_targets") or summary.get("target_count")
+    top_findings = _safe_list(summary.get("top_findings"))[:5]
+    targets = _safe_list(case.get("targets"))
+    target_count = case.get("total_targets") or summary.get("target_count") or len(targets)
     successful = case.get("successful_targets")
     failed = case.get("failed_targets")
-    overlap_count = int(summary.get("within_case_pair_count", 0)) + int(summary.get("historical_pair_count", 0))
     duration = _duration_label(case.get("started_at") or job.get("started_at"), case.get("finished_at") or job.get("finished_at"))
 
     base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
-    summary_url = f"{base_url}/cases/{case_id}/summary" if base_url and case_id else None
+    first_target = str(targets[0]) if targets else None
+    summary_url = f"{base_url}/domain/{first_target}" if base_url and first_target else None
 
     highlights = []
     for item in top_findings:
-        left = str(item.get("left_target") or "").strip()
-        right = str(item.get("right_target") or "").strip()
+        target = str(item.get("target") or "").strip()
+        linked_target = str(item.get("linked_target") or "").strip()
         score = item.get("score")
-        line = f"{left} vs {right}".strip()
+        line = f"{target} ↔ {linked_target}".strip()
         if score is not None:
             line = f"{line} ({score})"
         if line:
             highlights.append(line)
 
     text_lines = [
-        f"**IP Intel case {case_id or 'unknown'}**",
+        f"**IP Intel ingest {case_id or 'unknown'}**",
         f"Status: `{status}`",
     ]
     if duration:
@@ -487,27 +501,27 @@ def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> b
     text_lines.append(f"Submitted: `{target_count or 0}`")
     text_lines.append(f"Succeeded: `{successful or 0}`")
     text_lines.append(f"Failed: `{failed or 0}`")
-    text_lines.append(f"Overlaps: `{overlap_count}`")
+    text_lines.append(f"Pool connections found: `{len(top_findings)}`")
     if highlights:
-        text_lines.append("Top findings:")
+        text_lines.append("Strongest pool connections:")
         text_lines.extend(f"- {item}" for item in highlights)
     if summary_url:
-        text_lines.append(f"[Open summary]({summary_url})")
+        text_lines.append(f"[Open in pool]({summary_url})")
 
     card_lines = [
-        "<h2>IP Intel Case Complete</h2>",
-        f"<p><strong>Case:</strong> {case_id or 'unknown'}</p>",
+        "<h2>IP Intel Ingest Complete</h2>",
+        f"<p><strong>Ingest:</strong> {case_id or 'unknown'}</p>",
         f"<p><strong>Status:</strong> {status}</p>",
         f"<p><strong>Duration:</strong> {duration or 'n/a'}</p>",
         f"<p><strong>Targets:</strong> submitted {target_count or 0}, succeeded {successful or 0}, failed {failed or 0}</p>",
-        f"<p><strong>Overlaps:</strong> {overlap_count}</p>",
+        f"<p><strong>Pool connections found:</strong> {len(top_findings)}</p>",
     ]
     if highlights:
         card_lines.append("<ul>")
         card_lines.extend(f"<li>{item}</li>" for item in highlights)
         card_lines.append("</ul>")
     if summary_url:
-        card_lines.append(f'<p><a href="{summary_url}">Open case summary</a></p>')
+        card_lines.append(f'<p><a href="{summary_url}">Open in pool</a></p>')
 
     payload = {
         "text": "\n".join(text_lines),
@@ -515,14 +529,14 @@ def send_case_notification(case: Mapping[str, Any], job: Mapping[str, Any]) -> b
         "attachments": [
             {
                 "color": "#1c8a5d" if status == "completed" else "#ba4a3d",
-                "title": f"Case {case_id or 'unknown'}",
+                "title": f"Ingest {case_id or 'unknown'}",
                 "title_link": summary_url,
                 "fields": [
                     {"short": True, "title": "Submitted", "value": str(target_count or 0)},
                     {"short": True, "title": "Duration", "value": duration or "n/a"},
                     {"short": True, "title": "Succeeded", "value": str(successful or 0)},
                     {"short": True, "title": "Failed", "value": str(failed or 0)},
-                    {"short": True, "title": "Overlaps", "value": str(overlap_count)},
+                    {"short": True, "title": "Pool connections", "value": str(len(top_findings))},
                     {"short": True, "title": "Status", "value": status},
                 ],
             }

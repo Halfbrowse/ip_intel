@@ -160,11 +160,11 @@ def test_send_case_email_includes_counts_and_findings(monkeypatch) -> None:
         "failed_targets": 1,
         "started_at": "2026-06-10 10:00:00",
         "finished_at": "2026-06-10 10:05:00",
+        "targets": ["alpha.example"],
         "summary": {
-            "within_case_pair_count": 1,
-            "historical_pair_count": 2,
+            "target_count": 1,
             "top_findings": [
-                {"left_target": "alpha.example", "right_target": "beta.example", "score": 72},
+                {"target": "alpha.example", "linked_target": "beta.example", "score": 72},
             ],
         },
     }
@@ -178,9 +178,9 @@ def test_send_case_email_includes_counts_and_findings(monkeypatch) -> None:
     assert "Submitted: 3" in body
     assert "Succeeded: 2" in body
     assert "Failed: 1" in body
-    assert "Overlaps: 3" in body
-    assert "alpha.example vs beta.example (72)" in body
-    assert "https://intel.example.com/cases/case-1/summary" in body
+    assert "Pool connections found: 1" in body
+    assert "alpha.example ↔ beta.example (72)" in body
+    assert "https://intel.example.com/domain/alpha.example" in body
 
 
 def test_send_opencti_email_formats_progress(monkeypatch) -> None:

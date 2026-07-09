@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import itertools
 import logging
 import threading
-import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any
 
-from utils import cluster
 from utils import check
 from core import ip_intel
 from core import basic
 from core.analysis_service import (
     AnalysisRun,
     analyze_target,
-    build_helper_rows,
     clean_target,
     normalize_inputs,
     pairing_label,
@@ -25,24 +21,16 @@ from cases.case_store import (
     append_job_log,
     complete_case,
     create_case,
-    find_historical_candidates,
     get_case,
     get_job,
     get_pending_crt_sh_retries,
-    list_search_runs_by_ids,
-    list_pairings,
-    list_search_runs,
     load_case_inputs,
     mark_case_started,
     patch_search_run_payload,
     recoverable_jobs,
-    replace_cluster,
-    replace_pairings,
     save_search_run,
-    update_case_summary,
     update_job_progress,
 )
-from utils.evidence_meta import evidence_definition
 from integrations.mattermost_alerts import send_case_notification
 from integrations.email_alerts import send_case_email
 
@@ -60,8 +48,6 @@ _JOB_LOG_LEVELS = {
 }
 
 
-DEFAULT_CLUSTER_THRESHOLD = 30
-
 # Per-case concurrency for target analysis. Each target spends most of its
 # time waiting on network I/O (DNS, WHOIS, TLS probes, provider APIs), so a
 # small pool cuts wall-clock time roughly linearly without hammering sources.
@@ -69,11 +55,10 @@ ANALYSIS_WORKERS = 4
 
 
 class CaseRuntime:
-    def __init__(self, *, cluster_threshold: int = DEFAULT_CLUSTER_THRESHOLD) -> None:
+    def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="case-runtime")
         self._lock = threading.Lock()
         self._futures: dict[str, Future[Any]] = {}
-        self._cluster_threshold = cluster_threshold
 
     def submit_existing(self, case_id: str, job_id: str) -> None:
         with self._lock:
@@ -220,7 +205,12 @@ class CaseRuntime:
 
                         for discovered in run.discovered_targets:
                             target = clean_target(str(discovered.get("target") or ""))
-                            if not target or target in seen_targets or item["depth"] >= 1:
+                            if (
+                                not target
+                                or target in seen_targets
+                                or target == run.normalized_target
+                                or item["depth"] >= 1
+                            ):
                                 continue
                             seen_targets.add(target)
                             total_targets += 1
@@ -264,10 +254,7 @@ class CaseRuntime:
                 completed_targets=completed_targets,
                 failed_targets=failed_targets,
             )
-            self._log(job_id, "info", "Building overlap pairings", stage="comparison")
-            pairings = self._build_pairings(case_id, saved_runs)
-            replace_pairings(case_id, pairings)
-
+            self._log(job_id, "info", "Checking pool connections", stage="comparison")
             update_job_progress(
                 job_id,
                 stage="clustering",
@@ -276,16 +263,7 @@ class CaseRuntime:
                 completed_targets=completed_targets,
                 failed_targets=failed_targets,
             )
-            self._log(job_id, "info", "Building cluster graph", stage="clustering")
-            cluster_payload, graph_payload = self._build_clusters(saved_runs, pairings)
-            replace_cluster(
-                case_id,
-                threshold=self._cluster_threshold,
-                payload=cluster_payload,
-                graph_payload=graph_payload,
-            )
-
-            summary = self._build_summary(saved_runs, pairings, cluster_payload)
+            summary = self._build_pool_summary(saved_runs)
             update_job_progress(
                 job_id,
                 stage="notification",
@@ -323,234 +301,44 @@ class CaseRuntime:
         finally:
             analysis_pool.shutdown(wait=False, cancel_futures=True)
 
-    def recompute_case(self, case_id: str) -> dict[str, int]:
+    def _build_pool_summary(self, runs: list[dict[str, Any]]) -> dict[str, Any]:
         """
-        Re-run pairing, clustering, and the case summary from the stored scan
-        runs without re-scanning anything. Used to apply scoring fixes to
-        cases that were analyzed before those fixes existed.
+        Completion summary for a job, built from the shared correlation pool
+        instead of a case-scoped pairwise comparison. Every target this job
+        scanned already joined the one global graph inline (analyze_target ->
+        intel_db.save_search), so "what did this submission connect to" is
+        just the same cross-corpus linkage the /api/graph/* endpoints expose
+        (utils.check.links_for) -- there is no separate per-case comparison
+        to run.
         """
-        runs: list[dict[str, Any]] = []
-        for row in list_search_runs(case_id, only_success=True):
-            payload = dict(row.get("payload") or {})
-            runs.append(
-                {
-                    "id": row["id"],
-                    "analysis": AnalysisRun(
-                        target=str(row.get("root_input") or row["normalized_target"]),
-                        normalized_target=row["normalized_target"],
-                        target_type=str(row.get("target_type") or "domain"),
-                        depth=int(row.get("depth") or 0),
-                        discovered_from=row.get("discovered_from"),
-                        discovery_reason=row.get("discovery_reason"),
-                        discovery_kind=row.get("discovery_kind"),
-                        is_seed=bool(row.get("is_seed")),
-                        payload=payload,
-                        helpers=build_helper_rows(payload),
-                        status=str(row.get("status") or "completed"),
-                    ),
-                }
-            )
-
-        pairings = self._build_pairings(case_id, runs)
-        replace_pairings(case_id, pairings)
-        cluster_payload, graph_payload = self._build_clusters(runs, pairings)
-        replace_cluster(
-            case_id,
-            threshold=self._cluster_threshold,
-            payload=cluster_payload,
-            graph_payload=graph_payload,
-        )
-        update_case_summary(case_id, self._build_summary(runs, pairings, cluster_payload))
-        return {
-            "runs": len(runs),
-            "pairs": len(pairings),
-            "clusters": int(cluster_payload.get("cluster_count", 0)),
-        }
-
-    def _build_pairings(self, case_id: str, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        pairings: list[dict[str, Any]] = []
-        successful = [item for item in runs if item["analysis"].status == "completed"]
-
-        for left, right in itertools.combinations(successful, 2):
-            if _same_site(left["analysis"].normalized_target, right["analysis"].normalized_target):
-                # A domain always "matches" its own subdomains — comparing
-                # gnawo.com to www.gnawo.com proves nothing and used to
-                # flood the results with meaningless 100% pairs.
-                continue
-            pairing = _pair_record(
-                scope="within_case",
-                left_run_id=left["id"],
-                right_run_id=right["id"],
-                left=left["analysis"],
-                right=right["analysis"],
-            )
-            if pairing is not None:
-                pairings.append(pairing)
-
-        for left in successful:
-            for historical in find_historical_candidates(
-                case_id,
-                left["analysis"].normalized_target,
-                left["analysis"].helpers,
-            ):
-                if _same_site(left["analysis"].normalized_target, historical["normalized_target"]):
-                    continue
-                right_payload = dict(historical["payload"] or {})
-                right_analysis = AnalysisRun(
-                    target=historical["root_input"],
-                    normalized_target=historical["normalized_target"],
-                    target_type=historical["target_type"],
-                    depth=historical["depth"],
-                    discovered_from=historical.get("discovered_from"),
-                    discovery_reason=historical.get("discovery_reason"),
-                    discovery_kind=historical.get("discovery_kind"),
-                    is_seed=historical.get("is_seed", False),
-                    payload=right_payload,
-                    helpers={},
+        seeds = [item for item in runs if item["analysis"].is_seed]
+        top_findings: list[dict[str, Any]] = []
+        for item in seeds:
+            label = pairing_label(item["analysis"].payload)
+            try:
+                links = check.links_for(label, limit=3)
+            except Exception:
+                links = []
+            for link in links:
+                top_findings.append(
+                    {
+                        "target": label,
+                        "linked_target": link.get("target"),
+                        "score": link.get("score"),
+                        "confidence": link.get("confidence"),
+                        "strength": link.get("strength"),
+                    }
                 )
-                pairing = _pair_record(
-                    scope="historical",
-                    left_run_id=left["id"],
-                    right_run_id=historical["id"],
-                    left=left["analysis"],
-                    right=right_analysis,
-                )
-                if pairing is not None:
-                    pairings.append(pairing)
-
-        pairings = _apply_subdomain_rollup(runs, pairings)
-        pairings.sort(key=lambda item: (item["scope"], -item["score"], item["left_target"], item["right_target"]))
-        return pairings
-
-    def _build_clusters(
-        self,
-        runs: list[dict[str, Any]],
-        pairings: list[dict[str, Any]],
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        member_details = _cluster_member_details(runs, pairings)
-        labels = {pairing_label(item["analysis"].payload) for item in runs}
-        labels.update(member_details)
-        labels.update(item["left_target"] for item in pairings)
-        labels.update(item["right_target"] for item in pairings)
-
-        union_find = cluster.UnionFind()
-        for label in labels:
-            union_find.find(label)
-
-        edges_used: list[dict[str, Any]] = []
-        for item in pairings:
-            if item["score"] < self._cluster_threshold:
-                continue
-            payload = item["payload"]
-            matches = payload.get("matches", {}) or {}
-            left = item["left_target"]
-            right = item["right_target"]
-            union_find.union(left, right)
-            edges_used.append(
-                {
-                    "a": left,
-                    "b": right,
-                    "score": item["score"],
-                    "paths": list(matches.keys()),
-                    "has_strong": bool(cluster.STRONG_PATHS & set(matches.keys())),
-                    # Carry the pairing id so the graph can point each edge back
-                    # at the exact pair whose evidence the summary page renders.
-                    "pairing_id": item["id"],
-                }
-            )
-
-        groups = union_find.groups()
-        cluster_items: list[dict[str, Any]] = []
-        isolates: list[str] = []
-        for members in groups.values():
-            target_members = sorted(members)
-            if len(target_members) < 2:
-                isolates.extend(target_members)
-                continue
-            members, observation_edges = _cluster_entity_members(target_members, member_details)
-            item = cluster._summarize_cluster(target_members, edges_used)
-            item["members"] = members
-            item["member_count"] = len(members)
-            item["target_count"] = len(target_members)
-            item["related_ips"] = [member for member in members if member not in target_members]
-            item["related_ip_count"] = len(item["related_ips"])
-            item["edges"] = [*item.get("edges", []), *observation_edges]
-            cluster_items.append(item)
-        cluster_items.sort(key=lambda item: (-item["max_edge_score"], -item.get("target_count", len(item["members"]))))
-        isolates.sort()
-
-        all_entities = set(isolates)
-        for item in cluster_items:
-            all_entities.update(item["members"])
-
-        result = {
-            "threshold": self._cluster_threshold,
-            "domain_count": len(labels),
-            "entity_count": len(all_entities),
-            "cluster_count": len(cluster_items),
-            "edge_count": len(edges_used),
-            "clusters": cluster_items,
-            "isolates": isolates,
-        }
-        # Reduce the graph to the *submitted* domains plus the subdomains that
-        # bridge one submitted domain to another. Everything else (non-submitted
-        # domains, IPs, non-bridging subdomains) is dropped so the connection map
-        # shows only the story that matters: who was asked about, and what links
-        # them.
-        submitted = {
-            pairing_label(run["analysis"].payload)
-            for run in runs
-            if run["analysis"].is_seed
-        }
-        graph = cluster.submitted_bridge_graph(
-            cluster.build_graph_payload(result), basic._apex, submitted
-        )
-        # Point each apex↔apex evidence edge at the apex pairing that the summary
-        # page shows for those two domains, so clicking a relationship in the
-        # graph and selecting the same two entities on the summary render the
-        # identical evidence packet. (Bridge-subdomain edges keep their own
-        # pairing ids, threaded through build_graph_payload.)
-        apex_pairing_id: dict[frozenset[str], str] = {}
-        for item in pairings:
-            left, right = item["left_target"], item["right_target"]
-            if basic._apex(left) == left and basic._apex(right) == right and left != right:
-                apex_pairing_id[frozenset((left, right))] = item["id"]
-        for edge in graph.get("edges", []):
-            if edge.get("kind") == "membership":
-                continue
-            pairing_id = apex_pairing_id.get(frozenset((edge["from"], edge["to"])))
-            if pairing_id:
-                edge["pairing_id"] = pairing_id
-        return result, graph
-
-    def _build_summary(
-        self,
-        runs: list[dict[str, Any]],
-        pairings: list[dict[str, Any]],
-        cluster_payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        within_case = [item for item in pairings if item["scope"] == "within_case"]
-        historical = [item for item in pairings if item["scope"] == "historical"]
-        top_findings = [
-            {
-                "pairing_id": item["id"],
-                "scope": item["scope"],
-                "left_target": item["left_target"],
-                "right_target": item["right_target"],
-                "score": item["score"],
-                "top_evidence": item["payload"].get("top_paths", []),
-                "summary": item["payload"].get("summary"),
-            }
-            for item in sorted(pairings, key=lambda entry: entry["score"], reverse=True)[:3]
-        ]
+        top_findings.sort(key=lambda entry: entry.get("score") or 0, reverse=True)
+        top_findings = top_findings[:5]
         return {
-            "target_count": len([item for item in runs if item["analysis"].is_seed]),
+            "target_count": len(seeds),
             "run_count": len(runs),
-            "within_case_pair_count": len(within_case),
-            "historical_pair_count": len(historical),
-            "cluster_count": cluster_payload.get("cluster_count", 0),
             "top_findings": top_findings,
-            "highlights": [item["summary"] for item in top_findings if item.get("summary")],
+            "highlights": [
+                f"{entry['target']} ↔ {entry['linked_target']} (score {entry['score']})"
+                for entry in top_findings
+            ],
         }
 
     def _log(self, job_id: str, level: str, message: str, *, stage: str | None = None) -> None:
@@ -566,171 +354,6 @@ class CaseRuntime:
         )
 
 
-def _same_site(left: str, right: str) -> bool:
-    """True when both targets are hostnames under the same registrable apex."""
-    left = str(left or "").strip().lower()
-    right = str(right or "").strip().lower()
-    if not left or not right:
-        return False
-    if ip_intel.is_ip(left) or ip_intel.is_ip(right):
-        return left == right
-    return basic._apex(left) == basic._apex(right)
-
-
-# A subdomain link credits its apex at a slight discount: the matched
-# infrastructure was the subdomain's, one indirection from the apex itself.
-_SUBDOMAIN_ROLLUP_DISCOUNT = 0.8
-
-
-def _rollup_summary(info: dict[str, Any]) -> str:
-    return (
-        f"Main-domain link inferred from {info['via_left']} ↔ {info['via_right']} "
-        f"(inherited {info['source_score']} → {info['score']} from that overlap)."
-    )
-
-
-def _apply_subdomain_rollup(
-    runs: list[dict[str, Any]],
-    pairings: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Make a subdomain's cross-domain link count for its apex ("main domain").
-
-    A follow-up subdomain like ``vpn.a.com`` can link hard to a different apex
-    (``b.com``) while the apexes themselves share nothing directly — both hide
-    behind Cloudflare — so the operator-level link ``a.com ↔ b.com`` never
-    surfaces. We take the single strongest such subdomain link per apex pair
-    (max-only, no stacking), discount it slightly, and roll it up onto the apex
-    pairing so the main-domain relationship carries the weight and the apex
-    joins the subdomain's cluster.
-    """
-    # apex label -> a scanned apex-level run id we can attach a pairing to.
-    apex_run: dict[str, str] = {}
-    for run in runs:
-        analysis = run["analysis"]
-        if analysis.target_type != "domain":
-            continue
-        label = analysis.normalized_target
-        if label == basic._apex(label):
-            apex_run.setdefault(label, run["id"])
-
-    # Best (max) discounted rollup per apex pair, with its source sub-pairing.
-    best: dict[tuple[str, str], dict[str, Any]] = {}
-    for pairing in pairings:
-        if pairing["scope"] != "within_case":
-            continue
-        left, right = pairing["left_target"], pairing["right_target"]
-        if ip_intel.is_ip(left) or ip_intel.is_ip(right):
-            continue
-        apex_l, apex_r = basic._apex(left), basic._apex(right)
-        if apex_l == apex_r:
-            continue
-        # At least one endpoint must be an actual subdomain; a direct
-        # apex↔apex pairing already credits the main domains.
-        if left == apex_l and right == apex_r:
-            continue
-        if apex_l not in apex_run or apex_r not in apex_run:
-            continue  # apex was never scanned — nothing to attach to
-        rolled = int(round(pairing["score"] * _SUBDOMAIN_ROLLUP_DISCOUNT))
-        if rolled <= 0:
-            continue
-        key = tuple(sorted((apex_l, apex_r)))
-        # This subdomain pairing is now represented by an apex pairing, so the
-        # frontend folds it away and shows it only when the apex connection is
-        # expanded ("compare main domains" view).
-        pairing["payload"]["folded_into_apex"] = [key[0], key[1]]
-        current = best.get(key)
-        if current is None or rolled > current["score"]:
-            best[key] = {
-                "score": rolled,
-                "apex_a": key[0],
-                "apex_b": key[1],
-                "via_left": left,
-                "via_right": right,
-                "source_score": pairing["score"],
-                "source_payload": pairing["payload"],
-            }
-
-    if not best:
-        return pairings
-
-    # Existing direct apex↔apex within-case pairings, for de-duplication.
-    direct: dict[tuple[str, str], dict[str, Any]] = {}
-    for pairing in pairings:
-        if pairing["scope"] != "within_case":
-            continue
-        l, r = pairing["left_target"], pairing["right_target"]
-        if (l == basic._apex(l) and r == basic._apex(r)
-                and basic._apex(l) != basic._apex(r)):
-            direct[tuple(sorted((l, r)))] = pairing
-
-    for key, info in best.items():
-        provenance = {
-            "kind": "subdomain_rollup",
-            "via": [info["via_left"], info["via_right"]],
-            "source_score": info["source_score"],
-            "discount": _SUBDOMAIN_ROLLUP_DISCOUNT,
-        }
-        existing = direct.get(key)
-        if existing is not None:
-            # Keep one row per apex pair: take the stronger of the direct
-            # evidence and the rolled-up subdomain link.
-            if info["score"] > existing["score"]:
-                existing["score"] = info["score"]
-                existing["payload"]["derived_boost"] = provenance
-                existing["payload"]["summary"] = _rollup_summary(info)
-            continue
-
-        src = info["source_payload"] or {}
-        rollup_evidence = {
-            "id": "subdomain_rollup",
-            "type": "subdomain_rollup",
-            "label": "Linked through a subdomain",
-            "category": "Infrastructure",
-            "importance": "strong",
-            "description": (
-                f"{info['via_left']} ↔ {info['via_right']} overlap is attributed "
-                f"to the apex domains that own those hostnames."
-            ),
-            "why_it_matters": (
-                "A subdomain caught sharing infrastructure with another domain "
-                "implicates the operator behind its apex, even when the apexes "
-                "hide behind a CDN and share nothing directly."
-            ),
-            "caveat": (
-                "Inferred link: the apexes did not match directly — the evidence "
-                "below belongs to the subdomain that carried it."
-            ),
-            "matched_values": [info["via_left"], info["via_right"]],
-        }
-        payload = {
-            "scope": "within_case",
-            "a_domain": info["apex_a"],
-            "b_domain": info["apex_b"],
-            "score": info["score"],
-            "match_count": 0,
-            "derived": provenance,
-            "matches": {},
-            "top_paths": src.get("top_paths", []),
-            "subdomain_overlap": src.get("subdomain_overlap"),
-            "summary": _rollup_summary(info),
-            "evidence_items": [rollup_evidence, *(src.get("evidence_items") or [])],
-        }
-        pairings.append({
-            "id": str(uuid.uuid4()),
-            "scope": "within_case",
-            "left_run_id": apex_run[info["apex_a"]],
-            "right_run_id": apex_run[info["apex_b"]],
-            "left_target": info["apex_a"],
-            "right_target": info["apex_b"],
-            "score": info["score"],
-            "match_count": 0,
-            "payload": payload,
-        })
-
-    return pairings
-
-
 def _job_percent(stage: str, completed_targets: int, failed_targets: int, total_targets: int) -> int:
     if total_targets <= 0:
         return 5
@@ -744,270 +367,6 @@ def _job_percent(stage: str, completed_targets: int, failed_targets: int, total_
     if stage == "notification":
         return 95
     return 0
-
-
-def _cluster_member_details(
-    runs: list[dict[str, Any]],
-    pairings: list[dict[str, Any]],
-) -> dict[str, list[dict[str, str]]]:
-    details: dict[str, list[dict[str, str]]] = {}
-    current_run_ids = {item["id"] for item in runs}
-
-    def merge(label: str, observed_ips: list[dict[str, Any]]) -> None:
-        entries = details.setdefault(label, [])
-        seen = {(item["ip"], item["source"]) for item in entries}
-        for item in observed_ips:
-            ip = str(item.get("ip") or "").strip()
-            source = str(item.get("source") or "observed").strip() or "observed"
-            key = (ip, source)
-            if not ip or key in seen:
-                continue
-            seen.add(key)
-            entries.append({"ip": ip, "source": source})
-        entries.sort(key=lambda item: (item["ip"], item["source"]))
-
-    for item in runs:
-        analysis = item["analysis"]
-        merge(
-            pairing_label(analysis.payload),
-            list(analysis.helpers.get("observed_ips") or []),
-        )
-
-    historical_ids = {
-        pair["left_run_id"]
-        for pair in pairings
-        if pair["left_run_id"] not in current_run_ids
-    } | {
-        pair["right_run_id"]
-        for pair in pairings
-        if pair["right_run_id"] not in current_run_ids
-    }
-    for row in list_search_runs_by_ids(sorted(historical_ids)):
-        payload = row.get("payload") or {}
-        merge(pairing_label(payload), list(row.get("observed_ips") or []))
-
-    return details
-
-
-def _cluster_entity_members(
-    target_members: list[str],
-    member_details: dict[str, list[dict[str, str]]],
-) -> tuple[list[str], list[dict[str, Any]]]:
-    members = list(target_members)
-    member_set = set(target_members)
-    observation_edges: list[dict[str, Any]] = []
-    seen_edges: set[tuple[str, str, str]] = set()
-
-    for label in target_members:
-        for item in member_details.get(label, []):
-            ip = item["ip"]
-            source = item["source"]
-            if ip not in member_set:
-                member_set.add(ip)
-                members.append(ip)
-            edge_key = (label, ip, source)
-            if edge_key in seen_edges:
-                continue
-            seen_edges.add(edge_key)
-            observation_edges.append(
-                {
-                    "a": label,
-                    "b": ip,
-                    "score": 1,
-                    "paths": [f"observed_ip:{source}"],
-                    "has_strong": False,
-                }
-            )
-
-    return members, observation_edges
-
-
-def _pair_record(
-    *,
-    scope: str,
-    left_run_id: str,
-    right_run_id: str,
-    left: AnalysisRun,
-    right: AnalysisRun,
-) -> dict[str, Any] | None:
-    pair = check.compare_pair(left.payload, right.payload)
-    if (pair["match_count"] == 0
-            and not pair["urlscan_cross_refs"]
-            and not (pair.get("subdomain_overlap") or {}).get("shared_labels")):
-        return None
-
-    left_target = pairing_label(left.payload)
-    right_target = pairing_label(right.payload)
-    pair["scope"] = scope
-    pair["a_domain"] = left_target
-    pair["b_domain"] = right_target
-    pair["top_paths"] = sorted(
-        pair["matches"].keys(),
-        key=lambda value: -check.MATCH_WEIGHTS.get(value, 5),
-    )[:5]
-    pair["summary"] = _pair_summary(pair)
-    pair["evidence_items"] = _pair_evidence(pair)
-
-    return {
-        "id": str(uuid.uuid4()),
-        "scope": scope,
-        "left_run_id": left_run_id,
-        "right_run_id": right_run_id,
-        "left_target": left_target,
-        "right_target": right_target,
-        "score": int(pair["score"]),
-        "match_count": int(pair["match_count"]),
-        "payload": pair,
-    }
-
-
-def _pair_summary(pair: dict[str, Any]) -> str:
-    paths = pair.get("top_paths", []) or []
-    labels: list[str] = []
-    for path in paths:
-        label = evidence_definition(path).label
-        if label not in labels:
-            labels.append(label)
-        if len(labels) == 3:
-            break
-    if not labels:
-        return "The pair only shared low-level context."
-    if len(labels) == 1:
-        summary = labels[0]
-    else:
-        summary = ", ".join(labels[:-1]) + f", and {labels[-1]}"
-    return f"Overlap driven by {summary.lower()}."
-
-
-def _pair_evidence(pair: dict[str, Any]) -> list[dict[str, Any]]:
-    evidence_items: list[dict[str, Any]] = []
-    cert_quality = pair.get("cert_quality") or {}
-    freshness = pair.get("freshness") or {}
-
-    for path, value in (pair.get("matches") or {}).items():
-        definition = evidence_definition(path)
-        importance = _evidence_importance(path, definition.base_importance, cert_quality, freshness)
-        evidence_items.append(
-            {
-                "id": path,
-                "type": path,
-                "label": definition.label,
-                "category": definition.category,
-                "importance": importance,
-                "description": definition.description,
-                "why_it_matters": definition.why_it_matters,
-                "caveat": _evidence_caveat(path, definition.caveat, cert_quality, freshness),
-                "matched_values": value if isinstance(value, list) else [value],
-            }
-        )
-
-    for index, item in enumerate(pair.get("urlscan_cross_refs") or []):
-        evidence_items.append(
-            {
-                "id": f"urlscan-cross-ref-{index}",
-                "type": "urlscan_cross_refs",
-                "label": "Shared urlscan cross-reference",
-                "category": "Web content",
-                "importance": "supporting" if item.get("relationship") != "shared_referrer" else "strong",
-                "description": "urlscan observed both targets on a shared or related rendered page context.",
-                "why_it_matters": "It can show embedding, shared referrers, or adjacent hosting history.",
-                "caveat": "Rendered-scan data needs manual review because edges and third-party content can add noise.",
-                "matched_values": [item],
-            }
-        )
-
-    shared_labels = (pair.get("subdomain_overlap") or {}).get("shared_labels") or []
-    if shared_labels:
-        evidence_items.append(
-            {
-                "id": "subdomain_overlap",
-                "type": "subdomain_overlap",
-                "label": "Shared subdomain naming",
-                "category": "Infrastructure",
-                "importance": "strong" if len(shared_labels) >= 4 else "supporting",
-                "description": "Both targets expose the same non-default subdomain labels under different apexes.",
-                "why_it_matters": "A reused private naming convention points at one operator standing up the same internal services behind each domain.",
-                "caveat": "Generic labels are filtered, but a small overlap can still be coincidental — weigh it alongside other signals.",
-                "matched_values": shared_labels,
-            }
-        )
-    return evidence_items
-
-
-def _evidence_importance(
-    path: str,
-    base_importance: str,
-    cert_quality: dict[str, Any],
-    freshness: dict[str, Any],
-) -> str:
-    if path == "tls_certs.probes[*].fingerprint_sha256":
-        quality = cert_quality.get("quality")
-        if quality == "junk":
-            return "low-signal"
-        if quality == "weak":
-            return "strong"
-        return "decisive"
-    if path == "ssh_host_keys.probes[*].fingerprint_sha256" and freshness.get("platform_demotes_ssh"):
-        return "supporting"
-    if path in {"non_cf_ips", "dns.A", "hackertarget.hits[*].ip", "urlscan.hits[*].ip", "circl_pdns.records[*].rdata"}:
-        quality = freshness.get("ip_match_quality")
-        if quality == "historical":
-            return "supporting"
-        if quality == "mixed":
-            return "strong"
-        if quality == "current":
-            return "strong"
-    return base_importance
-
-
-def _evidence_caveat(
-    path: str,
-    default_caveat: str,
-    cert_quality: dict[str, Any],
-    freshness: dict[str, Any],
-) -> str:
-    caveats = [default_caveat]
-    if path == "tls_certs.probes[*].fingerprint_sha256" and cert_quality.get("reason"):
-        caveats.append(str(cert_quality["reason"]))
-    if path == "ssh_host_keys.probes[*].fingerprint_sha256" and freshness.get("platform_demotes_ssh"):
-        caveats.append("The hosting platform context suggests this SSH key may belong to shared platform infrastructure.")
-    if path in {"non_cf_ips", "dns.A", "hackertarget.hits[*].ip", "urlscan.hits[*].ip", "circl_pdns.records[*].rdata"} and freshness.get("ip_match_quality"):
-        caveats.append(f"IP overlap context: {freshness['ip_match_quality']}.")
-    return " ".join(caveats)
-
-
-def build_case_response(case_row: dict[str, Any]) -> dict[str, Any]:
-    summary = case_row.get("summary") or {}
-    return {
-        "id": case_row["id"],
-        "title": case_row["title"],
-        "status": case_row["status"],
-        "input_mode": case_row["input_mode"],
-        "summary": _summary_text(summary),
-        "progress": case_row.get("job_percent", 0),
-        "job_status": case_row.get("job_status"),
-        "pair_count": summary.get("within_case_pair_count", 0) + summary.get("historical_pair_count", 0),
-        "cluster_count": summary.get("cluster_count", 0),
-        "targets": list(case_row.get("targets") or []),
-        "created_at": case_row.get("created_at"),
-        "updated_at": case_row.get("updated_at"),
-        "started_at": case_row.get("started_at"),
-        "finished_at": case_row.get("finished_at"),
-        "job_id": case_row.get("job_id"),
-        "job": build_job_response(case_row),
-        "metrics": {
-            "pairs": summary.get("within_case_pair_count", 0) + summary.get("historical_pair_count", 0),
-            "clusters": summary.get("cluster_count", 0),
-            "targets": summary.get("target_count", case_row.get("total_targets", 0)),
-        },
-        "highlights": summary.get("highlights", []),
-        "counts": {
-            "submitted": case_row.get("total_targets", 0),
-            "successful": case_row.get("successful_targets", 0),
-            "failed": case_row.get("failed_targets", 0),
-        },
-        "raw_summary": summary,
-    }
 
 
 def build_job_response(row: dict[str, Any]) -> dict[str, Any]:
@@ -1048,95 +407,6 @@ def build_job_response(row: dict[str, Any]) -> dict[str, Any]:
         "summary": _job_summary(row),
         "error": row.get("error"),
     }
-
-
-# Mirrors the importance ranking used by the frontend so the "top" evidence
-# shipped with the slim pairs list matches what the UI treats as strongest.
-_EVIDENCE_IMPORTANCE_RANK = {
-    "decisive": 0,
-    "key": 0,
-    "anchoring": 0,
-    "strong": 1,
-    "supporting": 2,
-    "low-signal": 3,
-    "low_signal": 3,
-}
-
-# How many of the strongest evidence items ship inline with the pairs list,
-# and how many matched values each of those items keeps. The full evidence
-# set stays available via GET /api/cases/{case_id}/pairs/{pair_id}.
-TOP_EVIDENCE_LIMIT = 3
-_TOP_EVIDENCE_VALUE_LIMIT = 3
-
-
-def _evidence_rank(item: dict[str, Any]) -> int:
-    importance = str(item.get("importance") or "").lower()
-    return _EVIDENCE_IMPORTANCE_RANK.get(importance, 2)
-
-
-def _slim_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
-    slim = dict(item)
-    matched_values = slim.get("matched_values")
-    if isinstance(matched_values, list) and len(matched_values) > _TOP_EVIDENCE_VALUE_LIMIT:
-        slim["matched_values"] = matched_values[:_TOP_EVIDENCE_VALUE_LIMIT]
-        slim["matched_value_count"] = len(matched_values)
-    return slim
-
-
-def build_pairs_response(case_id: str) -> dict[str, Any]:
-    rows = list_pairings(case_id)
-    case_inputs = load_case_inputs(case_id)
-    seed_set = {inp["normalized_target"] for inp in case_inputs if inp.get("normalized_target")}
-    items = []
-    for row in rows:
-        payload = row.get("payload") or {}
-        left = row["left_target"]
-        right = row["right_target"]
-        is_seed_pair = (left in seed_set and right in seed_set)
-        evidence_items = payload.get("evidence_items") or []
-        evidence_counts: dict[str, int] = {}
-        for evidence in evidence_items:
-            category = str(evidence.get("category") or "Other")
-            evidence_counts[category] = evidence_counts.get(category, 0) + 1
-        top_evidence = [
-            _slim_evidence_item(evidence)
-            for evidence in sorted(evidence_items, key=_evidence_rank)[:TOP_EVIDENCE_LIMIT]
-        ]
-        items.append(
-            {
-                "id": row["id"],
-                "scope": row["scope"],
-                "status": "completed",
-                "left": left,
-                "right": right,
-                "score": row["score"],
-                "confidence": payload.get("confidence", check.confidence_from_score(row["score"])),
-                "strength": payload.get("strength"),
-                "summary": payload.get("summary"),
-                "evidence": top_evidence,
-                "evidence_count": len(evidence_items),
-                "evidence_counts": evidence_counts,
-                "top_paths": payload.get("top_paths", []),
-                "match_count": row["match_count"],
-                "is_seed_pair": is_seed_pair,
-                # Subdomain pair already represented by an apex rollup — hidden
-                # from the main "compare main domains" list, shown on expand.
-                "folded_into_apex": payload.get("folded_into_apex") or None,
-                # Apex pairing that inherited a subdomain link's weight.
-                "derived": bool(payload.get("derived") or payload.get("derived_boost")),
-            }
-        )
-    return {
-        "pairs": items,
-        "seed_targets": sorted(seed_set),
-    }
-
-
-def _summary_text(summary: dict[str, Any]) -> str:
-    target_count = int(summary.get("target_count", 0))
-    overlap_count = int(summary.get("within_case_pair_count", 0)) + int(summary.get("historical_pair_count", 0))
-    cluster_count = int(summary.get("cluster_count", 0))
-    return f"{target_count} targets scanned, {overlap_count} overlaps recorded, {cluster_count} clusters built."
 
 
 def _job_summary(row: dict[str, Any]) -> str:
