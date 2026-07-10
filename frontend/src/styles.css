@@ -85,9 +85,26 @@
   --pre-bg: #0f1720;
   --pre-text: #e6eef3;
   --graph-glow: rgba(10, 126, 164, 0.08);
-  --graph-bg: rgba(255, 255, 255, 0.96);
+  --graph-bg: #f7f8fa;
+  --graph-stage-border: rgba(15, 26, 36, 0.14);
+  --graph-stage-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
   --graph-node-ring: #ffffff;
-  --graph-label-halo: rgba(255, 255, 255, 0.92);
+  --graph-node-icon: rgba(255, 255, 255, 0.88);
+  --graph-label: #2f3a45;
+  --graph-label-muted: #6b7280;
+  --graph-label-halo: rgba(247, 248, 250, 0.94);
+  --graph-edge-label: #4b5563;
+  --graph-edge-label-bg: rgba(247, 248, 250, 0.92);
+  --graph-panel-bg: #ffffff;
+  --graph-panel-border: rgba(15, 26, 36, 0.12);
+  --graph-panel-text: #0e161d;
+  --graph-panel-muted: #57646f;
+  --graph-input-bg: #f3f5f7;
+  --graph-input-text: #0e161d;
+  --graph-input-border: rgba(15, 26, 36, 0.16);
+  --graph-empty-bg: rgba(255, 255, 255, 0.94);
+  --graph-empty-text: #0e161d;
+  --graph-empty-muted: #57646f;
   --state-muted-bg: rgba(15, 26, 36, 0.05);
   --state-error-border: rgba(186, 74, 61, 0.2);
   --tooltip-shadow: 0 2px 8px rgba(14, 22, 29, 0.1);
@@ -146,8 +163,25 @@
   --pre-text: #e8f0ff;
   --graph-glow: rgba(53, 208, 200, 0.1);
   --graph-bg: #050b10;
+  --graph-stage-border: rgba(83, 144, 199, 0.24);
+  --graph-stage-shadow: inset 0 0 0 1px rgba(12, 27, 45, 0.8);
   --graph-node-ring: rgba(8, 15, 23, 0.9);
+  --graph-node-icon: rgba(255, 255, 255, 0.86);
+  --graph-label: #dbeafe;
+  --graph-label-muted: #9fb2c8;
   --graph-label-halo: rgba(5, 11, 16, 0.88);
+  --graph-edge-label: #bfd7ef;
+  --graph-edge-label-bg: rgba(5, 11, 16, 0.94);
+  --graph-panel-bg: #081525;
+  --graph-panel-border: rgba(83, 144, 199, 0.24);
+  --graph-panel-text: #e5f2ff;
+  --graph-panel-muted: #92a6bd;
+  --graph-input-bg: #0b1828;
+  --graph-input-text: #e5f2ff;
+  --graph-input-border: rgba(83, 144, 199, 0.28);
+  --graph-empty-bg: #0b1828;
+  --graph-empty-text: #e5f2ff;
+  --graph-empty-muted: #92a6bd;
   --state-muted-bg: rgba(148, 163, 184, 0.06);
   --state-error-border: rgba(248, 113, 113, 0.3);
   --tooltip-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
@@ -1056,7 +1090,7 @@ a:focus-visible {
   width: 100%;
   min-height: 460px;
   display: block;
-  background: #06111d;
+  background: var(--graph-bg);
 }
 
 .graph-workbench {
@@ -1069,13 +1103,10 @@ a:focus-visible {
 .graph-stage {
   position: relative;
   overflow: hidden;
-  border: 1px solid rgba(83, 144, 199, 0.24);
+  border: 1px solid var(--graph-stage-border);
   border-radius: var(--radius-panel);
-  background: #06111d;
-  box-shadow: inset 0 0 0 1px rgba(12, 27, 45, 0.8);
-  --graph-label-halo: rgba(6, 17, 29, 0.92);
-  --graph-node-ring: #081525;
-  --graph-node-icon: rgba(255, 255, 255, 0.86);
+  background: var(--graph-bg);
+  box-shadow: var(--graph-stage-shadow);
 }
 
 .graph-empty-state {
@@ -1086,22 +1117,22 @@ a:focus-visible {
   display: grid;
   gap: 4px;
   padding: 14px 16px;
-  border: 1px solid rgba(83, 144, 199, 0.24);
+  border: 1px solid var(--graph-panel-border);
   border-radius: var(--radius-panel);
-  background: #0b1828;
-  color: #e5f2ff;
+  background: var(--graph-empty-bg);
+  color: var(--graph-empty-text);
   text-align: center;
   box-shadow: var(--shadow);
   pointer-events: none;
 }
 
 .graph-empty-state span {
-  color: #92a6bd;
+  color: var(--graph-empty-muted);
   font-size: 0.84rem;
 }
 
 .graph-node-label {
-  fill: #dbeafe;
+  fill: var(--graph-label);
   font-family: var(--font-display);
   font-size: 0.76rem;
   font-weight: 400;
@@ -1114,7 +1145,7 @@ a:focus-visible {
 }
 
 .graph-edge-label-text {
-  fill: #bfd7ef;
+  fill: var(--graph-edge-label);
   font-family: var(--font-display);
   font-size: 0.62rem;
   letter-spacing: 0.01em;
@@ -1122,7 +1153,7 @@ a:focus-visible {
 }
 
 .graph-edge-label-bg {
-  fill: #06111d;
+  fill: var(--graph-edge-label-bg);
   opacity: 0.94;
 }
 
@@ -1142,10 +1173,10 @@ a:focus-visible {
   align-items: flex-end;
   gap: 10px 12px;
   padding: 12px;
-  border: 1px solid rgba(83, 144, 199, 0.24);
+  border: 1px solid var(--graph-panel-border);
   border-radius: var(--radius-panel);
-  background: #071321;
-  color: #dbeafe;
+  background: var(--graph-panel-bg);
+  color: var(--graph-panel-text);
 }
 
 .graph-control {
@@ -1155,7 +1186,7 @@ a:focus-visible {
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
-  color: #92a6bd;
+  color: var(--graph-panel-muted);
 }
 
 .graph-control.compact {
@@ -1178,10 +1209,10 @@ a:focus-visible {
 .graph-control input[type="search"] {
   width: 100%;
   padding: 7px 10px;
-  border: 1px solid rgba(83, 144, 199, 0.28);
+  border: 1px solid var(--graph-input-border);
   border-radius: var(--radius-panel);
-  background: #0b1828;
-  color: #e5f2ff;
+  background: var(--graph-input-bg);
+  color: var(--graph-input-text);
   font-size: 0.84rem;
   font-weight: 500;
   text-transform: none;
@@ -1226,7 +1257,7 @@ a:focus-visible {
   font-weight: 500;
   text-transform: capitalize;
   letter-spacing: normal;
-  color: #dbeafe;
+  color: var(--graph-panel-text);
   cursor: pointer;
   min-width: 0;
   white-space: nowrap;
@@ -1240,9 +1271,9 @@ a:focus-visible {
 }
 
 .graph-controls .secondary-button {
-  background: #0b1828;
-  border-color: rgba(83, 144, 199, 0.32);
-  color: #dbeafe;
+  background: var(--graph-input-bg);
+  border-color: var(--graph-input-border);
+  color: var(--graph-panel-text);
 }
 
 .graph-controls .primary-button {
@@ -1347,15 +1378,15 @@ a:focus-visible {
   max-height: 100%;
   overflow: auto;
   padding: 14px;
-  border: 1px solid rgba(83, 144, 199, 0.24);
+  border: 1px solid var(--graph-panel-border);
   border-radius: var(--radius-panel);
-  background: #081525;
-  color: #e5f2ff;
+  background: var(--graph-panel-bg);
+  color: var(--graph-panel-text);
 }
 
 .graph-inspector .muted,
 .graph-inspector .card-copy {
-  color: #92a6bd;
+  color: var(--graph-panel-muted);
 }
 
 .graph-inspector-head {
@@ -1389,7 +1420,7 @@ a:focus-visible {
 }
 
 .graph-inspector-meta dt {
-  color: #7f98b2;
+  color: var(--graph-panel-muted);
   font-size: 0.7rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -1398,6 +1429,15 @@ a:focus-visible {
 .graph-inspector-meta dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.graph-selection-summary {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.graph-selection-summary strong {
+  color: var(--graph-panel-text);
 }
 
 .graph-inspector .simple-list {
@@ -2112,9 +2152,6 @@ a:focus-visible {
   flex-direction: column;
   gap: 14px;
   margin-bottom: 18px;
-  position: sticky;
-  top: 12px;
-  z-index: 5;
 }
 
 .selection-row {

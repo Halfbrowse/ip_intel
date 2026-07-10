@@ -408,6 +408,9 @@ const INTERACTIVE_RENDERER_JS = `
 
   function showEdge(e) {
     detailHeader(e.from + " \\u2194 " + e.to);
+    var selected = document.createElement("p");
+    selected.textContent = "Selected link: " + e.from + " to " + e.to;
+    detail.appendChild(selected);
     var p = document.createElement("p");
     p.textContent = "What these two have in common:";
     detail.appendChild(p);
@@ -426,26 +429,11 @@ const INTERACTIVE_RENDERER_JS = `
       .sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
     detailHeader(n.label);
     var p = document.createElement("p");
-    p.textContent = "Connected to " + related.length + (related.length === 1 ? " other domain:" : " other domains:");
+    p.textContent = "Selected domain: " + n.label;
     detail.appendChild(p);
-    var ul = document.createElement("ul");
-    related.slice(0, 8).forEach(function (e) {
-      var other = e.from === n.id ? e.to : e.from;
-      var li = document.createElement("li");
-      var strong = document.createElement("strong");
-      strong.textContent = other;
-      li.appendChild(strong);
-      if (e.labels.length) {
-        li.appendChild(document.createTextNode(" \\u2014 " + e.labels.slice(0, 3).join(", ")));
-      }
-      ul.appendChild(li);
-    });
-    if (related.length > 8) {
-      var li = document.createElement("li");
-      li.textContent = "...and " + (related.length - 8) + " more connections.";
-      ul.appendChild(li);
-    }
-    detail.appendChild(ul);
+    var summary = document.createElement("p");
+    summary.textContent = "Visible relationships: " + related.length;
+    detail.appendChild(summary);
   }
 })();
 `;
@@ -2102,13 +2090,16 @@ const ClusterGraph = memo(function ClusterGraph({
             <>
               <div className="graph-inspector-head">
                 <div>
-                  <span className="muted">Relationship</span>
+                  <span className="muted">Selected link</span>
                   <strong>{evidenceType(selectedEdgeData)}</strong>
                 </div>
                 <button className="secondary-button small" onClick={clearFocus} type="button">
                   Clear
                 </button>
               </div>
+              <p className="card-copy graph-selection-summary">
+                <strong>{selectedEdgeData.from}</strong> to <strong>{selectedEdgeData.to}</strong>
+              </p>
               <dl className="graph-inspector-meta">
                 <div>
                   <dt>Source</dt>
@@ -2142,13 +2133,16 @@ const ClusterGraph = memo(function ClusterGraph({
             <>
               <div className="graph-inspector-head">
                 <div>
-                  <span className="muted">Entity</span>
+                  <span className="muted">Selected domain</span>
                   <strong>{selectedNodeData.label || selectedNode}</strong>
                 </div>
                 <button className="secondary-button small" onClick={clearFocus} type="button">
                   Clear
                 </button>
               </div>
+              <p className="card-copy graph-selection-summary">
+                <strong>{selectedNodeData.label || selectedNode}</strong>
+              </p>
               <dl className="graph-inspector-meta">
                 <div>
                   <dt>Type</dt>
@@ -2163,31 +2157,12 @@ const ClusterGraph = memo(function ClusterGraph({
                   <dd>{selectedNodeEdges.length}</dd>
                 </div>
               </dl>
-              <p className="card-copy">
-                Connected to {selectedNodeEdges.length} other
-                {selectedNodeEdges.length === 1 ? " node" : " nodes"}:
-              </p>
-              <ul className="simple-list">
-                {selectedNodeEdges.slice(0, 8).map((edge) => {
-                  const other = edge.from === selectedNode ? edge.to : edge.from;
-                  const labels = evidenceLabels(edge);
-                  return (
-                    <li key={edgeKey(edge)}>
-                      <strong>{other}</strong>
-                      {labels.length > 0 ? ` - ${labels.slice(0, 3).join(", ")}` : ""}
-                    </li>
-                  );
-                })}
-                {selectedNodeEdges.length > 8 ? (
-                  <li>...and {selectedNodeEdges.length - 8} more relationships.</li>
-                ) : null}
-              </ul>
             </>
           ) : (
             <div className="graph-inspector-empty">
               <span className="muted">Inspector</span>
               <strong>Select a node or relationship</strong>
-              <p className="card-copy">Details, evidence, score, tier, and direct neighbors appear here.</p>
+              <p className="card-copy">Details, evidence, score, and tier appear here.</p>
             </div>
           )}
         </aside>
