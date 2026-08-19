@@ -138,6 +138,15 @@ def cluster(overlap_dir: Path, threshold: int) -> dict:
 
     groups = uf.groups()
 
+    # Bucket edges by their final cluster root once, up front, so
+    # _summarize_cluster doesn't have to rescan the *entire* edges_used list
+    # for every cluster (every edge belongs to exactly one final cluster by
+    # construction, so this single pass replaces what was an O(clusters ×
+    # total_edges) scan with O(total_edges)).
+    edges_by_root: dict[str, list[dict]] = defaultdict(list)
+    for edge in edges_used:
+        edges_by_root[uf.find(edge["a"])].append(edge)
+
     # Split real clusters (≥ 2 members) from isolates (singleton domains).
     clusters:  list[dict] = []
     isolates:  list[str]  = []
@@ -145,7 +154,7 @@ def cluster(overlap_dir: Path, threshold: int) -> dict:
         if len(members) < 2:
             isolates.append(members[0])
             continue
-        clusters.append(_summarize_cluster(sorted(members), edges_used))
+        clusters.append(_summarize_cluster(sorted(members), edges_by_root.get(_root, [])))
 
     # Rank clusters: strongest evidence first, then by member count.
     clusters.sort(key=lambda c: (-c["max_edge_score"], -len(c["members"])))

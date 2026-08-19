@@ -25,9 +25,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# The two helpers below are shared with — and owned by — the live graph
+# The helpers below are shared with — and owned by — the live graph
 # engine; import them rather than keeping a second copy.
-from utils.check import confidence_from_score, _is_cloudflare_ip_local
+from utils.check import confidence_from_score, _is_cloudflare_ip_local, _is_generic_email
 
 
 
@@ -57,7 +57,7 @@ LIST_MATCH_FIELDS: dict[str, list[str]] = {
     "hackertarget.hits":    ["ip"],
     "urlscan.hits":         ["ip"],
     "circl_pdns.records":   ["rdata"],
-    "censys.hits":          ["ip"],
+    "censys.hits":          ["ip", "cert_fingerprint_sha256"],
     "shodan.hits":          ["ip"],
     "netlas.hits":          ["ip"],
     "dns.MX":               ["exchange"],
@@ -90,33 +90,6 @@ _GENERIC_VALUE_MARKERS = (
     "not available",
     "select request email form",
 )
-
-
-# Email domains belonging to registrars, hosting providers, and privacy
-# proxies. A WHOIS / contact email at one of these is a registrar role address
-# (abuse@godaddy.com, hostmaster@cloudflare.com) — it identifies the provider,
-# not the domain owner. Two domains "sharing" abuse@godaddy.com share a
-# registrar, nothing more; treat it like a shared Cloudflare IP and never let
-# it stand as an identity match.
-_GENERIC_EMAIL_DOMAINS = (
-    "godaddy.com", "secureserver.net", "namecheap.com", "namecheaphosting.com",
-    "cloudflare.com", "domainsbyproxy.com", "whoisguard.com",
-    "withheldforprivacy.com", "withheldforprivacy.email", "privacyguardian.org",
-    "contactprivacy.com", "privacyprotect.org", "gandi.net", "ovh.net",
-    "ionos.com", "1and1.com", "hostgator.com", "bluehost.com", "googledomains.com",
-    "markmonitor.com", "cscglobal.com", "tucows.com", "enom.com", "enomdomains.com",
-    "publicdomainregistry.com", "wildwestdomains.com", "porkbun.com", "dynadot.com",
-    "name.com", "networksolutions.com", "register.com", "fastdomain.com",
-    "key-systems.net", "1api.net", "hostinger.com", "squarespace.com",
-)
-
-
-def _is_generic_email(text: str) -> bool:
-    """True for registrar/provider/privacy-proxy emails (not owner identity)."""
-    if "@" not in text:
-        return False
-    domain = text.rpartition("@")[2].strip()
-    return any(domain == d or domain.endswith("." + d) for d in _GENERIC_EMAIL_DOMAINS)
 
 
 def _is_generic_value(v) -> bool:
@@ -196,6 +169,26 @@ _DEFAULT_DKIM_SELECTORS = {
     "pm", "ctct1", "ctct2", "sig1", "everlytickey1", "everlytickey2",
 }
 
+# Phone numbers that ship with a theme or get typed in as filler: samples from
+# the ranges reserved for fiction (555-01xx in North America, Ofcom's 7700
+# 900xxx in the UK) and keypad runs. Two sites sharing one of these share a
+# template, not a switchboard. Single-digit repeats (000…, 999…) are rejected
+# by rule rather than enumerated — see _value_ok_for_path.
+_PLACEHOLDER_PHONES = {
+    "1234567", "1234567890", "12345678901", "0123456789", "9876543210",
+    "5551234567", "15551234567", "5550100", "15555550100",
+    "447700900000", "447700900123",
+}
+
+# Burn / null sinks rather than anyone's receiving wallet — a token contract or
+# a "provably unspendable" note can put these on any site.
+_NULL_CRYPTO_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",
+    "0x000000000000000000000000000000000000dead",
+    "1111111111111111111114olvt2",
+    "1bitcoineateraddressdontsendf59kue",
+}
+
 _HOSTNAME_RE = None
 
 
@@ -220,6 +213,19 @@ def _value_ok_for_path(path: str, v) -> bool:
         # Kubernetes fake certs, ...) ship with the proxy software itself —
         # only hostname-shaped names are evidence.
         return isinstance(v, str) and _looks_like_hostname(v)
+    if path in ("page_metadata.phone_numbers", "legal_pages.phones"):
+        if not isinstance(v, str):
+            return False
+        digits = "".join(ch for ch in v if ch.isdigit())
+        if len(digits) < 7 or len(set(digits)) == 1:
+            return False
+        return digits not in _PLACEHOLDER_PHONES
+    if path == "page_metadata.crypto_wallet_values":
+        # Values are "<chain>|<address>" (core.analysis_service._merge_page_metadata).
+        if not isinstance(v, str) or "|" not in v:
+            return False
+        address = v.split("|", 1)[1].strip().lower()
+        return bool(address) and address not in _NULL_CRYPTO_ADDRESSES
     return True
 
 
@@ -388,6 +394,24 @@ MATCH_WEIGHTS: dict[str, int] = {
     # entirely) or a plain dns.A record that may itself be a proxy front, so it
     # sits just below the crypto-fingerprint tier.
     "non_cf_ips":                                  50,
+    # A leaf certificate fingerprint two domains were both seen serving,
+    # according to the paid Censys cert search. Byte-identity of one specific
+    # certificate, so strictly stronger than a shared CN (40, a wildcard string
+    # many hosts legitimately share) and at least as strong as a shared origin
+    # box (non_cf_ips, 50).
+    #
+    # Deliberately *not* in the 90-100 crypto tier that our own probed
+    # fingerprints occupy, for one concrete reason: `assess_cert_match_quality`
+    # cannot see it. That function is what stops a shared default wildcard vhost
+    # from reading as shared operation, and it works by inspecting the matched
+    # cert's CN, issuer and expiry — fields that live on `tls_certs.probes`
+    # entries but not on a Censys hit, which carries the fingerprint alone. An
+    # unqualifiable match must not carry a qualifiable match's weight.
+    #
+    # Raising this to the crypto tier is a real option, but it needs the cert
+    # body captured from `host.services[*].cert` in the search response first,
+    # so the quality assessment can run on it.
+    "censys.hits[*].cert_fingerprint_sha256":       55,
     "dns.A":                                       25,
     "dns.AAAA":                                    25,
     "hackertarget.hits[*].ip":                     20,
@@ -423,6 +447,24 @@ MATCH_WEIGHTS: dict[str, int] = {
     "page_metadata.favicon_md5":                   18,
     "page_metadata.favicon_murmurhash3":           18,
     "page_metadata.source_map_urls":               18,
+    # A wallet address is a public key: only its keyholder can spend what both
+    # sites collect, so a shared address is an ownership statement, not a
+    # resemblance. It outranks a shared origin box (a host can be rented
+    # alongside strangers) and sits just under the crypto-fingerprint tier,
+    # short of it only because page text can be scraped and republished by an
+    # impersonator, which no private key ever is.
+    "page_metadata.crypto_wallet_values":          55,
+    # A published number has to be answered by someone, which makes it a real
+    # operational tie — but call centres, franchise networks, and template
+    # numbers share one line across unrelated sites often enough that it must
+    # not carry a pair on its own. Pinned at exactly the `has_strong_signal`
+    # cutoff in link_strength: a lone phone match reaches "moderate" and stops.
+    "page_metadata.phone_numbers":                 30,
+    # Same signal from the imprint/legal page rather than the homepage. Worth
+    # marginally more: a number in an Impressum is the one the operator had to
+    # publish to satisfy a disclosure rule, so it is less likely than a footer
+    # number to be a shared reseller or support line.
+    "legal_pages.phones":                          34,
     "page_metadata.social_handle_values":          10,
     "page_metadata.authors":                        8,
     "page_metadata.rel_me":                        10,
@@ -435,6 +477,12 @@ MATCH_WEIGHTS: dict[str, int] = {
     "mail_client_config.domains":                  10,
     "legal_pages.entity_names":                    18,
     "legal_pages.registration_ids":                35,
+    # A registered address is often an agent/accountant/coworking suite shared
+    # by thousands of unrelated companies, so it stays below the entity name.
+    "legal_pages.addresses":                       14,
+    # An operator-chosen mailbox; registrar and privacy-proxy role addresses
+    # are already dropped by _is_generic_value before they reach scoring.
+    "legal_pages.emails":                          22,
     "well_known.security_contacts":                12,
     "well_known.assetlinks_packages":              20,
     "well_known.ads_txt_publishers":               18,
@@ -792,6 +840,10 @@ def score_matches(matches: dict, cross_refs: list[dict],
 _DECISIVE_PATHS = {
     "microsoft_tenant.tenant_guid",
     "legal_pages.registration_ids",
+    # Both sites take payment to the same wallet: the proceeds are provably
+    # spendable by one keyholder, which is an ownership claim of the same order
+    # as a shared company registration number.
+    "page_metadata.crypto_wallet_values",
 }
 
 

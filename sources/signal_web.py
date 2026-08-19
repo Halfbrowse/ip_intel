@@ -6,6 +6,7 @@ import html
 import json
 import re
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -37,6 +38,30 @@ DEFAULT_TIMEOUT = 15.0
 DEFAULT_SCRIPT_MAX_BYTES = 262_144
 DEFAULT_MAX_SCRIPTS = 8
 DEFAULT_MAX_FAVICONS = 6
+
+# Per-probe fan-out for the multi-URL fetchers (well-known files, legal pages,
+# mail client config). These previously walked their path lists sequentially,
+# so on a slow/unreachable site every path hit the full DEFAULT_TIMEOUT one
+# after another (N paths -> N x 15s). httpx.Client is thread-safe for
+# concurrent requests over its shared pool, so we fan the paths out instead:
+# the whole fetcher now costs ~one timeout, not N. Capped so a target with many
+# paths doesn't open an unbounded number of sockets at once.
+_PROBE_FANOUT = 8
+
+
+def _run_probes_concurrent(fns: list, *, max_workers: int = _PROBE_FANOUT) -> list:
+    """Run zero-arg callables concurrently, returning results in input order.
+
+    Each callable must handle its own exceptions (all the probe helpers already
+    return an error-shaped dict rather than raising), so results line up 1:1
+    with `fns` and order is preserved for deterministic aggregation.
+    """
+    if not fns:
+        return []
+    with ThreadPoolExecutor(
+        max_workers=min(len(fns), max_workers), thread_name_prefix="web-probe"
+    ) as ex:
+        return list(ex.map(lambda fn: fn(), fns))
 
 LEGAL_PAGE_PATHS = (
     "/impressum",
@@ -84,12 +109,54 @@ MAIL_CLIENT_CONFIG_PATHS = {
     ),
 }
 
-_SOCIAL_NOISE = {"", "home", "login", "signup", "help", "support", "about", "contact", "profile.php", "pages"}
+# Case-insensitive denylist of literal path segments the patterns below can
+# capture instead of a real handle. Most of these are share/embed/widget
+# endpoints or content permalinks (post, reel, pin, status ids all live one
+# segment further in than these patterns reach) rather than operator
+# identities, so the captured literal is identical across thousands of
+# unrelated sites — exactly the "reel"/"groups"/"share" bug class, just for
+# every platform in _SOCIAL_PATTERNS instead of just the three reported.
+_SOCIAL_NOISE = {
+    "", "home", "login", "signup", "help", "support", "about", "contact", "profile.php", "pages",
+    # app chrome / legal / nav segments repeated across most of these platforms
+    "search", "explore", "settings", "notifications", "messages", "hashtag", "tag",
+    "privacy", "terms", "tos", "legal", "cookies", "policies", "faq", "join",
+    "business", "ads", "careers", "press", "developers", "apps",
+    "accounts", "direct", "watch", "video", "videos", "photo", "photos", "live", "topic",
+    "widgets", "widget", "plugins", "embed",
+    # share / outbound-redirect endpoints — identical on every page carrying a
+    # share button or an outbound link, never a real handle
+    "share", "share.php", "sharer", "away.php", "l.php", "dk",
+    # Telegram's own reserved deep-link namespace (core.telegram.org/api/links) —
+    # Telegram never allows a real @username to collide with these
+    "joinchat", "addstickers", "addtheme", "addstyle", "addemoji", "proxy", "socks",
+    "iv", "confirmphone", "setlanguage", "auth", "call", "boost", "auction", "giftcode", "nft",
+    # VK/OK feed & widget/embed endpoints that show up on any site embedding a
+    # VK comment box, like button, or OK share button — not an operator identity
+    "feed", "im", "widget_comments.php", "widget_community.php", "widget_recomm.php",
+    "widget_events.php", "al_widget.php", "video_ext.php",
+    # Facebook feature/content-permalink endpoints — same "captures the
+    # structural prefix, not the id" problem as profile.php/pages above
+    "groups", "events", "marketplace", "gaming", "login.php", "photo.php",
+    "video.php", "permalink.php", "story.php",
+    # Instagram content permalinks / app pages, not a profile
+    "reel", "reels", "tv", "stories",
+    # LinkedIn Showcase pages nest under /company/showcase/<id>, so the
+    # "company" branch captures the literal "showcase" instead of the id
+    "showcase",
+    # Pinterest pin permalinks (pinterest.com/pin/<id>) and source-domain
+    # aggregation pages (pinterest.com/source/<domain>), not a user
+    "pin", "source",
+}
 _SOCIAL_PATTERNS = (
     ("telegram", re.compile(r"https?://t\.me/([A-Za-z0-9_]{3,60})", re.I)),
     ("vkontakte", re.compile(r"https?://(?:www\.)?vk\.com/([^\s\"'<>/?]{2,80})", re.I)),
     ("odnoklassniki", re.compile(r"https?://(?:www\.)?ok\.ru/(?:profile/|group/)?([^\s\"'<>/?]{2,80})", re.I)),
-    ("odnoklassniki", re.compile(r"https?://(?:www\.)?odnoklassniki\.ru/([^\s\"'<>/?]{2,80})", re.I)),
+    # Mirrors the ok.ru pattern above: without stripping the optional
+    # "profile/"/"group/" prefix, odnoklassniki.ru/profile/<id> would capture
+    # the literal "profile" instead of the id that actually identifies the
+    # account — the same structural-prefix bug as Facebook's profile.php/pages.
+    ("odnoklassniki", re.compile(r"https?://(?:www\.)?odnoklassniki\.ru/(?:profile/|group/)?([^\s\"'<>/?]{2,80})", re.I)),
     ("twitter_x", re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com/(?!search|share|intent|home)([^\s\"'<>/?]{2,60})", re.I)),
     ("tiktok", re.compile(r"https?://(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]{2,60})", re.I)),
     ("instagram", re.compile(r"https?://(?:www\.)?instagram\.com/([^\s\"'<>/?]{2,60})", re.I)),
@@ -112,7 +179,23 @@ _SOCIAL_PATTERNS = (
     # github.com/facebook shows up on hundreds of unrelated sites crediting
     # React. That makes it a reliable false-positive generator rather than an
     # ownership signal, so it's excluded instead of denylisted after the fact.
-    ("mastodon", re.compile(r"https?://([A-Za-z0-9.-]+)/@([A-Za-z0-9_]{2,80})", re.I)),
+    #
+    # Deliberately excludes tiktok.com/youtube.com (already covered above by
+    # dedicated patterns — without this the same @handle would double-book
+    # under "mastodon" too) and known npm/CDN package-registry hosts that
+    # serve scoped packages straight off the root (unpkg.com/@babel/core,
+    # esm.sh/@material-ui/core, cdn.skypack.dev/@popperjs/core, jspm.dev/@...).
+    # Those show up in <script src> on huge numbers of unrelated sites and,
+    # unlike a real fediverse handle, would extract the identical scope name
+    # ("babel", "popperjs", ...) as a shared "social handle" everywhere the
+    # same CDN package is loaded from — a false-positive generator worse than
+    # the reported reel/groups/share bugs since it isn't social media at all.
+    ("mastodon", re.compile(
+        r"https?://(?!(?:www\.)?(?:tiktok\.com|youtube\.com|unpkg\.com|(?:cdn\.)?jsdelivr\.net|"
+        r"cdnjs\.cloudflare\.com|esm\.(?:sh|run)|(?:cdn\.)?skypack\.dev|jspm\.(?:dev|io))\b)"
+        r"([A-Za-z0-9.-]+)/@([A-Za-z0-9_]{2,80})",
+        re.I,
+    )),
 )
 
 # Site-ownership-proof meta tags: webmaster-tools verification codes are minted
@@ -185,14 +268,45 @@ _SOURCE_MAP_RE = re.compile(
 )
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 _PHONE_RE = re.compile(r"(?<!\w)(?:\+\d{1,3}[\s().-]*)?(?:\(?\d{1,4}\)?[\s().-]*){2,6}\d{2,4}(?!\w)")
+_PHONE_HREF_SCHEMES = ("tel:", "callto:", "sms:")
+_PHONE_META_KEYS = ("telephone", "phone", "contact:phone_number", "business:contact_data:phone_number", "og:phone_number")
+# 555-01XX is an IANA/NANP-reserved range set aside specifically for fictional
+# use in film, docs and templates (like 555-0100 example.com), so it shows up
+# verbatim on unrelated placeholder/demo sites and would otherwise link them.
+_PHONE_FICTIONAL_555_RE = re.compile(r"55501\d\d")
+_PHONE_DATE_SHAPE_RE = re.compile(
+    r"^(?:(?:19|20)\d{2}[-/.](?:0[1-9]|1[0-2])[-/.](?:0[1-9]|[12]\d|3[01])"
+    r"|(?:0[1-9]|[12]\d|3[01])[-/.](?:0[1-9]|1[0-2])[-/.](?:19|20)\d{2}"
+    r"|(?:0[1-9]|1[0-2])[-/.](?:0[1-9]|[12]\d|3[01])[-/.](?:19|20)\d{2})$"
+)
+# Nearby labels that mean a digit run is a structured identifier (order/VAT/
+# tracking/ISBN/coordinates/...) rather than a contact number -- these ids are
+# frequently formatted with phone-shaped separators (spaces, dashes) so the
+# digit pattern alone can't tell them apart from a real phone number.
+_PHONE_NEGATIVE_CONTEXT_RE = re.compile(
+    r"(?i)\b(order\s*no|invoice|tracking|reference\s*no|ref\.?\s*no|isbn|issn|sku|part\s*no|serial\s*no|"
+    r"model\s*no|case\s*no|version|coordinates?|latitude|longitude|zip\s*code|postal\s*code|postcode|"
+    r"price|cost|amount\s*due|total\s*due|vat\s*(?:no|id|number)|tax\s*id|ust-?id|siret|siren|iban|swift|bic|"
+    r"account\s*no|registration\s*no|company\s*no|reg\.?\s*no|company\s*number|hrb)\b"
+)
+_PHONE_POSITIVE_CONTEXT_RE = re.compile(r"(?i)\b(tel|telephone|phone|mobile|call|fax|whatsapp|hotline|contact)\b")
 _ENTITY_LABEL_RE = re.compile(
     r"(?im)^(?:.*?\b(?:company|registered name|legal name|operator|owner|publisher|provided by|trading as|responsible(?: for content)?)\b[^:\n]{0,30}:\s*)([^\n]{3,140})$"
 )
+# Word separators are spaces/tabs, never "\s" — "\s" matches newlines, so a
+# company name at the end of one line was glued to the company on the next
+# ("Beispiel Medien GmbH\nTaboola, Inc" became a single entity), fabricating
+# names that belong to nobody and that no other site could ever match except
+# one carrying the identical two lines.
+#
+# No "/" in the name character class either: with it, a URL path immediately
+# before a name was swallowed into the match ("gb/privacy/privacy-policy/
+# Twitter, Inc"), producing a selector that is partly someone else's link.
 _ENTITY_SUFFIX_RE = re.compile(
-    r"\b([A-Z][A-Za-z0-9&.,'()/\-]*(?:\s+[A-Z][A-Za-z0-9&.,'()/\-]*){0,8}\s+"
+    r"\b([A-Z][A-Za-z0-9&.,'()\-]*(?:[ \t]+[A-Z][A-Za-z0-9&.,'()\-]*){0,8}[ \t]+"
     r"(?:LLC|L\.L\.C\.|Ltd|Limited|Inc\.?|Incorporated|Corp\.?|Corporation|Company|Co\.?|"
     r"GmbH|AG|S\.?A\.?R\.?L\.?|S\.?A\.?|SAS|BV|B\.V\.|NV|N\.V\.|AB|AS|Oy|Oyj|ApS|"
-    r"Sp\.?\s*z\s*o\.?o\.?|s\.?r\.?o\.?|SRL|Srl|OÜ|UG|PLC|Pty Ltd|Pte Ltd|BVBA|CVBA|Kft|d\.?o\.?o\.?))\b"
+    r"Sp\.?[ \t]*z[ \t]*o\.?o\.?|s\.?r\.?o\.?|SRL|Srl|OÜ|UG|PLC|Pty Ltd|Pte Ltd|BVBA|CVBA|Kft|d\.?o\.?o\.?))\b"
 )
 _REGISTRATION_LINE_RE = re.compile(
     r"(?im)^.*\b(?:company|commercial|trade|business|merchant|enterprise|register|registration|registered|"
@@ -432,9 +546,26 @@ def capture_http_fingerprint(headers_or_response: Any, *, status_code: int | Non
         for name, values in grouped.items()
         if name.startswith("x-drupal-")
     }
+    # Full header map + redirect chain, so a caller that needs to fingerprint
+    # managed hosting or trace redirects does not have to re-fetch the page.
+    # core.basic.get_live_probe used to make its own HEAD/GET for exactly this;
+    # it now derives both from here, leaving one homepage fetch per scan.
+    headers_map = {name: value for name, value in items}
+    redirect_chain = []
+    for hop in getattr(headers_or_response, "history", None) or []:
+        try:
+            redirect_chain.append({
+                "url": str(getattr(hop, "url", "") or "") or None,
+                "status": getattr(hop, "status_code", None),
+                "location": (getattr(hop, "headers", None) or {}).get("Location"),
+            })
+        except Exception:
+            continue
     return {
         "status_code": response_status,
         "url": response_url,
+        "headers": headers_map,
+        "redirect_chain": redirect_chain,
         "header_order": [name.lower() for name, _ in items],
         "server": _first(grouped.get("server")),
         "x_powered_by": _first(grouped.get("x-powered-by")),
@@ -461,8 +592,11 @@ class _HTMLSignalParser(HTMLParser):
         self.anchor_urls: list[str] = []
         self.canonical_url: str | None = None
         self.inline_scripts: list[str] = []
+        self.microdata_telephone_values: list[str] = []
         self._ignoring = 0
         self._current_inline_script: list[str] | None = None
+        self._telephone_itemprop_stack: list[str] = []
+        self._telephone_itemprop_buffer: list[str] = []
 
     def _absolute_url(self, value: str | None) -> str | None:
         if not value:
@@ -477,6 +611,12 @@ class _HTMLSignalParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_dict = {str(name).lower(): (value if value is not None else "") for name, value in attrs if name}
         tag = tag.lower()
+        if "telephone" in attrs_dict.get("itemprop", "").lower().split():
+            declared = attrs_dict.get("content") or attrs_dict.get("href")
+            if declared:
+                self.microdata_telephone_values.append(declared.strip())
+            else:
+                self._telephone_itemprop_stack.append(tag)
         if tag == "html" and attrs_dict.get("lang"):
             self.html_lang = attrs_dict["lang"].lower()
         if tag == "title":
@@ -554,12 +694,20 @@ class _HTMLSignalParser(HTMLParser):
             if snippet:
                 self.inline_scripts.append(snippet[:32_768])
             self._current_inline_script = None
+        if self._telephone_itemprop_stack and tag == self._telephone_itemprop_stack[-1]:
+            self._telephone_itemprop_stack.pop()
+            value = "".join(self._telephone_itemprop_buffer).strip()
+            if value:
+                self.microdata_telephone_values.append(value)
+            self._telephone_itemprop_buffer = []
 
     def handle_data(self, data: str) -> None:
         if self.in_title and data:
             self.title_parts.append(data)
         if self._current_inline_script is not None and data:
             self._current_inline_script.append(data)
+        if self._telephone_itemprop_stack and data:
+            self._telephone_itemprop_buffer.append(data)
 
 
 def _extract_social_profiles(*sources: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -614,6 +762,33 @@ def scan_script_disclosures(script_text: str, *, script_url: str | None = None, 
     }
 
 
+# ── Tracking-ID patterns ─────────────────────────────────────────────────────
+# These run over the *whole* HTML document, so the boundary they use decides
+# how much of the page can impersonate an analytics account.
+#
+# `\b` was the boundary here, and `\b` is happy to sit on a hyphen: in
+# `LOGO-G-ABCDEF12.png` there is a word boundary between `-` and `G`, so the
+# old pattern extracted `G-ABCDEF12` from an image filename. Likewise
+# `class="col-G-123456"` and `srcset="hero-G-2X4K80.webp"`. A GA property is
+# weighted 170 in utils/evidence_meta.py and sits in
+# db/intel_db.py's _ACCOUNT_BOUND_TRACKING_SUBKINDS (500-domain denylist
+# ceiling rather than 50), so two unrelated sites built from one theme that
+# ships the same hashed asset name were being reported as sharing a Google
+# Analytics account at "strong" confidence.
+#
+# `(?<![\w-])` / `(?![\w-])` additionally refuse a hyphen on either side, so an
+# ID has to stand on its own rather than be a fragment of a longer token.
+# GA4 measurement IDs are `G-` plus exactly 10 alphanumerics; pinning the
+# length (rather than the old 6–12 window) is what rules out the short
+# `col-G-123456`-shaped hits that survive the boundary on their own.
+_ID_EDGE = r"(?<![\w-])"
+_ID_END = r"(?![\w-])"
+GA_PROPERTY_RE = re.compile(
+    rf"{_ID_EDGE}(UA-\d{{4,12}}-\d{{1,3}}|G-[A-Z0-9]{{10}}|AW-[0-9]{{8,12}}){_ID_END}"
+)
+GTM_CONTAINER_RE = re.compile(rf"{_ID_EDGE}(GTM-[A-Z0-9]{{4,8}}){_ID_END}")
+
+
 def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {
         "title": None,
@@ -644,6 +819,8 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
         "inline_source_map_urls": [],
         "inline_bundlers": [],
         "homepage_text_hash": None,
+        "phone_numbers": [],
+        "crypto_wallets": {},
     }
     raw = str(html_doc or "")
     if not raw:
@@ -656,8 +833,8 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
     except Exception:
         pass
 
-    ga = re.findall(r"\b(UA-\d{4,12}-\d{1,3}|G-[A-Z0-9]{6,12}|AW-[0-9]{8,12})\b", raw)
-    gtm = re.findall(r"\b(GTM-[A-Z0-9]{4,8})\b", raw)
+    ga = GA_PROPERTY_RE.findall(raw)
+    gtm = GTM_CONTAINER_RE.findall(raw)
     fb = re.findall(r"fbq\([\"']init[\"'],\s*[\"'](\d{8,20})[\"']", raw)
     tt = re.findall(r"ttq\.load\([\"']([A-Z0-9]{15,25})[\"']", raw)
     ym_one = re.findall(r"\bym\((\d{5,12})\s*,", raw)
@@ -714,6 +891,20 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
             if value not in site_verifications[provider]:
                 site_verifications[provider].append(value)
 
+    phone_numbers = _extract_homepage_phones(
+        body_text=html_to_text(raw),
+        anchor_urls=parser.anchor_urls,
+        inline_scripts=parser.inline_scripts,
+        meta_tags=meta_tags,
+        microdata_values=parser.microdata_telephone_values,
+    )
+    crypto_wallets = _extract_crypto_wallets(
+        html_doc=raw,
+        body_text=html_to_text(raw),
+        anchor_urls=parser.anchor_urls,
+        meta_tags=meta_tags,
+    )
+
     out.update(
         {
             "title": _clean_candidate("".join(parser.title_parts)) or None,
@@ -750,6 +941,8 @@ def parse_homepage_html(html_doc: str, *, page_url: str | None = None) -> dict[s
             "inline_source_map_urls": _dedupe_preserve(inline_source_maps),
             "inline_bundlers": _dedupe_preserve(inline_bundlers),
             "homepage_text_hash": html_text_hash(raw),
+            "phone_numbers": phone_numbers,
+            "crypto_wallets": crypto_wallets,
         }
     )
     return out
@@ -944,7 +1137,12 @@ def parse_humans_txt(content: bytes | str | None) -> dict[str, Any]:
         "sections": sections,
         "fields": key_values,
         "emails": _dedupe_preserve(_EMAIL_RE.findall(text)),
-        "phones": _dedupe_preserve(_filter_phones(_PHONE_RE.findall(text))),
+        # humans.txt is plain text — no anchors, no JSON-LD, no meta tags — so
+        # the text sweep *is* the structured path here. Routed through
+        # _extract_text_phones rather than the raw regex so it shares the one
+        # normalizer with the homepage and legal-page extractors, which is what
+        # makes a number found here comparable to the same number found there.
+        "phones": _dedupe_preserve(_extract_text_phones(text)),
         "urls": _dedupe_preserve(re.findall(r"https?://[^\s>]+", text, re.I)),
         "normalized_text_hash": normalized_text_hash(text),
     }
@@ -997,6 +1195,34 @@ def _parser_for_well_known(name: str):
     }[name]
 
 
+# Platforms, ad networks and infrastructure vendors named in the boilerplate of
+# an enormous number of sites. Even on a genuine imprint these appear as the
+# hoster, the analytics provider or the consent vendor, never as the operator —
+# and because the same handful recur everywhere, admitting them produces
+# selectors shared by thousands of unrelated domains.
+_THIRD_PARTY_ENTITY_RE = re.compile(
+    r"(?i)\b(?:google|alphabet|youtube|facebook|meta platforms?|instagram|whatsapp|apple|"
+    r"microsoft|linkedin|amazon|aws|twitter|x corp|snap|tiktok|bytedance|yandex|"
+    r"vkontakte|mail\.ru|telegram|cloudflare|akamai|fastly|oracle|addthis|adobe|"
+    r"salesforce|hubspot|mailchimp|taboola|outbrain|criteo|pubmatic|openx|rubicon|"
+    r"magnite|xandr|appnexus|casale|index exchange|sovrn|sharethrough|teads|smartclip|"
+    r"yieldlab|simpli\.?fi|spot\.im|disqus|zendesk|intercom|stripe|paypal|shopify|"
+    r"wordpress|automattic|wix|squarespace|hetzner|ovh|digitalocean|comscore|nielsen|"
+    r"quantcast|matomo|hotjar|full circle studies|sourcepoint|usercentrics|cookiebot)\b"
+)
+
+# An imprint identifies the operator — one company, occasionally two (operator
+# plus parent or publisher). Past a handful the extractor has stopped reading an
+# imprint and started reading prose about other people's companies, so the tail
+# is dropped rather than trusted.
+_MAX_IDENTITY_VALUES = 3
+
+# A postal address fits on an envelope. These bounds are what separate one from
+# a paragraph that merely contains "Street" or "Floor".
+_MAX_ADDRESS_LENGTH = 120
+_MAX_ADDRESS_WORDS = 18
+
+
 def _extract_entity_names(text: str) -> list[str]:
     entities: list[str] = []
     for match in _ENTITY_LABEL_RE.finditer(text):
@@ -1007,7 +1233,10 @@ def _extract_entity_names(text: str) -> list[str]:
         candidate = _clean_candidate(match.group(1))
         if len(candidate) >= 4 and candidate not in entities:
             entities.append(candidate)
-    return entities
+    kept = [e for e in entities if not _THIRD_PARTY_ENTITY_RE.search(e)]
+    # Order is document order, so the survivors nearest the top of the imprint
+    # are the ones kept — that is where the operator states itself.
+    return kept[:_MAX_IDENTITY_VALUES]
 
 
 def _normalize_vat(token: str) -> str | None:
@@ -1044,14 +1273,598 @@ def _extract_registration_ids(text: str) -> list[str]:
     return hits
 
 
+_PHONE_GROUPING_RE = re.compile(r"[ ().\-/]")
+
+
 def _filter_phones(matches: Sequence[str]) -> list[str]:
+    """Phone-shaped runs scraped from free text, minus the ones that aren't.
+
+    Free text is full of digit runs that are not phone numbers — order numbers,
+    pixel and app ids, figures quoted in prose. A bare run with no country code
+    and no grouping ("6789156", "155833707900388") is far more often one of
+    those than a number, because a real published number is written to be
+    dialled and so carries either a leading "+" or some separator. Requiring
+    that is what stops an ad-network id in shared boilerplate from becoming a
+    "shared phone number" linking every site that embeds the same widget.
+
+    Numbers the page declares explicitly (tel:/callto: hrefs, JSON-LD
+    `telephone`, meta phone tags) never reach here — they go through
+    _normalize_declared_phone — so this rule costs nothing where intent is
+    already unambiguous.
+    """
     phones: list[str] = []
     for match in matches:
         cleaned = re.sub(r"\s+", " ", match).strip(" ,;")
         digits = re.sub(r"\D", "", cleaned)
-        if 7 <= len(digits) <= 15 and cleaned not in phones:
+        if not 7 <= len(digits) <= 15:
+            continue
+        if not cleaned.startswith("+") and not _PHONE_GROUPING_RE.search(cleaned):
+            continue
+        if cleaned not in phones:
             phones.append(cleaned)
     return phones
+
+
+def _is_placeholder_phone_digits(digits: str) -> bool:
+    """True for template/demo numbers that appear verbatim on unrelated sites.
+
+    All-same-digit runs (0000000000), ascending/descending runs
+    (1234567890, 9876543210 -- wraps at 9->0 so 0123456789 is caught too),
+    and the NANP fictional 555-01xx exchange are never real subscriber
+    numbers, so treating them as a shared selector would fabricate a
+    same-operator link between any two sites that both ship the same
+    placeholder markup.
+    """
+    if len(set(digits)) == 1:
+        return True
+    if len(digits) >= 4:
+        ascending = all((int(digits[i + 1]) - int(digits[i])) % 10 == 1 for i in range(len(digits) - 1))
+        descending = all((int(digits[i]) - int(digits[i + 1])) % 10 == 1 for i in range(len(digits) - 1))
+        if ascending or descending:
+            return True
+    if _PHONE_FICTIONAL_555_RE.search(digits):
+        return True
+    if len(digits) == 13 and digits[:3] in ("978", "979"):
+        return True  # ISBN-13 prefix, not a phone country code shape
+    return False
+
+
+def _normalize_phone(cleaned: str) -> str | None:
+    """Collapse a phone-shaped string to a comparable, roughly-E.164 form.
+
+    No `phonenumbers` dependency is available in this environment, so this is
+    a conservative regex/heuristic normalizer rather than a validated one: it
+    strips formatting and keeps a leading "+" (or converts a leading "00"
+    international-dialing prefix to "+") so the same number written with
+    different separators on two sites still compares equal.
+    """
+    if cleaned.startswith("+"):
+        digits = re.sub(r"\D", "", cleaned)
+        return f"+{digits}" if digits else None
+    digits = re.sub(r"\D", "", cleaned)
+    if not digits:
+        return None
+    if digits.startswith("00") and 10 <= len(digits) <= 15:
+        rest = digits[2:]
+        if 8 <= len(rest) <= 13:
+            return f"+{rest}"
+    return digits
+
+
+def _normalize_declared_phone(raw: str) -> str | None:
+    """Normalize a phone value from an explicit field (tel: href, JSON-LD
+    `telephone`, meta tag, microdata) -- these carry their own context, so
+    unlike free body text they don't need a separator/keyword check, only
+    the placeholder/shape guards that apply everywhere.
+    """
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return None
+    cleaned = cleaned.split("?", 1)[0].split(";", 1)[0].strip()
+    digits = re.sub(r"\D", "", cleaned)
+    if not (7 <= len(digits) <= 15) or _is_placeholder_phone_digits(digits):
+        return None
+    return _normalize_phone(cleaned)
+
+
+def normalize_contact_phone(value: Any) -> str | None:
+    """Canonical match key for a phone number, for every layer that stores or
+    compares one (identifiers table, correlation selectors, legacy pairwise).
+
+    Kept here, next to the extractor, so there is one spelling of a number
+    rather than one per layer: a second normalizer that skipped, say, the
+    00->+ international-prefix rewrite would file "0044 20 …" and "+44 20 …"
+    as two different selectors and silently miss the match between them.
+    """
+    return _normalize_declared_phone(str(value or ""))
+
+
+# Bech32 (BIP-173) and CashAddr are defined as single-case encodings and
+# Ethereum is plain hex -- EIP-55 only overlays a checksum onto the *case* of
+# the hex digits -- so folding those canonicalizes two spellings of one
+# address into one selector. Base58Check (legacy BTC/LTC/DOGE, TRON, XRP,
+# Solana) and Monero's Base58 variant encode payload bytes in the case itself:
+# folding them yields a string that no longer decodes to a valid address, which
+# would put a value into the evidence that an analyst cannot check against a
+# block explorer or cite in a report.
+_BECH32_WALLET_PREFIXES = ("bc1", "tb1", "ltc1", "tltc1", "bcrt1", "bitcoincash:")
+
+
+def normalize_crypto_address(chain: Any, value: Any) -> str | None:
+    """Canonical match key for a wallet address on `chain`.
+
+    Case-folds only the encodings where case carries no data (see above);
+    every other address is preserved byte-for-byte.
+    """
+    text = str(value or "").strip().strip("\"'`")
+    if not text:
+        return None
+    lowered = text.lower()
+    if str(chain or "").strip().lower() == "ethereum" or lowered.startswith(_BECH32_WALLET_PREFIXES):
+        return lowered
+    return text
+
+
+def _extract_href_phones(urls: Sequence[str]) -> list[str]:
+    values: list[str] = []
+    for url in urls:
+        lowered = str(url or "").lower()
+        for scheme in _PHONE_HREF_SCHEMES:
+            if lowered.startswith(scheme):
+                normalized = _normalize_declared_phone(url[len(scheme):])
+                if normalized:
+                    values.append(normalized)
+                break
+    return values
+
+
+def _walk_jsonld_telephones(node: Any) -> Iterable[str]:
+    if isinstance(node, Mapping):
+        value = node.get("telephone")
+        if isinstance(value, str) and value.strip():
+            yield value.strip()
+        for child in node.values():
+            yield from _walk_jsonld_telephones(child)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_jsonld_telephones(item)
+
+
+def _extract_jsonld_phones(inline_scripts: Sequence[str]) -> list[str]:
+    values: list[str] = []
+    for script_text in inline_scripts:
+        text = script_text.strip()
+        if not text or "telephone" not in text.lower():
+            continue
+        try:
+            data = json.loads(text)
+        except Exception:
+            continue
+        for raw in _walk_jsonld_telephones(data):
+            normalized = _normalize_declared_phone(raw)
+            if normalized:
+                values.append(normalized)
+    return values
+
+
+def _extract_text_phones(text: str) -> list[str]:
+    """Pull phone numbers out of visible body text.
+
+    Unlike the declared-field sources (tel: links, JSON-LD, meta tags), free
+    text has no field label telling us "this is a phone number" -- the same
+    digit shape also matches dates, prices, order/SKU numbers, ISBNs, VAT and
+    registration ids, and tracking numbers. So on top of the placeholder/shape
+    guards, a bare digit run (no "+", no space/dash/dot/paren separators) is
+    only accepted next to an explicit phone-intent word (tel/phone/call/...),
+    and any match near an id/price/date-ish label is dropped outright.
+    """
+    values: list[str] = []
+    for match in _PHONE_RE.finditer(text):
+        raw = match.group(0)
+        cleaned = raw.strip(" ,;.")
+        digits = re.sub(r"\D", "", cleaned)
+        if not (7 <= len(digits) <= 15) or _is_placeholder_phone_digits(digits):
+            continue
+        if _PHONE_DATE_SHAPE_RE.match(cleaned):
+            continue
+        window = text[max(0, match.start() - 40) : match.start()]
+        if _PHONE_NEGATIVE_CONTEXT_RE.search(window):
+            continue
+        has_plus = cleaned.startswith("+")
+        has_separator = bool(re.search(r"[\s().-]", cleaned))
+        if not has_plus and not has_separator and not _PHONE_POSITIVE_CONTEXT_RE.search(window):
+            continue
+        normalized = _normalize_phone(cleaned)
+        if normalized:
+            values.append(normalized)
+    return values
+
+
+def _extract_homepage_phones(
+    *, body_text: str, anchor_urls: Sequence[str], inline_scripts: Sequence[str], meta_tags: Mapping[str, Sequence[str]], microdata_values: Sequence[str]
+) -> list[str]:
+    phones: list[str] = []
+    phones.extend(_extract_href_phones(anchor_urls))
+    phones.extend(_extract_jsonld_phones(inline_scripts))
+    for value in microdata_values:
+        normalized = _normalize_declared_phone(value)
+        if normalized:
+            phones.append(normalized)
+    for key in _PHONE_META_KEYS:
+        for value in meta_tags.get(key) or []:
+            normalized = _normalize_declared_phone(value)
+            if normalized:
+                phones.append(normalized)
+    phones.extend(_extract_text_phones(body_text))
+    return sorted(set(phones))
+
+
+# A wallet address is scored as a correlation selector, so a single false
+# positive invents a shared-operator link between two unrelated organisations.
+# Every candidate below is therefore checksum-verified -- Base58Check,
+# bech32/bech32m polymod, EIP-55, Keccak -- rather than shape-matched, and the
+# patterns exist only to isolate runs of alphabet-legal characters for the
+# validators to confirm or drop.
+_CRYPTO_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+# The same 58 characters in a different order: XRP is Base58Check over this
+# alphabet, so an XRP address decodes to garbage under the standard one.
+_CRYPTO_RIPPLE_ALPHABET = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz"
+_CRYPTO_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+# Base58Check version byte -> chain. 0x05 is both Bitcoin P2SH and Litecoin's
+# legacy P2SH ("3..."), which are byte-identical, so it is keyed as bitcoin --
+# the overwhelmingly more likely issuer. Bitcoin Cash legacy addresses share
+# Bitcoin's version bytes too and are likewise keyed bitcoin; only CashAddr
+# ("bitcoincash:q...") is attributable to bitcoin_cash.
+_CRYPTO_BASE58_VERSIONS = {
+    0x00: "bitcoin",
+    0x05: "bitcoin",
+    0x1E: "dogecoin",
+    0x30: "litecoin",
+    0x32: "litecoin",
+    0x41: "tron",
+}
+# Testnet HRPs (tb1/tltc1) are deliberately absent: test coins carry no
+# operator value and their addresses are pasted verbatim out of wallet docs.
+_CRYPTO_BECH32_HRPS = {"bc": "bitcoin", "ltc": "litecoin"}
+_CRYPTO_URI_SCHEMES = frozenset(
+    {"bitcoin", "bitcoincash", "dogecoin", "ethereum", "litecoin", "monero", "ripple", "solana", "tron"}
+)
+_CRYPTO_SCAN_PATTERNS = (
+    re.compile(r"(?<![A-Za-z0-9])0[xX][0-9a-fA-F]{40}(?![A-Za-z0-9])"),
+    re.compile(r"(?<![A-Za-z0-9])(?:bc|ltc)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{8,87}(?![A-Za-z0-9])", re.I),
+    re.compile(r"(?<![A-Za-z0-9])bitcoincash:[qp][qpzry9x8gf2tvdw0s3jn54khce6mua7l]{41}(?![A-Za-z0-9])", re.I),
+    re.compile(r"(?<![A-Za-z0-9])[48][1-9A-HJ-NP-Za-km-z]{94}(?:[1-9A-HJ-NP-Za-km-z]{11})?(?![A-Za-z0-9])"),
+    re.compile(r"(?<![A-Za-z0-9])[13LMDTr][1-9A-HJ-NP-Za-km-z]{24,39}(?![A-Za-z0-9])"),
+    re.compile(r"(?<![A-Za-z0-9])[1-9A-HJ-NP-Za-km-z]{43,44}(?![A-Za-z0-9])"),
+)
+_CRYPTO_ETH_RE = re.compile(r"0[xX][0-9a-fA-F]{40}")
+_CRYPTO_CASHADDR_RE = re.compile(r"(?:bitcoincash:)?[qp][qpzry9x8gf2tvdw0s3jn54khce6mua7l]{41}", re.I)
+_CRYPTO_BECH32_RE = re.compile(r"(?:bc|ltc)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{8,87}", re.I)
+_CRYPTO_MONERO_RE = re.compile(r"[48][1-9A-HJ-NP-Za-km-z]{94}(?:[1-9A-HJ-NP-Za-km-z]{11})?")
+_CRYPTO_SOLANA_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{43,44}")
+_CRYPTO_BASE58CHECK_RE = re.compile(r"[13LMDTr][1-9A-HJ-NP-Za-km-z]{24,39}")
+_CRYPTO_ETH_CONTEXT_RE = re.compile(
+    r"(?i)(\beth\b|\bether(?:eum)?\b|\berc-?20\b|\bbep-?20\b|\bbnb\b|\busdt\b|\busdc\b|\bmetamask\b|"
+    r"\bwallet\b|\bdonat|\bcrypto|etherscan|bscscan|polygonscan|blockscout)"
+)
+_CRYPTO_SOL_CONTEXT_RE = re.compile(r"(?i)(\bsol\b|\bsolana\b|\bphantom\b|\bspl\b|\bwallet\b|\bdonat|solscan)")
+# Burn/null sinks plus the canonical spec and documentation examples. These are
+# quoted verbatim on thousands of unrelated pages (wallet tutorials, BIP text
+# pasted into blog posts, token-contract boilerplate), so accepting one would
+# link every site that mentions it -- the same false-link bug class as the
+# social "share"/"reel" literals above. Compared lowercased.
+_CRYPTO_NOISE = {
+    "0x0000000000000000000000000000000000000000",
+    "0x000000000000000000000000000000000000dead",
+    "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+    "1a1zp1ep5qgefi2dmptftl5slmv7divfna",
+    "1bvbmseystwetqtfn5au4m4gfg7xjanvn2",
+    "3j98t1wpez73cnmqviecrnyiwrnqrhwnly",
+    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "bc1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kt5nd6y",
+    "t9yd14nj9j7xab4dbgeix9h8unkkhxuwwb",
+    "rrrrrrrrrrrrrrrrrrrrrholvtp",
+    "so11111111111111111111111111111111111111112",
+    "tokenkegqfezyinwajbnbgkpfxcwubvf9ss623vq5da",
+}
+_KECCAK_ROUND_CONSTANTS = (
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+    0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+    0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+)
+_KECCAK_ROTATIONS = (
+    0, 1, 62, 28, 27,
+    36, 44, 6, 55, 20,
+    3, 10, 43, 25, 39,
+    41, 45, 15, 21, 8,
+    18, 2, 61, 56, 14,
+)
+_KECCAK_MASK = (1 << 64) - 1
+_CRYPTO_MAX_CANDIDATES = 512
+# Encoded block length -> decoded byte count for Monero's block-wise Base58.
+_MONERO_BLOCK_SIZES = (0, 1, 2, 3, 3, 4, 4, 5, 6, 6, 7, 8)
+
+
+def _keccak_f1600(lanes: list[int]) -> None:
+    for round_constant in _KECCAK_ROUND_CONSTANTS:
+        parity = [lanes[x] ^ lanes[x + 5] ^ lanes[x + 10] ^ lanes[x + 15] ^ lanes[x + 20] for x in range(5)]
+        for x in range(5):
+            neighbour = parity[(x + 1) % 5]
+            column = parity[(x - 1) % 5] ^ (((neighbour << 1) | (neighbour >> 63)) & _KECCAK_MASK)
+            for y in range(0, 25, 5):
+                lanes[x + y] ^= column
+        rotated = [0] * 25
+        for x in range(5):
+            for y in range(5):
+                shift = _KECCAK_ROTATIONS[x + 5 * y]
+                lane = lanes[x + 5 * y]
+                rotated[y + 5 * ((2 * x + 3 * y) % 5)] = ((lane << shift) | (lane >> (64 - shift))) & _KECCAK_MASK
+        for y in range(0, 25, 5):
+            row = rotated[y:y + 5]
+            for x in range(5):
+                lanes[x + y] = row[x] ^ (~row[(x + 1) % 5] & row[(x + 2) % 5] & _KECCAK_MASK)
+        lanes[0] ^= round_constant
+
+
+def _keccak256(data: bytes) -> bytes:
+    """Keccak-256 (the pre-NIST padding Ethereum and Monero use, not sha3_256)."""
+    rate = 136
+    padded = bytearray(data)
+    padded.append(0x01)
+    while len(padded) % rate:
+        padded.append(0x00)
+    padded[-1] ^= 0x80
+    lanes = [0] * 25
+    for offset in range(0, len(padded), rate):
+        for index in range(rate // 8):
+            start = offset + index * 8
+            lanes[index] ^= int.from_bytes(padded[start:start + 8], "little")
+        _keccak_f1600(lanes)
+    return b"".join(lane.to_bytes(8, "little") for lane in lanes[:4])
+
+
+def _base58_decode(value: str, alphabet: str = _CRYPTO_BASE58_ALPHABET) -> bytes | None:
+    number = 0
+    for char in value:
+        digit = alphabet.find(char)
+        if digit < 0:
+            return None
+        number = number * 58 + digit
+    body = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    return b"\x00" * (len(value) - len(value.lstrip(alphabet[0]))) + body
+
+
+def _base58check_payload(value: str, alphabet: str = _CRYPTO_BASE58_ALPHABET) -> bytes | None:
+    decoded = _base58_decode(value, alphabet)
+    if decoded is None or len(decoded) < 5:
+        return None
+    payload, checksum = decoded[:-4], decoded[-4:]
+    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
+        return None
+    return payload
+
+
+def _bech32_polymod(values: list[int]) -> int:
+    generator = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    checksum = 1
+    for value in values:
+        top = checksum >> 25
+        checksum = ((checksum & 0x1FFFFFF) << 5) ^ value
+        for index in range(5):
+            if (top >> index) & 1:
+                checksum ^= generator[index]
+    return checksum
+
+
+def _bech32_decode(address: str) -> tuple[str, list[int], int] | None:
+    if len(address) > 90 or (address.lower() != address and address.upper() != address):
+        return None
+    address = address.lower()
+    split = address.rfind("1")
+    if split < 1 or split + 7 > len(address):
+        return None
+    data: list[int] = []
+    for char in address[split + 1:]:
+        position = _CRYPTO_BECH32_CHARSET.find(char)
+        if position < 0:
+            return None
+        data.append(position)
+    hrp = address[:split]
+    constant = _bech32_polymod([ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + data)
+    if constant not in (1, 0x2BC830A3):
+        return None
+    return hrp, data[:-6], constant
+
+
+def _bech32_witness_program(data: Sequence[int]) -> bytes | None:
+    accumulator = 0
+    bits = 0
+    out = bytearray()
+    for value in data:
+        accumulator = (accumulator << 5) | value
+        bits += 5
+        while bits >= 8:
+            bits -= 8
+            out.append((accumulator >> bits) & 0xFF)
+    if bits >= 5 or (accumulator << (8 - bits)) & 0xFF:
+        return None
+    return bytes(out)
+
+
+def _cashaddr_checksum_ok(prefix: str, payload: str) -> bool:
+    values = [ord(char) & 0x1F for char in prefix] + [0]
+    for char in payload:
+        position = _CRYPTO_BECH32_CHARSET.find(char)
+        if position < 0:
+            return False
+        values.append(position)
+    checksum = 1
+    for value in values:
+        top = checksum >> 35
+        checksum = ((checksum & 0x07FFFFFFFF) << 5) ^ value
+        for index, constant in enumerate((0x98F2BC8E61, 0x79B76D99E2, 0xF33E5FB3C4, 0xAE2EABE2A8, 0x1E4F43E470)):
+            if (top >> index) & 1:
+                checksum ^= constant
+    return checksum ^ 1 == 0
+
+
+def _monero_base58_decode(value: str) -> bytes | None:
+    out = bytearray()
+    for offset in range(0, len(value), 11):
+        chunk = value[offset:offset + 11]
+        size = _MONERO_BLOCK_SIZES[len(chunk)]
+        number = 0
+        for char in chunk:
+            digit = _CRYPTO_BASE58_ALPHABET.find(char)
+            if digit < 0:
+                return None
+            number = number * 58 + digit
+        if not size or number >> (8 * size):
+            return None
+        out.extend(number.to_bytes(size, "big"))
+    return bytes(out)
+
+
+def _eip55_checksum_ok(body: str) -> bool:
+    digest = _keccak256(body.lower().encode()).hex()
+    for index, char in enumerate(body):
+        if char.isalpha() and char.isupper() != (int(digest[index], 16) >= 8):
+            return False
+    return True
+
+
+def _classify_crypto_address(value: str, *, eth_context: bool, sol_context: bool) -> tuple[str, str] | None:
+    if _CRYPTO_ETH_RE.fullmatch(value):
+        body = value[2:]
+        if body.lower() == body or body.upper() == body:
+            # A single-case 40-hex string carries no checksum at all, and is
+            # shape-identical to a git SHA fragment, a webpack/asset content
+            # hash or a tracking id -- all rampant in page HTML and bundled JS.
+            # Only take one where the page itself says it is a wallet: a
+            # payment URI, or an explicit ETH/wallet/donate label beside it.
+            if not eth_context:
+                return None
+        elif not _eip55_checksum_ok(body):
+            return None
+        # Stored lowercased so the same wallet displayed checksummed on one page
+        # and lowercased on another is one selector rather than two.
+        return "ethereum", value.lower()
+    if _CRYPTO_CASHADDR_RE.fullmatch(value):
+        payload = value.split(":", 1)[-1].lower()
+        return ("bitcoin_cash", payload) if _cashaddr_checksum_ok("bitcoincash", payload) else None
+    if _CRYPTO_BECH32_RE.fullmatch(value):
+        decoded = _bech32_decode(value)
+        if decoded is None:
+            return None
+        hrp, data, constant = decoded
+        if not data:
+            return None
+        version = data[0]
+        if version > 16 or constant != (1 if version == 0 else 0x2BC830A3):
+            return None
+        program = _bech32_witness_program(data[1:])
+        if program is None or not 2 <= len(program) <= 40:
+            return None
+        if version == 0 and len(program) not in (20, 32):
+            return None
+        chain = _CRYPTO_BECH32_HRPS.get(hrp)
+        return (chain, value.lower()) if chain else None
+    if _CRYPTO_MONERO_RE.fullmatch(value):
+        decoded = _monero_base58_decode(value)
+        if decoded is None or len(decoded) not in (69, 77) or decoded[0] not in (18, 19, 42):
+            return None
+        return ("monero", value) if _keccak256(decoded[:-4])[:4] == decoded[-4:] else None
+    if _CRYPTO_SOLANA_RE.fullmatch(value):
+        # Solana addresses are a bare base58 ed25519 key with no checksum
+        # whatsoever, so any 43/44-char base58 run -- minified JS identifiers,
+        # asset digests, session tokens -- has the same shape. The 32-byte
+        # decode alone rejects far too little, so an explicit SOL/wallet label
+        # or a solana: URI is required as well.
+        if not sol_context:
+            return None
+        decoded = _base58_decode(value)
+        return ("solana", value) if decoded is not None and len(decoded) == 32 else None
+    if _CRYPTO_BASE58CHECK_RE.fullmatch(value):
+        payload = _base58check_payload(value)
+        if payload is not None and len(payload) == 21:
+            chain = _CRYPTO_BASE58_VERSIONS.get(payload[0])
+            if chain:
+                return chain, value
+        if value.startswith("r"):
+            payload = _base58check_payload(value, _CRYPTO_RIPPLE_ALPHABET)
+            if payload is not None and len(payload) == 21 and payload[0] == 0x00:
+                return "ripple", value
+    return None
+
+
+def _identify_crypto_address(value: str, *, eth_context: bool = False, sol_context: bool = False) -> tuple[str, str] | None:
+    identified = _classify_crypto_address(value, eth_context=eth_context, sol_context=sol_context)
+    if identified is None or identified[1].lower() in _CRYPTO_NOISE:
+        return None
+    return identified
+
+
+def _crypto_uri_address(href: str) -> str | None:
+    """Pull the payee out of a BIP-21 style payment URI (bitcoin:<addr>?amount=...)."""
+    scheme, separator, rest = str(href or "").partition(":")
+    if not separator or scheme.lower() not in _CRYPTO_URI_SCHEMES:
+        return None
+    address = rest.split("?", 1)[0].split("@", 1)[0].split("/", 1)[0].strip()
+    if address[:4].lower() == "pay-":
+        address = address[4:]
+    return address or None
+
+
+def _scan_crypto_text(text: str, found: dict[str, set[str]], cache: dict[tuple[str, bool, bool], Any]) -> None:
+    if not text:
+        return
+    for pattern in _CRYPTO_SCAN_PATTERNS:
+        for match in pattern.finditer(text):
+            if len(cache) >= _CRYPTO_MAX_CANDIDATES:
+                return
+            # Deliberately tight: a label sits right against the address it
+            # names ("ETH: 0x..", "0x.. (ETH)"), so a wider window mostly buys
+            # leakage from the neighbouring line -- which is how a build hash
+            # printed under a donation block gets mistaken for a wallet.
+            window = text[max(0, match.start() - 40) : match.start()] + " " + text[match.end() : match.end() + 20]
+            key = (
+                match.group(0),
+                bool(_CRYPTO_ETH_CONTEXT_RE.search(window)),
+                bool(_CRYPTO_SOL_CONTEXT_RE.search(window)),
+            )
+            if key not in cache:
+                cache[key] = _identify_crypto_address(key[0], eth_context=key[1], sol_context=key[2])
+            identified = cache[key]
+            if identified:
+                found.setdefault(identified[0], set()).add(identified[1])
+
+
+def _extract_crypto_wallets(
+    *, html_doc: str, body_text: str, anchor_urls: Sequence[str], meta_tags: Mapping[str, Sequence[str]]
+) -> dict[str, list[str]]:
+    found: dict[str, set[str]] = {}
+    # Validation is pure-Python Keccak/Base58 arithmetic, so a page repeating a
+    # candidate thousands of times would otherwise pay for it every occurrence.
+    cache: dict[tuple[str, bool, bool], Any] = {}
+    for href in anchor_urls:
+        declared = _crypto_uri_address(str(href or ""))
+        # A payment URI is itself the label the context gates look for.
+        identified = _identify_crypto_address(declared, eth_context=True, sol_context=True) if declared else None
+        if identified:
+            found.setdefault(identified[0], set()).add(identified[1])
+    _scan_crypto_text(body_text, found, cache)
+    _scan_crypto_text(html_doc, found, cache)
+    for url in anchor_urls:
+        _scan_crypto_text(str(url or ""), found, cache)
+    for key, values in meta_tags.items():
+        for value in values:
+            # Scanned with the meta name attached: on a declared field the key
+            # ("eth-wallet", "donation:xmr") is the label the context gates want.
+            _scan_crypto_text(f"{key} {value}", found, cache)
+    return {chain: sorted(addresses) for chain, addresses in sorted(found.items())}
 
 
 def _extract_addresses(text: str) -> list[str]:
@@ -1070,22 +1883,103 @@ def _extract_addresses(text: str) -> list[str]:
             if lines[index + 1] not in candidate:
                 candidate = f"{candidate}, {lines[index + 1]}"
         cleaned = _clean_candidate(candidate)
-        if cleaned and cleaned not in addresses:
-            addresses.append(cleaned)
-    return addresses
+        if not cleaned or cleaned in addresses:
+            continue
+        # A street word inside a sentence is not an address. Consent boilerplate
+        # is full of them ("...das Kommentarsystem Disqus (Disqus, Inc., 717
+        # Market Street, ...) verwenden, um..."), and the whole paragraph was
+        # being filed as one address. A real postal address is short.
+        if len(cleaned) > _MAX_ADDRESS_LENGTH or len(cleaned.split()) > _MAX_ADDRESS_WORDS:
+            continue
+        if _THIRD_PARTY_ENTITY_RE.search(cleaned):
+            continue
+        addresses.append(cleaned)
+    return addresses[:_MAX_IDENTITY_VALUES]
+
+
+# Paths whose whole purpose is to say who runs the site. A privacy policy or
+# terms page is deliberately NOT in this set: by construction it enumerates
+# *other* companies — every ad network, analytics vendor, CDN and comment
+# widget the site embeds, each with its postal address — so mining one for "the
+# operator's legal entity and address" harvests Google, Meta, Apple and two
+# dozen adtech firms instead of the operator. Because every site running the
+# same consent boilerplate yields the same names, those landed as mid-degree
+# selectors (~45 domains each) and linked whole unrelated populations together.
+_IDENTITY_PATH_RE = re.compile(
+    r"(?i)(impressum|imprint|legal[-_]?notices?|mentions[-_]?legales|aviso[-_]?legal|"
+    r"kontakt|contact|about|ueber[-_]?uns|über[-_]?uns|company|legal)"
+)
+# Checked first: a path can match both (/legal/privacy-policy), and when it does
+# the privacy half is what decides.
+_PRIVACY_TERMS_PATH_RE = re.compile(
+    r"(?i)(privacy|datenschutz|terms|tos\b|agb\b|cookie|gdpr|dsgvo)"
+)
+
+
+def _is_operator_identity_page(page_url: str | None) -> bool:
+    """Whether this page is meant to state who operates the site.
+
+    Applied to the URL *after* redirects, so a /legal that lands on
+    /privacy-policy is judged on where it ended up.
+    """
+    if not page_url:
+        return False
+    path = urlparse(str(page_url)).path or "/"
+    if _PRIVACY_TERMS_PATH_RE.search(path):
+        return False
+    return bool(_IDENTITY_PATH_RE.search(path))
+
+
+def _extract_legal_page_phones(html_doc: str, text: str, page_meta: Mapping[str, Any]) -> list[str]:
+    """Phones from a legal/contact page, structured-first.
+
+    Same extractor the homepage uses: `tel:` hrefs, JSON-LD telephone fields,
+    microdata and phone meta tags, then a plain-text regex sweep as the
+    fallback. This path used to be the bare regex alone, which was weakest on
+    exactly the pages most likely to mark contact details up — `/contact` and
+    `/about` are both in LEGAL_PAGE_PATHS, and a `tel:` href normalizes
+    reliably where rendered text ("+44 (0)20 7…") often does not.
+
+    The three structured inputs live on the parser rather than in
+    parse_homepage_html's return, so the document is re-parsed here instead of
+    widening that return value: `inline_scripts` holds every inline script body,
+    and parse_homepage_html's output is persisted as page_metadata, so exposing
+    them there would add the full script text of every page to stored payloads.
+    Falls back to the text sweep alone if the re-parse fails.
+    """
+    try:
+        parser = _HTMLSignalParser()
+        parser.feed(html_doc or "")
+        parser.close()
+    except Exception:
+        return _filter_phones(_PHONE_RE.findall(text))
+    return _extract_homepage_phones(
+        body_text=text,
+        anchor_urls=parser.anchor_urls,
+        inline_scripts=parser.inline_scripts,
+        meta_tags=page_meta.get("meta_tags") or {},
+        microdata_values=parser.microdata_telephone_values,
+    )
 
 
 def extract_legal_page_signals(html_doc: str, *, page_url: str | None = None) -> dict[str, Any]:
     text = html_to_text(html_doc, preserve_lines=True)
     page_meta = parse_homepage_html(html_doc, page_url=page_url)
+    # Phones, emails and the text hash are collected from every legal page: a
+    # contact address on a privacy policy is usually still the operator's (a
+    # DPO or abuse mailbox), and the hash describes the page itself. Only the
+    # identity fields are restricted, because only they are corrupted by a page
+    # that talks about other companies.
+    identity_page = _is_operator_identity_page(page_url)
     return {
         "url": page_url,
         "title": page_meta.get("title"),
         "normalized_text_hash": normalized_text_hash(text),
-        "entity_names": _extract_entity_names(text),
-        "registration_ids": _extract_registration_ids(text),
-        "addresses": _extract_addresses(text),
-        "phones": _filter_phones(_PHONE_RE.findall(text)),
+        "operator_identity_page": identity_page,
+        "entity_names": _extract_entity_names(text) if identity_page else [],
+        "registration_ids": _extract_registration_ids(text) if identity_page else [],
+        "addresses": _extract_addresses(text) if identity_page else [],
+        "phones": _extract_legal_page_phones(html_doc, text, page_meta),
         "emails": _dedupe_preserve(_EMAIL_RE.findall(text)),
     }
 
@@ -1277,6 +2171,12 @@ def _sync_fetch_homepage(target: str, client: httpx.Client, *, timeout: float = 
                     "content_type": response.headers.get("content-type"),
                     "page_metadata": parse_homepage_html(body, page_url=str(response.url)),
                     "http_fingerprint": capture_http_fingerprint(response),
+                    # Transient: lets core.basic run its CMS heuristics over the
+                    # markup this fetch already downloaded, instead of
+                    # get_live_probe issuing a second request for the first 32KB.
+                    # Stripped before the payload is persisted — see
+                    # core.basic.get_page_metadata.
+                    "body_prefix": (body or "")[:32768],
                     "error": None,
                 }
             )
@@ -1427,11 +2327,21 @@ def _select_well_known_result(name: str, attempts: list[dict[str, Any]]) -> dict
 
 def _sync_fetch_well_known_files(target: str, client: httpx.Client, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     root_url = normalize_target_url(target)
-    results: dict[str, Any] = {}
-    for name, paths in WELL_KNOWN_PATHS.items():
-        attempts = [_well_known_attempt_sync(root_url, path, client, timeout=timeout) for path in paths]
-        results[name] = _select_well_known_result(name, attempts)
-    return results
+    # Fan every (name, path) attempt out at once, then regroup by name — one
+    # timeout wall for the whole fetcher instead of one per path.
+    jobs = [
+        (name, path)
+        for name, paths in WELL_KNOWN_PATHS.items()
+        for path in paths
+    ]
+    attempts = _run_probes_concurrent(
+        [lambda name=name, path=path: _well_known_attempt_sync(root_url, path, client, timeout=timeout)
+         for name, path in jobs]
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in WELL_KNOWN_PATHS}
+    for (name, _path), attempt in zip(jobs, attempts):
+        grouped[name].append(attempt)
+    return {name: _select_well_known_result(name, grouped[name]) for name in WELL_KNOWN_PATHS}
 
 
 def fetch_well_known_files(target: str, client: httpx.Client | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
@@ -1465,14 +2375,13 @@ def _sync_scrape_legal_pages(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     root_url = normalize_target_url(target)
-    pages: list[dict[str, Any]] = []
     entity_names: list[str] = []
     registration_ids: list[str] = []
     addresses: list[str] = []
     phones: list[str] = []
     emails: list[str] = []
-    for raw_path in _dedupe_preserve(str(path).strip() for path in paths if str(path).strip()):
-        path = raw_path if raw_path.startswith("/") else f"/{raw_path}"
+
+    def _fetch_one(path: str) -> dict[str, Any]:
         url = urljoin(root_url, path)
         try:
             response = client.get(url, headers=DEFAULT_HEADERS, timeout=timeout, follow_redirects=True)
@@ -1487,7 +2396,7 @@ def _sync_scrape_legal_pages(
                 "phones": [],
                 "emails": [],
             }
-            entry = {
+            return {
                 "path": path,
                 "requested_url": url,
                 "url": str(response.url),
@@ -1497,7 +2406,7 @@ def _sync_scrape_legal_pages(
                 **parsed,
             }
         except Exception as exc:
-            entry = {
+            return {
                 "path": path,
                 "requested_url": url,
                 "url": url,
@@ -1512,7 +2421,14 @@ def _sync_scrape_legal_pages(
                 "phones": [],
                 "emails": [],
             }
-        pages.append(entry)
+
+    # Fetch all candidate paths concurrently (was sequential: N paths x timeout).
+    normalized_paths = [
+        raw_path if raw_path.startswith("/") else f"/{raw_path}"
+        for raw_path in _dedupe_preserve(str(path).strip() for path in paths if str(path).strip())
+    ]
+    pages = _run_probes_concurrent([lambda p=p: _fetch_one(p) for p in normalized_paths])
+    for entry in pages:
         entity_names.extend(entry["entity_names"])
         registration_ids.extend(entry["registration_ids"])
         addresses.extend(entry["addresses"])
@@ -2052,47 +2968,60 @@ def _sync_probe_mail_client_config(target: str, client: httpx.Client, *, timeout
     autoconfig: list[dict[str, Any]] = []
     servers: list[str] = []
     domains: list[str] = []
-    for kind, entries in probes.items():
-        for probe in entries:
-            url = probe.get("url")
-            if not url:
-                continue
-            try:
-                response = client.get(url, headers=DEFAULT_HEADERS, timeout=timeout, follow_redirects=True)
-                body = response.content
-                parsed = parse_autodiscover_xml(body) if kind == "autodiscover" else parse_autoconfig_xml(body)
-                entry = {
-                    "label": probe["label"],
-                    "url": str(response.url),
-                    "status_code": response.status_code,
-                    "content_type": response.headers.get("content-type"),
-                    "parsed": parsed,
-                    "error": None,
-                }
-            except Exception as exc:
-                entry = {
-                    "label": probe["label"],
-                    "url": url,
-                    "status_code": None,
-                    "content_type": None,
-                    "parsed": {},
-                    "error": str(exc),
-                }
-            if kind == "autodiscover":
-                autodiscover.append(entry)
-                parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
-                servers.extend(parsed.get("servers", []))
-                domains.extend(parsed.get("domains", []))
-            else:
-                autoconfig.append(entry)
-                parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
-                for server in parsed.get("incoming_servers", []) + parsed.get("outgoing_servers", []):
-                    if not isinstance(server, Mapping):
-                        continue
-                    hostname = server.get("hostname")
-                    if hostname:
-                        servers.append(hostname)
-                domains.extend(parsed.get("domains", []))
+
+    # These probe autodiscover.<domain> / autoconfig.<domain> hosts that usually
+    # don't exist and hang until timeout, so fetching them concurrently (rather
+    # than one-after-another) is the biggest single win for the parity phase.
+    jobs = [
+        (kind, probe)
+        for kind, entries in probes.items()
+        for probe in entries
+        if probe.get("url")
+    ]
+
+    def _probe_one(kind: str, probe: dict[str, Any]) -> dict[str, Any]:
+        url = probe.get("url")
+        try:
+            response = client.get(url, headers=DEFAULT_HEADERS, timeout=timeout, follow_redirects=True)
+            body = response.content
+            parsed = parse_autodiscover_xml(body) if kind == "autodiscover" else parse_autoconfig_xml(body)
+            return {
+                "label": probe["label"],
+                "url": str(response.url),
+                "status_code": response.status_code,
+                "content_type": response.headers.get("content-type"),
+                "parsed": parsed,
+                "error": None,
+            }
+        except Exception as exc:
+            return {
+                "label": probe["label"],
+                "url": url,
+                "status_code": None,
+                "content_type": None,
+                "parsed": {},
+                "error": str(exc),
+            }
+
+    entries = _run_probes_concurrent(
+        [lambda kind=kind, probe=probe: _probe_one(kind, probe) for kind, probe in jobs]
+    )
+    for (kind, _probe), entry in zip(jobs, entries):
+        if kind == "autodiscover":
+            autodiscover.append(entry)
+            parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
+            servers.extend(parsed.get("servers", []))
+            domains.extend(parsed.get("domains", []))
+        else:
+            autoconfig.append(entry)
+            parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
+            for server in parsed.get("incoming_servers", []) + parsed.get("outgoing_servers", []):
+                if not isinstance(server, Mapping):
+                    continue
+                hostname = server.get("hostname")
+                if hostname:
+                    servers.append(hostname)
+            domains.extend(parsed.get("domains", []))
     return {
         "autodiscover": autodiscover,
         "autoconfig": autoconfig,
@@ -2180,6 +3109,122 @@ async def async_probe_mail_client_config(
         return await _async_probe_mail_client_config(target, owned_client, timeout=timeout)
 
 
+# ── The page_metadata vocabulary ─────────────────────────────────────────────
+# Three collectors historically produced page metadata under three spellings of
+# the same values — `parse_homepage_html` (this module), `fetch_page_metadata`
+# (the sync/case pipeline) and `core.ip_intel._process_page_html` (the async
+# pipeline) — while every *consumer* reads exactly one spelling each:
+# db/intel_db.py wants `favicon_mmh3`, utils/pairwise.py wants
+# `favicon_murmurhash3`, and both want `adsense_publisher_ids`, which the sync
+# collector emitted as `adsense_ids`. The mismatch is silent: a renamed key
+# reads as "this domain has no AdSense publisher ID" rather than as an error,
+# so the highest-weighted tracking signal in utils/evidence_meta.py (190.0)
+# simply never reached the graph on the case pipeline.
+#
+# Rather than teach each consumer every spelling, page metadata passes through
+# here once, on the way out of every collector. Aliases are *added*, never
+# renamed away, because stored payloads and both engines' historical rows use
+# the older keys and must keep resolving.
+_PAGE_METADATA_ALIASES: tuple[tuple[str, str], ...] = (
+    # (source key as some collector emits it, canonical key consumers read)
+    ("adsense_ids", "adsense_publisher_ids"),
+    ("rel_me_links", "rel_me"),
+    # `homepage_text_hash` is the canonical spelling: the value is a sha256 of
+    # the *normalized extracted text* (scripts/styles/comments stripped,
+    # whitespace collapsed — see html_text_hash), and calling it
+    # `homepage_html_hash` invited exactly one dangerous misreading, that it
+    # could be matched against Censys' `web.endpoints.http.body_hash_sha256`,
+    # which hashes the raw HTTP body. It cannot; see the warning in
+    # sources/censys_discovery.py where that selector is deliberately left
+    # unfed. Mirrored in both directions rather than renamed away, because
+    # `homepage_html_hash` is what stored payloads, the db identifier id_type
+    # and the graph's `html_hash` observations all use — those keep their
+    # spelling so graph history is not split in two.
+    ("homepage_text_hash", "homepage_html_hash"),
+    ("homepage_html_hash", "homepage_text_hash"),
+    # Deliberately NOT aliased: `script_assets` is a list of {url, host, type}
+    # records in this module and a flat list of URLs in core/ip_intel.py.
+    # Aliasing them would hide which shape a payload carries — and note
+    # `_script_urls_from_input` does NOT transparently accept both: given a
+    # mapping it reads `script_urls` first and its `script_assets` branch
+    # requires record items, so hand it the whole page_metadata mapping (which
+    # carries `script_urls`) rather than a bare `script_assets` list.
+    # Two live spellings of the favicon murmurhash, both actively read; mirror
+    # in both directions so a payload from either collector satisfies both.
+    ("favicon_murmurhash3", "favicon_mmh3"),
+    ("favicon_mmh3", "favicon_murmurhash3"),
+)
+
+# Keys every consumer iterates. `parse_homepage_html` returns the meta-tag
+# derived ones as scalars (there is only ever one `fb:app_id` on a page), which
+# made `core.analysis_service._identifiers` iterate the *string* and emit one
+# identifier per character — so any two sites carrying a Twitter handle shared
+# the selectors "a", "e", "o"... Normalizing to lists here removes the whole
+# class of bug rather than guarding at each of the several read sites.
+_PAGE_METADATA_LIST_KEYS: tuple[str, ...] = (
+    "fb_app_id",
+    "twitter_site",
+    "twitter_creator",
+    "authors",
+    "rel_me",
+    "adsense_publisher_ids",
+    "phone_numbers",
+)
+
+
+def canonicalize_page_metadata(meta: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize one collector's page metadata into the vocabulary consumers read.
+
+    Idempotent and non-destructive: safe to apply to a freshly scraped payload,
+    to a payload already canonicalized, or to one loaded back out of storage
+    (db/intel_db.py applies it on the rebuild path so historical searches gain
+    the canonical keys without a rescan).
+    """
+    if not isinstance(meta, Mapping):
+        return {}
+    out: dict[str, Any] = dict(meta)
+
+    for source_key, canonical_key in _PAGE_METADATA_ALIASES:
+        value = out.get(source_key)
+        if value in (None, "", [], {}):
+            continue
+        if out.get(canonical_key) in (None, "", [], {}):
+            out[canonical_key] = value
+
+    # AdSense publisher IDs reach us in two spellings — the `ca-pub-<digits>`
+    # literal in an AdSense snippet, and the bare `pub-<digits>` used in script
+    # URLs and in ads.txt. One collector stripped the prefix and one did not, so
+    # the two engines stored values that could never join. The bare form wins:
+    # it is what `parse_ads_txt` already yields for `ads_txt_publishers`, so
+    # canonicalizing here lets a homepage AdSense tag and an ads.txt entry
+    # recognise each other as the same publisher account.
+    adsense = out.get("adsense_publisher_ids")
+    if adsense:
+        normalized: list[str] = []
+        for item in adsense if isinstance(adsense, (list, tuple, set)) else [adsense]:
+            text = str(item or "").strip().lower()
+            if text.startswith("ca-"):
+                text = text[3:]
+            if text and text not in normalized:
+                normalized.append(text)
+        out["adsense_publisher_ids"] = normalized
+
+    for key in _PAGE_METADATA_LIST_KEYS:
+        value = out.get(key)
+        if value in (None, "", [], {}):
+            # Assign, don't setdefault: parse_homepage_html emits these as None,
+            # and setdefault is a no-op when the key already exists, so the
+            # list-guarantee this function documents was silently not held.
+            out[key] = []
+            continue
+        if not isinstance(value, (list, tuple, set)):
+            out[key] = [value]
+        else:
+            out[key] = list(value)
+
+    return out
+
+
 def fetch_page_metadata(
     domain: str,
     save_favicon_as: Path | None = None,
@@ -2204,6 +3249,8 @@ def fetch_page_metadata(
         "social_links": {},
         "social_handles": {},
         "site_verifications": {},
+        "phone_numbers": [],
+        "crypto_wallets": {},
         "favicon_md5": None,
         "favicon_murmurhash3": None,
         "favicon_saved": None,
@@ -2211,6 +3258,10 @@ def fetch_page_metadata(
         "http_fingerprint": homepage.get("http_fingerprint"),
         "final_url": homepage.get("url"),
         "status_code": homepage.get("status_code"),
+        # Underscore-prefixed to mark it transient: core.basic.get_page_metadata
+        # pops it after deriving the CMS so 32KB of markup per scan never
+        # reaches the stored payload.
+        "_html_prefix": homepage.get("body_prefix") or "",
     }
     result.update(homepage.get("page_metadata") or {})
     favicon_result = _sync_fetch_favicons(
@@ -2226,28 +3277,42 @@ def fetch_page_metadata(
         first_icon = icons[0]
         result["favicon_md5"] = first_icon.get("md5")
         result["favicon_murmurhash3"] = first_icon.get("murmurhash3")
+        # `hash_favicon_bytes` has always computed this; nothing surfaced it, so
+        # sources/censys_discovery.py's `favicon_sha256` selector could never
+        # fire. It is the exact-match favicon pivot that avoids the mmh3
+        # base64 construction entirely, so it is worth the one line.
+        result["favicon_sha256"] = first_icon.get("sha256")
         if save_favicon_as is not None and first_icon.get("content"):
             save_favicon_as.write_bytes(first_icon["content"])
             result["favicon_saved"] = str(save_favicon_as)
-    return result
+    return canonicalize_page_metadata(result)
 
 
 def extract_page_enrichment(html_doc: str, *, base_url: str | None = None) -> dict[str, Any]:
     parsed = parse_homepage_html(html_doc, page_url=base_url)
+    # Both spellings reach this point: the `ca-pub-…` literal from
+    # parse_homepage_html and a bare `pub-…` scraped from script URLs.
+    # canonicalize_page_metadata folds them to the bare form, so emit as found
+    # and let the one normalizer decide — the other collector kept `ca-pub-…`,
+    # which is what made the two engines' publisher IDs unjoinable.
     adsense_ids = sorted(
         {
-            *[value[3:] if value.startswith("ca-") else value for value in (parsed.get("adsense_ids") or [])],
+            *(parsed.get("adsense_ids") or []),
             *re.findall(r"\b(pub-\d{10,20})\b", str(html_doc or ""), re.I),
         }
     )
-    return {
+    enrichment = {
         "adsense_publisher_ids": _dedupe_preserve(adsense_ids),
         "fb_app_id": [parsed["fb_app_id"]] if parsed.get("fb_app_id") else [],
         "twitter_site": [parsed["twitter_site"]] if parsed.get("twitter_site") else [],
         "twitter_creator": [parsed["twitter_creator"]] if parsed.get("twitter_creator") else [],
         "authors": parsed.get("authors") or [],
         "rel_me": parsed.get("rel_me_links") or [],
-        "homepage_html_hash": parsed.get("homepage_text_hash"),
+        # Emit the canonical spelling; canonicalize_page_metadata mirrors it to
+        # `homepage_html_hash` for the stored-payload and graph consumers.
+        "homepage_text_hash": parsed.get("homepage_text_hash"),
+        "phone_numbers": parsed.get("phone_numbers") or [],
+        "crypto_wallets": parsed.get("crypto_wallets") or {},
         "meta_tags": parsed.get("meta_tags") or {},
         "script_assets": parsed.get("script_urls") or [],
         "bundler_hints": _dedupe_preserve(
@@ -2255,6 +3320,7 @@ def extract_page_enrichment(html_doc: str, *, base_url: str | None = None) -> di
             + [item.get("type") for item in parsed.get("script_assets") or [] if isinstance(item, Mapping) and item.get("type")]
         ),
     }
+    return canonicalize_page_metadata(enrichment)
 
 
 async def afetch_homepage_profile(
@@ -2285,13 +3351,16 @@ async def afetch_homepage_profile(
             "social_links": page_metadata.get("social_links") or {},
             "social_handles": page_metadata.get("social_handles") or {},
             "site_verifications": page_metadata.get("site_verifications") or {},
+            "phone_numbers": page_metadata.get("phone_numbers") or [],
+            "crypto_wallets": page_metadata.get("crypto_wallets") or {},
             "adsense_publisher_ids": [value[3:] if value.startswith("ca-") else value for value in (page_metadata.get("adsense_ids") or [])],
             "fb_app_id": [page_metadata["fb_app_id"]] if page_metadata.get("fb_app_id") else [],
             "twitter_site": [page_metadata["twitter_site"]] if page_metadata.get("twitter_site") else [],
             "twitter_creator": [page_metadata["twitter_creator"]] if page_metadata.get("twitter_creator") else [],
             "authors": page_metadata.get("authors") or [],
             "rel_me": page_metadata.get("rel_me_links") or [],
-            "homepage_html_hash": page_metadata.get("homepage_text_hash"),
+            # Canonical spelling; mirrored to homepage_html_hash on the way out.
+            "homepage_text_hash": page_metadata.get("homepage_text_hash"),
             "meta_tags": page_metadata.get("meta_tags") or {},
             "script_assets": page_metadata.get("script_urls") or [],
             "bundler_hints": _dedupe_preserve(page_metadata.get("inline_bundlers") or []),
@@ -2321,14 +3390,16 @@ async def afetch_homepage_profile(
         first = icons[0]
         result["favicon_md5"] = first.get("md5")
         result["favicon_mmh3"] = first.get("murmurhash3")
+        result["favicon_sha256"] = first.get("sha256")
         if save_favicon_as is not None and first.get("content"):
             save_favicon_as.write_bytes(first["content"])
             result["favicon_saved"] = str(save_favicon_as)
     else:
         result["favicon_md5"] = None
         result["favicon_mmh3"] = None
+        result["favicon_sha256"] = None
         result["favicon_saved"] = None
-    return result
+    return canonicalize_page_metadata(result)
 
 
 async def afetch_well_known_artifacts(domain: str, client: httpx.AsyncClient) -> dict[str, Any]:
@@ -2344,31 +3415,23 @@ async def afetch_well_known_artifacts(domain: str, client: httpx.AsyncClient) ->
     }
 
 
-async def ascrape_legal_pages(domain: str, client: httpx.AsyncClient) -> list[dict[str, Any]]:
-    raw = await async_scrape_legal_pages(domain, client=client)
-    pages = []
-    for page in raw.get("pages") or []:
-        if not isinstance(page, Mapping):
-            continue
-        pages.append(
-            {
-                "url": page.get("url"),
-                "entities": page.get("entities") or [],
-                "registration_numbers": {
-                    "companies_house": [value for value in page.get("registration_ids") or [] if re.fullmatch(r"\d{8}", str(value or ""))],
-                    "vat_ids": [value for value in page.get("registration_ids") or [] if re.fullmatch(r"[A-Z]{2}\d{8,12}", str(value or ""))],
-                    "delaware_file_numbers": [],
-                    "german_hrb": [value for value in page.get("registration_ids") or [] if str(value or "").startswith("HRB")],
-                    "siret": [value for value in page.get("registration_ids") or [] if re.fullmatch(r"\d{14}", str(value or ""))],
-                },
-                "postal_addresses": page.get("addresses") or [],
-                "phone_numbers": page.get("phones") or [],
-                "emails": page.get("emails") or [],
-                "urls": page.get("urls") or [],
-                "text_hash": page.get("text_hash"),
-            }
-        )
-    return pages
+async def ascrape_legal_pages(domain: str, client: httpx.AsyncClient) -> dict[str, Any]:
+    """Legal-page identity signals, in the one shape every consumer reads.
+
+    This used to re-key each page into a private vocabulary (`entities`,
+    `postal_addresses`, `phone_numbers`, `text_hash`) and return a bare list.
+    Two things were wrong with that. The re-keying read fields
+    `extract_legal_page_signals` does not emit — it produces `entity_names` and
+    `normalized_text_hash` — so `entities` and `text_hash` were *always* empty,
+    silently. And returning a list dropped the aggregates, so the
+    `legal_pages.entity_names` / `.phones` / `.registration_ids` paths that
+    utils/pairwise.py weights at 18/34/35 could never match on this engine.
+    Both engines now return `async_scrape_legal_pages`' dict unchanged:
+    `{pages, entity_names, registration_ids, addresses, phones, emails}`, which
+    is what core.analysis_service._compact_legal_pages and db/intel_db.py's
+    both-shapes reader already expect.
+    """
+    return await async_scrape_legal_pages(domain, client=client)
 
 
 async def afetch_mail_client_config(domain: str, client: httpx.AsyncClient) -> dict[str, Any]:

@@ -13,17 +13,22 @@ otherwise DATABASE_URL (the same database used for case storage).
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import logging
 import os
 import ipaddress
 import re
 import threading
+import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 from urllib.parse import urlsplit
 
 from pathlib import Path
@@ -31,6 +36,8 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+
+LOGGER = logging.getLogger("ip_intel.intel_db")
 
 DEFAULT_DATABASE_URL = "postgresql://ip_intel:ip_intel@postgres:5432/ip_intel"
 
@@ -493,6 +500,23 @@ CREATE TABLE IF NOT EXISTS graph_selector_groups (
 );
 CREATE INDEX IF NOT EXISTS idx_graph_selector_groups_kind ON graph_selector_groups(kind, degree DESC);
 
+-- Precomputed multi-hop reachability: for every registrable domain, every
+-- OTHER domain reachable within GRAPH_PATH_MAX_HOPS through the scored
+-- adjacency in graph_links, with the actual hop-by-hop evidence chain baked
+-- in. Rebuilt in the same pass as graph_links (rebuild_clusters), so "why is
+-- A related to C" is always an indexed SELECT, never a live traversal
+-- triggered by a search or page load.
+CREATE TABLE IF NOT EXISTS graph_paths (
+    registrable_domain  TEXT    NOT NULL,
+    target              TEXT    NOT NULL,
+    hops                INTEGER NOT NULL,
+    min_hop_score       NUMERIC NOT NULL,
+    chain               JSONB   NOT NULL,
+    computed_at         TEXT,
+    PRIMARY KEY (registrable_domain, target)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_paths_rd ON graph_paths(registrable_domain, hops);
+
 CREATE TABLE IF NOT EXISTS graph_state (
     id                  BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
     dirty               BOOLEAN NOT NULL DEFAULT TRUE,
@@ -504,6 +528,47 @@ CREATE TABLE IF NOT EXISTS graph_state (
 INSERT INTO graph_state (id, dirty, dirty_at)
 VALUES (TRUE, TRUE, NOW())
 ON CONFLICT (id) DO NOTHING;
+
+-- Censys host-enrichment daily budget. It lives on graph_state because that is
+-- the schema's only singleton state row, and unlike the rest of the
+-- correlation tables it is never DELETEd/TRUNCATEd by a graph rebuild (see
+-- rebuild_graph) — a counter that reset on every rebuild would let a sweep
+-- blow straight through the plan's 20k/day cap. Added as ALTERs rather than
+-- new columns in the CREATE above so existing deployments pick them up:
+-- init_db() re-runs every statement here on each process start.
+ALTER TABLE graph_state ADD COLUMN IF NOT EXISTS censys_enrichment_day   DATE;
+ALTER TABLE graph_state ADD COLUMN IF NOT EXISTS censys_enrichment_count INTEGER NOT NULL DEFAULT 0;
+
+-- Continuous-maintenance state for the derived graph, same singleton row and
+-- same reasoning as the Censys counters above: it must survive the rebuilds
+-- that empty every other correlation table, so it cannot live in one of them.
+-- dirty_domains is the incremental rescore queue -- the registrable domains
+-- whose materialized link scores a recent write invalidated (see
+-- _mark_graph_dirty / apply_pending_graph_rescores). full_reconcile_at is when
+-- the last full rebuild_all_correlation finished, which is what paces the
+-- periodic reconcile, and incremental_at is purely observability.
+-- Note: schema_statements() splits this string on semicolons, so prose here
+-- must never contain one.
+ALTER TABLE graph_state ADD COLUMN IF NOT EXISTS dirty_domains     TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE graph_state ADD COLUMN IF NOT EXISTS full_reconcile_at TIMESTAMPTZ;
+ALTER TABLE graph_state ADD COLUMN IF NOT EXISTS incremental_at    TIMESTAMPTZ;
+-- Seed the reconcile clock on first upgrade only (the column is NULL exactly
+-- once, on the deployment that introduces it). Without this a NULL would read
+-- as "infinitely overdue" and every process start would kick off a full
+-- reconcile of the whole corpus.
+UPDATE graph_state SET full_reconcile_at = NOW() WHERE full_reconcile_at IS NULL;
+
+-- Per-IP home for host enrichment. The scalar fields it can improve (asn,
+-- asn_desc, country, network_name, network_cidr) already have columns above and
+-- are filled by merge_censys_enrichment on the scan path. These two carry what
+-- no other provider gives us (reputation, GreyNoise, VPN/proxy/hosting
+-- classification, service labels) plus the marker the pool sweep uses to tell
+-- an un-enriched IP from one Censys has simply never seen.
+-- Note: schema_statements() splits this string on semicolons, so prose here
+-- must never contain one.
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS censys_enrichment  JSONB;
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS censys_enriched_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_ips_censys_enriched ON ips(censys_enriched_at);
 
 """
 
@@ -869,6 +934,62 @@ def schema_statements() -> list[str]:
     return [stmt.strip() for stmt in _SCHEMA.strip().split(";") if stmt.strip()]
 
 
+# How long a schema statement will wait for a lock before giving up. The DDL is
+# all `IF NOT EXISTS`, so on an initialized database every statement is a no-op
+# — but a no-op `CREATE INDEX IF NOT EXISTS` still takes a lock on its table to
+# decide that, and a lock request that cannot be granted *queues*, blocking
+# every later request on that table behind it. See _schema_objects_present.
+_SCHEMA_LOCK_TIMEOUT = os.environ.get("SCHEMA_LOCK_TIMEOUT", "5s")
+
+
+def _expected_schema_relations() -> list[str]:
+    """Every table and index name the schema declares.
+
+    Parsed from the DDL rather than hardcoded so a relation added to _SCHEMA is
+    covered automatically — a hardcoded list would silently stop creating new
+    indexes the moment someone added one.
+    """
+    names: list[str] = list(_ALL_TABLES)
+    for stmt in schema_statements():
+        match = re.search(
+            r"CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)", stmt, re.IGNORECASE
+        )
+        if match:
+            names.append(match.group(1))
+    return names
+
+
+def _schema_objects_present() -> bool:
+    """Is every declared table and index already there?
+
+    One indexed catalog read, taking no locks on any application table. This is
+    the fast path that makes init_db free on an already-initialized database.
+
+    It exists because the old unconditional DDL loop was a live hazard, not a
+    micro-optimization. Every statement ran in ONE transaction, so blocking on
+    the last table meant holding locks on every earlier one — and a scan's
+    `INSERT INTO searches` was observed waiting 9 minutes behind a
+    `CREATE INDEX ... ON graph_clusters` that was itself waiting on a long
+    rebuild transaction. Two unrelated tables, one stalled pipeline, purely
+    because re-asserting an existing schema is not actually free.
+    """
+    expected = _expected_schema_relations()
+    try:
+        with _conn() as c:
+            row = c.execute(
+                # DISTINCT and visibility-scoped: pg_class spans every schema,
+                # so a same-named relation in another one would otherwise count
+                # towards ours and let a genuinely incomplete schema pass.
+                "SELECT count(DISTINCT relname) AS n FROM pg_class "
+                " WHERE relname = ANY(%s) AND pg_table_is_visible(oid)",
+                (expected,),
+            ).fetchone()
+    except Exception:
+        # Cannot tell — fall through to the DDL, which will raise a better error.
+        return False
+    return int((row or {}).get("n") or 0) >= len(set(expected))
+
+
 def init_db() -> None:
     """Create the schema once per process (idempotent and concurrency-safe)."""
     global _SCHEMA_READY
@@ -877,7 +998,16 @@ def init_db() -> None:
     with _SCHEMA_LOCK:
         if _SCHEMA_READY:
             return
+        if _schema_objects_present():
+            _SCHEMA_READY = True
+            return
         with _conn() as c:
+            # Belt and braces for the genuinely-missing-schema path: even here a
+            # statement must fail fast rather than queue behind a long
+            # transaction while holding locks on everything it already touched.
+            # The caller sees the error and retries on the next call, which is
+            # strictly better than stalling every writer in the process.
+            c.execute(f"SET LOCAL lock_timeout = '{_SCHEMA_LOCK_TIMEOUT}'")
             c.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_ADVISORY_LOCK_KEY,))
             for stmt in schema_statements():
                 c.execute(stmt)
@@ -1148,6 +1278,20 @@ def _merge_ip_detail_entry(
             asn_info[key] = value
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return `value` if it's a dict, else an empty dict.
+
+    Guards the persistence layer against upstream shape drift: a payload field
+    that is normally a dict (e.g. `whois`, `page_metadata`, a provider result)
+    occasionally arrives as a list. The common ``result.get("x") or {}`` idiom
+    does *not* catch that — a non-empty list is truthy, so it passes through and
+    the following ``.get(...)`` raises ``'list' object has no attribute 'get'``,
+    which aborts the whole best-effort save and drops the result from the pool.
+    Coercing at each dict access keeps one malformed field from losing the row.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def normalize_ip_details(value: Any) -> dict[str, dict[str, Any]]:
     normalized: dict[str, dict[str, Any]] = {}
     if isinstance(value, Mapping):
@@ -1218,7 +1362,7 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
             }
         )
 
-    dns = result.get("dns", {})
+    dns = _as_dict(result.get("dns"))
     for ip in _iter_dns_host_values(dns.get("A")):
         add(ip, "resolved_ip", "dns_a")
     for ip in _iter_dns_host_values(dns.get("AAAA")):
@@ -1230,7 +1374,7 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
     for host in _iter_dns_host_values(dns.get("NS")):
         add(host, "nameserver", "nameserver")
 
-    for whois_ns in _parse_json_list((result.get("whois") or {}).get("nameservers")):
+    for whois_ns in _parse_json_list(_as_dict(result.get("whois")).get("nameservers")):
         add(whois_ns, "whois_nameserver", "whois_nameserver")
 
     for subdomain in result.get("subdomains", []) or []:
@@ -1238,15 +1382,23 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
     for subdomain in result.get("zone_transfer", []) or []:
         add(subdomain, "zone_transfer", "zone_transfer")
 
-    historical = result.get("historical_dns", {}) or {}
+    historical = _as_dict(result.get("historical_dns"))
     for record in historical.get("records", []) or []:
+        if not isinstance(record, dict):
+            continue
         if str(record.get("rrtype") or "").upper() in {"A", "AAAA"}:
             add(record.get("rdata"), "historical_ip", "historical_dns", record)
 
     for entry in result.get("spf_origins", []) or []:
-        add(entry.get("ip"), "spf_origin", "spf", entry)
+        if isinstance(entry, dict):
+            add(entry.get("ip"), "spf_origin", "spf", entry)
 
-    cert_transparency = result.get("cert_transparency", {}) or {}
+    # See the ct_certs projection below for why this reads `crt_sh` first: the
+    # `cert_transparency` spelling is never present in any payload, so every
+    # CT-derived observation here was silently empty. Note `cross_domain_sans`
+    # genuinely does not exist under crt_sh (that key came from the retired
+    # async engine) — the SANs on each cert are what carries the signal now.
+    cert_transparency = _as_dict(result.get("crt_sh")) or _as_dict(result.get("cert_transparency"))
     for san in cert_transparency.get("cross_domain_sans", []) or []:
         add(san, "cross_domain_san", "cross_san")
     for cert in cert_transparency.get("certs", []) or []:
@@ -1262,23 +1414,31 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
         ("viewdns", "subdomain_leak", "viewdns_host", "subdomain"),
     ]:
         for entry in origin.get(key, []) or []:
+            if not isinstance(entry, dict):
+                continue
             add(entry.get("ip"), "origin_ip", source_name, entry)
             add(entry.get(subdomain_key), relation_name, source_name, entry)
 
     for entry in origin.get("urlscan", []) or []:
+        if not isinstance(entry, dict):
+            continue
         add(entry.get("ip"), "origin_ip", "origin_hit", entry)
         add(entry.get("url"), "urlscan_url", "urlscan_url", entry)
 
     for provider_key in ("censys", "shodan", "netlas"):
-        provider_result = origin.get(provider_key) or {}
+        provider_result = _as_dict(origin.get(provider_key))
         for hit in provider_result.get("hits", []) or []:
+            if not isinstance(hit, dict):
+                continue
             add(hit.get("ip"), "provider_ip", "provider_hit", hit)
             for hostname in hit.get("hostnames", []) or []:
                 add(hostname, "provider_hostname", "provider_hit", hit)
 
     for scan_key in ("scan", "provider_scan", "country_scan"):
-        scan_result = origin.get(scan_key) or {}
+        scan_result = _as_dict(origin.get(scan_key))
         for hit in scan_result.get("hits", []) or []:
+            if not isinstance(hit, dict):
+                continue
             add(hit.get("ip"), "scan_ip", "scan_hit", hit)
             add(hit.get("cn"), "scan_certificate_cn", "tls_cn", hit)
             for san in hit.get("sans", []) or []:
@@ -1292,12 +1452,14 @@ def extract_related_targets(result: dict[str, Any], *, include_self: bool = Fals
             add(domain, "reverse_ip_domain", "reverse_ip", {"ip": ip, "domain": domain})
 
     for cert in result.get("non_cf_tls_certs", []) or []:
+        if not isinstance(cert, dict):
+            continue
         add(cert.get("ip"), "tls_ip", "origin_hit", cert)
         add(cert.get("cn"), "tls_cn", "tls_cn", cert)
         for san in cert.get("sans", []) or []:
             add(san, "tls_san", "tls_san", cert)
 
-    if result.get("tls_cert"):
+    if isinstance(result.get("tls_cert"), dict):
         cert = result.get("tls_cert") or {}
         add(cert.get("ip"), "tls_ip", "origin_hit", cert)
         add(cert.get("cn"), "tls_cn", "tls_cn", cert)
@@ -1617,8 +1779,10 @@ def _extract_ip_port_map(result: dict[str, Any]) -> dict[tuple[str, str], int | 
     origin = _origin_candidates(result)
 
     for provider in ("censys", "shodan", "netlas"):
-        provider_result = origin.get(provider) or {}
+        provider_result = _as_dict(origin.get(provider))
         for hit in provider_result.get("hits") or []:
+            if not isinstance(hit, dict):
+                continue
             ip = hit.get("ip")
             if ip:
                 mapping[(ip, provider)] = hit.get("port")
@@ -1628,8 +1792,10 @@ def _extract_ip_port_map(result: dict[str, Any]) -> dict[tuple[str, str], int | 
         ("provider_scan", "scan_provider"),
         ("country_scan", "scan_country"),
     ]:
-        scan_result = origin.get(scan_key) or {}
+        scan_result = _as_dict(origin.get(scan_key))
         for hit in scan_result.get("hits") or []:
+            if not isinstance(hit, dict):
+                continue
             ip = hit.get("ip")
             if ip:
                 mapping[(ip, source)] = hit.get("port") or 443
@@ -1664,14 +1830,57 @@ def _stable_text_hash(value: Any) -> str | None:
 
 
 def _normalize_identifier_hash(value: Any) -> str | None:
-    text = str(value or "").strip().lower()
+    """Reduce any spelling of a digest to lowercase hex, the stored form.
+
+    Two producers disagree on how an SSH host-key SHA-256 is written:
+    core/basic.py's probe emits raw lowercase hex, while
+    sources/signal_transport.py emits OpenSSH's `SHA256:<base64>`. Lowercasing
+    the latter used to be the *whole* of the handling here, which both failed
+    to convert it to hex (so the same host key produced two unrelated values
+    and never correlated) and destroyed base64's significant case (so two
+    distinct keys could collide). Decode the base64 form to hex before any
+    case folding; everything else keeps the previous behavior.
+    """
+    text = str(value or "").strip()
     if not text:
         return None
+
+    base64_body = re.fullmatch(r"(?i:sha256):([A-Za-z0-9+/]{40,50}={0,2})", text)
+    if base64_body:
+        candidate = base64_body.group(1)
+        padded = candidate + "=" * (-len(candidate) % 4)
+        try:
+            digest = base64.b64decode(padded, validate=True)
+        except (binascii.Error, ValueError):
+            digest = b""
+        if len(digest) == 32:
+            return digest.hex()
+
+    text = text.lower()
     text = re.sub(r"^(sha256|spki|md5):", "", text)
     text = re.sub(r"\s+", "", text)
     if ":" in text and re.fullmatch(r"[0-9a-f:]+", text):
         text = text.replace(":", "")
     return text or None
+
+
+def _ssh_host_key_records(result: Mapping[str, Any] | Any) -> list[Mapping[str, Any]]:
+    """Every SSH host-key probe in a result, whichever engine wrote it.
+
+    core/analysis_service.py stores `{"probes": [...]}` while core/ip_intel.py
+    stores a bare list, and the two read sites here each understood only one of
+    them: identifier extraction iterated the dict's *keys* (so case-pipeline
+    scans contributed no tier-1 SSH identifiers at all), and the graph
+    projection called `.get("probes")` on a list (the `'list' object has no
+    attribute 'get'` that core/analysis_service.py's save-failure logging was
+    written to chase down). Accept both here instead.
+    """
+    raw = result.get("ssh_host_keys") if isinstance(result, Mapping) else None
+    if isinstance(raw, Mapping):
+        raw = raw.get("probes")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [entry for entry in raw if isinstance(entry, Mapping) and not entry.get("error")]
 
 
 def _normalize_identifier_email(value: Any) -> str | None:
@@ -1686,14 +1895,13 @@ def _normalize_identifier_email(value: Any) -> str | None:
 
 
 def _normalize_identifier_phone(value: Any) -> str | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    keep_plus = text.startswith("+")
-    digits = re.sub(r"\D+", "", text)
-    if len(digits) < 7:
-        return None
-    return f"+{digits}" if keep_plus else digits
+    # Delegates to the extractor's normalizer so a number filed from a legal
+    # page lands on the same key as the identical number seen on the homepage,
+    # and so template/placeholder numbers are rejected here too rather than
+    # only at scan time.
+    from sources.signal_web import normalize_contact_phone
+
+    return normalize_contact_phone(value)
 
 
 def _normalize_identifier_guid(value: Any) -> str | None:
@@ -1784,6 +1992,15 @@ def _normalize_identifier_value(id_type: str, value: Any) -> str | None:
     if id_type in _IDENTIFIER_HANDLE_TYPES:
         text = _normalize_generic_identifier(value)
         return text.lstrip("@") if text else None
+    if id_type == "crypto_wallet":
+        # "<chain>|<address>" — only the chain half is safe to fold; see
+        # sources.signal_web.normalize_crypto_address.
+        from sources.signal_web import normalize_crypto_address
+
+        chain, _, address = str(value or "").partition("|")
+        chain_key = _normalize_generic_identifier(chain)
+        normalized = normalize_crypto_address(chain_key, address)
+        return f"{chain_key}|{normalized}" if chain_key and normalized else None
     if "guid" in id_type or id_type.endswith("_tenant"):
         normalized = _normalize_identifier_guid(value)
         return normalized or _normalize_generic_identifier(value)
@@ -2215,6 +2432,20 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
                 source=f"page_metadata.social_handles.{platform}",
             )
 
+    for value in _normalize_text_list(page.get("phone_numbers") or []):
+        add(value, id_type="contact_phone", tier="tier_3", category="identity", source="page_metadata.phone_numbers")
+
+    wallets = page.get("crypto_wallets") or {}
+    for chain, addresses in wallets.items():
+        for address in _normalize_text_list(addresses or []):
+            add(
+                f"{_normalize_generic_identifier(chain) or chain}|{address}",
+                id_type="crypto_wallet",
+                tier="tier_1",
+                category="identity",
+                source=f"page_metadata.crypto_wallets.{chain}",
+            )
+
     social_links = page.get("social_links") or {}
     for platform, urls in social_links.items():
         for url in _normalize_text_list(urls or []):
@@ -2253,7 +2484,21 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
     for include in _normalize_text_list(email_security.get("spf_includes") or []):
         add(include, id_type="spf_include", tier="tier_4", category="email", source="email_security.spf_includes")
 
-    dmarc_report_uris = email_security.get("dmarc_report_uris") or {}
+    # Prefer the structured {"rua": [...], "ruf": [...]} map. core/analysis_service
+    # replaces `dmarc_report_uris` itself with a flat list of addresses (utils/
+    # pairwise.py can only score that exact path, and a dict there scores
+    # nothing), and stashes the tagged form under `dmarc_report_uris_by_tag`.
+    # The isinstance guard is the load-bearing part: this used to be a bare
+    # `or {}`, which passes a list straight through to `.get()` below and raises
+    # AttributeError. save_search is called inside a try/except in
+    # analyze_target, so that aborted persistence for the whole scan and
+    # reported it as a warning — a searches row with no identifiers, no IPs and
+    # no certs, from a scan that otherwise looked like it succeeded.
+    dmarc_report_uris = email_security.get("dmarc_report_uris_by_tag")
+    if not isinstance(dmarc_report_uris, Mapping):
+        legacy = email_security.get("dmarc_report_uris")
+        # Payloads stored before the split still carry the tagged dict here.
+        dmarc_report_uris = legacy if isinstance(legacy, Mapping) else {}
     for key, id_type in [
         ("dmarc_rua", "dmarc_rua"),
         ("dmarc_ruf", "dmarc_ruf"),
@@ -2368,11 +2613,26 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
                 raw={"artifact": key},
             )
 
-    legal_pages = result.get("legal_pages") or []
+    # `legal_pages` is the dict signal_web.scrape_legal_pages returns (per-page
+    # entries under "pages", plus those pages' signals deduped up to the top
+    # level). Iterating it directly walked its *keys* — six strings, every one
+    # rejected by the Mapping guard below — so this whole block silently
+    # produced no legal identifiers at all. The per-page entries are what we
+    # want: same signals, but each carries the url that sourced it. A bare list
+    # is the older payload shape, still accepted.
+    legal_raw = result.get("legal_pages")
+    if isinstance(legal_raw, Mapping):
+        legal_pages = list(legal_raw.get("pages") or []) or [legal_raw]
+    elif isinstance(legal_raw, list):
+        legal_pages = legal_raw
+    else:
+        legal_pages = []
     for page_entry in legal_pages:
         if not isinstance(page_entry, Mapping):
             continue
-        add(page_entry.get("text_hash"), id_type="legal_text_hash", tier="tier_2", category="legal", source="legal_pages.text_hash", raw={"url": page_entry.get("url")})
+        # extract_legal_page_signals names this `normalized_text_hash`; the old
+        # `text_hash` key it looked for has never existed on these entries.
+        add(page_entry.get("normalized_text_hash"), id_type="legal_text_hash", tier="tier_2", category="legal", source="legal_pages.text_hash", raw={"url": page_entry.get("url")})
         for value in _collect_values_for_key_substrings(page_entry, ("email", "mail")):
             add(value, id_type="contact_email", tier="tier_3", category="legal", source="legal_pages.contact", raw=page_entry)
         for value in _collect_values_for_key_substrings(page_entry, ("phone", "tel", "mobile")):
@@ -2384,9 +2644,24 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
         for value in _collect_values_for_key_substrings(page_entry, ("vat", "register", "registry", "registration", "company_number", "company-id", "reg")):
             add(value, id_type="legal_registration", tier="tier_3", category="legal", source="legal_pages.registration", raw=page_entry)
 
-    for cert in result.get("non_cf_tls_certs") or ([] if not result.get("tls_cert") else [result.get("tls_cert")]):
-        if isinstance(cert, Mapping):
-            _append_cert_identifiers(items, seen, cert, source="tls_certs", observed_at=observed_at)
+    # Both engines' cert shapes, deduplicated — see the tls_certs insert for why
+    # `tls_cert` and `tls_certs["probes"]` can be the same object. Reading only
+    # the ip_intel spelling meant every case-pipeline domain scan contributed
+    # zero cert-derived tier-1 identifiers.
+    _cert_candidates = list(result.get("non_cf_tls_certs") or [])
+    if result.get("tls_cert"):
+        _cert_candidates.append(result["tls_cert"])
+    _cert_candidates.extend((result.get("tls_certs") or {}).get("probes") or [])
+    _seen_cert_ids: set[Any] = set()
+    for cert in _cert_candidates:
+        if not isinstance(cert, Mapping) or cert.get("error"):
+            continue
+        _fp = _normalize_identifier_hash(cert.get("sha256") or cert.get("fingerprint_sha256"))
+        _identity = _fp or id(cert)
+        if _identity in _seen_cert_ids:
+            continue
+        _seen_cert_ids.add(_identity)
+        _append_cert_identifiers(items, seen, cert, source="tls_certs", observed_at=observed_at)
 
     for followup in result.get("subdomain_followups") or []:
         if not isinstance(followup, Mapping):
@@ -2443,17 +2718,23 @@ def extract_search_identifiers(result: dict[str, Any]) -> list[dict[str, Any]]:
                 add(hit.get("ip"), id_type="scan_ip", tier="tier_3", category="infrastructure", source=f"origin_candidates.{scan_key}", raw=hit)
             _append_cert_identifiers(items, seen, hit, source=f"origin_candidates.{scan_key}", observed_at=observed_at)
 
-    cert_transparency = result.get("cert_transparency") or {}
+    # Same key fix as above: crt_sh is what the pipeline writes, so reading
+    # `cert_transparency` alone meant no cert SAN ever became an identifier.
+    cert_transparency = result.get("crt_sh") or result.get("cert_transparency") or {}
     for san in _normalize_text_list(cert_transparency.get("cross_domain_sans") or []):
         add(san, id_type="cross_san_domain", tier="tier_3", category="tls_ct", source="cert_transparency.cross_domain_sans")
     for cert in cert_transparency.get("certs") or []:
         if isinstance(cert, Mapping):
             _append_cert_identifiers(items, seen, cert, source="cert_transparency", observed_at=observed_at)
 
-    for ssh_key in result.get("ssh_host_keys") or []:
-        if not isinstance(ssh_key, Mapping):
-            continue
-        add(ssh_key.get("sha256") or ssh_key.get("fingerprint_sha256"), id_type="ssh_host_key_sha256", tier="tier_1", category="ssh", source="ssh_host_keys", raw=ssh_key)
+    for ssh_key in _ssh_host_key_records(result):
+        # `fingerprint_sha256` first: signal_transport emits BOTH a prefixed
+        # "SHA256:<b64>" (which _normalize_identifier_hash decodes to hex) and a
+        # bare `sha256` base64 string (which it cannot recognise, and would
+        # merely lowercase — losing base64's significant case and never joining
+        # core/basic.py's hex). The graph projection already prefers this order;
+        # this site had the opposite preference, so the two disagreed.
+        add(ssh_key.get("fingerprint_sha256") or ssh_key.get("sha256"), id_type="ssh_host_key_sha256", tier="tier_1", category="ssh", source="ssh_host_keys", raw=ssh_key)
         add(ssh_key.get("md5") or ssh_key.get("fingerprint_md5"), id_type="ssh_host_key_md5", tier="tier_2", category="ssh", source="ssh_host_keys", raw=ssh_key)
 
     return items
@@ -2578,13 +2859,14 @@ def get_domain_tiers(domains: Iterable[str]) -> dict[str, int]:
 def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, timestamp: str) -> None:
     """Write all structured child table rows from a result dict."""
     typ = result.get("type", "unknown")
-    ip_details = result.get("ip_details", {})
+    ip_details = _as_dict(result.get("ip_details"))
     ip_ports = _extract_ip_port_map(result)
 
     if typ == "domain":
         for ip, info in ip_details.items():
+            info = _as_dict(info)
             sources = sorted(set(info.get("sources") or []))
-            asn = info.get("asn_info") or {}
+            asn = _as_dict(info.get("asn_info"))
             info_cf = info.get("cloudflare")
             cf_value = 1 if info_cf else (0 if info_cf is not None else None)
             for source in sources:
@@ -2609,7 +2891,7 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
                     ),
                 )
     elif typ == "ip":
-        asn = result.get("asn_info", {})
+        asn = _as_dict(result.get("asn_info"))
         c.execute(
             """INSERT INTO ips
                (search_id, ip, source, cloudflare, ptr, asn, asn_desc, asn_registry, country,
@@ -2632,10 +2914,41 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
             ),
         )
 
-    tls_list = result.get("non_cf_tls_certs") or ([result["tls_cert"]] if result.get("tls_cert") else [])
+    # Both engines' cert shapes. This used to read only `non_cf_tls_certs` /
+    # `tls_cert` (core/ip_intel.py's spelling), so every cert the live case
+    # pipeline probed — which writes `tls_certs.probes` with the fingerprint
+    # under `fingerprint_sha256` — was dropped on the floor and this table
+    # stayed empty for the whole web pipeline. The denylist's shared-hosting
+    # bundle rules read these rows for each certificate's true SAN list, so an
+    # empty table meant no bundle was ever detected.
+    tls_list = list(result.get("non_cf_tls_certs") or [])
+    if result.get("tls_cert"):
+        tls_list.append(result["tls_cert"])
+    tls_list.extend((result.get("tls_certs") or {}).get("probes") or [])
+    # Deduplicate: core/analysis_service.py's IP path sets `tls_certs["probes"]`
+    # to a list containing the very same dict as `tls_cert`, so reading both
+    # shapes (which is what makes the case pipeline populate this table at all)
+    # would otherwise write two identical rows per IP scan and double-count
+    # every cert in _load_tls_observations and cluster_by_tls_cert.
+    seen_certs: set[Any] = set()
     for cert in tls_list:
-        if not cert:
+        if not isinstance(cert, dict) or cert.get("error"):
             continue
+        fingerprint = _normalize_identifier_hash(
+            cert.get("sha256") or cert.get("fingerprint_sha256")
+        )
+        # Keyed on (fingerprint, ip, port), not the fingerprint alone: one cert
+        # served from several IPs is several genuine observations, and this
+        # table records the ip/port it was seen on. Fingerprint-only dedupe
+        # would silently drop every origin after the first. Falls back to object
+        # identity when there is no usable hash, so such a cert is still
+        # written exactly once.
+        identity = (
+            (fingerprint, cert.get("ip"), cert.get("port", 443)) if fingerprint else id(cert)
+        )
+        if identity in seen_certs:
+            continue
+        seen_certs.add(identity)
         c.execute(
             """INSERT INTO tls_certs
                (search_id, ip, port, sni_used, cn, sans, issuer_cn, issuer_org, not_before, not_after, sha256, spki_sha256, observed_at)
@@ -2646,17 +2959,18 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
                 cert.get("cn"), _json(cert.get("sans", [])),
                 cert.get("issuer_cn"), cert.get("issuer_org"),
                 cert.get("not_before"), cert.get("not_after"),
-                cert.get("sha256"), cert.get("spki_sha256"), timestamp,
+                _normalize_identifier_hash(cert.get("sha256") or cert.get("fingerprint_sha256")),
+                _normalize_identifier_hash(cert.get("spki_sha256")), timestamp,
             ),
         )
 
     origin = _origin_candidates(result)
     for scan_key, scan_label in [("scan", "gcp"), ("provider_scan", "asn"), ("country_scan", "country")]:
-        scan_result = origin.get(scan_key) or {}
-        if not isinstance(scan_result, dict) or scan_result.get("skipped"):
+        scan_result = _as_dict(origin.get(scan_key))
+        if scan_result.get("skipped"):
             continue
         for hit in scan_result.get("hits") or []:
-            if not hit.get("ip"):
+            if not isinstance(hit, dict) or not hit.get("ip"):
                 continue
             c.execute(
                 """INSERT INTO scan_hits
@@ -2673,30 +2987,47 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
             )
 
     for provider in ("censys", "shodan", "netlas"):
-        provider_result = origin.get(provider) or {}
-        if not isinstance(provider_result, dict):
-            continue
+        provider_result = _as_dict(origin.get(provider))
         for hit in provider_result.get("hits") or []:
+            if not isinstance(hit, dict):
+                continue
+            # `services` is deliberately no longer promoted out of the hit.
+            # Censys host enrichment owns port/protocol data now
+            # (censys_enrichment.services), and the cert search was billing
+            # search credits for an overlapping port list on a second meter.
+            # Nothing ever read this column — the provider_hits SELECT below
+            # does not include it — and the full hit, services included, is
+            # still archived in `raw_json`, so nothing is actually lost.
             c.execute(
                 """INSERT INTO provider_hits
                    (search_id, provider, ip, port, protocol, asn, asn_desc, org, country, cloudflare,
-                    services, hostnames, mode, status, query_type, total, observed_at, raw_json)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    hostnames, mode, status, query_type, total, observed_at, raw_json)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (
                     sid, provider, hit.get("ip"), hit.get("port"), hit.get("protocol"),
                     _normalize_asn(hit.get("asn")),
                     hit.get("asn_name") or hit.get("asn_desc"),
                     hit.get("org"), hit.get("country"),
                     1 if hit.get("cloudflare") else 0,
-                    _json(hit.get("services", [])), _json(hit.get("hostnames", [])),
+                    _json(hit.get("hostnames", [])),
                     provider_result.get("mode"), provider_result.get("status"),
                     provider_result.get("query_type"), provider_result.get("total"),
                     timestamp, _json(hit),
                 ),
             )
 
-    ct = result.get("cert_transparency", {})
+    # `crt_sh` first: that is the key core/basic.py's SERVICES registry writes
+    # and the only one any current payload carries. This read used to be
+    # `cert_transparency` alone — a spelling no pipeline has ever produced — so
+    # `_as_dict` returned {} on every single scan and ct_certs/cross_sans stayed
+    # empty database-wide (0 rows across 2,983 searches) while 1,291 payloads
+    # sat there holding the certs. Same class of bug as the tls_certs one fixed
+    # above, and found the same way: comparing what the JSONB payload holds
+    # against what the relational table actually got.
+    ct = _as_dict(result.get("crt_sh")) or _as_dict(result.get("cert_transparency"))
     for cert in ct.get("certs", []):
+        if not isinstance(cert, dict):
+            continue
         c.execute(
             "INSERT INTO ct_certs (search_id, cert_id, issuer, not_before, not_after, sans, observed_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
             (sid, cert.get("id"), cert.get("issuer"), cert.get("not_before"), cert.get("not_after"), _json(cert.get("sans", [])), timestamp),
@@ -2704,12 +3035,27 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
     for san in ct.get("cross_domain_sans", []):
         c.execute("INSERT INTO cross_sans (search_id, san) VALUES (%s,%s)", (sid, san))
 
-    for sub in result.get("subdomains", []):
-        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (%s,%s,%s)", (sid, sub, "crt.sh"))
-    for sub in result.get("zone_transfer", []):
-        c.execute("INSERT INTO subdomains (search_id, subdomain, source) VALUES (%s,%s,%s)", (sid, sub, "zone_transfer"))
+    # crt.sh alone can return thousands of subdomains for a large org, so this
+    # is batched with executemany instead of one INSERT round-trip per row.
+    # Also read out of the crt_sh block. The top-level `subdomains` key this
+    # used to read is likewise never present — crt.sh's subdomain list is nested
+    # under `crt_sh.subdomains` (1,291 payloads carry it, and the table had 0
+    # rows). The top-level spelling is kept as a fallback for any payload shape
+    # that does supply it.
+    subdomain_rows = [
+        (sid, sub, "crt.sh")
+        for sub in (ct.get("subdomains") or result.get("subdomains") or [])
+        if isinstance(sub, str) and sub.strip()
+    ] + [
+        (sid, sub, "zone_transfer") for sub in result.get("zone_transfer", [])
+    ]
+    if subdomain_rows:
+        c.cursor().executemany(
+            "INSERT INTO subdomains (search_id, subdomain, source) VALUES (%s,%s,%s)",
+            subdomain_rows,
+        )
 
-    dns = result.get("dns", {})
+    dns = _as_dict(result.get("dns"))
     for rtype, values in dns.items():
         if not values:
             continue
@@ -2722,16 +3068,21 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
         elif isinstance(values, dict):
             c.execute("INSERT INTO dns_records (search_id, rtype, value) VALUES (%s,%s,%s)", (sid, rtype, _json(values)))
 
-    for rec in result.get("historical_dns", {}).get("records", []):
-        c.execute(
+    historical_rows = [
+        (sid, rec.get("rrtype"), rec.get("rdata"), rec.get("first_seen"), rec.get("last_seen"))
+        for rec in _as_dict(result.get("historical_dns")).get("records", [])
+        if isinstance(rec, dict)
+    ]
+    if historical_rows:
+        c.cursor().executemany(
             "INSERT INTO historical_dns (search_id, rrtype, rdata, first_seen, last_seen) VALUES (%s,%s,%s,%s,%s)",
-            (sid, rec.get("rrtype"), rec.get("rdata"), rec.get("first_seen"), rec.get("last_seen")),
+            historical_rows,
         )
 
     for entry in result.get("spf_origins", []):
         c.execute("INSERT INTO spf_origins (search_id, ip, cidr) VALUES (%s,%s,%s)", (sid, entry.get("ip"), entry.get("cidr")))
 
-    whois_row = result.get("whois", {})
+    whois_row = _as_dict(result.get("whois"))
     if whois_row and not whois_row.get("error"):
         emails_raw = whois_row.get("emails") or []
         if isinstance(emails_raw, str):
@@ -2760,7 +3111,7 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
         for nameserver in ns_raw:
             c.execute("INSERT INTO nameservers (search_id, nameserver) VALUES (%s,%s)", (sid, nameserver))
 
-    meta = result.get("page_metadata", {})
+    meta = _as_dict(result.get("page_metadata"))
     for id_type, key in [
         ("ga", "google_analytics"), ("gtm", "gtm_ids"), ("fb_pixel", "facebook_pixel"),
         ("tiktok_pixel", "tiktok_pixel"), ("yandex_metrika", "yandex_metrika"), ("adsense", "adsense_publisher_ids"),
@@ -2768,8 +3119,8 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
         for value in (meta.get(key) or []):
             c.execute("INSERT INTO tracking_ids (search_id, id_type, id_value) VALUES (%s,%s,%s)", (sid, id_type, str(value)))
 
-    handles = meta.get("social_handles", {})
-    links = meta.get("social_links", {})
+    handles = _as_dict(meta.get("social_handles"))
+    links = _as_dict(meta.get("social_links"))
     for platform in set(handles) | set(links):
         urls = links.get(platform) or []
         for handle in (handles.get(platform) or []):
@@ -2782,21 +3133,25 @@ def _save_child_tables(c: psycopg.Connection[Any], sid: int, result: dict, times
     if favicon_md5:
         c.execute("INSERT INTO favicons (search_id, md5) VALUES (%s,%s)", (sid, favicon_md5))
 
-    email_security = result.get("email_security", {})
+    email_security = _as_dict(result.get("email_security"))
     c.execute(
         "INSERT INTO page_metadata (search_id, html_lang, cms_generator, favicon_md5, dmarc) VALUES (%s,%s,%s,%s,%s)",
         (sid, meta.get("html_lang"), meta.get("cms_generator"), favicon_md5, email_security.get("dmarc")),
     )
 
-    for item in extract_related_targets(result):
-        c.execute(
+    discovered_rows = [
+        (
+            sid, item["target"], item["target_type"], item["relation"],
+            item["source"], int(item.get("score") or 0), timestamp, _json(item.get("raw_json")),
+        )
+        for item in extract_related_targets(result)
+    ]
+    if discovered_rows:
+        c.cursor().executemany(
             """INSERT INTO discovered_targets
                (search_id, target, target_type, relation, source, score, observed_at, raw_json)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (
-                sid, item["target"], item["target_type"], item["relation"],
-                item["source"], int(item.get("score") or 0), timestamp, _json(item.get("raw_json")),
-            ),
+            discovered_rows,
         )
 
     _refresh_search_identifiers(c, sid, result)
@@ -2806,16 +3161,18 @@ def finalize_search(search_id: int, result: dict, *, timestamp: str) -> None:
     """Complete a search: save all fields to search_fields + child tables, update searches row."""
     cf = result.get("cloudflare_fronted")
     cf_val = 1 if cf else (0 if cf is not None else None)
-    source_errors = result.get("source_errors")
     related_summary = summarize_related_targets(result)
 
     result["search_id"] = search_id
     result["related_targets_summary"] = related_summary
 
     with _conn() as c:
+        # `searches.source_errors` is no longer written: the retry path that was
+        # its only consumer is gone. The column stays (nullable) so rows written
+        # before this change still read back rather than needing a migration.
         c.execute(
-            "UPDATE searches SET cloudflare_fronted = %s, source_errors = %s WHERE id = %s",
-            (cf_val, _json(source_errors) if source_errors else None, search_id),
+            "UPDATE searches SET cloudflare_fronted = %s WHERE id = %s",
+            (cf_val, search_id),
         )
         _save_child_tables(c, search_id, result, timestamp)
         # `related_targets_summary` was set on `result` above, so the loop below
@@ -2829,12 +3186,53 @@ def finalize_search(search_id: int, result: dict, *, timestamp: str) -> None:
 
     # Derived correlation layer, in its own transaction: the raw append-only save
     # above is already committed, so a projection failure can never lose intel.
+    #
+    # The projection and the affected-domain expansion run inline (both are
+    # bounded, indexed work on the rows this search just wrote), but the actual
+    # rescore does not: it is queued for the maintenance loop, which drains it
+    # within one tick. That keeps a scan's own commit path free of the
+    # I/O-bound per-domain scoring pass while still making the whole
+    # neighbourhood correct seconds later, rather than whenever someone
+    # remembers to press "Recompute graph".
     try:
         with _conn() as c:
-            persist_correlation(c, result, search_id=search_id, recount=True)
-        _mark_clusters_dirty()
+            touch = persist_correlation(c, result, search_id=search_id, recount=True)
+            affected = _affected_registrable_domains(c, touch)
+        _mark_graph_dirty(affected)
     except Exception:  # pragma: no cover - defensive; correlation is rebuildable
         pass
+
+
+def _hydrate_result(meta: Mapping[str, Any], fields: dict | None, search_id: int) -> dict | None:
+    """Stitch a `searches` row together with its `search_fields` payload.
+
+    Split out of get_result so a caller that already holds a connection — the
+    rebuild loop, which reprojects every stored search — can supply both halves
+    itself instead of paying a fresh connection per search.
+    """
+    if fields is None:
+        return None
+    fields.setdefault("input", meta["target"])
+    fields.setdefault("type", meta["type"])
+    fields.setdefault("timestamp", meta["timestamp"])
+    fields["search_id"] = search_id
+    # Canonicalize the stored page metadata on the way out rather than only at
+    # scrape time. Every search saved before the collectors agreed on one
+    # vocabulary carries keys no consumer reads — `adsense_ids` instead of
+    # `adsense_publisher_ids`, `favicon_murmurhash3` without `favicon_mmh3`,
+    # scalar `fb_app_id` — and those searches are the whole historical corpus.
+    # Doing it here means the periodic rebuild_all_correlation() reconcile
+    # recovers the missing selectors from stored intel on its own schedule; no
+    # rescan, and nothing to remember to run.
+    #
+    # Local import: sources.signal_web pulls httpx, and this module is imported
+    # by migration/CLI paths that have no reason to load the scraping stack.
+    from sources.signal_web import canonicalize_page_metadata
+
+    page_metadata = fields.get("page_metadata")
+    if isinstance(page_metadata, Mapping):
+        fields["page_metadata"] = canonicalize_page_metadata(page_metadata)
+    return fields
 
 
 def get_result(search_id: int) -> dict | None:
@@ -2846,14 +3244,7 @@ def get_result(search_id: int) -> dict | None:
         ).fetchone()
         if not meta:
             return None
-        result = _load_result_from_fields(c, search_id)
-    if result is None:
-        return None
-    result.setdefault("input", meta["target"])
-    result.setdefault("type", meta["type"])
-    result.setdefault("timestamp", meta["timestamp"])
-    result["search_id"] = search_id
-    return result
+        return _hydrate_result(meta, _load_result_from_fields(c, search_id), search_id)
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
@@ -2995,6 +3386,126 @@ def record_entity_edge(
     )
 
 
+# ── Correlation layer: batched writers ──────────────────────────────────────
+#
+# The single-row upserts above are one network round trip each, and projecting
+# one search fires two or three per observation — so a scan with 200
+# observations pays ~500 sequential waits, and a full reconcile over the whole
+# corpus pays that per stored search. The batched forms below send one
+# statement per table per search instead, unnesting parallel arrays into the
+# same INSERT ... ON CONFLICT the single-row versions use, so the semantics
+# (insert-or-widen, never clobbering `attributing`/`entity_count`) are
+# unchanged and only the number of round trips differs.
+#
+# Callers MUST pass rows already deduplicated on the conflict target: Postgres
+# rejects an ON CONFLICT DO UPDATE that would touch the same row twice in one
+# statement ("cannot affect row a second time"). _merge_window does that
+# folding, mirroring LEAST/GREATEST — including their treatment of NULL as
+# "no opinion" rather than as a minimum, which is why it cannot just be min().
+
+
+def _merge_window(
+    existing: tuple[str | None, str | None] | None,
+    first_seen: str | None,
+    last_seen: str | None,
+) -> tuple[str | None, str | None]:
+    """Widen a (first_seen, last_seen) pair the way LEAST/GREATEST would.
+
+    The columns are TEXT holding normalized ISO-8601, so lexicographic order is
+    chronological order and plain string compare is correct.
+    """
+    if existing is None:
+        return (first_seen, last_seen)
+    old_first, old_last = existing
+    new_first = first_seen if old_first is None else (
+        old_first if first_seen is None else min(old_first, first_seen)
+    )
+    new_last = last_seen if old_last is None else (
+        old_last if last_seen is None else max(old_last, last_seen)
+    )
+    return (new_first, new_last)
+
+
+def _batch_upsert_entities(
+    c: psycopg.Connection[Any], rows: list[tuple[str, str, str | None, str | None, str | None]]
+) -> dict[tuple[str, str], int]:
+    """Insert-or-widen many entities; returns {(kind, value): id} for all of them."""
+    if not rows:
+        return {}
+    kinds, values, rds, firsts, lasts = (list(col) for col in zip(*rows))
+    out = c.execute(
+        """INSERT INTO entities (kind, value, registrable_domain, first_seen, last_seen)
+           SELECT * FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[], %s::text[])
+           ON CONFLICT (kind, value) DO UPDATE SET
+               registrable_domain = COALESCE(EXCLUDED.registrable_domain, entities.registrable_domain),
+               first_seen = LEAST(entities.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(entities.last_seen, EXCLUDED.last_seen)
+           RETURNING id, kind, value""",
+        (kinds, values, rds, firsts, lasts),
+    ).fetchall()
+    return {(row["kind"], row["value"]): int(row["id"]) for row in out}
+
+
+def _batch_upsert_selectors(
+    c: psycopg.Connection[Any], rows: list[tuple[str, str, str | None, str | None]]
+) -> dict[tuple[str, str], int]:
+    """Insert-or-widen many selectors; returns {(kind, value): id} for all of them."""
+    if not rows:
+        return {}
+    kinds, values, firsts, lasts = (list(col) for col in zip(*rows))
+    out = c.execute(
+        """INSERT INTO selectors (kind, value, entity_count, attributing, first_seen, last_seen)
+           SELECT kind, value, 0, TRUE, first_seen, last_seen
+             FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[])
+                    AS t(kind, value, first_seen, last_seen)
+           ON CONFLICT (kind, value) DO UPDATE SET
+               first_seen = LEAST(selectors.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(selectors.last_seen, EXCLUDED.last_seen)
+           RETURNING id, kind, value""",
+        (kinds, values, firsts, lasts),
+    ).fetchall()
+    return {(row["kind"], row["value"]): int(row["id"]) for row in out}
+
+
+def _batch_record_observations(
+    c: psycopg.Connection[Any],
+    rows: list[tuple[int, int, str, str | None, str | None, int | None]],
+) -> None:
+    """Insert-or-widen many entity→selector observations."""
+    if not rows:
+        return
+    eids, sids, sources, firsts, lasts, search_ids = (list(col) for col in zip(*rows))
+    c.execute(
+        """INSERT INTO observations (entity_id, selector_id, source, first_seen, last_seen, search_id)
+           SELECT * FROM unnest(%s::bigint[], %s::bigint[], %s::text[],
+                                %s::text[], %s::text[], %s::bigint[])
+           ON CONFLICT (entity_id, selector_id, source) DO UPDATE SET
+               first_seen = LEAST(observations.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(observations.last_seen, EXCLUDED.last_seen),
+               search_id  = COALESCE(observations.search_id, EXCLUDED.search_id)""",
+        (eids, sids, sources, firsts, lasts, search_ids),
+    )
+
+
+def _batch_record_entity_edges(
+    c: psycopg.Connection[Any],
+    rows: list[tuple[int, int, str, str, str | None, str | None]],
+) -> None:
+    """Insert-or-widen many structural entity→entity edges."""
+    if not rows:
+        return
+    srcs, dsts, kinds, sources, firsts, lasts = (list(col) for col in zip(*rows))
+    c.execute(
+        """INSERT INTO entity_edges (src_entity_id, dst_entity_id, kind, source, first_seen, last_seen)
+           SELECT * FROM unnest(%s::bigint[], %s::bigint[], %s::text[],
+                                %s::text[], %s::text[], %s::text[])
+           ON CONFLICT (src_entity_id, dst_entity_id, kind) DO UPDATE SET
+               first_seen = LEAST(entity_edges.first_seen, EXCLUDED.first_seen),
+               last_seen  = GREATEST(entity_edges.last_seen, EXCLUDED.last_seen)""",
+        (srcs, dsts, kinds, sources, firsts, lasts),
+    )
+
+
 def set_selector_attributing(c: psycopg.Connection[Any], selector_id: int, attributing: bool) -> None:
     """Flag (or unflag) a selector as non-attributing noise (denylist)."""
     c.execute("UPDATE selectors SET attributing = %s WHERE id = %s", (bool(attributing), selector_id))
@@ -3010,6 +3521,29 @@ def recompute_selector_degree(c: psycopg.Connection[Any], selector_id: int) -> i
     )
     row = c.execute("SELECT entity_count FROM selectors WHERE id = %s", (selector_id,)).fetchone()
     return int(row["entity_count"]) if row else 0
+
+
+def recompute_selector_degrees(c: psycopg.Connection[Any], selector_ids: Iterable[int]) -> None:
+    """Batch form of recompute_selector_degree: recomputes every id in one
+    round-trip instead of one UPDATE per selector. Used by persist_correlation,
+    which can touch dozens of selectors per analyzed target."""
+    ids = sorted({int(sel_id) for sel_id in selector_ids if sel_id is not None})
+    if not ids:
+        return
+    c.execute(
+        """UPDATE selectors s SET entity_count = COALESCE(o.cnt, 0)
+           FROM (
+               SELECT selector_id, count(DISTINCT entity_id) AS cnt
+               FROM observations WHERE selector_id = ANY(%s) GROUP BY selector_id
+           ) o
+           WHERE s.id = o.selector_id AND s.id = ANY(%s)""",
+        (ids, ids),
+    )
+    c.execute(
+        "UPDATE selectors SET entity_count = 0 WHERE id = ANY(%s) AND id NOT IN "
+        "(SELECT selector_id FROM observations WHERE selector_id = ANY(%s))",
+        (ids, ids),
+    )
 
 
 def recompute_all_selector_degrees(c: psycopg.Connection[Any]) -> None:
@@ -3127,6 +3661,181 @@ def _meta_tag_site_signals(page: Mapping[str, Any]) -> tuple[dict[str, list[str]
                 handles[platform].append(handle)
 
     return verifications, handles
+
+
+# Legal/imprint page signals, as selector kind -> the key each is published
+# under. An imprint is a disclosure the operator is legally obliged to make
+# about itself, so it is the densest identity source on a site: the phone and
+# email feed the same selectors as their homepage equivalents, the rest are
+# their own kinds. `normalized_text_hash` is per-page only (the aggregate has
+# no hash of its own), which is why it is read separately below.
+_LEGAL_PAGE_SELECTOR_KEYS = {
+    "contact_phone": "phones",
+    "contact_email": "emails",
+    "legal_entity": "entity_names",
+    "legal_registration": "registration_ids",
+    "legal_address": "addresses",
+}
+
+# An entity name shorter than this is a parsing fragment ("Ltd", "GmbH")
+# rather than a company. Kept low enough to let short real names through
+# ("BMW AG").
+_LEGAL_ENTITY_MIN_LENGTH = 6
+
+
+def _normalize_legal_selector_value(kind: str, value: Any) -> str | None:
+    if kind == "contact_phone":
+        return _normalize_identifier_phone(value)
+    if kind == "contact_email":
+        from utils.check import _is_generic_email
+
+        email = _normalize_identifier_email(value)
+        # A registrar/privacy-proxy role address identifies the provider, not
+        # the operator — the email equivalent of a shared Cloudflare IP.
+        return None if not email or _is_generic_email(email) else email
+    text = _normalize_generic_identifier(value)
+    if not text:
+        return None
+    if kind in ("legal_entity", "legal_address"):
+        from sources.signal_web import (
+            _MAX_ADDRESS_LENGTH,
+            _MAX_ADDRESS_WORDS,
+            _THIRD_PARTY_ENTITY_RE,
+        )
+
+        # Backstop for payloads where provenance is already gone (the flattened
+        # aggregate, and results stored before the extractor was fixed). A
+        # platform or ad network named in boilerplate is never the operator,
+        # and it recurs on so many unrelated sites that admitting it links them
+        # all to each other.
+        if _THIRD_PARTY_ENTITY_RE.search(text):
+            return None
+        if kind == "legal_address" and (
+            len(text) > _MAX_ADDRESS_LENGTH or len(text.split()) > _MAX_ADDRESS_WORDS
+        ):
+            # A street word inside a sentence is not an address.
+            return None
+    if kind == "legal_entity" and len(text) < _LEGAL_ENTITY_MIN_LENGTH:
+        return None
+    if kind == "legal_address" and not any(ch.isdigit() for ch in text):
+        # A real postal address carries a street number or a postcode; a bare
+        # label ("Office", "Registered address") is a parsing fragment, and one
+        # shared across two sites would link them on nothing.
+        return None
+    if kind == "legal_registration":
+        from sources.signal_web import _REG_ID_TOKEN_RE, _normalize_vat
+
+        # The extractor emits one structured token per value, so anything that
+        # is not wholly an ID ("business", "site data", a clause about company
+        # news) came from a result stored before that was tightened. It matters
+        # more here than for the other kinds because a registration number is
+        # the heaviest selector there is: a registry issues it to exactly one
+        # company, so a shared one reads as an ownership statement — and a
+        # prose fragment shared by ten sites reads as ten ownership statements.
+        if not (_REG_ID_TOKEN_RE.fullmatch(text) or _normalize_vat(text)):
+            return None
+    return text
+
+
+def _legal_page_signals(result: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Normalized selector values from a scan's legal/imprint pages.
+
+    Handles both payload shapes: the aggregated dict written by
+    core.analysis_service._compact_legal_pages and the raw list of per-page
+    entries that signal_web.scrape_legal_pages returns.
+    """
+    legal = result.get("legal_pages")
+    aggregate: Mapping[str, Any] = {}
+    if isinstance(legal, Mapping):
+        aggregate = legal
+        entries = [e for e in (legal.get("pages") or []) if isinstance(e, Mapping)]
+    elif isinstance(legal, list):
+        entries = [e for e in legal if isinstance(e, Mapping)]
+    else:
+        entries = []
+
+    signals: dict[str, list[str]] = {}
+
+    def push(kind: str, value: Any) -> None:
+        normalized = _normalize_legal_selector_value(kind, value)
+        if not normalized:
+            return
+        bucket = signals.setdefault(kind, [])
+        if normalized not in bucket:
+            bucket.append(normalized)
+
+    from sources.signal_web import _is_operator_identity_page
+
+    # Which page a value came from decides whether it describes this operator.
+    # A privacy policy enumerates *other* companies — every ad network,
+    # analytics vendor and CDN the site embeds, with postal addresses — so its
+    # entity/address/registration values are somebody else's identity.
+    #
+    # Filtered here as well as at extraction because the graph replays stored
+    # scan JSON: observations are append-only and no scan supersedes an earlier
+    # one, so results captured before the extractor was fixed would otherwise
+    # keep re-projecting their boilerplate on every rebuild, and a rescan would
+    # only add clean values *beside* the old dirty ones.
+    identity_kinds = {"legal_entity", "legal_address", "legal_registration"}
+    scoped_entries = [e for e in entries if _is_operator_identity_page(e.get("url"))]
+
+    for kind, key in _LEGAL_PAGE_SELECTOR_KEYS.items():
+        if kind in identity_kinds and entries:
+            # Per-page values carry a URL, so they can be attributed. The
+            # aggregate is a union across every page with that provenance
+            # already thrown away, so it is skipped whenever per-page entries
+            # exist to replace it.
+            for entry in scoped_entries:
+                for value in entry.get(key) or []:
+                    push(kind, value)
+            continue
+        for value in aggregate.get(key) or []:
+            push(kind, value)
+        for entry in entries:
+            for value in entry.get(key) or []:
+                push(kind, value)
+
+    for entry in entries:
+        digest = _normalize_identifier_hash(entry.get("normalized_text_hash"))
+        if digest:
+            bucket = signals.setdefault("legal_text_hash", [])
+            if digest not in bucket:
+                bucket.append(digest)
+
+    return signals
+
+
+def _payment_contact_signals(page: Mapping[str, Any]) -> tuple[list[str], dict[str, list[str]]]:
+    """Normalized homepage phone numbers + chain->wallet addresses for one
+    page_metadata blob.
+
+    Both are normalized here rather than at scan time so the two sides of a
+    match are comparable regardless of how the page wrote them, each through
+    the shared normalizer for its kind (sources.signal_web) so the identifiers
+    table, the selectors, and the legacy pairwise engine all agree on one key.
+    """
+    from sources.signal_web import normalize_crypto_address
+
+    phones: list[str] = []
+    for value in _normalize_text_list(page.get("phone_numbers") or []):
+        normalized = _normalize_identifier_phone(value)
+        if normalized and normalized not in phones:
+            phones.append(normalized)
+
+    wallets: dict[str, list[str]] = {}
+    for chain, addresses in (page.get("crypto_wallets") or {}).items():
+        chain_key = _normalize_generic_identifier(chain)
+        if not chain_key:
+            continue
+        for address in _normalize_text_list(addresses):
+            normalized = normalize_crypto_address(chain_key, address)
+            if not normalized:
+                continue
+            wallets.setdefault(chain_key, [])
+            if normalized not in wallets[chain_key]:
+                wallets[chain_key].append(normalized)
+
+    return phones, wallets
 
 
 def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -3268,21 +3977,56 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
                 src = (info.get("sources") or ["dns"])[0]
                 add_resolves(owner, ip, str(src), ts, ts)
             asn_info = info.get("asn_info") or {}
-            add_obs(ip, "asn", _normalize_asn(asn_info.get("asn")), "rdap", ts, ts)
-            add_obs(ip, "network_cidr", asn_info.get("network_cidr") or asn_info.get("asn_cidr"), "rdap", ts, ts)
+            # Provenance was "rdap" until the RDAP leg was removed from
+            # core.basic.get_ip_whois; ASN now comes from ipinfo Lite and the
+            # CIDR from Censys host enrichment. The label is re-derived on every
+            # rebuild_clusters rather than stored per scan, so renaming it
+            # relabels history uniformly instead of splitting it in two.
+            add_obs(ip, "asn", _normalize_asn(asn_info.get("asn")), "ip_enrichment", ts, ts)
+            add_obs(ip, "network_cidr", asn_info.get("network_cidr") or asn_info.get("asn_cidr"), "ip_enrichment", ts, ts)
             for domain in info.get("other_domains_on_ip") or []:
                 add_resolves(domain, ip, "reverse_ip", ts, ts)
 
         if res.get("type") == "ip" and owner:
             asn_info = res.get("asn_info") or {}
-            add_obs(owner, "asn", _normalize_asn(asn_info.get("asn")), "rdap", ts, ts)
-            add_obs(owner, "network_cidr", asn_info.get("network_cidr") or asn_info.get("asn_cidr"), "rdap", ts, ts)
+            add_obs(owner, "asn", _normalize_asn(asn_info.get("asn")), "ip_enrichment", ts, ts)
+            add_obs(owner, "network_cidr", asn_info.get("network_cidr") or asn_info.get("asn_cidr"), "ip_enrichment", ts, ts)
+
+        # ── SPF sending origins exhibited by the owner domain ──
+        # Where a domain is authorised to send mail from. Most sites delegate to
+        # a handful of large providers, so this is high-degree by nature and
+        # leans on rarity_weight + denylist seeding to stay quiet, exactly like
+        # `asn`; what it catches is the operator running their own mail host.
+        if owner:
+            for entry in res.get("spf_origins") or []:
+                if not isinstance(entry, Mapping):
+                    continue
+                # Prefer the CIDR: a sender that rotates addresses inside its
+                # own block still matches, where a bare IP would not.
+                add_obs(owner, "spf_origin", entry.get("cidr") or entry.get("ip"), "spf", ts, ts)
+
+        # ── Historical A/AAAA records: past co-location ──
+        # Carries each record's own first/last seen rather than the scan
+        # timestamp, so check.recency_weight discounts it for its real age
+        # (full credit 180 days, then decaying to a 0.3 floor). That is what
+        # keeps a host two domains shared in 2019 from reading as present-day
+        # co-location while still surfacing an operator who moved.
+        for rec in _as_dict(res.get("historical_dns")).get("records") or []:
+            if not isinstance(rec, Mapping):
+                continue
+            if str(rec.get("rrtype") or "").strip().upper() not in ("A", "AAAA"):
+                continue
+            if owner:
+                add_resolves(
+                    owner, rec.get("rdata"), "historical_dns",
+                    _safe_iso(rec.get("first_seen")), _safe_iso(rec.get("last_seen")),
+                )
 
         # ── SSH host keys exhibited by the IP they were grabbed from ──
-        for probe in (res.get("ssh_host_keys") or {}).get("probes") or []:
-            if not isinstance(probe, Mapping) or probe.get("error"):
-                continue
-            fp = _normalize_identifier_hash(probe.get("fingerprint_sha256"))
+        for probe in _ssh_host_key_records(res):
+            fp = _normalize_identifier_hash(
+                probe.get("fingerprint_sha256") or probe.get("sha256")
+            )
             if probe.get("ip") and fp:
                 add_obs(probe.get("ip"), "ssh_fp", fp, "self_scan", ts, ts)
                 if owner:
@@ -3307,6 +4051,20 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
             for platform, handles in social_handles_all.items():
                 for handle in handles:
                     add_obs(owner, "social_handle", f"{platform}|{handle}", "self_scan", ts, ts)
+            # Contact phone numbers and payment wallets solicited on the page.
+            phones, wallets = _payment_contact_signals(page)
+            for phone in phones:
+                add_obs(owner, "contact_phone", phone, "self_scan", ts, ts)
+            for chain, addresses in wallets.items():
+                for address in addresses:
+                    add_obs(owner, "crypto_wallet", f"{chain}|{address}", "self_scan", ts, ts)
+            # Imprint/legal-page identity: phone and email land on the same
+            # selectors as their homepage equivalents (same operator, just a
+            # different page); entity name, registration id, address and the
+            # page-text hash are their own kinds.
+            for kind, values in _legal_page_signals(res).items():
+                for value in values:
+                    add_obs(owner, kind, value, "self_scan", ts, ts)
 
         # ── Nameservers exhibited by the owner domain ──
         if owner:
@@ -3316,6 +4074,36 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
             if isinstance(whois_row, Mapping) and not whois_row.get("error"):
                 for ns in _normalize_nameservers(whois_row.get("nameservers")):
                     add_obs(owner, "nameserver", ns, "whois", ts, ts)
+                # Registrant identity lands on the same selectors as the
+                # imprint-page equivalents rather than getting whois-only kinds:
+                # it is the same operator, declared to the registrar instead of
+                # on the page. An address that appears in both places has to be
+                # one selector or the two sites would never match on it — the
+                # same reasoning _legal_page_signals applies to imprint phones.
+                # Provenance survives as the observation's source ("whois").
+                #
+                # Redacted placeholders are dropped exactly as
+                # _save_child_tables drops them before registrant_emails, and
+                # _normalize_legal_selector_value then discards registrar and
+                # privacy-proxy mailboxes (the email equivalent of a shared CDN
+                # IP) plus name fragments too short to be a real company.
+                whois_emails = whois_row.get("emails") or []
+                if isinstance(whois_emails, str):
+                    whois_emails = [whois_emails]
+                for email in whois_emails:
+                    if _is_redacted_whois_value(email):
+                        continue
+                    add_obs(
+                        owner, "contact_email",
+                        _normalize_legal_selector_value("contact_email", email), "whois", ts, ts,
+                    )
+                for name in _normalize_text_list(whois_row.get("name")):
+                    if _is_redacted_whois_value(name):
+                        continue
+                    add_obs(
+                        owner, "legal_entity",
+                        _normalize_legal_selector_value("legal_entity", name), "whois", ts, ts,
+                    )
 
         # ── CT certs (crt.sh) SANs exhibited by the owner ──
         ct = res.get("cert_transparency") or {}
@@ -3346,71 +4134,277 @@ def extract_selectors(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
 
 # ── Correlation layer: persistence / rebuild ────────────────────────────────
 
+class CorrelationTouch(NamedTuple):
+    """What one projected result invalidated in the derived graph.
+
+    ``selector_ids`` is every selector the projection observed. The two
+    ``rescore_*`` sets are the subset whose *degree change actually moves a
+    score* — see _affected_registrable_domains for why that is a strictly
+    smaller and, crucially, bounded set. ``registrable_domains`` is the scan's
+    own domains, which always need rescoring whether or not anything else did.
+    """
+
+    selector_ids: set[int]
+    rescore_selector_ids: set[int]
+    rescore_ip_entity_ids: set[int]
+    registrable_domains: set[str]
+
+    @classmethod
+    def empty(cls) -> "CorrelationTouch":
+        return cls(set(), set(), set(), set())
+
+
+def _resolves_to_degrees(c: psycopg.Connection[Any], ip_entity_ids: Iterable[int]) -> dict[int, int]:
+    """How many distinct registrable domains resolve to each of these IP entities."""
+    ids = sorted({int(i) for i in ip_entity_ids if i is not None})
+    if not ids:
+        return {}
+    rows = c.execute(
+        """SELECT ee.dst_entity_id AS id, count(DISTINCT e.registrable_domain) AS degree
+             FROM entity_edges ee
+             JOIN entities e ON e.id = ee.src_entity_id
+            WHERE ee.kind = 'resolves_to'
+              AND ee.dst_entity_id = ANY(%s)
+              AND e.registrable_domain IS NOT NULL
+            GROUP BY ee.dst_entity_id""",
+        (ids,),
+    ).fetchall()
+    return {int(row["id"]): int(row["degree"]) for row in rows}
+
+
+def _ips_table_observations(c: psycopg.Connection[Any], search_id: int) -> list[dict[str, Any]]:
+    """asn / network_cidr observations read from the current `ips` rows.
+
+    Mirrors what extract_selectors derives from result["ip_details"], but from
+    the columns as they stand *now* rather than as the scan recorded them —
+    see persist_correlation for why that difference matters.
+    """
+    rows = c.execute(
+        """SELECT DISTINCT ON (ip) ip, asn, network_cidr, observed_at
+             FROM ips
+            WHERE search_id = %s AND ip IS NOT NULL AND ip <> ''
+            ORDER BY ip, observed_at DESC NULLS LAST, id DESC""",
+        (search_id,),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        ts = _safe_iso(row.get("observed_at"))
+        pairs = (("asn", _normalize_asn(row.get("asn"))), ("network_cidr", row.get("network_cidr")))
+        for kind, value in pairs:
+            text = str(value or "").strip()
+            if text:
+                out.append({
+                    "entity": row["ip"], "kind": kind, "value": text,
+                    "source": "ip_record", "first_seen": ts, "last_seen": ts,
+                })
+    return out
+
+
 def persist_correlation(
     c: psycopg.Connection[Any],
     result: dict[str, Any],
     *,
     search_id: int | None = None,
     recount: bool = True,
-) -> set[int]:
-    """Upsert the correlation projection of one result. Returns touched selector ids.
+) -> CorrelationTouch:
+    """Upsert the correlation projection of one result. Returns what it touched.
 
     When recount is True (live ingest), the degree of every touched selector is
-    refreshed immediately. Backfill passes recount=False and batch-recomputes
-    all degrees once at the end.
+    refreshed immediately and the returned CorrelationTouch carries everything
+    the incremental rescore needs. Backfill passes recount=False and
+    batch-recomputes all degrees once at the end, so it skips the extra
+    before/after reads and returns only the touched selector ids.
     """
     data = extract_selectors(result)
-    ent_ids: dict[str, int] = {}
-    for ent in data["entities"]:
-        info = classify_entity(ent["value"])
-        if not info:
-            continue
-        ent_ids[info["value"]] = upsert_entity(
-            c,
-            kind=info["kind"],
-            value=info["value"],
-            registrable_domain=info["registrable_domain"],
-            first_seen=ent.get("first_seen"),
-            last_seen=ent.get("last_seen"),
-        )
+    # The `ips` table, not the stored result JSON, is the live view of an
+    # address: store_censys_enrichment gap-fills asn/network_cidr there long
+    # after the scan that wrote the JSON, and nothing rewrites the JSON. Reading
+    # the columns as well is what lets an out-of-band enrichment become graph
+    # evidence on the next reprojection instead of staying invisible until the
+    # domain happens to be rescanned. Emitted under its own source, so it
+    # widens the same selector rather than competing with the rdap-sourced
+    # observation — the pattern `nameserver` already uses for dns vs whois.
+    if search_id is not None:
+        data["observations"].extend(_ips_table_observations(c, search_id))
+    own_rds: set[str] = set()
+    # Classification is pure and the same raw string recurs constantly within
+    # one result (every observation on a host repeats that host), so memoize it
+    # rather than re-parsing the suffix list per observation.
+    classified: dict[str, dict[str, Any] | None] = {}
 
+    def _classify(raw: Any) -> dict[str, Any] | None:
+        key = str(raw)
+        if key not in classified:
+            classified[key] = classify_entity(raw)
+        return classified[key]
+
+    # Fold every entity this result names — declared up front, plus the ones
+    # only an observation mentions — into one deduplicated batch. Both sources
+    # went through per-row upserts before, the second one lazily inside the
+    # observation loop; collecting first is what lets a single statement cover
+    # them, and it does not change which entities get created (an edge endpoint
+    # still never creates one).
+    entity_rows: dict[tuple[str, str], tuple[str | None, tuple[str | None, str | None]]] = {}
+
+    def _want_entity(raw: Any, first_seen: str | None, last_seen: str | None) -> None:
+        info = _classify(raw)
+        if not info:
+            return
+        key = (info["kind"], info["value"])
+        rd, window = entity_rows.get(key, (None, None))
+        entity_rows[key] = (
+            rd or info["registrable_domain"],
+            _merge_window(window, _safe_iso(first_seen), _safe_iso(last_seen)),
+        )
+        if info["registrable_domain"]:
+            own_rds.add(info["registrable_domain"])
+
+    for ent in data["entities"]:
+        _want_entity(ent["value"], ent.get("first_seen"), ent.get("last_seen"))
+    for obs in data["observations"]:
+        _want_entity(obs["entity"], obs.get("first_seen"), obs.get("last_seen"))
+
+    ent_id_by_key = _batch_upsert_entities(
+        c,
+        [(kind, value, rd, window[0], window[1])
+         for (kind, value), (rd, window) in entity_rows.items()],
+    )
+    # Rebuilt with exactly the key set the per-row version produced: a declared
+    # entity is keyed by its *normalized* value, an entity that only an
+    # observation names by the raw string that named it. The distinction only
+    # bites when the two differ, but keying both for every entity would admit
+    # edges the old code skipped — a behaviour change, and not one a batching
+    # patch should be making.
+    ent_ids: dict[Any, int] = {}
+    for ent in data["entities"]:
+        info = _classify(ent["value"])
+        if info and (eid := ent_id_by_key.get((info["kind"], info["value"]))) is not None:
+            ent_ids[info["value"]] = eid
+    for obs in data["observations"]:
+        raw = obs["entity"]
+        if raw in ent_ids:
+            continue
+        info = _classify(raw)
+        if info and (eid := ent_id_by_key.get((info["kind"], info["value"]))) is not None:
+            ent_ids[raw] = eid
+
+    selector_rows: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+    for obs in data["observations"]:
+        if obs["entity"] not in ent_ids:
+            continue
+        key = (obs["kind"], obs["value"])
+        selector_rows[key] = _merge_window(
+            selector_rows.get(key), _safe_iso(obs.get("first_seen")), _safe_iso(obs.get("last_seen"))
+        )
+    sel_id_by_key = _batch_upsert_selectors(
+        c, [(kind, value, window[0], window[1]) for (kind, value), window in selector_rows.items()]
+    )
+
+    observation_rows: dict[tuple[int, int, str], tuple[str | None, str | None]] = {}
     touched: set[int] = set()
     for obs in data["observations"]:
         eid = ent_ids.get(obs["entity"])
-        if eid is None:
-            eid = upsert_entity_value(c, obs["entity"], first_seen=obs.get("first_seen"), last_seen=obs.get("last_seen"))
-            if eid is None:
-                continue
-            ent_ids[obs["entity"]] = eid
-        sel_id = upsert_selector(
-            c, kind=obs["kind"], value=obs["value"],
-            first_seen=obs.get("first_seen"), last_seen=obs.get("last_seen"),
-        )
-        record_observation(
-            c, entity_id=eid, selector_id=sel_id, source=obs["source"],
-            first_seen=obs.get("first_seen"), last_seen=obs.get("last_seen"), search_id=search_id,
+        sel_id = sel_id_by_key.get((obs["kind"], obs["value"]))
+        if eid is None or sel_id is None:
+            continue
+        key = (eid, sel_id, str(obs["source"] or ""))
+        observation_rows[key] = _merge_window(
+            observation_rows.get(key), _safe_iso(obs.get("first_seen")), _safe_iso(obs.get("last_seen"))
         )
         touched.add(sel_id)
+    _batch_record_observations(
+        c,
+        [(eid, sel_id, source, window[0], window[1], search_id)
+         for (eid, sel_id, source), window in observation_rows.items()],
+    )
 
+    resolves_dst = {
+        ent_ids[edge["dst"]]
+        for edge in data["edges"]
+        if edge["kind"] == "resolves_to" and edge["dst"] in ent_ids and edge["src"] in ent_ids
+    }
+    # Read before the edges land: an IP's fan-out is the other half of the
+    # degree-staleness problem, and only the pre-write value distinguishes
+    # "this IP was already too crowded to score" from "this write is what
+    # crowded it", which is a change every domain on that IP needs to see.
+    ip_degree_before = _resolves_to_degrees(c, resolves_dst) if recount else {}
+
+    edge_rows: dict[tuple[int, int, str], tuple[str, tuple[str | None, str | None]]] = {}
     for edge in data["edges"]:
         s = ent_ids.get(edge["src"])
         d = ent_ids.get(edge["dst"])
         if s is None or d is None:
             continue
-        record_entity_edge(
-            c, src_entity_id=s, dst_entity_id=d, kind=edge["kind"], source=edge["source"],
-            first_seen=edge.get("first_seen"), last_seen=edge.get("last_seen"),
+        key = (s, d, str(edge["kind"]))
+        source, window = edge_rows.get(key, (str(edge["source"] or ""), None))
+        edge_rows[key] = (
+            source,
+            _merge_window(window, _safe_iso(edge.get("first_seen")), _safe_iso(edge.get("last_seen"))),
         )
+    _batch_record_entity_edges(
+        c,
+        [(src, dst, kind, source, window[0], window[1])
+         for (src, dst, kind), (source, window) in edge_rows.items()],
+    )
 
-    if recount:
-        for sel_id in touched:
-            recompute_selector_degree(c, sel_id)
-        apply_denylist_for_selectors(c, touched)
-    return touched
+    if not recount:
+        return CorrelationTouch(touched, set(), set(), own_rds)
+
+    # Which of the touched nodes can actually have moved somebody else's score.
+    # Both tests are "was it scoring-relevant before this write, or is it now?"
+    # — a node that was noise before and is still noise after contributes 0 to
+    # every link either way (link_candidates_for filters on sel.attributing;
+    # check._score_ip_row zeroes an IP past its noise degree), so its degree
+    # changing is unobservable and its neighbourhood does not need rescoring.
+    # Reading the "before" state is what makes the *transition* visible: a
+    # selector that this write pushed over CORRELATION_DEGREE_THRESHOLD reads
+    # as plain noise afterwards, but it just *removed* evidence from every
+    # domain that shared it, and those links are now wrong until someone
+    # rescores them.
+    attributing_before = {
+        int(row["id"])
+        for row in c.execute(
+            "SELECT id FROM selectors WHERE id = ANY(%s) AND attributing", (sorted(touched),)
+        ).fetchall()
+    } if touched else set()
+
+    recompute_selector_degrees(c, touched)
+    apply_denylist_for_selectors(c, touched)
+
+    attributing_after = {
+        int(row["id"])
+        for row in c.execute(
+            "SELECT id FROM selectors WHERE id = ANY(%s) AND attributing", (sorted(touched),)
+        ).fetchall()
+    } if touched else set()
+    ip_noise_degree = _ip_noise_degree()
+    ip_degree_after = _resolves_to_degrees(c, resolves_dst)
+    rescore_ips = {
+        ip_id
+        for ip_id in resolves_dst
+        if ip_degree_before.get(ip_id, 0) <= ip_noise_degree
+        or ip_degree_after.get(ip_id, 0) <= ip_noise_degree + 1
+    }
+    return CorrelationTouch(touched, attributing_before | attributing_after, rescore_ips, own_rds)
 
 
 def _truncate_correlation(c: psycopg.Connection[Any]) -> None:
-    c.execute("TRUNCATE entity_edges, observations, selectors, entities RESTART IDENTITY CASCADE")
+    """Empty the projection tables ahead of a full reproject.
+
+    DELETE, not TRUNCATE, for exactly the reason spelled out above
+    rebuild_clusters' own DELETEs: TRUNCATE takes an ACCESS EXCLUSIVE lock held
+    until commit, and this runs at the *start* of a transaction that then
+    reprojects the entire corpus — so every /api/pool, /api/domain and
+    /api/graph read (they all join entities/selectors/observations) would block
+    for the whole rebuild instead of just reading the previous snapshot under
+    MVCC. That was survivable while a full rebuild was a deliberate operator
+    action; it is not survivable now that one runs unattended on a timer.
+    Deleted in FK order (children first) since DELETE has no CASCADE here.
+    """
+    c.execute("DELETE FROM entity_edges")
+    c.execute("DELETE FROM observations")
+    c.execute("DELETE FROM selectors")
+    c.execute("DELETE FROM entities")
 
 
 def clusters_dirty() -> bool:
@@ -3420,20 +4414,530 @@ def clusters_dirty() -> bool:
         return True if row is None else bool(row["dirty"])
 
 
-def _mark_clusters_dirty() -> None:
+# Censys Core plan allows 20,000 host-enrichment calls per day; past that the
+# API returns 429. Overridable so a plan with unlimited enrichment can lift it.
+CENSYS_ENRICHMENT_DAILY_LIMIT = int(os.environ.get("CENSYS_ENRICHMENT_DAILY_LIMIT") or 20_000)
+
+
+def claim_censys_enrichment_calls(count: int = 1) -> int:
+    """Reserve up to `count` host-enrichment calls against today's budget.
+
+    Returns how many were actually granted — 0 once the day's cap is spent, so
+    callers skip the request rather than spending it on a guaranteed 429. The
+    day rolls over on UTC, not the server's local timezone, so the window
+    matches what Censys is counting.
+
+    The row is locked with SELECT ... FOR UPDATE before the increment, and both
+    statements share one transaction. That explicit lock is what keeps
+    concurrent claimers from overshooting the cap: computing the grant in a CTE
+    instead would read the statement's snapshot, and under READ COMMITTED a
+    claimer blocked on the row lock re-evaluates only its WHERE clause, not the
+    CTE — so two workers would both derive a grant from the same stale `used`.
+    Deriving it in RETURNING fails for the mirror-image reason: RETURNING sees
+    the post-UPDATE row, so it would measure the count it had just written.
+    """
+    init_db()
+    if count <= 0:
+        return 0
+    with _conn() as c:
+        row = c.execute(
+            """SELECT CASE WHEN censys_enrichment_day = (NOW() AT TIME ZONE 'utc')::date
+                           THEN censys_enrichment_count ELSE 0 END AS used
+                 FROM graph_state
+                WHERE id
+                  FOR UPDATE"""
+        ).fetchone()
+        if row is None:
+            return 0
+        used = int(row["used"] or 0)
+        granted = max(0, min(int(count), CENSYS_ENRICHMENT_DAILY_LIMIT - used))
+        if not granted:
+            return 0
+        c.execute(
+            """UPDATE graph_state
+                  SET censys_enrichment_day   = (NOW() AT TIME ZONE 'utc')::date,
+                      censys_enrichment_count = %s,
+                      updated_at              = NOW()
+                WHERE id""",
+            (used + granted,),
+        )
+    return granted
+
+
+def release_censys_enrichment_calls(count: int = 1) -> None:
+    """Hand back calls claimed for a request that never reached the quota.
+
+    A 401/403/409 means the credential or the plan is wrong, not that we spent
+    enrichment budget — Censys never counted it. Without this, a deployment on
+    a tier that lacks host enrichment would burn the whole 20k counter on
+    identical failures and look like it had simply run out for the day.
+    """
+    if count <= 0:
+        return
     init_db()
     with _conn() as c:
         c.execute(
-            """INSERT INTO graph_state (id, dirty, dirty_at, updated_at)
-               VALUES (TRUE, TRUE, NOW(), NOW())
-               ON CONFLICT (id) DO UPDATE SET
-                   dirty = TRUE,
-                   dirty_at = NOW(),
-                   updated_at = NOW()"""
+            """UPDATE graph_state
+                  SET censys_enrichment_count = GREATEST(censys_enrichment_count - %s, 0),
+                      updated_at = NOW()
+                WHERE id AND censys_enrichment_day = (NOW() AT TIME ZONE 'utc')::date""",
+            (int(count),),
         )
 
 
-def _mark_clusters_clean(c: psycopg.Connection[Any]) -> None:
+def censys_enrichment_usage() -> dict[str, int]:
+    """Today's host-enrichment spend and what's left of the daily cap."""
+    init_db()
+    with _conn() as c:
+        row = c.execute(
+            """SELECT CASE WHEN censys_enrichment_day = (NOW() AT TIME ZONE 'utc')::date
+                           THEN censys_enrichment_count ELSE 0 END AS used
+                 FROM graph_state WHERE id"""
+        ).fetchone()
+    used = int((row or {}).get("used") or 0)
+    return {
+        "used": used,
+        "limit": CENSYS_ENRICHMENT_DAILY_LIMIT,
+        "remaining": max(CENSYS_ENRICHMENT_DAILY_LIMIT - used, 0),
+    }
+
+
+def ips_pending_censys_enrichment(limit: int = 1000, *, refresh_all: bool = False) -> list[str]:
+    """Distinct pool IPs that have not been host-enriched yet.
+
+    Ordered by how many pool rows reference the IP, so a sweep that runs out of
+    daily budget has spent it on the addresses the most channels resolve to.
+    `refresh_all` re-enriches already-enriched IPs too (oldest first), for when
+    the stored view has gone stale rather than missing.
+    """
+    init_db()
+    where = "" if refresh_all else "WHERE censys_enriched_at IS NULL"
+    order = "MIN(censys_enriched_at) ASC NULLS FIRST, COUNT(*) DESC" if refresh_all else "COUNT(*) DESC"
+    with _conn() as c:
+        rows = c.execute(
+            f"""SELECT ip FROM ips {where}
+                 GROUP BY ip
+                 ORDER BY {order}
+                 LIMIT %s""",
+            (int(limit),),
+        ).fetchall()
+    return [r["ip"] for r in rows if r.get("ip")]
+
+
+def store_censys_enrichment(ip: str, enrichment: dict) -> list[int]:
+    """Attach an enrichment result to every `ips` row for this address.
+
+    Also fills the scalar columns that were left empty by RDAP/ipinfo — the
+    same gap-fill precedence merge_censys_enrichment applies on the scan path,
+    so a sweep and a rescan converge on the same values instead of one
+    overwriting the other.
+
+    Returns the search_ids whose rows changed. Those searches need reprojecting
+    for a newly filled asn/network_cidr to reach the graph (see
+    _ips_table_observations); the caller batches that, because a pool-wide
+    sweep hits the same searches over and over and reprojecting per IP would
+    redo the same work thousands of times.
+    """
+    init_db()
+    observed = datetime.now(timezone.utc).isoformat()
+    cidrs = enrichment.get("network_cidrs") or []
+    with _conn() as c:
+        result = c.execute(
+            # asn/asn_desc/network_* stay gap-fills so an unlimited source
+            # (ipinfo Lite) is never overwritten by the 20k/day one. `country`
+            # is different: enrichment now *owns* geo (see
+            # utils.censys_enrichment.merge_censys_enrichment), so it overwrites
+            # rather than gap-fills — but only when it actually answered, so a
+            # skipped/not_found sweep never blanks a country ipinfo already set.
+            """UPDATE ips
+                  SET censys_enrichment  = %(payload)s,
+                      censys_enriched_at = %(observed)s,
+                      asn          = COALESCE(NULLIF(asn, ''),          %(asn)s),
+                      asn_desc     = COALESCE(NULLIF(asn_desc, ''),     %(asn_desc)s),
+                      country      = COALESCE(NULLIF(%(country)s, ''),  country),
+                      network_name = COALESCE(NULLIF(network_name, ''), %(network_name)s),
+                      network_cidr = COALESCE(NULLIF(network_cidr, ''), %(network_cidr)s)
+                WHERE ip = %(ip)s
+               RETURNING search_id""",
+            {
+                "ip": ip,
+                "payload": _json(enrichment),
+                "observed": observed,
+                "asn": _normalize_asn(enrichment.get("asn")),
+                "asn_desc": enrichment.get("as_name") or enrichment.get("as_description"),
+                "country": enrichment.get("as_country") or enrichment.get("country_code"),
+                "network_name": enrichment.get("network_name"),
+                "network_cidr": (cidrs[0] if cidrs else enrichment.get("bgp_prefix")),
+            },
+        )
+        return [int(row["search_id"]) for row in result.fetchall() if row.get("search_id")]
+
+
+def _mark_clusters_dirty_stmt(c: psycopg.Connection[Any]) -> None:
+    c.execute(
+        """INSERT INTO graph_state (id, dirty, dirty_at, updated_at)
+           VALUES (TRUE, TRUE, NOW(), NOW())
+           ON CONFLICT (id) DO UPDATE SET
+               dirty = TRUE,
+               dirty_at = NOW(),
+               updated_at = NOW()"""
+    )
+
+
+def _mark_clusters_dirty() -> None:
+    init_db()
+    with _conn() as c:
+        _mark_clusters_dirty_stmt(c)
+
+
+# ── Continuous graph maintenance ────────────────────────────────────────────
+#
+# Three tiers, cheapest and freshest first. Together they replace what used to
+# be "an O(pool) rebuild every 20s while anything is dirty, plus a full
+# recompute only when a human clicks the button":
+#
+#  1. incremental rescore (this section) — runs seconds after a write and only
+#     touches the domains that write actually invalidated. Maintains the scored
+#     link layer: graph_links + graph_connection_counts.
+#  2. rebuild_clusters() — still a whole-pool pass, but now rate-limited to
+#     GRAPH_CLUSTER_REBUILD_INTERVAL instead of firing on every dirty tick. It
+#     owns the derived structures the incremental path deliberately does NOT
+#     maintain: connected components (graph_clusters/graph_cluster_links),
+#     multi-hop paths (graph_paths) and the browse-by-edge groups
+#     (graph_selector_groups). Those are global, order-dependent structures —
+#     a component can *split* when a selector turns into noise, which no
+#     bounded local patch can detect — so they are recomputed wholesale rather
+#     than maintained approximately.
+#  3. rebuild_all_correlation() — the periodic full reconcile, every
+#     GRAPH_FULL_RECONCILE_INTERVAL. Reprojects every stored search, recomputes
+#     every degree and reseeds the whole denylist, which is what corrects any
+#     drift tiers 1 and 2 accumulated (and what picks up changed extraction or
+#     weighting logic). Still available manually via /api/graph/recompute and
+#     scripts/backfill_correlation.py.
+
+
+def _incremental_batch_limit() -> int:
+    """Domains rescored per maintenance tick."""
+    try:
+        return max(1, int(os.environ.get("GRAPH_INCREMENTAL_BATCH", "500")))
+    except ValueError:
+        return 500
+
+
+def _incremental_queue_max() -> int:
+    """Queue length past which the incremental path gives up and defers to a
+    whole-pool rebuild.
+
+    Rescoring N domains one by one stops being a saving somewhere below the
+    size of the pool, and a bulk sweep (the OpenCTI channel run ingests
+    thousands of domains back to back) blows past that in minutes. Dropping the
+    queue there is not a loss of work: the dirty flag is raised in the same
+    transaction, so tier 2's whole-pool pass still recomputes every one of
+    them — and a domain that has never been through any pass reads as
+    "not computed yet" rather than "no connections" (see cached_links_for), so
+    the UI falls back to live scoring for it in the meantime.
+    """
+    try:
+        return max(1, int(os.environ.get("GRAPH_INCREMENTAL_QUEUE_MAX", "5000")))
+    except ValueError:
+        return 5000
+
+
+def _cluster_rebuild_interval() -> float:
+    try:
+        return max(0.0, float(os.environ.get("GRAPH_CLUSTER_REBUILD_INTERVAL", "900")))
+    except ValueError:
+        return 900.0
+
+
+def _full_reconcile_interval() -> float:
+    """Seconds between automatic full reconciles. 0 disables the schedule
+    (the manual endpoint and the CLI still work)."""
+    try:
+        return max(0.0, float(os.environ.get("GRAPH_FULL_RECONCILE_INTERVAL", "86400")))
+    except ValueError:
+        return 86400.0
+
+
+def _ip_noise_degree() -> int:
+    """utils/check.py's cutoff past which a shared IP scores zero. Imported
+    lazily (check imports this module) and read rather than duplicated, so the
+    incremental path's idea of "this IP can still move a score" cannot drift
+    from the scorer's."""
+    from utils import check as _check
+
+    return int(_check._IP_NOISE_DEGREE)
+
+
+# Cache-invalidation fan-out. Anything that wants to hear "these domains' graph
+# answers just changed" registers here — the callback fires *after* the write
+# transaction commits, so a listener that reacts by re-reading the database
+# sees the new state. Scope is "domains" (the tuple names exactly what changed)
+# or "all" (a whole-pool rebuild landed and every cached answer is suspect).
+# Hooks must not raise anything the caller has to care about: a failing cache
+# must never fail or roll back a graph write, so exceptions are logged and
+# swallowed here.
+GraphInvalidationHook = Callable[[str, tuple[str, ...]], None]
+_GRAPH_INVALIDATION_HOOKS: list[GraphInvalidationHook] = []
+
+
+def register_graph_invalidation_hook(hook: GraphInvalidationHook) -> None:
+    """Register a callback fired after a committed change to the derived graph."""
+    if hook not in _GRAPH_INVALIDATION_HOOKS:
+        _GRAPH_INVALIDATION_HOOKS.append(hook)
+
+
+def _notify_graph_invalidation(scope: str, domains: Iterable[str] = ()) -> None:
+    if not _GRAPH_INVALIDATION_HOOKS:
+        return
+    payload = tuple(domains)
+    for hook in list(_GRAPH_INVALIDATION_HOOKS):
+        try:
+            hook(scope, payload)
+        except Exception as exc:
+            LOGGER.warning("graph invalidation hook %r failed: %s", hook, exc)
+
+
+def _affected_registrable_domains(c: psycopg.Connection[Any], touch: CorrelationTouch) -> set[str]:
+    """Every registrable domain whose materialized link scores this write made wrong.
+
+    This is the whole difficulty of incremental correlation. A link's score is
+    ``base_weight x rarity(degree) x time_overlap x recency`` and rarity is
+    ``1/log2(degree)`` over the selector's *global* degree — so observing one
+    more entity on a selector changes the score of every link anywhere in the
+    pool that rests on it, not just the links of the domain we happened to
+    scan. Rescoring only the scanned domain would leave every co-sharer holding
+    a number that no longer reproduces, and a stale score is worse than a slow
+    one: it is silently wrong on the pool page and in the exported evidence.
+    So we rescore the full neighbourhood, and rely on the fact that the
+    neighbourhood is bounded:
+      * an *attributing* selector has degree <= CORRELATION_DEGREE_THRESHOLD by
+        construction (seed_denylist rule 1 flips anything above it to noise),
+        so it can name at most that many domains — or, for the account-bound
+        kinds that rule exempts, CORRELATION_ACCOUNT_DEGREE_THRESHOLD, which is
+        larger but still a constant, so the bound below holds either way;
+      * a non-attributing selector contributes nothing to any score, so it is
+        skipped entirely — which is precisely why the pathological high-degree
+        nodes (a nameserver on 40,000 domains, a CDN ASN) cost nothing here;
+      * the same argument holds for shared IPs against check._IP_NOISE_DEGREE.
+    The one-write-crosses-the-threshold case is caught by taking the union of
+    the before and after states (see persist_correlation), which is why a
+    selector that just *became* noise still drags its ex-neighbours along.
+    Cost is therefore O(touched_nodes x threshold), independent of pool size.
+    """
+    affected = {rd for rd in touch.registrable_domains if rd}
+    if touch.rescore_selector_ids:
+        rows = c.execute(
+            """SELECT DISTINCT e.registrable_domain AS rd
+                 FROM observations o
+                 JOIN entities e ON e.id = o.entity_id
+                WHERE o.selector_id = ANY(%s)
+                  AND e.registrable_domain IS NOT NULL""",
+            (sorted(touch.rescore_selector_ids),),
+        ).fetchall()
+        affected.update(row["rd"] for row in rows)
+    if touch.rescore_ip_entity_ids:
+        rows = c.execute(
+            """SELECT DISTINCT e.registrable_domain AS rd
+                 FROM entity_edges ee
+                 JOIN entities e ON e.id = ee.src_entity_id
+                WHERE ee.kind = 'resolves_to'
+                  AND ee.dst_entity_id = ANY(%s)
+                  AND e.registrable_domain IS NOT NULL""",
+            (sorted(touch.rescore_ip_entity_ids),),
+        ).fetchall()
+        affected.update(row["rd"] for row in rows)
+    return affected
+
+
+def _mark_graph_dirty(domains: Iterable[str]) -> int:
+    """Queue `domains` for incremental rescore and flag the graph dirty.
+
+    Two statements on the singleton row rather than one: the upsert keeps
+    working if the row somehow does not exist yet, and the merge is a plain
+    UPDATE. Both take the same row lock, so concurrent ingests serialize on it
+    instead of losing each other's entries — which is also why no long-running
+    rebuild may hold that lock for its whole transaction (see rebuild_clusters).
+    Returns the resulting queue length, 0 meaning it overflowed and a whole-pool
+    rebuild will pick the work up instead.
+    """
+    init_db()
+    values = sorted({str(d).strip() for d in domains if str(d or "").strip()})
+    with _conn() as c:
+        _mark_clusters_dirty_stmt(c)
+        if not values:
+            return 0
+        row = c.execute(
+            """UPDATE graph_state gs
+                  SET dirty_domains = CASE
+                          WHEN cardinality(m.merged) > %(cap)s THEN ARRAY[]::text[]
+                          ELSE m.merged
+                      END,
+                      updated_at = NOW()
+                 FROM (
+                      SELECT COALESCE(array_agg(DISTINCT d), ARRAY[]::text[]) AS merged
+                        FROM graph_state s, unnest(s.dirty_domains || %(new)s::text[]) AS d
+                       WHERE s.id AND d IS NOT NULL AND d <> ''
+                 ) m
+                WHERE gs.id
+               RETURNING cardinality(gs.dirty_domains) AS pending""",
+            {"new": values, "cap": _incremental_queue_max()},
+        ).fetchone()
+    return int((row or {}).get("pending") or 0)
+
+
+def apply_pending_graph_rescores(limit: int | None = None) -> dict[str, int]:
+    """Rescore the queued domains and patch their materialized links in place.
+
+    Scoring happens *outside* the write transaction (check.links_for opens its
+    own short-lived connections, exactly as rebuild_clusters' scoring pass
+    does), then one short transaction takes the shared rebuild advisory lock
+    and swaps the rows. Try-lock rather than wait: if a whole-pool rebuild is
+    mid-flight it is about to recompute these same domains anyway, and the
+    queue is only drained on success, so nothing is lost by returning and
+    retrying on the next tick.
+
+    Only rows for the batch's own domains are deleted, never rows pointing *at*
+    them: link scoring is symmetric, so whenever a pair's score moves both of
+    its endpoints are in the affected set (they share the selector or IP whose
+    degree changed — that is what put them in the set). A batch split across
+    ticks can leave the reverse row of a *dropped* link behind for one tick,
+    which is why the queue is drained oldest-first and in full.
+    """
+    init_db()
+    batch_limit = limit or _incremental_batch_limit()
+    with _conn() as c:
+        row = c.execute("SELECT dirty_domains FROM graph_state WHERE id").fetchone()
+    pending = sorted({d for d in ((row or {}).get("dirty_domains") or []) if d})
+    if not pending:
+        return {"rescored_domains": 0, "links": 0, "pending": 0}
+    batch = pending[:batch_limit]
+
+    from utils import check as _check
+
+    started = time.monotonic()
+    links_by_rd: dict[str, list[dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=min(_rebuild_workers(), len(batch)), thread_name_prefix="rescore") as ex:
+        futures = {ex.submit(_check.links_for, rd, limit=None): rd for rd in batch}
+        for fut in as_completed(futures):
+            links_by_rd[futures[fut]] = fut.result()
+
+    now = datetime.now(timezone.utc).isoformat()
+    link_rows: list[tuple[Any, ...]] = []
+    count_rows: list[tuple[Any, ...]] = []
+    for rd in batch:
+        links = links_by_rd[rd]
+        # Same shape as rebuild_clusters: every scored link is stored, but the
+        # pool-page count uses links_for's own default top-50 cut so the number
+        # never disagrees with the domain page.
+        count_rows.append((rd, len(links[:50]), now))
+        for link in links:
+            link_rows.append((
+                rd, link["target"], link["score"], link["confidence"], link["strength"],
+                link["shared_node_count"], _json(link["evidence"]), now,
+            ))
+
+    with _conn() as c:
+        lock_row = c.execute(
+            "SELECT pg_try_advisory_xact_lock(%s) AS locked", (_GRAPH_REBUILD_LOCK_KEY,)
+        ).fetchone()
+        if not lock_row or not lock_row["locked"]:
+            LOGGER.info("graph rescore: deferred — a full rebuild holds the lock (%d queued)", len(pending))
+            return {"rescored_domains": 0, "links": 0, "pending": len(pending), "skipped": 1}
+        c.execute("DELETE FROM graph_links WHERE registrable_domain = ANY(%s)", (batch,))
+        c.execute("DELETE FROM graph_connection_counts WHERE registrable_domain = ANY(%s)", (batch,))
+        if link_rows:
+            c.cursor().executemany(
+                """INSERT INTO graph_links
+                       (registrable_domain, target, score, confidence, strength,
+                        shared_node_count, evidence, computed_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                link_rows,
+            )
+        c.cursor().executemany(
+            """INSERT INTO graph_connection_counts (registrable_domain, connection_count, computed_at)
+               VALUES (%s,%s,%s)""",
+            count_rows,
+        )
+        # Subtract exactly what we scored instead of clearing the column: a scan
+        # that committed while this batch was scoring has already queued itself
+        # and must survive this update.
+        c.execute(
+            """UPDATE graph_state
+                  SET dirty_domains = ARRAY(
+                          SELECT unnest(dirty_domains) EXCEPT SELECT unnest(%s::text[])
+                      ),
+                      incremental_at = NOW(),
+                      updated_at = NOW()
+                WHERE id""",
+            (batch,),
+        )
+    _notify_graph_invalidation("domains", batch)
+    LOGGER.info(
+        "graph rescore: %d domain(s), %d link(s) in %.2fs (%d still queued)",
+        len(batch), len(link_rows), time.monotonic() - started, len(pending) - len(batch),
+    )
+    return {
+        "rescored_domains": len(batch),
+        "links": len(link_rows),
+        "pending": len(pending) - len(batch),
+    }
+
+
+def graph_maintenance_state() -> dict[str, Any]:
+    """Queue depth and age of each maintenance tier, for the scheduler and ops."""
+    init_db()
+    with _conn() as c:
+        row = c.execute(
+            """SELECT dirty,
+                      cardinality(dirty_domains) AS pending,
+                      EXTRACT(EPOCH FROM (NOW() - clean_at))         AS since_clean,
+                      EXTRACT(EPOCH FROM (NOW() - full_reconcile_at)) AS since_full
+                 FROM graph_state WHERE id"""
+        ).fetchone()
+    if row is None:
+        return {"dirty": True, "pending": 0, "since_clean": None, "since_full": None}
+    return {
+        "dirty": bool(row["dirty"]),
+        "pending": int(row["pending"] or 0),
+        "since_clean": None if row["since_clean"] is None else float(row["since_clean"]),
+        "since_full": None if row["since_full"] is None else float(row["since_full"]),
+    }
+
+
+def run_graph_maintenance() -> dict[str, Any]:
+    """One tick of continuous graph maintenance — see the tier comment above.
+
+    At most one heavy tier runs per tick: a due full reconcile subsumes both
+    cheaper tiers, and a whole-pool cluster rebuild subsumes the incremental
+    queue, so doing them in the same tick would only duplicate work.
+    """
+    state = graph_maintenance_state()
+    full_interval = _full_reconcile_interval()
+    since_full = state["since_full"]
+    if full_interval and (since_full is None or since_full >= full_interval):
+        LOGGER.info("graph maintenance: full reconcile due (%s s since last)", since_full)
+        return {"tier": "full_reconcile", **rebuild_all_correlation()}
+
+    cluster_interval = _cluster_rebuild_interval()
+    since_clean = state["since_clean"]
+    clusters_due = state["dirty"] and (since_clean is None or since_clean >= cluster_interval)
+    if clusters_due:
+        return {"tier": "clusters", **rebuild_clusters()}
+    if state["pending"]:
+        return {"tier": "incremental", **apply_pending_graph_rescores()}
+    return {"tier": "idle"}
+
+
+def _mark_clusters_clean(c: psycopg.Connection[Any], covered: Iterable[str] = ()) -> None:
+    """Clear the dirty flag, and with it the incremental queue entries this
+    whole-pool rebuild just subsumed.
+
+    `covered` is the queue as it stood when the rebuild started, not the queue
+    now: anything enqueued while the rebuild was running was written after the
+    rebuild had already read (or scored) that domain, so it still needs its own
+    incremental pass and must survive.
+    """
     c.execute(
         """INSERT INTO graph_state (id, dirty, clean_at, rebuild_started_at, updated_at)
            VALUES (TRUE, FALSE, NOW(), NULL, NOW())
@@ -3443,6 +4947,17 @@ def _mark_clusters_clean(c: psycopg.Connection[Any]) -> None:
                rebuild_started_at = NULL,
                updated_at = NOW()"""
     )
+    covered_list = [str(d) for d in covered if d]
+    if covered_list:
+        c.execute(
+            """UPDATE graph_state
+                  SET dirty_domains = ARRAY(
+                          SELECT unnest(dirty_domains) EXCEPT SELECT unnest(%s::text[])
+                      ),
+                      updated_at = NOW()
+                WHERE id""",
+            (covered_list,),
+        )
 
 
 def rebuild_all_correlation() -> dict[str, int]:
@@ -3450,20 +4965,74 @@ def rebuild_all_correlation() -> dict[str, int]:
 
     Drops the derived tables and re-projects every stored search (oldest first
     so time windows widen monotonically), then recomputes degrees and seeds the
-    denylist. This is the deterministic "recompute without rescanning" path.
+    denylist. This is the deterministic "recompute without rescanning" path,
+    and the periodic reconcile that corrects whatever the incremental path
+    drifted on — see the maintenance-tier comment above _incremental_batch_limit.
+
+    Takes the shared rebuild advisory lock for the whole reprojection, waiting
+    rather than skipping: an incremental rescore is a 20-second-cadence
+    background chore and can retry, but this pass is the correctness backstop
+    and must not be the one that gets dropped. It empties and refills
+    entities/selectors/observations in a single transaction, so a concurrent
+    rescore that ran against the half-built graph would write scores computed
+    from a corpus that never existed.
     """
     init_db()
+    started = time.monotonic()
     with _conn() as c:
+        c.execute("SELECT pg_advisory_xact_lock(%s)", (_GRAPH_REBUILD_LOCK_KEY,))
+        LOGGER.info("rebuild_all_correlation: dropping derived tables")
         _truncate_correlation(c)
-        ids = [int(row["id"]) for row in c.execute("SELECT id FROM searches ORDER BY id ASC").fetchall()]
-        for sid in ids:
-            result = get_result(sid)
+        # Metadata for the whole corpus in one read, rather than get_result's
+        # connect-and-query per search. Four small columns per row, so this
+        # stays a few MB even for a large pool, and it takes the per-search
+        # cost down to the one query that actually has to be per-search (the
+        # JSONB field payload). Reading it on `c` also means the projection
+        # sees the same snapshot as the transaction holding the rebuild lock,
+        # where a per-search connection saw a slightly newer one each time.
+        metas = {
+            int(row["id"]): row
+            for row in c.execute(
+                "SELECT id, target, type, timestamp FROM searches ORDER BY id ASC"
+            ).fetchall()
+        }
+        ids = sorted(metas)
+        total = len(ids)
+        LOGGER.info("rebuild_all_correlation: projecting %d stored search(es)", total)
+        # Logged every ~5% of the way through (capped at 500) instead of
+        # per-search: the per-search work itself (persist_correlation) is a
+        # handful of INSERTs, cheap enough that per-row logging would dominate
+        # the log with noise rather than signal, but this is also the slowest
+        # single phase for a large corpus, so silence here is exactly what
+        # makes a rebuild look hung. The cap keeps the first line from taking
+        # forever on a very large corpus; the heartbeat covers a slow patch
+        # (a few unusually large stored results) that would otherwise go quiet
+        # for a whole percentage-point's worth of searches.
+        log_every = max(1, min(total // 20, 500))
+        heartbeat_seconds = 10.0
+        last_logged = started
+        for i, sid in enumerate(ids, 1):
+            result = _hydrate_result(metas[sid], _load_result_from_fields(c, sid), sid)
             if result is not None:
                 persist_correlation(c, result, search_id=sid, recount=False)
+            now_mono = time.monotonic()
+            if i % log_every == 0 or i == total or now_mono - last_logged >= heartbeat_seconds:
+                LOGGER.info(
+                    "rebuild_all_correlation: projected %d/%d searches (%.1fs elapsed)",
+                    i, total, now_mono - started,
+                )
+                last_logged = now_mono
+        LOGGER.info("rebuild_all_correlation: recomputing selector degrees")
         recompute_all_selector_degrees(c)
+        LOGGER.info("rebuild_all_correlation: seeding denylist")
+        denylist_started = time.monotonic()
         denylisted = seed_denylist(c)
+        LOGGER.info(
+            "rebuild_all_correlation: denylisted %d selector(s) (%.1fs)",
+            denylisted, time.monotonic() - denylist_started,
+        )
         counts = {
-            "searches": len(ids),
+            "searches": total,
             "entities": c.execute("SELECT count(*) AS n FROM entities").fetchone()["n"],
             "selectors": c.execute("SELECT count(*) AS n FROM selectors").fetchone()["n"],
             "observations": c.execute("SELECT count(*) AS n FROM observations").fetchone()["n"],
@@ -3471,19 +5040,33 @@ def rebuild_all_correlation() -> dict[str, int]:
             "denylisted_selectors": denylisted,
         }
     # Clusters depend on the freshly seeded denylist, so rebuild them last.
+    # Outside the transaction above so the advisory lock is released first —
+    # rebuild_clusters takes it itself, and would otherwise deadlock against a
+    # lock this process already holds only by luck of it being the same session.
+    LOGGER.info("rebuild_all_correlation: projection done in %.1fs, rebuilding clusters", time.monotonic() - started)
     counts.update(rebuild_clusters())
+    # Paces the automatic schedule, and resets it when an operator runs a
+    # recompute by hand — a manual reconcile is still a reconcile, so the timer
+    # should start from it rather than firing again minutes later.
+    with _conn() as c:
+        c.execute("UPDATE graph_state SET full_reconcile_at = NOW(), updated_at = NOW() WHERE id")
+    _notify_graph_invalidation("all")
+    LOGGER.info("rebuild_all_correlation: done in %.1fs total", time.monotonic() - started)
     return counts
 
 
-def rebuild_correlation_for_search(search_id: int) -> set[int]:
-    """Incrementally (re)project a single search into the correlation graph."""
+def rebuild_correlation_for_search(search_id: int) -> CorrelationTouch:
+    """Incrementally (re)project a single search into the correlation graph and
+    queue everything its degree changes invalidated for rescore."""
     init_db()
     result = get_result(search_id)
     if result is None:
-        return set()
+        return CorrelationTouch.empty()
     with _conn() as c:
-        touched = persist_correlation(c, result, search_id=search_id, recount=True)
-    return touched
+        touch = persist_correlation(c, result, search_id=search_id, recount=True)
+        affected = _affected_registrable_domains(c, touch)
+    _mark_graph_dirty(affected)
+    return touch
 
 
 # ── Correlation layer: denylist seeding ─────────────────────────────────────
@@ -3493,6 +5076,24 @@ def _degree_threshold() -> int:
         return int(os.getenv("CORRELATION_DEGREE_THRESHOLD", "50"))
     except ValueError:
         return 50
+
+
+# Selectors that are issued *to an account*, not deployed on infrastructure: a
+# webmaster-tools verification code proves control of a Google/Bing account, and
+# an AdSense publisher or GA property id binds to one payment/analytics account.
+# Nobody ends up sharing one by renting the same CDN, so high degree here means
+# "this account owns a lot of domains" — the finding itself — where for a
+# nameserver or an ASN it means "this is public infrastructure". They still get
+# a ceiling (see _account_degree_threshold) because a verification code baked
+# into a widely-redistributed CMS theme does happen.
+_ACCOUNT_BOUND_TRACKING_SUBKINDS = ("adsense_publisher", "ga_property")
+
+
+def _account_degree_threshold() -> int:
+    try:
+        return int(os.getenv("CORRELATION_ACCOUNT_DEGREE_THRESHOLD", "500"))
+    except ValueError:
+        return 500
 
 
 def _san_bundle_threshold() -> int:
@@ -3536,8 +5137,23 @@ def seed_denylist(c: psycopg.Connection[Any]) -> int:
 
     threshold = _degree_threshold()
     # 1) High-degree selectors of any kind are shared infrastructure noise
-    #    (Cloudflare universal-SSL SAN sets, big nameservers/ASNs, ...).
-    c.execute("UPDATE selectors SET attributing = FALSE WHERE entity_count > %s", (threshold,))
+    #    (Cloudflare universal-SSL SAN sets, big nameservers/ASNs, ...) —
+    #    except the account-bound kinds, where degree is the signal rather than
+    #    the noise and a state broadcaster's own verification code would
+    #    otherwise be discarded precisely because it covers its whole network.
+    #    Rarity weighting still discounts them: 1/log2(degree) takes a token on
+    #    500 domains down to ~11% of its base weight, so a wide one degrades
+    #    smoothly instead of vanishing at a cliff.
+    c.execute(
+        """UPDATE selectors
+              SET attributing = FALSE
+            WHERE entity_count > CASE
+                    WHEN kind = 'site_verification'
+                      OR (kind = 'tracking_id'
+                          AND split_part(value, '|', 1) = ANY(%s))
+                    THEN %s ELSE %s END""",
+        (list(_ACCOUNT_BOUND_TRACKING_SUBKINDS), _account_degree_threshold(), threshold),
+    )
 
     # 2) Known noise ASNs (CDN/proxy, shared-hosting, big mail).
     noise_asns = sorted(_CDN_PROXY_ASNS | _SHARED_HOSTING_ASNS | _MAIL_ASNS)
@@ -3548,90 +5164,230 @@ def seed_denylist(c: psycopg.Connection[Any]) -> int:
         )
 
     # 3) Big-provider / registrar nameservers from the boring-NS list.
-    for row in c.execute("SELECT id, value FROM selectors WHERE kind = 'nameserver'").fetchall():
-        if _is_boring_nameserver(row["value"]):
-            c.execute("UPDATE selectors SET attributing = FALSE WHERE id = %s", (row["id"],))
-
     # 4) Shared-host / default certificate SANs (cPanel/Apache defaults, localhost…).
-    for row in c.execute("SELECT id, value FROM selectors WHERE kind = 'tls_san'").fetchall():
-        value = row["value"]
-        if _is_low_signal_tls_identity(value) or _text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS):
-            c.execute("UPDATE selectors SET attributing = FALSE WHERE id = %s", (row["id"],))
+    # Both decisions are made in Python (the predicates are pattern lists, not
+    # SQL), so the ids are collected and written in one statement each — the
+    # same shape rule 5 below already uses. Per-row UPDATEs here cost a round
+    # trip per selector of that kind, which on a large pool is tens of
+    # thousands of them for a few thousand actual flips.
+    boring_ns = [
+        row["id"]
+        for row in c.execute("SELECT id, value FROM selectors WHERE kind = 'nameserver'").fetchall()
+        if _is_boring_nameserver(row["value"])
+    ]
+    low_signal_sans = [
+        row["id"]
+        for row in c.execute("SELECT id, value FROM selectors WHERE kind = 'tls_san'").fetchall()
+        if _is_low_signal_tls_identity(row["value"])
+        or _text_contains_any(row["value"], _LOW_SIGNAL_HOSTING_PATTERNS)
+    ]
+    for ids in (boring_ns, low_signal_sans):
+        if ids:
+            c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (ids,))
 
     # 5) Certificates with an implausibly large, heterogeneous SAN list are
     #    shared-hosting/AutoSSL bundles covering many unrelated customer
     #    domains on one server — neither the cert fingerprint match nor any of
     #    its individual SANs are an ownership signal in that case, even when
     #    none of the bundled domains match a recognized hosting-provider
-    #    pattern (rule 4 only catches *known* providers by name). A single
-    #    operator's own cert rarely lists more than a handful of its own
-    #    domain variants, so SAN count alone is the tell. The SAN set for one
-    #    specific certificate is recovered by matching observations that share
-    #    the same entity + validity window as its tls_cert_sha256 observation
-    #    (they're always written together, from the same probed certificate).
-    san_threshold = _san_bundle_threshold()
-    bundles = c.execute(
-        """WITH cert_events AS (
-               SELECT o.entity_id, o.first_seen, o.last_seen, s.id AS cert_selector_id
-               FROM observations o JOIN selectors s ON s.id = o.selector_id
-               WHERE s.kind = 'tls_cert_sha256'
-           )
-           SELECT ce.cert_selector_id,
-                  array_agg(DISTINCT san_sel.id) AS san_selector_ids,
-                  count(DISTINCT san_sel.value) AS san_count
-           FROM cert_events ce
-           JOIN observations san_obs
-             ON san_obs.entity_id = ce.entity_id
-            AND san_obs.first_seen = ce.first_seen
-            AND san_obs.last_seen = ce.last_seen
-           JOIN selectors san_sel ON san_sel.id = san_obs.selector_id AND san_sel.kind = 'tls_san'
-           GROUP BY ce.cert_selector_id
-           HAVING count(DISTINCT san_sel.value) > %s""",
-        (san_threshold,),
-    ).fetchall()
-    bundle_selector_ids: set[int] = set()
-    for row in bundles:
-        bundle_selector_ids.add(row["cert_selector_id"])
-        bundle_selector_ids.update(row["san_selector_ids"] or [])
-    if bundle_selector_ids:
-        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (list(bundle_selector_ids),))
-
+    #    pattern (rule 4 only catches *known* providers by name).
+    #    Heterogeneity is measured in distinct *registrable* domains, not raw
+    #    SAN count: one operator legitimately putting 20 of its own subdomains
+    #    on a single cert is one owner, and counting names condemned all 20 of
+    #    its SAN selectors. 20 unrelated customers on an AutoSSL bundle is what
+    #    the rule is for, and only that trips it now.
     # 6) A cert whose *entire* SAN set is a known low-signal hosting/platform
     #    domain is a shared placeholder regardless of how many SANs it has —
     #    e.g. Firebase Hosting serves "firebaseapp.com, *.firebaseapp.com" as
     #    its generic default cert to any customer domain pointed at its shared
-    #    IPs, with only 2 SANs, so rule 5's size threshold never fires. Unlike
-    #    rule 5 (bundle too big to be one operator's) this is bundle too
-    #    on-the-nose to be one operator's: nobody's own cert lists only a
-    #    platform's own domain.
-    cert_san_values = c.execute(
-        """WITH cert_events AS (
-               SELECT o.entity_id, o.first_seen, o.last_seen, s.id AS cert_selector_id
-               FROM observations o JOIN selectors s ON s.id = o.selector_id
-               WHERE s.kind = 'tls_cert_sha256'
-           )
-           SELECT ce.cert_selector_id, array_agg(DISTINCT san_sel.value) AS san_values
-           FROM cert_events ce
-           JOIN observations san_obs
-             ON san_obs.entity_id = ce.entity_id
-            AND san_obs.first_seen = ce.first_seen
-            AND san_obs.last_seen = ce.last_seen
-           JOIN selectors san_sel ON san_sel.id = san_obs.selector_id AND san_sel.kind = 'tls_san'
-           GROUP BY ce.cert_selector_id"""
-    ).fetchall()
-    placeholder_cert_ids = [
-        row["cert_selector_id"]
-        for row in cert_san_values
-        if row["san_values"]
-        and all(
-            _is_low_signal_tls_identity(v) or _text_contains_any(v, _LOW_SIGNAL_HOSTING_PATTERNS)
-            for v in row["san_values"]
-        )
-    ]
-    if placeholder_cert_ids:
-        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (placeholder_cert_ids,))
+    #    IPs, with only 2 SANs, so rule 5's size threshold never fires.
+    # Both read each certificate's real SAN list from tls_certs/scan_hits —
+    # see _cert_bundle_denylist_ids for why they no longer reconstruct it from
+    # observation validity windows.
+    cert_bundle_ids = _cert_bundle_denylist_ids(c)
+    if cert_bundle_ids:
+        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (sorted(cert_bundle_ids),))
 
     return c.execute("SELECT count(*) AS n FROM selectors WHERE attributing = FALSE").fetchone()["n"]
+
+
+def _cert_san_sets(
+    c: psycopg.Connection[Any], *, fingerprints: set[str] | None = None
+) -> dict[str, set[str]]:
+    """Map each certificate fingerprint to the SAN set that certificate carries.
+
+    Read straight off ``tls_certs`` / ``scan_hits``, where a row *is* one
+    observed certificate and ``sans`` is that certificate's own SAN list.
+
+    This used to be reconstructed by joining ``observations`` to itself on
+    equal ``(entity_id, first_seen, last_seen)`` — the theory being that a
+    cert's fingerprint and its SANs are written together and so share a
+    validity window. They are, but observation windows do not stay put:
+    ``record_observation`` upserts with ``first_seen = LEAST(...)`` and
+    ``last_seen = GREATEST(...)``, so re-seeing a domain widens the row. After
+    the first certificate rotation a SAN carried by both the old and new cert
+    spans both windows and equals neither, the join returns nothing, and the
+    shared-hosting rules below silently stopped flagging anything — leaving a
+    40-domain AutoSSL bundle cert attributing at full weight, which is
+    780 bogus "strong" pairs from a single host.
+
+    Keying on the fingerprint avoids the question entirely: it identifies the
+    exact certificate, and never widens.
+
+    ``fingerprints`` bounds the read to specific certificates; ``None`` reads
+    the whole corpus (the full-rebuild path).
+    """
+    san_sets: dict[str, set[str]] = {}
+    for table in ("tls_certs", "scan_hits"):
+        if fingerprints is None:
+            rows = c.execute(
+                f"SELECT sha256, sans FROM {table} WHERE sha256 IS NOT NULL AND sans IS NOT NULL"
+            ).fetchall()
+        elif fingerprints:
+            # Bounded read for the incremental path: only the certificates the
+            # touched selectors actually belong to. Both tables index sha256.
+            rows = c.execute(
+                f"SELECT sha256, sans FROM {table} "
+                "WHERE sans IS NOT NULL AND sha256 = ANY(%s)",
+                (sorted(fingerprints),),
+            ).fetchall()
+        else:
+            rows = []
+        for row in rows:
+            fingerprint = _normalize_identifier_hash(row["sha256"])
+            if not fingerprint:
+                continue
+            raw_sans = row["sans"]
+            if isinstance(raw_sans, str):
+                try:
+                    raw_sans = json.loads(raw_sans)
+                except (ValueError, TypeError):
+                    continue
+            if not isinstance(raw_sans, (list, tuple)):
+                continue
+            bucket = san_sets.setdefault(fingerprint, set())
+            for san in raw_sans:
+                normalized = _normalize_tls_identity(san)
+                if normalized:
+                    bucket.add(normalized)
+    return san_sets
+
+
+def _cert_bundle_denylist_ids(
+    c: psycopg.Connection[Any], *, restrict_to: set[int] | None = None
+) -> set[int]:
+    """Selector ids to deny under the two shared-certificate rules.
+
+    Rule 5 — a certificate covering more distinct *registrable domains* than
+    ``_san_bundle_threshold()`` is a shared-hosting/AutoSSL bundle spanning
+    unrelated customers: neither its fingerprint nor any of its SANs attribute
+    anything. Counting registrable domains rather than SAN names is what keeps
+    a single operator's 20-subdomain cert out of the rule. Rule 6 — a certificate whose *entire* SAN set is known
+    platform boilerplate (Firebase's 2-SAN default cert and friends) is a
+    placeholder no matter how short it is.
+
+    ``restrict_to`` limits this to bundles that a set of freshly touched
+    selectors participates in — and bounds the *work*, not just the result: the
+    incremental path runs on every ingest, so reading every certificate and
+    every SAN selector in the corpus each time would make ingest cost grow with
+    total corpus size rather than with what changed.
+    """
+    # Which certificates can possibly be implicated. For the incremental path
+    # that is the touched cert selectors plus the certs carrying any touched SAN
+    # — resolved in SQL so the Python side only ever sees candidates.
+    fingerprints: set[str] | None = None
+    if restrict_to is not None:
+        if not restrict_to:
+            return set()
+        ids = sorted(restrict_to)
+        fingerprints = set()
+        for row in c.execute(
+            "SELECT value FROM selectors WHERE id = ANY(%s) AND kind = 'tls_cert_sha256'",
+            (ids,),
+        ).fetchall():
+            normalized = _normalize_identifier_hash(row["value"])
+            if normalized:
+                fingerprints.add(normalized)
+        touched_sans = [
+            _normalize_tls_identity(row["value"])
+            for row in c.execute(
+                "SELECT value FROM selectors WHERE id = ANY(%s) AND kind = 'tls_san'", (ids,)
+            ).fetchall()
+        ]
+        touched_sans = [san for san in touched_sans if san]
+        # `sans` holds raw certificate names while selector values are
+        # normalized, so match against the spellings _normalize_tls_identity
+        # collapses: the bare name, a wildcard, and a www host.
+        raw_candidates = sorted(
+            {
+                spelling
+                for san in touched_sans
+                if san
+                for spelling in (san, f"*.{san}", f"www.{san}", f"*.www.{san}")
+            }
+        )
+        if raw_candidates:
+            for table in ("tls_certs", "scan_hits"):
+                for row in c.execute(
+                    f"SELECT DISTINCT sha256 FROM {table} "
+                    "WHERE sha256 IS NOT NULL AND sans IS NOT NULL "
+                    "AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(sans) AS san "
+                    "            WHERE lower(rtrim(san, '.')) = ANY(%s))",
+                    (raw_candidates,),
+                ).fetchall():
+                    normalized = _normalize_identifier_hash(row["sha256"])
+                    if normalized:
+                        fingerprints.add(normalized)
+        if not fingerprints:
+            return set()
+
+    san_sets = _cert_san_sets(c, fingerprints=fingerprints)
+    if not san_sets:
+        return set()
+
+    cert_ids: dict[str, int] = {}
+    for row in c.execute(
+        "SELECT id, value FROM selectors WHERE kind = 'tls_cert_sha256'"
+    ).fetchall():
+        normalized = _normalize_identifier_hash(row["value"])
+        if normalized:
+            cert_ids[normalized] = row["id"]
+
+    san_ids: dict[str, int] = {}
+    for row in c.execute("SELECT id, value FROM selectors WHERE kind = 'tls_san'").fetchall():
+        normalized = _normalize_tls_identity(row["value"])
+        if normalized:
+            san_ids[normalized] = row["id"]
+
+    san_threshold = _san_bundle_threshold()
+    denied: set[int] = set()
+    for fingerprint, sans in san_sets.items():
+        cert_selector_id = cert_ids.get(fingerprint)
+        if cert_selector_id is None or not sans:
+            continue
+        member_ids = {san_ids[san] for san in sans if san in san_ids}
+
+        # Distinct owners, not distinct names — see rule 5's comment. Falls back
+        # to the name itself when registrable_domain declines (an IP SAN, or a
+        # bare hostname with no public suffix), so those still count separately.
+        distinct_owners = {registrable_domain(san) or san for san in sans}
+        is_bundle = len(distinct_owners) > san_threshold
+        is_placeholder = all(
+            _is_low_signal_tls_identity(san) or _text_contains_any(san, _LOW_SIGNAL_HOSTING_PATTERNS)
+            for san in sans
+        )
+        if not (is_bundle or is_placeholder):
+            continue
+        if restrict_to is not None and not ({cert_selector_id} | member_ids) & restrict_to:
+            continue
+
+        denied.add(cert_selector_id)
+        # Rule 6 condemns the placeholder certificate itself; its SANs are
+        # already handled by rule 4's pattern list and may legitimately belong
+        # to whoever registered them. Only a size-based bundle taints its SANs.
+        if is_bundle:
+            denied |= member_ids
+    return denied
 
 
 def apply_denylist_for_selectors(c: psycopg.Connection[Any], selector_ids: Iterable[int]) -> int:
@@ -3647,10 +5403,24 @@ def apply_denylist_for_selectors(c: psycopg.Connection[Any], selector_ids: Itera
 
     c.execute("UPDATE selectors SET attributing = TRUE WHERE id = ANY(%s)", (ids,))
 
+    # Same CASE as seed_denylist's rule 1. Applying a flat threshold here while
+    # the rebuild applies a raised one for site_verification and account-bound
+    # tracking subkinds made the two paths disagree: a broadcaster's
+    # google-site-verification token spanning 300 domains was attributing after
+    # a reconcile, non-attributing after the next ingest that touched it, and
+    # back again after the following reconcile — edges appearing and vanishing
+    # depending only on which path ran last.
     threshold = _degree_threshold()
     c.execute(
-        "UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s) AND entity_count > %s",
-        (ids, threshold),
+        """UPDATE selectors
+              SET attributing = FALSE
+            WHERE id = ANY(%s)
+              AND entity_count > CASE
+                    WHEN kind = 'site_verification'
+                      OR (kind = 'tracking_id'
+                          AND split_part(value, '|', 1) = ANY(%s))
+                    THEN %s ELSE %s END""",
+        (ids, list(_ACCOUNT_BOUND_TRACKING_SUBKINDS), _account_degree_threshold(), threshold),
     )
 
     noise_asns = sorted(_CDN_PROXY_ASNS | _SHARED_HOSTING_ASNS | _MAIL_ASNS)
@@ -3677,70 +5447,11 @@ def apply_denylist_for_selectors(c: psycopg.Connection[Any], selector_ids: Itera
         if _is_low_signal_tls_identity(value) or _text_contains_any(value, _LOW_SIGNAL_HOSTING_PATTERNS):
             c.execute("UPDATE selectors SET attributing = FALSE WHERE id = %s", (row["id"],))
 
-    san_threshold = _san_bundle_threshold()
-    bundles = c.execute(
-        """WITH cert_events AS (
-               SELECT o.entity_id, o.first_seen, o.last_seen, s.id AS cert_selector_id
-               FROM observations o JOIN selectors s ON s.id = o.selector_id
-               WHERE s.kind = 'tls_cert_sha256'
-           ),
-           cert_sans AS (
-               SELECT ce.cert_selector_id, san_sel.id AS san_selector_id, san_sel.value AS san_value
-               FROM cert_events ce
-               JOIN observations san_obs
-                 ON san_obs.entity_id = ce.entity_id
-                AND san_obs.first_seen = ce.first_seen
-                AND san_obs.last_seen = ce.last_seen
-               JOIN selectors san_sel ON san_sel.id = san_obs.selector_id AND san_sel.kind = 'tls_san'
-           )
-           SELECT cert_selector_id,
-                  array_agg(DISTINCT san_selector_id) AS san_selector_ids,
-                  count(DISTINCT san_value) AS san_count
-           FROM cert_sans
-           GROUP BY cert_selector_id
-           HAVING count(DISTINCT san_value) > %s
-              AND (cert_selector_id = ANY(%s) OR bool_or(san_selector_id = ANY(%s)))""",
-        (san_threshold, ids, ids),
-    ).fetchall()
-    bundle_selector_ids: set[int] = set()
-    for row in bundles:
-        bundle_selector_ids.add(row["cert_selector_id"])
-        bundle_selector_ids.update(row["san_selector_ids"] or [])
-    if bundle_selector_ids:
-        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (list(bundle_selector_ids),))
-
-    cert_san_values = c.execute(
-        """WITH cert_events AS (
-               SELECT o.entity_id, o.first_seen, o.last_seen, s.id AS cert_selector_id
-               FROM observations o JOIN selectors s ON s.id = o.selector_id
-               WHERE s.kind = 'tls_cert_sha256'
-           ),
-           cert_sans AS (
-               SELECT ce.cert_selector_id, san_sel.id AS san_selector_id, san_sel.value AS san_value
-               FROM cert_events ce
-               JOIN observations san_obs
-                 ON san_obs.entity_id = ce.entity_id
-                AND san_obs.first_seen = ce.first_seen
-                AND san_obs.last_seen = ce.last_seen
-               JOIN selectors san_sel ON san_sel.id = san_obs.selector_id AND san_sel.kind = 'tls_san'
-           )
-           SELECT cert_selector_id, array_agg(DISTINCT san_value) AS san_values
-           FROM cert_sans
-           GROUP BY cert_selector_id
-           HAVING cert_selector_id = ANY(%s) OR bool_or(san_selector_id = ANY(%s))""",
-        (ids, ids),
-    ).fetchall()
-    placeholder_cert_ids = [
-        row["cert_selector_id"]
-        for row in cert_san_values
-        if row["san_values"]
-        and all(
-            _is_low_signal_tls_identity(v) or _text_contains_any(v, _LOW_SIGNAL_HOSTING_PATTERNS)
-            for v in row["san_values"]
-        )
-    ]
-    if placeholder_cert_ids:
-        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (placeholder_cert_ids,))
+    # Same two shared-certificate rules as seed_denylist, limited to bundles
+    # the freshly touched selectors participate in.
+    cert_bundle_ids = _cert_bundle_denylist_ids(c, restrict_to=set(ids))
+    if cert_bundle_ids:
+        c.execute("UPDATE selectors SET attributing = FALSE WHERE id = ANY(%s)", (sorted(cert_bundle_ids),))
 
     return c.execute("SELECT count(*) AS n FROM selectors WHERE attributing = FALSE").fetchone()["n"]
 
@@ -3847,7 +5558,17 @@ def ip_network_context(ip_values: list[str]) -> dict[str, dict[str, Any]]:
     """Latest known network context per IP (ASN, network name/CIDR, reverse-proxy
     family, Cloudflare flag, country, PTR) — used to explain *what kind* of box a
     shared IP is (CDN/proxy edge vs. dedicated origin vs. shared-hosting pool)
-    instead of just reporting that an overlap exists."""
+    instead of just reporting that an overlap exists.
+
+    Also flattens the Censys host-enrichment classification out of the
+    `censys_enrichment` JSONB into scalar keys (`censys_hosting`,
+    `censys_proxy`, `censys_vpn`, `censys_tor`, `censys_relay`,
+    `censys_anonymous`, `censys_labels`). Those are IPinfo-derived and are the
+    only source in the pipeline for Tor/VPN/relay; utils.check reads them as a
+    *discount* on shared_ip evidence, never as the display label — that stays
+    `proxy_family` from detect_proxy_details. Flattened here so the JSON shape
+    lives in one place rather than in the scorer.
+    """
     values = sorted({v for v in ip_values if v})
     if not values:
         return {}
@@ -3855,13 +5576,55 @@ def ip_network_context(ip_values: list[str]) -> dict[str, dict[str, Any]]:
     with _conn() as c:
         rows = c.execute(
             """SELECT DISTINCT ON (ip) ip, cloudflare, asn, asn_desc, asn_registry, country,
-                      network_name, network_cidr, proxy_family, proxy_confidence, ptr
+                      network_name, network_cidr, proxy_family, proxy_confidence, ptr,
+                      censys_enrichment
                FROM ips
                WHERE ip = ANY(%s)
                ORDER BY ip, observed_at DESC NULLS LAST, id DESC""",
             (values,),
         ).fetchall()
-    return {row["ip"]: dict(row) for row in rows}
+
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        meta = dict(row)
+        enrichment = meta.pop("censys_enrichment", None)
+        if isinstance(enrichment, (str, bytes)):
+            try:
+                enrichment = json.loads(enrichment)
+            except (json.JSONDecodeError, TypeError):
+                enrichment = None
+        enrichment = enrichment if isinstance(enrichment, dict) else {}
+        for flag in ("hosting", "proxy", "vpn", "tor", "relay", "anonymous"):
+            meta[f"censys_{flag}"] = bool(enrichment.get(flag))
+        labels = enrichment.get("labels")
+        meta["censys_labels"] = [str(x) for x in labels] if isinstance(labels, list) else []
+        out[meta["ip"]] = meta
+    return out
+
+
+def tls_cert_context(sha256_values: list[str]) -> dict[str, dict[str, Any]]:
+    """Latest known certificate metadata per sha256 fingerprint — CN, issuer
+    CN/org, and the certificate's own cryptographic validity window
+    (not_before/not_after, as issued by the CA). Distinct from an
+    observation's first_seen/last_seen (when *we* last scanned it): a cert
+    can be long expired while still showing a recent last_seen if a probe
+    only recently re-encountered a stale record, and this is the field an
+    analyst actually needs to answer "is this certificate still alive" — used
+    to enrich tls_cert_sha256 evidence so investigators see the real story
+    behind a match, not just that one exists."""
+    values = sorted({v for v in sha256_values if v})
+    if not values:
+        return {}
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT DISTINCT ON (sha256) sha256, cn, issuer_cn, issuer_org, not_before, not_after
+               FROM tls_certs
+               WHERE sha256 = ANY(%s)
+               ORDER BY sha256, observed_at DESC NULLS LAST, id DESC""",
+            (values,),
+        ).fetchall()
+    return {row["sha256"]: dict(row) for row in rows}
 
 
 def link_candidates_for(value: str) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -3956,12 +5719,120 @@ def _cluster_max_fanout() -> int:
         return 25
 
 
+# ── Multi-hop path precompute ────────────────────────────────────────────────
+#
+# graph_links (built below) is a scored, weighted adjacency list -- each
+# domain's direct connections. _extend_paths walks it breadth-first, purely
+# in memory off the adjacency this same rebuild pass just computed (no extra
+# DB round-trips), and materializes every domain's multi-hop reachability
+# into graph_paths. This is what makes "why is A related to C" an indexed
+# SELECT everywhere it's surfaced (search, domain page, path lookups) instead
+# of a traversal triggered by the act of looking.
+
+# Cap on how many of a node's own outgoing links are followed per BFS step --
+# independent of graph_links' own unlimited storage -- so a hub domain with
+# hundreds of direct links can't blow up every other domain's path walk.
+_PATH_FRONTIER_LIMIT = 50
+
+
+def _graph_path_max_hops() -> int:
+    try:
+        return int(os.getenv("GRAPH_PATH_MAX_HOPS", "3"))
+    except ValueError:
+        return 3
+
+
+def _graph_path_max_nodes() -> int:
+    try:
+        return int(os.getenv("GRAPH_PATH_MAX_NODES", "200"))
+    except ValueError:
+        return 200
+
+
+def _rebuild_workers() -> int:
+    """Concurrency for rebuild_clusters()'s per-domain scoring pass.
+
+    Each check.links_for(rd) call runs read-only on its own short-lived
+    connection (never the rebuild's own `c`), so the loop parallelizes safely.
+    What it does *not* do is overlap latency with anything: Postgres runs on
+    this same host in the compose stack, so a worker "waiting on the database"
+    is waiting on the very cores its siblings need. Past the core count the
+    queries stop overlapping and start queueing — the scoring pass on a 4-core
+    box under the old flat default of 32 ran at a load average of ~32, roughly
+    8:1 oversubscription, which turns a ~300ms query into a ~9s one and adds
+    connection churn and work_mem pressure on top.
+
+    So the default tracks the machine rather than being a fixed number. Raise
+    REBUILD_WORKERS above the core count only when the database is genuinely
+    remote and there is round-trip latency to hide; lower it if Postgres has a
+    small max_connections.
+    """
+    default = max(2, min(16, os.cpu_count() or 4))
+    try:
+        value = int(os.environ.get("REBUILD_WORKERS", str(default)))
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+def _extend_paths(c: psycopg.Connection[Any], adjacency: dict[str, list[dict]], all_rds: list[str], now: str) -> None:
+    """BFS every domain out to _graph_path_max_hops() over `adjacency` (each
+    domain's own top-`_PATH_FRONTIER_LIMIT`-by-score graph_links rows, already
+    in memory from the loop that just rebuilt graph_links) and materialize the
+    shortest reachable chain to every node found into graph_paths."""
+    max_hops = _graph_path_max_hops()
+    max_nodes = _graph_path_max_nodes()
+    c.execute("DELETE FROM graph_paths")
+    rows: list[tuple[Any, ...]] = []
+    for source in all_rds:
+        visited = {source}
+        parent: dict[str, tuple[str, dict]] = {}
+        order: list[str] = []
+        queue: deque[tuple[str, int]] = deque([(source, 0)])
+        while queue and len(order) < max_nodes:
+            node, hops = queue.popleft()
+            if hops >= max_hops:
+                continue
+            for edge in adjacency.get(node, [])[:_PATH_FRONTIER_LIMIT]:
+                target = edge["target"]
+                if target in visited:
+                    continue
+                visited.add(target)
+                parent[target] = (node, edge)
+                order.append(target)
+                queue.append((target, hops + 1))
+                if len(order) >= max_nodes:
+                    break
+        for target in order:
+            chain: list[dict[str, Any]] = []
+            cur = target
+            while cur != source:
+                prev, edge = parent[cur]
+                chain.append({
+                    "from": prev, "to": cur,
+                    "score": edge["score"], "confidence": edge["confidence"],
+                    "strength": edge["strength"], "evidence": edge["evidence"],
+                })
+                cur = prev
+            chain.reverse()
+            rows.append(
+                (source, target, len(chain), min(hop["score"] for hop in chain), _json(chain), now)
+            )
+    if rows:
+        c.cursor().executemany(
+            """INSERT INTO graph_paths (registrable_domain, target, hops, min_hop_score, chain, computed_at)
+               VALUES (%s,%s,%s,%s,%s,%s)""",
+            rows,
+        )
+
+
 def rebuild_clusters() -> dict[str, int]:
     """Recompute and materialize global clusters from the attributing graph,
     plus the "browse by shared edge" groups (graph_selector_groups) — so both
     are ready to read as soon as this returns, with nothing computed live on
     request."""
     init_db()
+    started = time.monotonic()
     fanout = _cluster_max_fanout()
     parent: dict[str, str] = {}
 
@@ -3993,19 +5864,30 @@ def rebuild_clusters() -> dict[str, int]:
         if connector is not None and len(members) >= 2:
             connectors.append({**connector, "members": members})
 
+    # Marked in its own short transaction, deliberately not inside the long one
+    # below: an UPDATE on the graph_state singleton holds that row's lock until
+    # commit, and every ingest touches the same row to queue its rescore (see
+    # _mark_graph_dirty) and to claim Censys budget. Doing it inline would make
+    # every concurrent scan block for the entire duration of a rebuild.
+    # `covered` is read here too, so the queue entries this pass subsumes are
+    # the ones it can see at the start — later arrivals keep their own pass.
+    covered: list[str] = []
+    with _conn() as c:
+        row = c.execute(
+            """UPDATE graph_state SET rebuild_started_at = NOW(), updated_at = NOW()
+                WHERE id = TRUE RETURNING dirty_domains"""
+        ).fetchone()
+        covered = [d for d in ((row or {}).get("dirty_domains") or []) if d]
+
     with _conn() as c:
         lock_row = c.execute(
             "SELECT pg_try_advisory_xact_lock(%s) AS locked",
             (_GRAPH_REBUILD_LOCK_KEY,),
         ).fetchone()
         if not lock_row or not lock_row["locked"]:
+            LOGGER.info("rebuild_clusters: skipped — another rebuild is already in progress")
             return {"clusters": 0, "clustered_domains": 0, "connected_domains": 0, "skipped": 1}
-        c.execute(
-            """UPDATE graph_state
-               SET rebuild_started_at = NOW(),
-                   updated_at = NOW()
-               WHERE id = TRUE"""
-        )
+        LOGGER.info("rebuild_clusters: starting (fanout cap %d)", fanout)
 
         for row in c.execute(
             """SELECT sel.kind, sel.value, array_agg(DISTINCT e.registrable_domain) AS rds
@@ -4038,12 +5920,26 @@ def rebuild_clusters() -> dict[str, int]:
         components: dict[str, list[str]] = defaultdict(list)
         for rd in list(parent):
             components[find(rd)].append(rd)
+        LOGGER.info(
+            "rebuild_clusters: found %d connected component(s) over %d domain(s) (%.1fs elapsed)",
+            len(components), len(parent), time.monotonic() - started,
+        )
 
         now = datetime.now(timezone.utc).isoformat()
-        c.execute("TRUNCATE graph_clusters")
-        c.execute("TRUNCATE graph_cluster_links")
+        # DELETE, not TRUNCATE, on every materialized graph table below: this
+        # rebuild runs in one long transaction (the connection-scoring loop
+        # further down is the slow part) and TRUNCATE takes an ACCESS EXCLUSIVE
+        # lock held until commit, which blocks every concurrent /api/pool and
+        # /api/graph/clusters read (they LEFT JOIN these tables) for the whole
+        # rebuild — the frontend hangs with no data. DELETE takes only ROW
+        # EXCLUSIVE, so readers keep seeing the previous snapshot under MVCC and
+        # flip to the new one atomically on commit. Do not switch back to
+        # TRUNCATE.
+        c.execute("DELETE FROM graph_clusters")
+        c.execute("DELETE FROM graph_cluster_links")
         cluster_count = 0
         clustered = 0
+        cluster_rows: list[tuple[Any, ...]] = []
         for members in components.values():
             if len(members) < 2:
                 continue
@@ -4051,27 +5947,31 @@ def rebuild_clusters() -> dict[str, int]:
             cluster_id = min(members)
             size = len(members)
             for member in members:
-                c.execute(
-                    """INSERT INTO graph_clusters (registrable_domain, cluster_id, component_size, computed_at)
-                       VALUES (%s,%s,%s,%s)
-                       ON CONFLICT (registrable_domain) DO UPDATE SET
-                           cluster_id = EXCLUDED.cluster_id,
-                           component_size = EXCLUDED.component_size,
-                           computed_at = EXCLUDED.computed_at""",
-                    (member, cluster_id, size, now),
-                )
+                cluster_rows.append((member, cluster_id, size, now))
                 clustered += 1
+        if cluster_rows:
+            c.cursor().executemany(
+                """INSERT INTO graph_clusters (registrable_domain, cluster_id, component_size, computed_at)
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (registrable_domain) DO UPDATE SET
+                       cluster_id = EXCLUDED.cluster_id,
+                       component_size = EXCLUDED.component_size,
+                       computed_at = EXCLUDED.computed_at""",
+                cluster_rows,
+            )
 
         # Attribute each connector to its (single) cluster — all its members share a
         # union-find root — and record how many members it ties together.
-        for connector in connectors:
-            members = connector["members"]
-            c.execute(
+        if connectors:
+            c.cursor().executemany(
                 """INSERT INTO graph_cluster_links
                        (cluster_id, node_type, kind, value, member_count, computed_at)
                    VALUES (%s,%s,%s,%s,%s,%s)""",
-                (find(members[0]), connector["node_type"], connector["kind"],
-                 connector["value"], len(members), now),
+                [
+                    (find(connector["members"][0]), connector["node_type"], connector["kind"],
+                     connector["value"], len(connector["members"]), now)
+                    for connector in connectors
+                ],
             )
 
         # Pool-page "connections" count: the number of other registrable domains
@@ -4089,9 +5989,56 @@ def rebuild_clusters() -> dict[str, int]:
                 "SELECT DISTINCT registrable_domain FROM entities WHERE registrable_domain IS NOT NULL"
             ).fetchall()
         ]
-        c.execute("TRUNCATE graph_connection_counts")
-        c.execute("TRUNCATE graph_links")
+        c.execute("DELETE FROM graph_connection_counts")
+        c.execute("DELETE FROM graph_links")
         connected_domains = 0
+        # Each domain's own top-_PATH_FRONTIER_LIMIT-by-score links, captured
+        # here (links_for already sorts by score desc) so _extend_paths below
+        # can BFS entirely in memory instead of re-querying graph_links.
+        adjacency: dict[str, list[dict]] = {}
+        connection_count_rows: list[tuple[Any, ...]] = []
+        graph_link_rows: list[tuple[Any, ...]] = []
+        # check.links_for(rd) is a read-only round trip to Postgres on its own
+        # short-lived connection (link_candidates_for/ip_network_context each
+        # open their own via _conn() — never this function's `c`), so it never
+        # touches the rebuild's own connection/transaction and is safe to fan
+        # out across threads. This loop was previously sequential — one domain's
+        # worth of query latency at a time — and is the slow part of a rebuild
+        # on a large pool; scoring itself doesn't depend on ordering, only the
+        # aggregation into adjacency/connection_count_rows/graph_link_rows below
+        # does, so that part stays single-threaded and lock-free.
+        total_rds = len(all_rds)
+        workers = _rebuild_workers()
+        LOGGER.info("rebuild_clusters: scoring connections for %d domain(s) with %d worker(s)", total_rds, workers)
+        scoring_started = time.monotonic()
+        # Capped at 500 (not just total // 20): on a large pool (tens of
+        # thousands of domains) a pure percentage cadence means the first log
+        # line can be a long wait even while work is genuinely progressing —
+        # a heartbeat also fires on elapsed time so a slow patch (a few
+        # unusually well-connected hub domains) still produces output instead
+        # of going quiet for a whole percentage-point's worth of domains.
+        log_every = max(1, min(total_rds // 20, 500))
+        heartbeat_seconds = 10.0
+        last_logged = scoring_started
+        all_links_by_rd: dict[str, list[dict]] = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rebuild-score") as ex:
+            future_to_rd = {ex.submit(_check.links_for, rd, limit=None): rd for rd in all_rds}
+            completed = 0
+            for fut in as_completed(future_to_rd):
+                rd = future_to_rd[fut]
+                all_links_by_rd[rd] = fut.result()
+                completed += 1
+                now_mono = time.monotonic()
+                if (
+                    completed % log_every == 0
+                    or completed == total_rds
+                    or now_mono - last_logged >= heartbeat_seconds
+                ):
+                    LOGGER.info(
+                        "rebuild_clusters: scored %d/%d domains (%.1fs elapsed)",
+                        completed, total_rds, now_mono - scoring_started,
+                    )
+                    last_logged = now_mono
         for rd in all_rds:
             # Unlimited so graph_links caches every scored connection this
             # domain has, not just a top page-worth — connections_among()
@@ -4100,46 +6047,66 @@ def rebuild_clusters() -> dict[str, int]:
             # `scored` still caps at check.links_for's own default (50) so the
             # pool-page count never drifts from what the domain's own detail
             # page (which does apply that cap) shows.
-            all_links = _check.links_for(rd, limit=None)
+            all_links = all_links_by_rd[rd]
             scored = len(all_links[:50])
             connected_domains += 1 if scored else 0
-            # Insert unconditionally, even when scored is 0 — this table
+            adjacency[rd] = all_links[:_PATH_FRONTIER_LIMIT]
+            # Recorded unconditionally, even when scored is 0 — this table
             # doubles as the "rd has been through a rebuild pass" marker
             # cached_links_for() checks, not just a connection count.
-            c.execute(
+            connection_count_rows.append((rd, scored, now))
+            for link in all_links:
+                graph_link_rows.append((
+                    rd, link["target"], link["score"], link["confidence"], link["strength"],
+                    link["shared_node_count"], _json(link["evidence"]), now,
+                ))
+
+        LOGGER.info(
+            "rebuild_clusters: scoring done — %d connected domain(s), %d link(s) to insert (%.1fs)",
+            connected_domains, len(graph_link_rows), time.monotonic() - scoring_started,
+        )
+        # Batched with executemany (psycopg3 pipelines these) instead of one
+        # INSERT per row — this loop's row count is every domain (connection
+        # counts) and every scored edge (graph_links), which for a large
+        # correlation graph is thousands of individual round-trips otherwise.
+        if connection_count_rows:
+            c.cursor().executemany(
                 """INSERT INTO graph_connection_counts (registrable_domain, connection_count, computed_at)
                    VALUES (%s,%s,%s)""",
-                (rd, scored, now),
+                connection_count_rows,
             )
-            for link in all_links:
-                c.execute(
-                    """INSERT INTO graph_links
-                           (registrable_domain, target, score, confidence, strength,
-                            shared_node_count, evidence, computed_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (rd, link["target"], link["score"], link["confidence"], link["strength"],
-                     link["shared_node_count"], _json(link["evidence"]), now),
-                )
+        if graph_link_rows:
+            c.cursor().executemany(
+                """INSERT INTO graph_links
+                       (registrable_domain, target, score, confidence, strength,
+                        shared_node_count, evidence, computed_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                graph_link_rows,
+            )
+
+        LOGGER.info("rebuild_clusters: computing multi-hop paths (up to %d hops)", _graph_path_max_hops())
+        paths_started = time.monotonic()
+        _extend_paths(c, adjacency, all_rds, now)
+        LOGGER.info("rebuild_clusters: multi-hop paths done (%.1fs)", time.monotonic() - paths_started)
 
         # "Browse by shared edge" groups — same source edges as clustering above,
         # but unbounded by the clustering fanout cap: this is enumeration for
         # browsing, not graph unioning, so a wide-fanout shared IP still shows up.
-        c.execute("TRUNCATE graph_selector_groups")
-        for row in c.execute(
-            """SELECT sel.kind, sel.value, sel.entity_count AS degree,
-                      array_agg(DISTINCT e.registrable_domain) AS domains
-               FROM selectors sel
-               JOIN observations o ON o.selector_id = sel.id
-               JOIN entities e ON e.id = o.entity_id
-               WHERE sel.attributing AND e.registrable_domain IS NOT NULL
-               GROUP BY sel.id, sel.kind, sel.value, sel.entity_count
-               HAVING count(DISTINCT e.registrable_domain) >= 2"""
-        ).fetchall():
-            c.execute(
-                """INSERT INTO graph_selector_groups (kind, value, degree, domains, computed_at)
-                   VALUES (%s,%s,%s,%s,%s)""",
-                (row["kind"], row["value"], row["degree"], row["domains"], now),
-            )
+        LOGGER.info("rebuild_clusters: computing shared-edge browse groups")
+        c.execute("DELETE FROM graph_selector_groups")
+        selector_group_rows: list[tuple[Any, ...]] = [
+            (row["kind"], row["value"], row["degree"], row["domains"], now)
+            for row in c.execute(
+                """SELECT sel.kind, sel.value, sel.entity_count AS degree,
+                          array_agg(DISTINCT e.registrable_domain) AS domains
+                   FROM selectors sel
+                   JOIN observations o ON o.selector_id = sel.id
+                   JOIN entities e ON e.id = o.entity_id
+                   WHERE sel.attributing AND e.registrable_domain IS NOT NULL
+                   GROUP BY sel.id, sel.kind, sel.value, sel.entity_count
+                   HAVING count(DISTINCT e.registrable_domain) >= 2"""
+            ).fetchall()
+        ]
         for row in c.execute(
             """SELECT 'shared_ip' AS kind, ip.value AS value,
                       count(DISTINCT e.registrable_domain) AS degree,
@@ -4155,13 +6122,20 @@ def rebuild_clusters() -> dict[str, int]:
                GROUP BY ip.id, ip.value
                HAVING count(DISTINCT e.registrable_domain) >= 2"""
         ).fetchall():
-            c.execute(
+            selector_group_rows.append((row["kind"], row["value"], row["degree"], row["domains"], now))
+        if selector_group_rows:
+            c.cursor().executemany(
                 """INSERT INTO graph_selector_groups (kind, value, degree, domains, computed_at)
                    VALUES (%s,%s,%s,%s,%s)""",
-                (row["kind"], row["value"], row["degree"], row["domains"], now),
+                selector_group_rows,
             )
 
-        _mark_clusters_clean(c)
+        _mark_clusters_clean(c, covered)
+    _notify_graph_invalidation("all")
+    LOGGER.info(
+        "rebuild_clusters: done in %.1fs — %d cluster(s), %d clustered domain(s), %d connected domain(s)",
+        time.monotonic() - started, cluster_count, clustered, connected_domains,
+    )
     return {"clusters": cluster_count, "clustered_domains": clustered, "connected_domains": connected_domains}
 
 
@@ -4205,6 +6179,133 @@ def cached_links_for(value: str) -> list[dict[str, Any]] | None:
         }
         for row in rows
     ]
+
+
+def path_between(a_value: str, b_value: str) -> dict[str, Any] | None:
+    """Precomputed multi-hop chain from a to b (see graph_paths / _extend_paths,
+    populated by rebuild_clusters) — an indexed read, never a live traversal.
+    None if either side isn't a domain, they're the same domain, or nothing
+    reaches within _graph_path_max_hops()."""
+    init_db()
+    side_a = _resolve_side(a_value)
+    side_b = _resolve_side(b_value)
+    if not side_a or not side_b or side_a[0] != "rd" or side_b[0] != "rd":
+        return None
+    a_rd, b_rd = side_a[1], side_b[1]
+    if a_rd == b_rd:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT hops, chain FROM graph_paths WHERE registrable_domain = %s AND target = %s",
+            (a_rd, b_rd),
+        ).fetchone()
+        flipped = False
+        if row is None:
+            # _extend_paths' BFS is seeded per-source from that domain's own
+            # top-_PATH_FRONTIER_LIMIT links and capped at GRAPH_PATH_MAX_NODES
+            # visited nodes, so graph_paths is NOT guaranteed symmetric: b may
+            # discover a within its own frontier/cap even when a's BFS never
+            # reached b (or vice versa). Check the reverse row before giving up
+            # — a real, precomputed path shouldn't read as "none" just because
+            # of which side's BFS happened to surface it.
+            row = c.execute(
+                "SELECT hops, chain FROM graph_paths WHERE registrable_domain = %s AND target = %s",
+                (b_rd, a_rd),
+            ).fetchone()
+            flipped = True
+    if row is None:
+        return None
+    chain = row["chain"]
+    if flipped:
+        chain = [{**hop, "from": hop["to"], "to": hop["from"]} for hop in reversed(chain)]
+    return {"a": a_rd, "b": b_rd, "hops": row["hops"], "chain": chain}
+
+
+def related_through(value: str, *, max_hops: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """A domain's precomputed multi-hop neighborhood (graph_paths), shortest
+    chains first, then strongest weakest-hop. graph_paths is a strict superset
+    of graph_links (direct/1-hop connections are included, not just 2+-hop
+    ones), so this is a drop-in replacement for a live pool_links expansion."""
+    init_db()
+    side = _resolve_side(value)
+    if not side or side[0] != "rd":
+        return []
+    rd = side[1]
+    with _conn() as c:
+        if max_hops is not None:
+            rows = c.execute(
+                """SELECT target, hops, min_hop_score, chain FROM graph_paths
+                   WHERE registrable_domain = %s AND hops <= %s
+                   ORDER BY hops, min_hop_score DESC LIMIT %s""",
+                (rd, max_hops, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                """SELECT target, hops, min_hop_score, chain FROM graph_paths
+                   WHERE registrable_domain = %s
+                   ORDER BY hops, min_hop_score DESC LIMIT %s""",
+                (rd, limit),
+            ).fetchall()
+    return [
+        {
+            "target": row["target"],
+            "hops": row["hops"],
+            "min_hop_score": float(row["min_hop_score"]),
+            "chain": row["chain"],
+        }
+        for row in rows
+    ]
+
+
+def search_targets(query: str, *, limit: int = 20) -> dict[str, Any]:
+    """Ranked domain + selector-value matches for a global search box. Reads
+    only materialized tables (entities/graph_connection_counts/graph_clusters/
+    graph_selector_groups) — a substring lookup, unrelated to the multi-hop
+    precompute above, so it never needs a rebuild pass to be accurate."""
+    init_db()
+    needle = str(query or "").strip().lower()
+    if not needle:
+        return {"query": query, "domains": [], "selectors": []}
+    like = f"%{needle}%"
+    prefix = f"{needle}%"
+    with _conn() as c:
+        domain_rows = c.execute(
+            """WITH pool AS (SELECT DISTINCT registrable_domain FROM entities WHERE registrable_domain IS NOT NULL)
+               SELECT p.registrable_domain AS domain,
+                      COALESCE(gcc.connection_count, 0) AS connection_count,
+                      gc.cluster_id
+               FROM pool p
+               LEFT JOIN graph_connection_counts gcc ON gcc.registrable_domain = p.registrable_domain
+               LEFT JOIN graph_clusters gc ON gc.registrable_domain = p.registrable_domain
+               WHERE p.registrable_domain ILIKE %s
+               ORDER BY (p.registrable_domain ILIKE %s) DESC, connection_count DESC, p.registrable_domain
+               LIMIT %s""",
+            (like, prefix, limit),
+        ).fetchall()
+        selector_rows = c.execute(
+            """SELECT kind, value, degree, domains FROM graph_selector_groups
+               WHERE value ILIKE %s
+               ORDER BY (value ILIKE %s) DESC, degree DESC, value
+               LIMIT %s""",
+            (like, prefix, limit),
+        ).fetchall()
+    domains = [
+        {"domain": row["domain"], "connection_count": row["connection_count"], "cluster_id": row["cluster_id"]}
+        for row in domain_rows
+    ]
+    tiers = get_domain_tiers([entry["domain"] for entry in domains])
+    for entry in domains:
+        entry["tier"] = tiers.get(entry["domain"])
+    selectors = [
+        {
+            "kind": row["kind"],
+            "value": row["value"],
+            "domain_count": row["degree"],
+            "sample_domains": list(row["domains"] or [])[:5],
+        }
+        for row in selector_rows
+    ]
+    return {"query": query, "domains": domains, "selectors": selectors}
 
 
 # Most connectors of interest per cluster in the list view; the detail lookup
@@ -4333,6 +6434,11 @@ def list_pool_domains(
     (earliest entity first_seen); `ingested_at` is when it (or a subdomain of
     it) was first directly submitted, if ever.
 
+    `scan_count` is how many times anything under the domain has been scanned
+    and `last_scanned_at` when that last happened. Both are display-only: no
+    code path caps, skips or gates work on them. Scans are only startable from
+    the backend, so the number is a record of what was run, not a budget.
+
     `discovery_kind`/`discovery_reason`/`discovered_from` explain *how* a
     never-ingested domain entered the pool (subdomain enumeration, sibling
     discovery, wordlist hit, ...) and, where known, which other channel led to
@@ -4360,6 +6466,13 @@ def list_pool_domains(
                    gc.cluster_id,
                    gc.component_size AS cluster_size,
                    COALESCE(gcc.connection_count, 0) AS connection_count,
+                   -- How many times anything under this registrable domain has
+                   -- been scanned. Purely informational: it is displayed in the
+                   -- frontend and gates nothing. Derived from the `searches`
+                   -- join already present for `ingested`, so it needs no table
+                   -- of its own and stays correct for free.
+                   count(DISTINCT s.id) AS scan_count,
+                   max(s.timestamp) AS last_scanned_at,
                    COALESCE(bool_or(sf.json_value = 'true'::jsonb), FALSE) AS ingested,
                    min(s.timestamp) FILTER (WHERE sf.json_value = 'true'::jsonb) AS ingested_at,
                    (SELECT sf2.json_value #>> '{}' FROM searches apex_s
@@ -4462,6 +6575,7 @@ def _curate_intel(result: dict[str, Any]) -> dict[str, Any]:
             })
 
     site_verifications, social_handles_all = _meta_tag_site_signals(page)
+    phone_numbers, crypto_wallets = _payment_contact_signals(page)
     return {
         "search_id": result.get("search_id"),
         "timestamp": result.get("timestamp"),
@@ -4476,6 +6590,8 @@ def _curate_intel(result: dict[str, Any]) -> dict[str, Any]:
         "social_handles": social_handles_all,
         "social_links": as_dict(page.get("social_links")),
         "site_verifications": site_verifications,
+        "phone_numbers": phone_numbers,
+        "crypto_wallets": crypto_wallets,
         "opencti_labels": _normalize_text_list(result.get("opencti_labels")),
         # How this specific target's latest scan came to run: directly
         # submitted (is_seed) vs. queued as a follow-up from another target
@@ -4686,31 +6802,6 @@ def get_domain_targets() -> list[str]:
     return [str(row["target"]) for row in rows if row["target"]]
 
 
-def get_domains_with_source_errors(source: str | None = None) -> list[dict]:
-    init_db()
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT id, target, timestamp, source_errors FROM searches "
-            "WHERE source_errors IS NOT NULL ORDER BY timestamp DESC, id DESC"
-        ).fetchall()
-
-    results = []
-    for row in rows:
-        # source_errors is JSONB, so psycopg returns parsed values; older callers
-        # may still hand us JSON text, so stay tolerant.
-        errors = row["source_errors"] or []
-        if isinstance(errors, (str, bytes)):
-            try:
-                errors = json.loads(errors)
-            except (json.JSONDecodeError, TypeError):
-                errors = []
-        if not isinstance(errors, list):
-            errors = [errors] if errors else []
-        if source is None or source in errors:
-            results.append({"id": row["id"], "target": row["target"], "timestamp": row["timestamp"], "errors": errors})
-    return results
-
-
 def get_by_id(sid: int) -> dict | None:
     init_db()
     with _conn() as c:
@@ -4726,6 +6817,25 @@ def get_latest_search_id_for_target(target: str) -> int | None:
     with _conn() as c:
         row = _latest_row_for_target(c, target)
     return int(row["id"]) if row else None
+
+
+def existing_search_targets(targets: list[str]) -> set[str]:
+    """Return the subset of `targets` that already have at least one search row.
+
+    Lets the OpenCTI sweep skip re-scanning channels already in the pool with a
+    single indexed query instead of one lookup per domain. Matches on the exact
+    stored ``target`` (the normalized_target each search was saved under), so
+    callers should pass already-normalized values (clean_target output).
+    """
+    init_db()
+    if not targets:
+        return set()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT DISTINCT target FROM searches WHERE target = ANY(%s)",
+            (list(targets),),
+        ).fetchall()
+    return {row["target"] for row in rows}
 
 
 def update_search_payload(search_id: int, payload: dict[str, Any]) -> None:

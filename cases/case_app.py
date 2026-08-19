@@ -22,7 +22,8 @@ from fastapi.staticfiles import StaticFiles
 
 from cases.case_runtime import CaseRuntime, build_job_response, parse_submission
 from core.analysis_service import normalize_inputs
-from cases.case_store import get_job, healthcheck, init_db
+from cases.case_store import get_job, healthcheck, init_db, mark_interrupted_jobs
+from cases import cache
 from utils.evidence_meta import evidence_catalog
 from utils import check
 from db import intel_db
@@ -91,37 +92,64 @@ async def _crt_sh_retry_loop() -> None:
             LOGGER.warning("crt.sh retry sweep failed: %s", exc)
 
 
-_CLUSTER_REBUILD_INTERVAL = 20  # seconds between dirty-cluster checks
+_CLUSTER_REBUILD_INTERVAL = 20  # seconds between graph-maintenance checks
 
 
 async def _cluster_rebuild_loop() -> None:
-    """Keep graph_clusters materialized without the user waiting on it.
+    """Keep the whole derived graph current without the user waiting on it.
 
-    New intel marks the clusters "dirty" (see intel_db._mark_clusters_dirty);
-    this sweep rebuilds them shortly after, so the Clusters page always shows
-    an up-to-date graph without anyone clicking "Recompute graph" and waiting.
-    Skips the work entirely when nothing changed since the last rebuild.
+    One tick, three tiers, all of them decided in intel_db.run_graph_maintenance
+    (which owns the state they key off): the incremental rescore of whatever a
+    recent write invalidated, the rate-limited whole-pool cluster/path rebuild,
+    and the periodic full reconcile that used to be the manual "Recompute
+    graph" button. This loop stays the single scheduler for all of it — there
+    is deliberately no second timer thread — so the tier logic can be exercised
+    without standing up the app.
+
+    A tick that finds nothing due returns immediately, so an idle deployment
+    costs one cheap indexed SELECT every 20 seconds.
     """
     while True:
         await asyncio.sleep(_CLUSTER_REBUILD_INTERVAL)
-        if not intel_db.clusters_dirty():
-            continue
         try:
-            counts = await asyncio.to_thread(intel_db.rebuild_clusters)
-            LOGGER.info("Cluster rebuild: %s", counts)
+            counts = await asyncio.to_thread(intel_db.run_graph_maintenance)
+            if counts.get("tier") != "idle":
+                LOGGER.info("Graph maintenance: %s", counts)
         except Exception as exc:
-            LOGGER.warning("Cluster rebuild sweep failed: %s", exc)
+            LOGGER.warning("Graph maintenance sweep failed: %s", exc)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    runtime.recover()
+    # Auto-recovery is OFF by default: a restart must NOT resume or re-run any
+    # in-flight case (the OpenCTI sweep in particular re-scans a whole batch
+    # from the start on resume). Instead, mark any job left 'queued'/'running'
+    # as failed so it stops cleanly and never picks up where it left off. Set
+    # RECOVER_JOBS_ON_STARTUP=1 to restore the old resume-on-boot behavior.
+    if os.getenv("RECOVER_JOBS_ON_STARTUP") == "1":
+        runtime.recover()
+    else:
+        interrupted = mark_interrupted_jobs()
+        if interrupted:
+            LOGGER.info("Startup: marked %d interrupted job(s) failed (auto-recovery disabled)", interrupted)
+    # Invalidate through intel_db's post-commit hook rather than from the
+    # rebuild loop: the hook also fires for recomputes driven from the CLI
+    # scripts, which never run this process's loop. `invalidate` is a single
+    # INCR of the cache generation, so it is safe to call from the DB thread.
+    intel_db.register_graph_invalidation_hook(lambda scope, domains: cache.invalidate())
     retry_task = asyncio.create_task(_crt_sh_retry_loop())
     cluster_task = asyncio.create_task(_cluster_rebuild_loop())
+    # Starts the background re-warm worker and queues the initial warm through
+    # the same path, so boot and post-recompute warming behave identically.
+    # Warming stays off the event loop either way: the pool query it fills is
+    # multi-second on a large pool, and blocking boot on it would fail the
+    # container healthcheck.
+    cache.start_rewarm_worker()
     yield
     retry_task.cancel()
     cluster_task.cancel()
+    cache.stop_rewarm_worker()
 
 
 app = FastAPI(title="IP Intel", lifespan=lifespan)
@@ -235,7 +263,7 @@ def api_pool(
     ``total`` is the filtered total before pagination; ``domains`` is the
     current page.
     """
-    page = intel_db.list_pool_domains(
+    page = cache.pool_page(
         search=search,
         limit=limit,
         offset=offset,
@@ -247,7 +275,6 @@ def api_pool(
         ingested_before=ingested_before,
         discovered_after=discovered_after,
         discovered_before=discovered_before,
-        include_total=True,
     )
     return _etag_json_response(request, page)
 
@@ -257,7 +284,7 @@ def api_domain(value: str, request: Request) -> Response:
     """Everything gathered on one channel — hosts, extracted selectors, resolved
     IPs, and the raw intel (DNS/WHOIS/TLS/subdomains/trackers) — whether or not
     it has any connections."""
-    profile = intel_db.domain_profile(value)
+    profile = cache.domain_profile(value)
     if profile is None:
         raise HTTPException(status_code=404, detail="Nothing in the pool for this channel yet.")
     return _etag_json_response(request, profile)
@@ -277,7 +304,7 @@ async def api_graph_connections(request: Request) -> dict[str, Any]:
     if len(domains) < 1:
         raise HTTPException(status_code=400, detail="Provide a 'domains' list.")
     pool_links = bool((payload or {}).get("pool_links"))
-    return check.connections_among(domains, pool_links=pool_links)
+    return cache.graph_connections(domains, pool_links=pool_links)
 
 
 @app.post("/api/graph/email")
@@ -318,7 +345,7 @@ async def api_graph_email(
 @app.get("/api/graph/selector-kinds")
 def api_graph_selector_kinds(request: Request, min_domains: int = 2) -> Response:
     """Edge types available for browsing (selector kind / shared_ip) + group counts."""
-    return _etag_json_response(request, {"kinds": intel_db.selector_kind_counts(min_domains=min_domains)})
+    return _etag_json_response(request, {"kinds": cache.selector_kinds(min_domains=min_domains)})
 
 
 @app.get("/api/graph/by-selector")
@@ -327,7 +354,7 @@ def api_graph_by_selector(
 ) -> Response:
     """Browse by edge type: groups of domains that share a selector of `kind`
     (or any kind), e.g. all domain sets sharing a TLS cert / SSH key / IP."""
-    groups = intel_db.domains_by_selector(kind=kind, min_domains=min_domains, limit=limit)
+    groups = cache.by_selector(kind=kind, min_domains=min_domains, limit=limit)
     return _etag_json_response(request, {"kind": kind, "total": len(groups), "groups": groups})
 
 
@@ -384,7 +411,7 @@ async def api_favicon_image(kind: str, value: str) -> Response:
 def api_graph_links(value: str, request: Request) -> Response:
     """Ranked cross-corpus connections for an entity / registrable domain, each
     with its shared-node evidence breakdown."""
-    links = check.links_for(value)
+    links = cache.graph_links(value)
     return _etag_json_response(request, {"target": value, "total": len(links), "links": links})
 
 
@@ -396,10 +423,38 @@ def api_graph_link(a: str, b: str, request: Request) -> Response:
     return _etag_json_response(request, {"link": check.link_evidence(a, b)})
 
 
+@app.get("/api/graph/path")
+def api_graph_path(a: str, b: str, request: Request) -> Response:
+    """Precomputed shortest evidence chain connecting two channels (see
+    db.intel_db.path_between / graph_paths) — explains a same-cluster or
+    otherwise-reachable relationship hop by hop. Always an indexed read,
+    never scored live."""
+    if not a or not b:
+        raise HTTPException(status_code=400, detail="Provide both 'a' and 'b' query parameters.")
+    path = intel_db.path_between(a, b)
+    if path is None:
+        raise HTTPException(status_code=404, detail="No precomputed path within the configured hop limit.")
+    return _etag_json_response(request, {"path": path})
+
+
+@app.get("/api/graph/related/{value:path}")
+def api_graph_related(value: str, request: Request, max_hops: int | None = None, limit: int = 50) -> Response:
+    """A channel's precomputed multi-hop neighborhood (direct links plus
+    everything reachable through an intermediary), strongest/shortest first."""
+    related = intel_db.related_through(value, max_hops=max_hops, limit=limit)
+    return _etag_json_response(request, {"target": value, "total": len(related), "related": related})
+
+
+@app.get("/api/search")
+def api_search(q: str, request: Request, limit: int = 20) -> Response:
+    """Ranked domain / selector-value matches for the global search box."""
+    return _etag_json_response(request, cache.search(q, limit=limit))
+
+
 @app.get("/api/graph/clusters")
 def api_graph_clusters(request: Request, min_size: int = 2, limit: int = 100) -> Response:
     """Strongest clusters lake-wide."""
-    clusters = intel_db.list_graph_clusters(min_size=min_size, limit=limit)
+    clusters = cache.graph_clusters(min_size=min_size, limit=limit)
     return _etag_json_response(request, {"total": len(clusters), "clusters": clusters})
 
 

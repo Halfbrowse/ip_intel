@@ -1,8 +1,11 @@
 """
 Tests for the certificate-transparency fallback (crt.sh → Cert Spotter).
 
-Covers, for both core.basic (get_crt_sh/get_certspotter) and core.ip_intel
-(crt_sh_data/certspotter_data + the async _acrt_sh_data/_acertspotter_data):
+Covers core.basic (get_crt_sh/get_certspotter), the live pipeline's CT path, and
+core.ip_intel's async pair (_acrt_sh_data/_acertspotter_data), still used by
+cases/case_runtime.py's crt.sh retry sweep. The sync ip_intel twins
+(crt_sh_data/certspotter_data) were removed with the async scan engine, so the
+class covering them is gone too:
 
   - crt.sh success           → no fallback call is made
   - crt.sh zero rows (200)   → no fallback call is made (legit empty result)
@@ -256,106 +259,6 @@ class BasicCtFallbackTests(unittest.TestCase):
 
 # ── core.ip_intel (sync) ──────────────────────────────────────────────────────
 
-class IpIntelCtFallbackTests(unittest.TestCase):
-    def test_crt_sh_success_does_not_call_fallback(self) -> None:
-        calls: list[dict] = []
-        fake = make_fake_get(FakeResponse(200, CRT_SH_ENTRIES), [], calls)
-        with patch("core.ip_intel.requests.get", side_effect=fake):
-            result = ip_intel.crt_sh_data(DOMAIN)
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(certspotter_calls(calls), [])
-        self.assertEqual(result["ct_source"], "crt.sh")
-        self.assertEqual(result["subdomains"], ["api.example.com"])
-        self.assertEqual(result["cross_domain_sans"], ["shared.other-org.net"])
-
-    def test_crt_sh_zero_rows_is_not_a_failure(self) -> None:
-        calls: list[dict] = []
-        fake = make_fake_get(FakeResponse(200, []), [], calls)
-        with patch("core.ip_intel.requests.get", side_effect=fake):
-            result = ip_intel.crt_sh_data(DOMAIN)
-
-        self.assertEqual(certspotter_calls(calls), [])
-        self.assertEqual(result["ct_source"], "crt.sh")
-        self.assertEqual(result["total_certs"], 0)
-        self.assertEqual(result["certs"], [])
-
-    def test_crt_sh_429_falls_back_and_normalizes(self) -> None:
-        calls: list[dict] = []
-        fake = make_fake_get(FakeResponse(429, None), [CERTSPOTTER_PAGE], calls)
-        with patch("core.ip_intel.requests.get", side_effect=fake):
-            result = ip_intel.crt_sh_data(DOMAIN)
-
-        self.assertGreaterEqual(len(certspotter_calls(calls)), 1)
-        self.assertEqual(result["ct_source"], "certspotter")
-        self.assertNotIn("_failed", result)
-        # Exact crt_sh_data shape (what intel_db ct_certs + clustering consume).
-        self.assertEqual(
-            set(result),
-            {"subdomains", "total_certs", "issuers", "cross_domain_sans", "certs", "ct_source"},
-        )
-        self.assertEqual(result["subdomains"], ["api.example.com", "www.example.com"])
-        self.assertEqual(result["issuers"], ["R3"])
-        self.assertEqual(result["cross_domain_sans"], ["shared.other-org.net"])
-        cert = result["certs"][0]
-        self.assertEqual(
-            set(cert),
-            {"id", "issuer", "not_before", "not_after", "logged_at", "sans"},
-        )
-        self.assertEqual(cert["id"], 648494876)
-        self.assertEqual(cert["issuer"], "R3")
-        self.assertIsNone(cert["logged_at"])
-
-    def test_crt_sh_exception_falls_back(self) -> None:
-        calls: list[dict] = []
-        fake = make_fake_get(
-            requests.exceptions.ReadTimeout("crt.sh timed out"),
-            [CERTSPOTTER_PAGE],
-            calls,
-        )
-        with patch("core.ip_intel.requests.get", side_effect=fake):
-            result = ip_intel.crt_sh_data(DOMAIN)
-
-        self.assertEqual(result["ct_source"], "certspotter")
-        self.assertEqual(result["total_certs"], 1)
-
-    def test_both_sources_fail_returns_empty_shape(self) -> None:
-        calls: list[dict] = []
-        fake = make_fake_get(
-            FakeResponse(503, None),
-            [requests.exceptions.ConnectTimeout("certspotter down")],
-            calls,
-        )
-        with patch("core.ip_intel.requests.get", side_effect=fake):
-            result = ip_intel.crt_sh_data(DOMAIN)
-
-        self.assertEqual(result["subdomains"], [])
-        self.assertEqual(result["total_certs"], 0)
-        self.assertEqual(result["issuers"], [])
-        self.assertEqual(result["cross_domain_sans"], [])
-        self.assertEqual(result["certs"], [])
-
-    def test_certspotter_pagination_follows_after(self) -> None:
-        page1 = [
-            {"id": "100", "dns_names": ["a.example.com"], "issuer": {"name": "CN=R3"},
-             "not_before": "2026-01-01T00:00:00-00:00", "not_after": "2026-04-01T00:00:00-00:00"},
-        ]
-        page2 = [
-            {"id": "200", "dns_names": ["b.example.com"], "issuer": {"name": "CN=R3"},
-             "not_before": "2026-01-02T00:00:00-00:00", "not_after": "2026-04-02T00:00:00-00:00"},
-        ]
-        calls: list[dict] = []
-        fake = make_fake_get(FakeResponse(503, None), [page1, page2, []], calls)
-        with patch("core.ip_intel.requests.get", side_effect=fake):
-            result = ip_intel.certspotter_data(DOMAIN)
-
-        cs_calls = certspotter_calls(calls)
-        self.assertEqual(len(cs_calls), 3)
-        self.assertNotIn("after", cs_calls[0]["params"])
-        self.assertEqual(cs_calls[1]["params"]["after"], "100")
-        self.assertEqual(cs_calls[2]["params"]["after"], "200")
-        self.assertEqual(result["total_certs"], 2)
-        self.assertEqual(result["subdomains"], ["a.example.com", "b.example.com"])
 
 
 # ── core.ip_intel (async) ─────────────────────────────────────────────────────

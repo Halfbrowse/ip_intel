@@ -118,71 +118,77 @@
 }
 
 :root[data-theme="dark"] {
-  /* "Wire & Trace" — dark mode ("Scope"): the console the light theme is
-     modeled after. Phosphor-teal accent doubles as the trace-line signature. */
+  /* "Champagne & Midnight" — dark mode: a deep midnight-blue base with a
+     champagne-gold accent, replacing the previous phosphor-teal "Scope"
+     theme. Mirrors the same values applied to Reshaped's own dark tokens in
+     reshaped-theme.css, so anything not yet on a Reshaped component (chiefly
+     ClusterGraph.jsx's SVG) still matches. Evidence-strength colors in
+     ClusterGraph.jsx (EDGE_TIERS/DOMAIN_TIER_COLORS) are deliberately NOT
+     touched here -- those encode data (strong/moderate/weak), not UI chrome,
+     and must stay legible/consistent regardless of the active theme. */
   color-scheme: dark;
-  --bg: #070b10;
-  --bg-top: #0a0f16;
-  --bg-accent: rgba(53, 208, 200, 0.14);
-  --bg-accent-soft: rgba(53, 208, 200, 0.07);
-  --bg-accent-alt: rgba(134, 239, 172, 0.06);
-  --surface: rgba(13, 19, 26, 0.92);
-  --surface-strong: #0c131a;
-  --surface-muted: #101922;
-  --panel: rgba(12, 18, 25, 0.96);
-  --panel-strong: #0a0f15;
-  --border: rgba(148, 163, 184, 0.16);
-  --border-soft: rgba(148, 163, 184, 0.1);
-  --text: #eaf2f5;
-  --muted: #8da0ac;
-  --accent: #35d0c8;
-  --accent-strong: #1fa79d;
-  --trace: #35d0c8;
-  --link: #7fe3db;
+  --bg: #0b1229;
+  --bg-top: #0d1530;
+  --bg-accent: rgba(217, 194, 152, 0.14);
+  --bg-accent-soft: rgba(217, 194, 152, 0.07);
+  --bg-accent-alt: rgba(201, 168, 106, 0.06);
+  --surface: rgba(16, 21, 43, 0.92);
+  --surface-strong: #10152b;
+  --surface-muted: #141b36;
+  --panel: rgba(15, 21, 43, 0.96);
+  --panel-strong: #0d1530;
+  --border: rgba(216, 194, 152, 0.16);
+  --border-soft: rgba(216, 194, 152, 0.1);
+  --text: #f3e9d2;
+  --muted: #b8a788;
+  --accent: #d9c298;
+  --accent-strong: #c9a86a;
+  --trace: #d9c298;
+  --link: #e8d5b7;
   --success: #86efac;
   --warning: #fdba74;
   --danger: #fca5a5;
-  --info-soft: rgba(53, 208, 200, 0.16);
+  --info-soft: rgba(217, 194, 152, 0.16);
   --success-soft: rgba(22, 163, 74, 0.16);
   --warning-soft: rgba(217, 119, 6, 0.18);
   --danger-soft: rgba(220, 38, 38, 0.16);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
-  --hero-glow: rgba(53, 208, 200, 0.16);
-  --hero-grad-top: rgba(10, 15, 22, 0.96);
-  --hero-grad-bottom: rgba(7, 11, 16, 0.92);
-  --nav-link-bg: rgba(12, 18, 25, 0.7);
-  --input-focus-ring: rgba(53, 208, 200, 0.32);
-  --callout-bg: rgba(53, 208, 200, 0.12);
-  --callout-border: rgba(53, 208, 200, 0.22);
-  --callout-subtle-bg: rgba(148, 163, 184, 0.06);
-  --callout-subtle-border: rgba(148, 163, 184, 0.12);
-  --log-bg: rgba(3, 10, 19, 0.9);
-  --log-text: #e8f0ff;
-  --log-level: rgba(226, 232, 240, 0.65);
-  --pre-bg: rgba(3, 10, 19, 0.9);
-  --pre-text: #e8f0ff;
-  --graph-glow: rgba(53, 208, 200, 0.1);
-  --graph-bg: #050b10;
-  --graph-stage-border: rgba(83, 144, 199, 0.24);
-  --graph-stage-shadow: inset 0 0 0 1px rgba(12, 27, 45, 0.8);
-  --graph-node-ring: rgba(8, 15, 23, 0.9);
+  --hero-glow: rgba(217, 194, 152, 0.16);
+  --hero-grad-top: rgba(13, 18, 41, 0.96);
+  --hero-grad-bottom: rgba(11, 18, 41, 0.92);
+  --nav-link-bg: rgba(16, 21, 43, 0.7);
+  --input-focus-ring: rgba(217, 194, 152, 0.32);
+  --callout-bg: rgba(217, 194, 152, 0.12);
+  --callout-border: rgba(217, 194, 152, 0.22);
+  --callout-subtle-bg: rgba(184, 167, 136, 0.06);
+  --callout-subtle-border: rgba(184, 167, 136, 0.12);
+  --log-bg: rgba(8, 12, 28, 0.9);
+  --log-text: #f3e9d2;
+  --log-level: rgba(243, 233, 210, 0.65);
+  --pre-bg: rgba(8, 12, 28, 0.9);
+  --pre-text: #f3e9d2;
+  --graph-glow: rgba(217, 194, 152, 0.1);
+  --graph-bg: #0a0f22;
+  --graph-stage-border: rgba(217, 194, 152, 0.24);
+  --graph-stage-shadow: inset 0 0 0 1px rgba(11, 18, 41, 0.8);
+  --graph-node-ring: rgba(10, 15, 34, 0.9);
   --graph-node-icon: rgba(255, 255, 255, 0.86);
-  --graph-label: #dbeafe;
-  --graph-label-muted: #9fb2c8;
-  --graph-label-halo: rgba(5, 11, 16, 0.88);
-  --graph-edge-label: #bfd7ef;
-  --graph-edge-label-bg: rgba(5, 11, 16, 0.94);
-  --graph-panel-bg: #081525;
-  --graph-panel-border: rgba(83, 144, 199, 0.24);
-  --graph-panel-text: #e5f2ff;
-  --graph-panel-muted: #92a6bd;
-  --graph-input-bg: #0b1828;
-  --graph-input-text: #e5f2ff;
-  --graph-input-border: rgba(83, 144, 199, 0.28);
-  --graph-empty-bg: #0b1828;
-  --graph-empty-text: #e5f2ff;
-  --graph-empty-muted: #92a6bd;
-  --state-muted-bg: rgba(148, 163, 184, 0.06);
+  --graph-label: #f3e9d2;
+  --graph-label-muted: #b8a788;
+  --graph-label-halo: rgba(10, 15, 34, 0.88);
+  --graph-edge-label: #ead9b8;
+  --graph-edge-label-bg: rgba(10, 15, 34, 0.94);
+  --graph-panel-bg: #10152b;
+  --graph-panel-border: rgba(217, 194, 152, 0.24);
+  --graph-panel-text: #f3e9d2;
+  --graph-panel-muted: #b8a788;
+  --graph-input-bg: #141b36;
+  --graph-input-text: #f3e9d2;
+  --graph-input-border: rgba(217, 194, 152, 0.28);
+  --graph-empty-bg: #141b36;
+  --graph-empty-text: #f3e9d2;
+  --graph-empty-muted: #b8a788;
+  --state-muted-bg: rgba(216, 194, 152, 0.06);
   --state-error-border: rgba(248, 113, 113, 0.3);
   --tooltip-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
@@ -316,6 +322,10 @@ button {
   font-weight: 700;
 }
 
+.global-search {
+  width: 260px;
+}
+
 .theme-toggle-indicator {
   width: 10px;
   height: 10px;
@@ -410,6 +420,14 @@ button {
   margin: 0;
   font-family: var(--font-display);
   letter-spacing: 0;
+  /* Reshaped's root wrapper sets a fixed 20px line-height (its body-2 text
+     token) that inherits as an absolute length, not a multiplier -- so any
+     heading whose font-size is bumped past body text without its own
+     line-height override renders a line box far shorter than its glyphs,
+     visually overlapping the text below it. Every custom heading rule here
+     needs an explicit (unitless, so it scales with the element's own
+     font-size) line-height for exactly that reason. */
+  line-height: 1.15;
 }
 
 .panel h2,
@@ -420,6 +438,7 @@ button {
   margin: 0;
   font-family: "Space Grotesk", sans-serif;
   letter-spacing: 0;
+  line-height: 1.25;
 }
 
 .hero-copy h1 {
@@ -504,6 +523,41 @@ button {
 
 .section-stack.tight {
   gap: 12px;
+}
+
+/* Error-boundary fallback: the thrown message, readable but not shouting. */
+.error-detail {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: rgb(0 0 0 / 18%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Disclosure toggle that sits *inside* a Card rather than being the Card.
+   Used where the expanded body contains its own interactive elements, which
+   cannot legally (or usably) live inside a button. Full-width so the click
+   target still covers the whole header row. */
+.disclosure-button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.disclosure-button:focus-visible {
+  outline: 2px solid var(--accent, currentColor);
+  outline-offset: 4px;
+  border-radius: 4px;
 }
 
 .panel-header,
@@ -608,6 +662,41 @@ button {
 .search-field input:focus {
   outline: 2px solid var(--input-focus-ring);
   outline-offset: 2px;
+}
+
+/* The pool filter row (min/max connections, four date pickers, sort) is a
+   flex row with wrap. A TextField's <input> renders at width: 100% of its
+   own field, which a flex item with flex-basis: auto reports as "wants my
+   container's full width" -- so every field, given no width cap of its own,
+   stretches to fill the row and wrap kicks in after each one, i.e. one
+   field per line even though the row is wide enough for several. Capping
+   each field's width fixes that so they actually flow into a wrapped grid. */
+.pool-filter-row {
+  align-items: flex-end;
+}
+
+.pool-filter-field {
+  flex: 0 1 200px;
+  min-width: 160px;
+  max-width: 220px;
+}
+
+/* Tabs has no color prop, so the "pills" variant's selected-pill fill is
+   hardcoded to Reshaped's neutral background token -- which our dark theme
+   retints to a navy (#182047, see reshaped-theme.css) that reads as
+   low-contrast navy-on-navy against the midnight page background. The
+   attribute selectors (role/aria-selected, both stable across Reshaped
+   versions/builds) plus the .pills-accent class from Tabs.List give this a
+   higher specificity than Reshaped's own two-class rule, so no !important
+   is needed. Text is repainted with the "on-primary" token (dark navy) to
+   stay legible against the now-champagne fill. */
+.pills-accent [role="tab"][aria-selected="true"] {
+  color: var(--rs-color-on-background-primary);
+}
+
+.pills-accent [role="tab"][aria-selected="true"]::after {
+  background-color: var(--rs-color-background-primary);
+  opacity: 1;
 }
 
 .secondary-button,
@@ -1222,7 +1311,12 @@ a:focus-visible {
 
 .graph-control input[type="range"] {
   width: 140px;
-  accent-color: #35d0c8;
+  /* Was a literal #35d0c8 -- the old phosphor-teal "Scope" theme's accent,
+     left behind when the rest of the app moved to the champagne/midnight
+     palette. var(--accent) already carries the champagne value in dark
+     mode (and the intentionally-untouched teal in light mode), so this
+     just needed to point at the token instead of a frozen hex. */
+  accent-color: var(--accent);
   cursor: pointer;
 }
 
@@ -1277,8 +1371,13 @@ a:focus-visible {
 }
 
 .graph-controls .primary-button {
-  background: #0a7ea4;
-  border-color: #0a7ea4;
+  /* Same leftover-teal issue as the range input above: this duplicated the
+     base .primary-button rule's colors as a frozen light-mode hex instead
+     of the --accent token, so this one button stayed teal in dark mode
+     while every other primary button in the app correctly switched to
+     champagne. */
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 .graph-status {
@@ -1331,6 +1430,11 @@ a:focus-visible {
 
 .graph-legend-swatch.muted-swatch {
   background: #64748b;
+}
+
+.graph-legend-swatch.graph-legend-dashed {
+  background: repeating-linear-gradient(90deg, #94a3b8 0 4px, transparent 4px 7px);
+  height: 2px;
 }
 
 .graph-edge-hit {
@@ -1447,45 +1551,6 @@ a:focus-visible {
 .graph-inspector-empty {
   display: grid;
   gap: 6px;
-}
-
-/* Network graph modal — deliberately its own fixed-position overlay (see the
-   GraphModal comment in App.jsx) rather than expanding inline in the cluster
-   grid, so it always opens centered on screen instead of wherever its
-   triggering card happens to sit in the grid. */
-.graph-modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 100;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(5, 9, 13, 0.6);
-}
-
-.graph-modal {
-  width: min(1100px, 100%);
-  max-height: min(880px, 100%);
-  overflow: auto;
-  display: grid;
-  gap: 16px;
-  padding: 20px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-panel);
-  background: var(--surface-strong);
-  box-shadow: 0 24px 56px rgba(0, 0, 0, 0.4);
-}
-
-.graph-modal-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.linkage-signal-chips {
-  margin-top: 2px;
 }
 
 .graph-tooltip {
@@ -1689,6 +1754,24 @@ a:focus-visible {
 
 .linkage-card.expanded {
   border-color: var(--accent);
+}
+
+.path-chain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.path-chain-step {
+  display: block;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 0 0 4px 2px;
 }
 
 .linkage-card-main {
@@ -2064,6 +2147,16 @@ a:focus-visible {
   color: var(--muted);
 }
 
+/* Without this gap, .breadcrumb-row's bottom edge and .page-heading's
+   top edge touch directly (both sit in normal flow with no margin between
+   them), so the trace border-top below lands right at the breadcrumb
+   text's baseline instead of visually separating the two rows -- reading
+   as a stray underline slicing through "Pool / Connections" rather than a
+   section divider above the heading. */
+.breadcrumb-row {
+  margin-bottom: 14px;
+}
+
 .page-heading {
   margin-bottom: 22px;
   border-top: 2px solid var(--trace);
@@ -2075,6 +2168,10 @@ a:focus-visible {
   font-family: var(--font-display);
   letter-spacing: 0;
   font-size: clamp(1.8rem, 3vw, 2.4rem);
+  /* See .hero-copy h1 for why this needs an explicit line-height: without
+     one it inherits Reshaped's fixed 20px body line-height and the enlarged
+     glyphs overlap the subtitle paragraph below. */
+  line-height: 1.15;
 }
 
 .page-heading p {
@@ -2119,33 +2216,6 @@ a:focus-visible {
   padding: 10px 0;
 }
 
-/* Segmented control (mode switch) */
-.segmented {
-  display: inline-flex;
-  gap: 4px;
-  padding: 4px;
-  margin-bottom: 22px;
-  background: var(--surface-muted);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-pill);
-}
-
-.segmented-item {
-  border: 0;
-  border-radius: var(--radius-pill);
-  padding: 9px 18px;
-  font-weight: 700;
-  color: var(--muted);
-  background: transparent;
-  cursor: pointer;
-  transition: background 0.18s ease, color 0.18s ease;
-}
-
-.segmented-item.active {
-  background: var(--accent);
-  color: #fff;
-}
-
 /* Selection bar + token chips */
 .selection-bar {
   display: flex;
@@ -2169,83 +2239,6 @@ a:focus-visible {
   flex: 1 1 280px;
   min-height: 38px;
   align-items: center;
-}
-
-.token {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 12px;
-  border-radius: var(--radius-pill);
-  font-weight: 700;
-  font-size: 0.86rem;
-  color: var(--text);
-  background: var(--bg-accent-soft, var(--surface-muted));
-  border: 1px solid var(--accent);
-  cursor: pointer;
-}
-
-.token-x {
-  color: var(--muted);
-  font-size: 1.1em;
-  line-height: 1;
-}
-
-.token:hover .token-x {
-  color: var(--danger);
-}
-
-/* Type-to-add autocomplete */
-.autocomplete {
-  position: relative;
-}
-
-.autocomplete-input {
-  width: 100%;
-  padding: 13px 16px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--surface-strong);
-  color: var(--text);
-  font: inherit;
-}
-
-.autocomplete-input:focus {
-  outline: 2px solid var(--input-focus-ring);
-  outline-offset: 2px;
-}
-
-.autocomplete-menu {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: calc(100% + 6px);
-  z-index: 20;
-  max-height: 280px;
-  overflow-y: auto;
-  background: var(--surface, var(--panel));
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: var(--shadow);
-  padding: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.autocomplete-option {
-  text-align: left;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  padding: 10px 12px;
-  border-radius: 10px;
-  cursor: pointer;
-  font: inherit;
-}
-
-.autocomplete-option:hover {
-  background: var(--surface-muted);
 }
 
 /* ── Domain detail page ─────────────────────────────────────────────────── */

@@ -12,6 +12,7 @@ import subprocess
 from typing import Any
 
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, rsa
 from cryptography.x509.oid import NameOID
@@ -59,17 +60,44 @@ def _load_certificate(certificate: bytes | x509.Certificate) -> tuple[x509.Certi
         raise ValueError("certificate must be PEM or DER encoded") from exc
 
 
-def tls_certificate_hashes(certificate: bytes | x509.Certificate) -> dict[str, str]:
-    """Return full-certificate and SubjectPublicKeyInfo SHA-256 hashes."""
+def _certificate_public_key(cert: x509.Certificate) -> Any | None:
+    """Public key of `cert`, or None for a key algorithm we cannot load.
+
+    Certificates keyed with algorithms cryptography has no support for (GOST,
+    SM2, ...) are still worth keeping: their names, validity and leaf hash are
+    all intact, so only the key-derived fields are dropped.
+    """
+
+    try:
+        return cert.public_key()
+    except (UnsupportedAlgorithm, ValueError):
+        return None
+
+
+def tls_certificate_hashes(certificate: bytes | x509.Certificate) -> dict[str, str | None]:
+    """Return full-certificate and SubjectPublicKeyInfo SHA-256 hashes.
+
+    The leaf hash covers the entire encoded certificate, so it changes on every
+    renewal, re-issue or SAN edit. The SPKI hash covers only the public key,
+    which operators overwhelmingly carry across those events rather than
+    generating a fresh key pair — so it keeps linking an operator's hosts
+    together long after their leaf fingerprints have diverged. This is the same
+    value browsers pin in HPKP-style pins.
+    """
 
     cert, der = _load_certificate(certificate)
-    spki_der = cert.public_key().public_bytes(
-        serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
+    public_key = _certificate_public_key(cert)
+    spki_der = (
+        public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        if public_key is not None
+        else None
     )
     return {
         "sha256": hashlib.sha256(der).hexdigest(),
-        "spki_sha256": hashlib.sha256(spki_der).hexdigest(),
+        "spki_sha256": hashlib.sha256(spki_der).hexdigest() if spki_der is not None else None,
     }
 
 

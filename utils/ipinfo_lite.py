@@ -1,16 +1,41 @@
 """
 ipinfo.io "Lite" API — fast ASN + country/continent lookups.
 
-The primary source for ASN/org/country identification, used by get_ip_whois
-in core/ip_intel.py and core/basic.py: its values win over RDAP's whenever it
-succeeds, since RDAP errors/times out per-RIR fairly often and this single
-endpoint rarely does. RDAP is still always queried too (and remains the sole
-source when this is unavailable) since ipinfo Lite's response carries no
-network_name/network_cidr/asn_cidr — RDAP supplements those, and feeds
-detect_proxy_details() alongside ipinfo Lite for edge-server/reverse-proxy
-classification. Needs IP_INFO_KEY set in .env; when absent, callers get back
-a `{"skipped": True, ...}` marker matching the convention used by the other
-optional-key providers (Censys, Shodan, Netlas).
+The primary source for ASN/org identification, used by core.basic.get_ip_whois.
+It is now the *only* source for asn/asn_description, and the fallback source for
+country/continent.
+
+RDAP (ipwhois.lookup_rdap) used to run alongside this and supply the
+network_name/network_cidr/asn_cidr that ipinfo Lite's response does not carry.
+It was removed: once Censys host enrichment landed, enrichment covered
+network_name/network_cidr (WHOIS network block, or bgp_prefix as a last resort)
+and RDAP's only remaining unique fields were asn_cidr and asn_registry — not
+worth being the slowest, least reliable leg in the chain, and the sole reason
+the per-IP loop in core.basic.analyze had to run sequentially.
+
+Geo precedence is the other way round: Censys enrichment wins on
+country/continent (it is the only source with city/province, and mixing
+providers produced incoherent locations), and the `ipinfo_country` /
+`ipinfo_continent` values this module writes are the fallback for the cases
+where enrichment does not answer — a sweep that has spent the 20k/day budget,
+and hosts Censys has never scanned.
+
+Needs IP_INFO_KEY set in .env; when absent, callers get back a
+`{"skipped": True, ...}` marker matching the convention used by the other
+optional-key provider (Censys).
+
+**Cost (checked 2026-08-12, and the reason this is primary rather than a
+fallback):** the Lite endpoint is free with no request cap at all. ipinfo's
+Lite API docs state it "has no daily or monthly limit and provides unlimited
+access", and https://ipinfo.io/lite advertises "unlimited API requests ... no
+fees, no credit card". That is specific to Lite: the *legacy* free endpoint is
+capped at 50k requests/month, which is what makes it tempting to assume Lite
+is metered too. Because Lite is uncapped, Censys host enrichment (free of
+credits, but hard-capped at 20k calls/day) stays a *gap-filler* for
+asn/as_name rather than the winner — spending a finite daily budget to
+re-derive what an unlimited source already returned would also blank those
+fields the moment the budget ran out mid-sweep. Geo is the deliberate exception
+described above. See merge_censys_enrichment in utils/censys_enrichment.py.
 """
 
 from __future__ import annotations
@@ -63,14 +88,18 @@ def get_ipinfo_lite(ip: str) -> dict:
 
 def merge_ipinfo_lite(asn_info: dict, ip: str) -> dict:
     """
-    Combine an RDAP-shaped asn_info dict (as returned by get_ip_whois) with
-    ipinfo Lite data for one IP, in place. ipinfo Lite is the primary source
-    for asn/asn_description/asn_country — its values win over RDAP's whenever
-    the lookup succeeds, since RDAP errors/times out per-RIR fairly often and
-    this is a single fast endpoint that rarely does. RDAP's network_name/
-    network_cidr/asn_cidr/asn_registry are kept as-is (ipinfo Lite's response
-    doesn't carry them), and RDAP's asn/asn_description/asn_country remain the
-    sole source if ipinfo Lite is unavailable (no IP_INFO_KEY) or errors.
+    Add ipinfo Lite data for one IP to an asn_info dict, in place. This is the
+    first leg of core.basic.get_ip_whois and receives an empty dict; Censys host
+    enrichment then runs over the result (merge_censys_enrichment).
+
+    Writes asn/asn_description/asn_country as the canonical values, plus the
+    `ipinfo_*` copies. The copies matter on their own: enrichment overwrites
+    asn_country when it answers, so `ipinfo_country`/`ipinfo_continent` are what
+    remain to fall back on when it does not.
+
+    When ipinfo Lite is unavailable (no IP_INFO_KEY) or errors, the marker is
+    stored under `asn_info["ipinfo"]` and nothing else is written — enrichment
+    then becomes the only source of ASN identity for that IP.
     """
     lite = get_ipinfo_lite(ip)
     if lite.get("skipped") or lite.get("error"):

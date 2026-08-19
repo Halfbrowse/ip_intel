@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Badge, Button, Checkbox, Slider, Text, TextField, View } from "reshaped";
 import { drag as d3Drag } from "d3-drag";
 import { zoom as d3Zoom, zoomIdentity } from "d3-zoom";
 import { select as d3Select } from "d3-selection";
@@ -468,9 +469,31 @@ const ClusterGraph = memo(function ClusterGraph({
   // Presentation controls — deliberately lean. The map only shows submitted
   // domains and their bridges, so there's no node-colour/size lens to pick.
   const [labelMode, setLabelMode] = useState("auto");
-  const [tierFilter, setTierFilter] = useState({ strong: true, moderate: true, weak: true });
+  // Weak links (score < 30) are hidden by default -- they're what made the
+  // map read as cluttered; the Strength checkboxes below still let a user
+  // switch them back on.
+  const [tierFilter, setTierFilter] = useState({ strong: true, moderate: true, weak: false });
   const [minScore, setMinScore] = useState(0);
   const [spread, setSpread] = useState(1);
+  // The Slider fires onChange continuously while dragging. `spread` used to be
+  // a dependency of the graph-build effect, which does a
+  // `g.selectAll("*").remove()` plus a fresh forceSimulation — so every step of
+  // a drag tore down and rebuilt the entire DOM and restarted the layout. The
+  // ref lets the forces read the live value while the effect below just
+  // reheats the existing simulation.
+  const spreadRef = useRef(spread);
+  // The two spread-dependent force accessors, defined once and stable. They
+  // read spreadRef rather than closing over `spread`, so a slider change can be
+  // applied by re-setting them on the live simulation instead of tearing the
+  // whole graph down and rebuilding it (see the spread effect below).
+  const linkDistance = useCallback((edge) => {
+    const scale = spreadRef.current;
+    if (edgeKind(edge) === "membership") return 48 * scale;
+    return (
+      (edgeTier(edge) === "strong" ? 100 : edgeTier(edge) === "moderate" ? 150 : 195) * scale
+    );
+  }, []);
+  const chargeStrength = useCallback(() => -420 * spreadRef.current, []);
   const [narrowSelection, setNarrowSelection] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState({ submitted: true, related: true });
@@ -725,7 +748,7 @@ const ClusterGraph = memo(function ClusterGraph({
       [UNCLASSIFIED_TIER]: true,
     });
     setEvidenceTypeFilter(allTrue(evidenceTypes));
-    setTierFilter({ strong: true, moderate: true, weak: true });
+    setTierFilter({ strong: true, moderate: true, weak: false });
     setMinScore(0);
     clearFocus();
   }, [clearFocus, evidenceTypes]);
@@ -997,7 +1020,11 @@ const ClusterGraph = memo(function ClusterGraph({
       .attr("stroke", (d) =>
         edgeKind(d) === "membership" ? MEMBERSHIP_COLOR : EDGE_TIERS[edgeTier(d)].color,
       )
-      .attr("stroke-dasharray", (d) => (edgeKind(d) === "membership" ? "3 4" : null))
+      // Dashed = membership tie, or an evidence edge with no direct pairwise
+      // score (direct: false) -- a multi-hop chain surfaced by the precomputed
+      // graph_paths lookup, not a live guess. Mirrors OpenCTI's own
+      // solid-for-direct / dotted-for-inferred convention.
+      .attr("stroke-dasharray", (d) => (edgeKind(d) === "membership" || d.direct === false ? "3 4" : null))
       .attr("stroke-width", (d) => d.width || 1.5);
 
     // Relationship-type label sat directly on the line (e.g. "TLS
@@ -1162,18 +1189,12 @@ const ClusterGraph = memo(function ClusterGraph({
         "link",
         forceLink(simLinks)
           .id((node) => node.id)
-          .distance((edge) => {
-            if (edgeKind(edge) === "membership") return 48 * spread;
-            return (
-              (edgeTier(edge) === "strong" ? 100 : edgeTier(edge) === "moderate" ? 150 : 195) *
-              spread
-            );
-          })
+          .distance(linkDistance)
           .strength((edge) =>
             edgeKind(edge) === "membership" ? 0.9 : edgeTier(edge) === "weak" ? 0.25 : 0.6,
           ),
       )
-      .force("charge", forceManyBody().strength(-420 * spread))
+      .force("charge", forceManyBody().strength(chargeStrength))
       .force("center", forceCenter(width / 2, height / 2))
       .force(
         "collide",
@@ -1269,7 +1290,6 @@ const ClusterGraph = memo(function ClusterGraph({
     displayEdges,
     width,
     height,
-    spread,
     radiusFor,
     metrics,
     seedTargets,
@@ -1278,7 +1298,41 @@ const ClusterGraph = memo(function ClusterGraph({
     handleEdgeClick,
     applyStyles,
     fitToView,
+    linkDistance,
+    chargeStrength,
   ]);
+
+  // --- Spread: reheat, don't rebuild -----------------------------------------
+  // Mutating the two distance/charge forces and giving the simulation a small
+  // alpha is all a spread change actually needs. The nodes keep their current
+  // positions and settle into the new spacing, which also looks better than
+  // the previous full re-layout: dragging the slider no longer scrambles the
+  // map the analyst was reading.
+  const spreadSettledRef = useRef(false);
+  useEffect(() => {
+    spreadRef.current = spread;
+    const simulation = simulationRef.current;
+    if (!simulation) {
+      return;
+    }
+    // Skip the first run. This effect is declared after the build effect, so on
+    // mount it fires against a simulation that just started at alpha 1 and
+    // would knock it down to 0.3 — every initial layout would relax from a
+    // third of the energy it was designed for, then fit-to-view early on an
+    // under-settled graph.
+    if (!spreadSettledRef.current) {
+      spreadSettledRef.current = true;
+      return;
+    }
+    // Public API rather than force.initialize(): re-setting the accessor makes
+    // d3 re-derive distances/strengths against the nodes and random source it
+    // already holds. Calling initialize() directly also worked, but it replaced
+    // d3's seeded generator with Math.random for the rest of the simulation's
+    // life, making the layout's jiggle non-reproducible.
+    simulation.force("link")?.distance(linkDistance);
+    simulation.force("charge")?.strength(chargeStrength);
+    simulation.alpha(0.3).restart();
+  }, [spread, linkDistance, chargeStrength]);
 
   // --- Zoom / pan (set up once) ----------------------------------------------
   useEffect(() => {
@@ -1655,11 +1709,18 @@ const ClusterGraph = memo(function ClusterGraph({
   const downloadImage = useCallback(() => {
     renderPresentationPng().then((result) => {
       if (!result) return;
+      // Append before clicking and revoke on the next tick: a detached <a>
+      // is ignored by some browsers, and revoking synchronously after
+      // .click() races the browser's read of the blob and drops the download
+      // outright in Firefox/Safari.
       const link = document.createElement("a");
-      link.href = URL.createObjectURL(result.blob);
+      const url = URL.createObjectURL(result.blob);
+      link.href = url;
       link.download = `${exportFileName}-${Date.now()}.png`;
+      document.body.appendChild(link);
       link.click();
-      URL.revokeObjectURL(link.href);
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
     });
   }, [renderPresentationPng, exportFileName]);
 
@@ -1667,10 +1728,13 @@ const ClusterGraph = memo(function ClusterGraph({
     const blob = buildInteractiveHtml();
     if (!blob) return;
     const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
+    link.href = url;
     link.download = `${exportFileName}-${Date.now()}.html`;
+    document.body.appendChild(link);
     link.click();
-    URL.revokeObjectURL(link.href);
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
   }, [buildInteractiveHtml, exportFileName]);
 
   const [emailState, setEmailState] = useState({ status: "idle", message: "" });
@@ -1753,6 +1817,7 @@ const ClusterGraph = memo(function ClusterGraph({
   const hasSelection = Boolean(selectedNode || selectedEdge);
   const focusViewActive = Boolean(narrowSelection && selectedScope);
   const presentTiers = DOMAIN_TIER_ORDER.filter((tier) => displayNodes.some((node) => node.tier === tier));
+  const hasInferredEdges = displayEdges.some((edge) => edgeKind(edge) === "evidence" && edge.direct === false);
   const filterTierKeys = DOMAIN_TIER_ORDER.filter((tier) => allNodes.some((node) => node.tier === tier));
   const hasUnclassifiedTier = allNodes.some((node) => !DOMAIN_TIER_COLORS[node.tier]);
   const hiddenRoleCount = Object.keys(ROLE_FILTERS).filter((role) => !roleFilter[role]).length;
@@ -1797,16 +1862,15 @@ const ClusterGraph = memo(function ClusterGraph({
       </div>
 
       <div className="graph-controls" aria-label="Knowledge graph controls">
-        <label className="graph-control graph-search-control">
-          <span>Search knowledge</span>
-          <input
-            aria-label="Search visible domains and evidence"
-            onChange={(e) => setSearchQuery(e.target.value)}
+        <div className="graph-control graph-search-control">
+          <TextField
+            inputAttributes={{ "aria-label": "Search visible domains and evidence", type: "search" }}
+            name="graph-search"
+            onChange={({ value }) => setSearchQuery(value)}
             placeholder="domain, IP, cert, ASN..."
-            type="search"
             value={searchQuery}
           />
-        </label>
+        </div>
 
         <label className="graph-control compact">
           <span>Labels</span>
@@ -1824,53 +1888,49 @@ const ClusterGraph = memo(function ClusterGraph({
           </select>
         </label>
 
-        <label className="graph-control compact">
-          <span>Spread</span>
-          <input
-            aria-label="Graph spread"
-            aria-valuetext={`${spread.toFixed(1)}x`}
-            max="2"
-            min="0.5"
-            onChange={(e) => setSpread(Number(e.target.value))}
-            step="0.1"
-            type="range"
+        <div className="graph-control compact">
+          <Text variant="caption-1">Spread</Text>
+          <Slider
+            max={2}
+            min={0.5}
+            name="graph-spread"
+            onChange={({ value }) => setSpread(value)}
+            step={0.1}
             value={spread}
           />
-        </label>
+        </div>
 
         {maxScore > 0 ? (
-          <label className="graph-control compact">
-            <span>Min. strength {minScore > 0 ? `(${minScore})` : ""}</span>
-            <input
-              aria-label="Minimum link strength"
-              aria-valuetext={minScore > 0 ? `${minScore}` : "Any strength"}
+          <div className="graph-control compact">
+            <Text variant="caption-1">Min. strength {minScore > 0 ? `(${minScore})` : ""}</Text>
+            <Slider
               max={maxScore}
-              min="0"
-              onChange={(e) => setMinScore(Number(e.target.value))}
-              step="1"
-              type="range"
+              min={0}
+              name="graph-min-score"
+              onChange={({ value }) => setMinScore(value)}
+              step={1}
               value={minScore}
             />
-          </label>
+          </div>
         ) : null}
 
         <div className="graph-control graph-filter-block">
           <span>Objects</span>
           <div className="graph-tier-toggles">
             {Object.entries(ROLE_FILTERS).map(([role, label]) => (
-              <label className="graph-tier-toggle" key={role}>
-                <input
-                  aria-label={`Show ${label.toLowerCase()} objects`}
-                  checked={roleFilter[role]}
-                  onChange={(e) => setRoleFilter((prev) => ({ ...prev, [role]: e.target.checked }))}
-                  type="checkbox"
-                />
+              <Checkbox
+                checked={roleFilter[role]}
+                inputAttributes={{ "aria-label": `Show ${label.toLowerCase()} objects` }}
+                key={role}
+                onChange={({ checked }) => setRoleFilter((prev) => ({ ...prev, [role]: checked }))}
+                size="small"
+              >
                 <span
                   className="graph-legend-swatch round"
                   style={{ background: role === "submitted" ? SUBMITTED_COLOR : otherRoleColor }}
                 />
                 {label}
-              </label>
+              </Checkbox>
             ))}
           </div>
         </div>
@@ -1880,32 +1940,27 @@ const ClusterGraph = memo(function ClusterGraph({
             <span>OpenCTI tier</span>
             <div className="graph-tier-toggles">
               {filterTierKeys.map((tier) => (
-                <label className="graph-tier-toggle" key={`filter-tier-${tier}`}>
-                  <input
-                    aria-label={`Show ${DOMAIN_TIER_LABELS[tier]} domains`}
-                    checked={domainTierFilter[String(tier)]}
-                    onChange={(e) =>
-                      setDomainTierFilter((prev) => ({ ...prev, [String(tier)]: e.target.checked }))
-                    }
-                    type="checkbox"
-                  />
+                <Checkbox
+                  checked={domainTierFilter[String(tier)]}
+                  inputAttributes={{ "aria-label": `Show ${DOMAIN_TIER_LABELS[tier]} domains` }}
+                  key={`filter-tier-${tier}`}
+                  onChange={({ checked }) => setDomainTierFilter((prev) => ({ ...prev, [String(tier)]: checked }))}
+                  size="small"
+                >
                   <span className="graph-legend-swatch round" style={{ background: DOMAIN_TIER_COLORS[tier] }} />
                   {DOMAIN_TIER_LABELS[tier].replace("Tier ", "T")}
-                </label>
+                </Checkbox>
               ))}
               {hasUnclassifiedTier ? (
-                <label className="graph-tier-toggle">
-                  <input
-                    aria-label="Show unclassified domains"
-                    checked={domainTierFilter[UNCLASSIFIED_TIER]}
-                    onChange={(e) =>
-                      setDomainTierFilter((prev) => ({ ...prev, [UNCLASSIFIED_TIER]: e.target.checked }))
-                    }
-                    type="checkbox"
-                  />
+                <Checkbox
+                  checked={domainTierFilter[UNCLASSIFIED_TIER]}
+                  inputAttributes={{ "aria-label": "Show unclassified domains" }}
+                  onChange={({ checked }) => setDomainTierFilter((prev) => ({ ...prev, [UNCLASSIFIED_TIER]: checked }))}
+                  size="small"
+                >
                   <span className="graph-legend-swatch round muted-swatch" />
                   Unclassified
-                </label>
+                </Checkbox>
               ) : null}
             </div>
           </div>
@@ -1916,17 +1971,15 @@ const ClusterGraph = memo(function ClusterGraph({
             <span>Relationship type</span>
             <div className="graph-tier-toggles scrollable">
               {evidenceTypes.map((type) => (
-                <label className="graph-tier-toggle" key={type} title={type}>
-                  <input
-                    aria-label={`Show ${type} relationships`}
-                    checked={evidenceTypeFilter[type] !== false}
-                    onChange={(e) =>
-                      setEvidenceTypeFilter((prev) => ({ ...prev, [type]: e.target.checked }))
-                    }
-                    type="checkbox"
-                  />
-                  {truncateLabel(type, 18)}
-                </label>
+                <Checkbox
+                  checked={evidenceTypeFilter[type] !== false}
+                  inputAttributes={{ "aria-label": `Show ${type} relationships` }}
+                  key={type}
+                  onChange={({ checked }) => setEvidenceTypeFilter((prev) => ({ ...prev, [type]: checked }))}
+                  size="small"
+                >
+                  <span title={type}>{truncateLabel(type, 18)}</span>
+                </Checkbox>
               ))}
             </div>
           </div>
@@ -1936,89 +1989,86 @@ const ClusterGraph = memo(function ClusterGraph({
           <span>Strength</span>
           <div className="graph-tier-toggles">
             {TIER_ORDER.map((tier) => (
-              <label className="graph-tier-toggle" key={tier}>
-                <input
-                  aria-label={`Show ${tier} links`}
-                  checked={tierFilter[tier]}
-                  onChange={(e) =>
-                    setTierFilter((prev) => ({ ...prev, [tier]: e.target.checked }))
-                  }
-                  type="checkbox"
-                />
-                <span
-                  className="graph-legend-swatch"
-                  style={{ background: EDGE_TIERS[tier].color }}
-                />
+              <Checkbox
+                checked={tierFilter[tier]}
+                inputAttributes={{ "aria-label": `Show ${tier} links` }}
+                key={tier}
+                onChange={({ checked }) => setTierFilter((prev) => ({ ...prev, [tier]: checked }))}
+                size="small"
+              >
+                <span className="graph-legend-swatch" style={{ background: EDGE_TIERS[tier].color }} />
                 {tier}
-              </label>
+              </Checkbox>
             ))}
           </div>
         </div>
 
         {activeCriteriaCount > 0 ? (
-          <button className="secondary-button small" onClick={resetKnowledgeFilters} title="Reset all graph filters" type="button">
+          <Button onClick={resetKnowledgeFilters} size="small" title="Reset all graph filters" variant="outline">
             Reset filters
-          </button>
+          </Button>
         ) : null}
 
         {hasSelection ? (
-          <button
-            aria-label={focusViewActive ? "Keep the selected neighborhood in context" : "Focus the graph on the selected neighborhood"}
-            className="secondary-button small"
+          <Button
+            attributes={{ "aria-label": focusViewActive ? "Keep the selected neighborhood in context" : "Focus the graph on the selected neighborhood" }}
             onClick={() => setNarrowSelection((current) => !current)}
+            size="small"
             title={focusViewActive ? "Keep the selected neighborhood in context" : "Focus the graph on the selected neighborhood"}
-            type="button"
+            variant="outline"
           >
             {focusViewActive ? "Keep context" : "Focus selection"}
-          </button>
+          </Button>
         ) : null}
 
         {hasSelection ? (
-          <button
-            aria-label="Fit the selected neighborhood"
-            className="secondary-button small"
+          <Button
+            attributes={{ "aria-label": "Fit the selected neighborhood" }}
             onClick={fitSelection}
+            size="small"
             title="Fit the selected neighborhood"
-            type="button"
+            variant="outline"
           >
             Fit selection
-          </button>
+          </Button>
         ) : null}
 
         {hasSelection ? (
-          <button className="secondary-button small" onClick={clearFocus} title="Clear graph selection" type="button">
+          <Button onClick={clearFocus} size="small" title="Clear graph selection" variant="outline">
             Clear selection
-          </button>
+          </Button>
         ) : null}
 
-        <button aria-label="Fit the whole graph" className="secondary-button small" onClick={resetView} title="Fit the whole graph" type="button">
+        <Button
+          attributes={{ "aria-label": "Fit the whole graph" }}
+          onClick={resetView}
+          size="small"
+          title="Fit the whole graph"
+          variant="outline"
+        >
           Fit graph
-        </button>
+        </Button>
 
-        <div className="graph-actions" aria-label="Graph export actions">
-          <button className="secondary-button small" onClick={downloadImage} title="Download PNG image" type="button">
+        <View attributes={{ "aria-label": "Graph export actions" }} direction="row" gap={2}>
+          <Button onClick={downloadImage} size="small" title="Download PNG image" variant="outline">
             PNG
-          </button>
+          </Button>
 
-          <button
-            className="secondary-button small"
-            onClick={downloadInteractive}
-            title="Download offline interactive HTML report"
-            type="button"
-          >
+          <Button onClick={downloadInteractive} size="small" title="Download offline interactive HTML report" variant="outline">
             HTML report
-          </button>
+          </Button>
 
-          <button
-            className="primary-button small"
+          <Button
+            color="primary"
             disabled={emailState.status === "sending"}
+            loading={emailState.status === "sending"}
             onClick={emailGraph}
+            size="small"
             title="Email the graph attachments"
-            type="button"
           >
             {emailState.status === "sending" ? "Sending..." : "Email"}
-          </button>
-        </div>
+          </Button>
+        </View>
       </div>
 
       <p className="graph-status" id={statusId} aria-live="polite">
@@ -2054,6 +2104,12 @@ const ClusterGraph = memo(function ClusterGraph({
             {EDGE_TIERS[tier].label}
           </span>
         ))}
+        {hasInferredEdges ? (
+          <span className="graph-legend-item" title="Solid = direct scored evidence. Dashed = a multi-hop chain, no direct evidence between this pair.">
+            <span className="graph-legend-swatch graph-legend-dashed" />
+            Dashed = multi-hop chain
+          </span>
+        ) : null}
         {presentTiers.length > 0
           ? presentTiers.map((tier) => (
               <span className="graph-legend-item" key={`domain-tier-${tier}`}>
@@ -2066,12 +2122,19 @@ const ClusterGraph = memo(function ClusterGraph({
 
       <div className="graph-workbench">
         <div className="graph-stage">
+          {/* role is "group", not "img": the nodes below are role="button"
+              tabindex="0" with keydown handlers, and the edge hit-lines are
+              focusable too. role="img" collapses the whole subtree into one
+              opaque graphic for assistive tech, so every one of those became
+              unreachable to a screen reader while still being tabbable — the
+              worst of both. "group" keeps the label and description while
+              leaving the children exposed. */}
           <svg
             ref={svgRef}
             className="cluster-graph"
             viewBox={`0 0 ${width} ${height}`}
             style={{ cursor: "grab", height }}
-            role="img"
+            role="group"
             aria-label="Network map of connected domains"
             aria-describedby={statusId}
           >
@@ -2093,9 +2156,9 @@ const ClusterGraph = memo(function ClusterGraph({
                   <span className="muted">Selected link</span>
                   <strong>{evidenceType(selectedEdgeData)}</strong>
                 </div>
-                <button className="secondary-button small" onClick={clearFocus} type="button">
+                <Button onClick={clearFocus} size="small" variant="outline">
                   Clear
-                </button>
+                </Button>
               </div>
               <p className="card-copy graph-selection-summary">
                 <strong>{selectedEdgeData.from}</strong> to <strong>{selectedEdgeData.to}</strong>
@@ -2136,9 +2199,9 @@ const ClusterGraph = memo(function ClusterGraph({
                   <span className="muted">Selected domain</span>
                   <strong>{selectedNodeData.label || selectedNode}</strong>
                 </div>
-                <button className="secondary-button small" onClick={clearFocus} type="button">
+                <Button onClick={clearFocus} size="small" variant="outline">
                   Clear
-                </button>
+                </Button>
               </div>
               <p className="card-copy graph-selection-summary">
                 <strong>{selectedNodeData.label || selectedNode}</strong>
@@ -2171,8 +2234,21 @@ const ClusterGraph = memo(function ClusterGraph({
   );
 });
 
+// Leaf-derived wording reads badly for these two ("Shared crypto wallet
+// values"), so they get spelled out rather than falling through below.
+const EVIDENCE_PATH_LABELS = {
+  "page_metadata.phone_numbers": "Shared phone number",
+  "page_metadata.crypto_wallet_values": "Shared crypto wallet address",
+  "legal_pages.phones": "Shared imprint phone number",
+  "legal_pages.emails": "Shared imprint email",
+  "legal_pages.addresses": "Shared registered address",
+};
+
 function formatPathFallback(path) {
   const text = String(path || "");
+  if (EVIDENCE_PATH_LABELS[text]) {
+    return EVIDENCE_PATH_LABELS[text];
+  }
   if (text.startsWith("observed_ip:")) {
     return "Observed IP address";
   }

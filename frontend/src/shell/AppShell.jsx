@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
+import { Button, Reshaped, Text, View } from "reshaped";
 
 import { Link, NavLink } from "../router.jsx";
+import SearchBox from "./SearchBox.jsx";
 
 const THEME_STORAGE_KEY = "theme";
 
@@ -22,11 +24,31 @@ export function getInitialTheme() {
   return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
 }
 
-function useTheme() {
+// Theme state lives at the app root (see ThemeProvider below, mounted once in
+// main.jsx) rather than inside AppShell itself, because Reshaped's own
+// color-mode context needs the value at the SAME level as the <Reshaped>
+// provider to correctly theme portaled content (Autocomplete/DropdownMenu/
+// Modal, which render outside AppShell's own DOM subtree via React portals).
+// Passing colorMode as a controlled prop -- not just toggling a DOM attribute
+// after the fact -- is what makes those portals pick up the right palette.
+const ThemeContext = createContext({ theme: "light", toggleTheme: () => {} });
+
+export function ThemeProvider({ children }) {
   const [theme, setTheme] = useState(getInitialTheme);
 
   useEffect(() => {
+    // Drives styles.css's :root[data-theme="dark"] block (everything not yet
+    // on a Reshaped component, chiefly ClusterGraph.jsx's SVG).
     document.documentElement.setAttribute("data-theme", theme);
+    // Reshaped's own root color-mode effect only sets data-rs-color-mode
+    // once (it no-ops on later renders once *anything* is present -- see
+    // reshaped's PrivateTheme component), so it never picks up later
+    // toggles on its own. Setting it here unconditionally on every change
+    // is what actually makes the toggle work for non-portaled content; the
+    // colorMode prop below (context-driven) is what makes it work for
+    // portaled content (Autocomplete/DropdownMenu/Modal), which read the
+    // color mode from React context rather than this DOM attribute.
+    document.documentElement.setAttribute("data-rs-color-mode", theme);
   }, [theme]);
 
   const toggleTheme = () => {
@@ -39,7 +61,17 @@ function useTheme() {
     setTheme(next);
   };
 
-  return { theme, toggleTheme };
+  return (
+    <ThemeContext.Provider value={{ theme, toggleTheme }}>
+      <Reshaped colorMode={theme} theme="slate">
+        {children}
+      </Reshaped>
+    </ThemeContext.Provider>
+  );
+}
+
+function useTheme() {
+  return useContext(ThemeContext);
 }
 
 export default function AppShell({ children }) {
@@ -49,8 +81,12 @@ export default function AppShell({ children }) {
     <div className="app-shell">
       <header className="app-header">
         <Link className="brand-mark" to="/">
-          <span>IP</span>
-          <strong>Intel</strong>
+          <Text as="span" variant="body-1" weight="bold">
+            IP
+          </Text>
+          <Text as="span" variant="body-1" weight="extrabold">
+            Intel
+          </Text>
         </Link>
         <nav className="app-nav" aria-label="Sections">
           {NAV_ITEMS.map((item) => (
@@ -63,18 +99,17 @@ export default function AppShell({ children }) {
             </NavLink>
           ))}
         </nav>
-        <div className="header-side">
-          <button
-            aria-pressed={theme === "dark"}
-            className="secondary-button theme-toggle"
+        <View align="center" direction="row" gap={3}>
+          <SearchBox />
+          <Button
+            attributes={{ "aria-pressed": theme === "dark" }}
             onClick={toggleTheme}
             title={theme === "dark" ? "Switch to the light theme" : "Switch to the dark theme"}
-            type="button"
+            variant="outline"
           >
-            <span aria-hidden="true" className="theme-toggle-indicator" />
             {theme === "dark" ? "Light mode" : "Dark mode"}
-          </button>
-        </div>
+          </Button>
+        </View>
       </header>
       <main className="app-main">{children}</main>
     </div>

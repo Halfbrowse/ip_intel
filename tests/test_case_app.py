@@ -9,6 +9,14 @@ import cases.case_app as case_app
 def _quiet(monkeypatch) -> None:
     monkeypatch.setattr(case_app, "init_db", lambda: None)
     monkeypatch.setattr(case_app.runtime, "recover", lambda: None)
+    # Take Redis out of the picture for every endpoint test. Without this the
+    # app's lifespan warms a live cache from a live database, and the endpoint
+    # then answers from that cache instead of calling the intel_db function the
+    # test just monkeypatched — so the assertions run against whatever real
+    # data happens to be in the pool. Nulling the client is the single lever:
+    # reads, warming and invalidation all go through it, and cases.cache is
+    # built to run degraded (computing live) whenever it returns None.
+    monkeypatch.setattr(case_app.cache, "_redis_client", lambda: None)
 
 
 def test_evidence_meta_endpoint(monkeypatch) -> None:
@@ -223,6 +231,74 @@ def test_graph_link_pair_endpoint(monkeypatch) -> None:
         response = client.get("/api/graph/link", params={"a": "a.com", "b": "b.com"})
     assert response.status_code == 200
     assert response.json()["link"]["a"] == "a.com"
+
+
+def test_graph_path_endpoint(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        case_app.intel_db,
+        "path_between",
+        lambda a, b: {"a": a, "b": b, "hops": 2, "chain": [
+            {"from": "a.com", "to": "b.com", "score": 90.0, "evidence": []},
+            {"from": "b.com", "to": "c.com", "score": 85.0, "evidence": []},
+        ]},
+    )
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/graph/path", params={"a": "a.com", "b": "c.com"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"]["hops"] == 2
+    assert body["path"]["chain"][0]["to"] == "b.com"
+
+
+def test_graph_path_endpoint_404_when_unreachable(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(case_app.intel_db, "path_between", lambda a, b: None)
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/graph/path", params={"a": "a.com", "b": "z.com"})
+    assert response.status_code == 404
+
+
+def test_graph_path_requires_both_params(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/graph/path", params={"a": "a.com"})
+    assert response.status_code == 422  # FastAPI's own required-query-param validation
+
+
+def test_graph_related_endpoint(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        case_app.intel_db,
+        "related_through",
+        lambda value, *, max_hops, limit: [{"target": "b.com", "hops": 1, "min_hop_score": 90.0, "chain": []}],
+    )
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/graph/related/a.com")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["target"] == "a.com"
+    assert body["total"] == 1
+    assert body["related"][0]["target"] == "b.com"
+
+
+def test_search_endpoint(monkeypatch) -> None:
+    _quiet(monkeypatch)
+    captured: dict = {}
+
+    def _search(q, *, limit):
+        captured["q"] = q
+        captured["limit"] = limit
+        return {"query": q, "domains": [{"domain": "a.com", "connection_count": 2, "cluster_id": None, "tier": None}], "selectors": []}
+
+    monkeypatch.setattr(case_app.intel_db, "search_targets", _search)
+    with TestClient(case_app.app) as client:
+        response = client.get("/api/search", params={"q": "a.co", "limit": 5})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["domains"][0]["domain"] == "a.com"
+    assert captured["q"] == "a.co"
+    assert captured["limit"] == 5
 
 
 def test_graph_clusters_endpoint(monkeypatch) -> None:

@@ -1,39 +1,40 @@
 #!/usr/bin/env python3
 """
-ip_intel.py — Domain / IP intelligence tool
+ip_intel.py — shared collection helpers for the scan pipeline.
 
-Usage:
-    uv run ip_intel.py <domain or IP>
+This module is a *library*, not an entry point. It used to hold a second,
+async scan engine (`analyze_domain` / `_analyze_domain_async`) plus a `main()`
+CLI, which duplicated ~12 collectors that `core/basic.py` already implements
+for the live pipeline — the same CIRCL passive-DNS query under two names
+(`circl_pdns` vs `historical_dns`), two `extract_spf_origins`, two page-metadata
+fetchers, and so on. Only the CLI and the retired OpenCTI worker ever called it,
+so the engine, the CLI and the duplicate collectors were removed; the scan path
+is `cases/case_runtime.py` → `core/analysis_service.py` → `core.basic.analyze`.
 
-Sources (all free, no API keys required by default):
-    - dnspython   : DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME, PTR)
-    - python-whois: Domain and IP WHOIS
-    - ipwhois     : IP ASN / network info via RDAP
-    - crt.sh      : Subdomain discovery + full cert transparency data (SANs, issuers)
-                    (falls back to Cert Spotter's free API on outage/rate-limit;
-                    optional CERTSPOTTER_API_KEY raises the Cert Spotter limit)
-    - hackertarget: Reverse IP lookup — skipped automatically for Cloudflare IPs
-    - CIRCL pDNS  : Passive / historical DNS records (pdns.circl.lu)
-    - Origin probe: Resolves crt.sh subdomains and flags any that bypass Cloudflare
-    - Censys      : Searches indexed TLS certs for IPs serving the domain's cert,
-                    plus historical cert→host observations (rotated origins)
-                    (optional — set CENSYS_API_KEY; needs Starter+ tier, and
-                    Enterprise Adversary Investigation for cert history)
-    - Shodan      : Searches indexed banners for ssl:"domain" hits
-                    (optional — set SHODAN_API_KEY in .env)
-    - Netlas      : Searches indexed TLS banners by cert CN — free tier available
-                    (optional — set NETLAS_KEY in .env)
-    - Origin scan : Two-phase TCP+TLS scan of targeted IP ranges (e.g. GCP) to
-                    find the cert CN directly. Opt-in via --scan flag.
+What remains here is what the live pipeline actually imports:
+
+    - censys_cert_search  : Censys Platform host search for certs naming a domain,
+                            plus the opt-in historical cert→host pivot
+                            (CENSYS_API_KEY + CENSYS_ORG_ID; Starter+ tier, and
+                            Enterprise Adversary Investigation for cert history)
+    - detect_proxy_details: CDN / reverse-proxy classification for an IP
+    - _classify_nameservers, attempt_zone_transfer
+    - probe_subdomain_origins / probe_mx_origins / probe_wordlist_subdomains
+      and _select_wordlist_followup_targets  (origin-leak hunting)
+    - _acrt_sh_data + the Cert Spotter fallback helpers, used by
+      cases/case_runtime.py's crt.sh retry path
+    - targeted_origin_scan / targeted_asn_scan / targeted_country_scan: two-phase
+      TCP+TLS sweeps of an IP range. Retained deliberately, but note nothing
+      currently calls them — analysis_service stubs them out for case mode
+      ("Targeted origin scan is not enabled for case mode") and the CLI that did
+      call them is gone.
 """
 
 import asyncio
-import hashlib
 import json
 import os
 import shutil
 import ssl
-import socket
 import subprocess
 import tempfile
 import threading
@@ -44,45 +45,17 @@ from dotenv import load_dotenv
 load_dotenv()
 import ipaddress
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
-import dns.asyncresolver
 import dns.resolver
-import dns.reversename
 import dns.zone
 import dns.query
-import dns.exception
 import httpx
 import requests
-import whois
-from ipwhois import IPWhois
-from ipwhois.exceptions import IPDefinedError
-from cryptography import x509
-from cryptography.x509.oid import NameOID
 from tqdm import tqdm
 
-from sources.signal_dns import (
-    acollect_spf_details,
-    aget_email_security_records,
-    aprobe_microsoft_tenant,
-    collect_spf_details,
-    extract_txt_tenancy_tokens,
-    get_email_security_records,
-    parse_caa_records,
-    probe_microsoft_tenant_sync,
-)
-from sources.signal_transport import fetch_ssh_host_key, fetch_tls_certificate, parse_certificate_der
-from utils.ipinfo_lite import merge_ipinfo_lite
-from utils.outbound import httpx_kwargs, requests_kwargs
-from utils.vpn import vpn_rotation_batch
-from sources.signal_web import (
-    extract_page_enrichment,
-    afetch_homepage_profile,
-    afetch_mail_client_config,
-    afetch_well_known_artifacts,
-    ascrape_legal_pages,
-)
+from sources.signal_transport import parse_certificate_der
+from utils.outbound import requests_kwargs
 
 
 RESULTS_DIR = Path(__file__).parent.parent / "results"
@@ -98,6 +71,28 @@ _DNS_FALLBACK_NAMESERVERS = tuple(
 _DNS_FALLBACK_LOCK = threading.Lock()
 _DNS_FALLBACK_WARNED = False
 
+# ── Process-wide DNS admission control ───────────────────────────────────────
+# Every DNS query this process makes passes through here, whoever issues it.
+#
+# The alternative — which is what was here — is each call site sizing its own
+# thread pool: 322 for the wordlist sweep, 20 for the crt.sh subdomain probe, 10
+# for MX, 8 for the record fan-out, plus one PTR per IP-enrichment worker. Each
+# looked reasonable alone. Multiplied by ANALYSIS_WORKERS concurrent targets
+# they put thousands of queries in flight against four public resolvers, which
+# throttle — and a throttled query does not fail fast, it costs a full timeout.
+#
+# The result was that tuning any one pool moved nothing measurable, because the
+# resolver was saturated by the others: halving the IP-enrichment workers left
+# per-IP time unchanged (3.31s -> 3.47s) while bounding the wordlist sweep alone
+# improved it to 2.48s. A shared resource needs a shared bound, not N local ones.
+#
+# So: call sites are free to be as concurrent as their own logic wants, and
+# total DNS pressure is this one number. Raise it if the resolvers can take more
+# (a local caching resolver can take far more than 1.1.1.1 will); lower it if
+# lookups start timing out under load.
+_DNS_MAX_INFLIGHT = max(1, int(os.getenv("DNS_MAX_INFLIGHT", "64")))
+_DNS_GATE = threading.Semaphore(_DNS_MAX_INFLIGHT)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -112,25 +107,8 @@ def log(msg: str) -> None:
     print(f"  [*] {message}", flush=True)
 
 
-def set_log_handler(handler) -> object:
-    """
-    Attach a log callback for the current worker thread.
-
-    Returns a token that can be passed back to reset_log_handler() to restore
-    the previous handler once the caller is done.
-    """
-    previous = getattr(_LOG_CONTEXT, "handler", None)
-    _LOG_CONTEXT.handler = handler
-    return previous
 
 
-def reset_log_handler(token: object) -> None:
-    """Restore the previous per-thread log callback returned by set_log_handler()."""
-    if token is None:
-        if hasattr(_LOG_CONTEXT, "handler"):
-            delattr(_LOG_CONTEXT, "handler")
-        return
-    _LOG_CONTEXT.handler = token
 
 
 def clean_target(target: str) -> str:
@@ -157,11 +135,6 @@ def _iter_mapping_items(values):
             yield item
 
 
-def _empty_dns_records(error: str | None = None) -> dict:
-    payload = {rtype: [] for rtype in _DNS_RECORD_TYPES}
-    if error:
-        payload["_resolver_error"] = error
-    return payload
 
 
 def _build_sync_resolver(*, timeout: float, lifetime: float):
@@ -178,18 +151,6 @@ def _build_sync_resolver(*, timeout: float, lifetime: float):
     return resolver
 
 
-def _build_async_resolver(*, timeout: float, lifetime: float):
-    try:
-        resolver = dns.asyncresolver.Resolver()
-    except Exception as exc:
-        if not _DNS_FALLBACK_NAMESERVERS:
-            raise
-        resolver = dns.asyncresolver.Resolver(configure=False)
-        resolver.nameservers = list(_DNS_FALLBACK_NAMESERVERS)
-        _warn_dns_fallback(exc)
-    resolver.timeout = timeout
-    resolver.lifetime = lifetime
-    return resolver
 
 
 def is_ip(target: str) -> bool:
@@ -289,6 +250,9 @@ def _classify_nameservers(nameservers: list[str]) -> dict[str, list[dict[str, st
 _PROXY_FAMILY_RULES = _load_proxy_rules()
 _SUBDOMAIN_WORDLIST = _load_lines(CONFIG_DIR / "subdomain_wordlist.txt")
 _WORDLIST_FOLLOWUP_LIMIT = 8
+# Concurrent DNS queries the wordlist sweep may have in flight. See
+# probe_wordlist_subdomains for why this is bounded rather than one per word.
+_WORDLIST_PROBE_WORKERS = max(1, int(os.environ.get("WORDLIST_PROBE_WORKERS", "24")))
 _BORING_NS_PROVIDERS = set(_load_lines(CONFIG_DIR / "boring_ns_providers.txt"))
 
 
@@ -393,7 +357,8 @@ def resolve_ips(hostname: str) -> list[str]:
     ips: list[str] = []
     for rtype in ("A", "AAAA"):
         try:
-            ips.extend(str(r) for r in resolver.resolve(hostname, rtype))
+            with _DNS_GATE:
+                ips.extend(str(r) for r in resolver.resolve(hostname, rtype))
         except Exception:
             pass
     return ips
@@ -401,57 +366,8 @@ def resolve_ips(hostname: str) -> list[str]:
 
 # ── DNS ───────────────────────────────────────────────────────────────────────
 
-def get_dns_records(domain: str) -> dict:
-    try:
-        resolver = _build_sync_resolver(timeout=5, lifetime=10)
-    except Exception as exc:
-        return _empty_dns_records(str(exc))
-
-    def _resolve(rtype: str) -> tuple[str, object]:
-        try:
-            answers = resolver.resolve(domain, rtype)
-            if rtype == "MX":
-                return rtype, [
-                    {"preference": r.preference, "exchange": str(r.exchange).rstrip(".")}
-                    for r in answers
-                ]
-            if rtype == "SOA":
-                r = answers[0]
-                return rtype, {
-                    "mname":   str(r.mname).rstrip("."),
-                    "rname":   str(r.rname).rstrip("."),
-                    "serial":  int(r.serial),
-                    "refresh": int(r.refresh),
-                    "retry":   int(r.retry),
-                    "expire":  int(r.expire),
-                    "minimum": int(r.minimum),
-                }
-            if rtype == "NS":
-                return rtype, sorted(str(r).rstrip(".") for r in answers)
-            if rtype == "TXT":
-                return rtype, [
-                    b"".join(r.strings).decode("utf-8", errors="replace")
-                    for r in answers
-                ]
-            return rtype, [str(r) for r in answers]
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-            return rtype, []
-        except dns.exception.DNSException as exc:
-            return rtype, {"error": str(exc)}
-
-    rtypes = _DNS_RECORD_TYPES
-    with ThreadPoolExecutor(max_workers=len(rtypes)) as ex:
-        return dict(ex.map(_resolve, rtypes))
 
 
-def get_ptr(ip: str) -> str | None:
-    try:
-        resolver = _build_sync_resolver(timeout=5, lifetime=5)
-        rev = dns.reversename.from_address(ip)
-        answers = resolver.resolve(rev, "PTR", lifetime=5)
-        return str(answers[0]).rstrip(".")
-    except Exception:
-        return None
 
 
 def attempt_zone_transfer(domain: str, nameservers: list[str]) -> list[str]:
@@ -584,131 +500,12 @@ def _certspotter_to_crt_sh_entries(issuances: list) -> list[dict]:
     return entries
 
 
-def certspotter_data(domain: str) -> dict:
-    """
-    Query Cert Spotter for certificate transparency data — the fallback used
-    when crt.sh fails, times out, or rate-limits. Paginates via the `after`
-    parameter until an empty page is returned. Same return shape as
-    crt_sh_data().
-    """
-    issuances: list = []
-    after: str | None = None
-    try:
-        for _ in range(CERTSPOTTER_MAX_PAGES):
-            resp = requests.get(
-                CERTSPOTTER_API_URL,
-                params=_certspotter_params(domain, after),
-                headers=_certspotter_headers(),
-                timeout=20,
-                **requests_kwargs(),
-            )
-            if resp.status_code != 200:
-                if issuances:
-                    break  # keep the pages we already collected
-                log(f"Cert Spotter HTTP {resp.status_code}")
-                return dict(_CRT_SH_EMPTY)
-            page = resp.json()
-            if not isinstance(page, list) or not page:
-                break
-            issuances.extend(page)
-            last_id = page[-1].get("id") if isinstance(page[-1], Mapping) else None
-            if not last_id:
-                break
-            after = str(last_id)
-    except Exception as exc:
-        if not issuances:
-            log(f"Cert Spotter failed: {exc}")
-            return dict(_CRT_SH_EMPTY)
-    result = _parse_crt_sh_entries(_certspotter_to_crt_sh_entries(issuances), domain)
-    result["ct_source"] = "certspotter"
-    return result
 
 
-def crt_sh_data(domain: str) -> dict:
-    """
-    Query crt.sh for full certificate transparency data.
-
-    Returns subdomains, cert metadata, and cross-domain SANs — names that appear
-    in the same certificate as the target domain but belong to a different domain.
-    Cross-domain SANs are a strong signal for shared hosting / origin server
-    infrastructure that may not be visible via reverse-IP lookups.
-
-    Falls back to Cert Spotter when crt.sh errors, times out, or rate-limits.
-    A legitimate empty (zero-cert) crt.sh response does NOT trigger the fallback.
-    """
-    try:
-        resp = requests.get(
-            "https://crt.sh/",
-            params={"q": domain, "output": "json"},
-            timeout=20,
-            headers={"Accept": "application/json"},
-            **requests_kwargs(),
-        )
-        if resp.status_code != 200:
-            log(f"crt.sh HTTP {resp.status_code} — falling back to Cert Spotter")
-            return certspotter_data(domain)
-        result = _parse_crt_sh_entries(resp.json(), domain)
-        result["ct_source"] = "crt.sh"
-        return result
-    except Exception as exc:
-        log(f"crt.sh failed ({exc}) — falling back to Cert Spotter")
-        return certspotter_data(domain)
 
 
 # ── Historical / Passive DNS via CIRCL ────────────────────────────────────────
 
-def circl_passive_dns(domain: str) -> dict:
-    """
-    Query CIRCL Passive DNS (pdns.circl.lu) for historical DNS records.
-
-    Returns historical A/AAAA records with first-seen / last-seen timestamps.
-    IPs that pre-date the current Cloudflare records may be the true origin servers.
-    No API key required.
-    """
-    result: dict = {"records": [], "unique_historical_ips": []}
-    try:
-        resp = requests.get(
-            f"https://www.circl.lu/pdns/query/{domain}",
-            timeout=15,
-            headers={"Accept": "application/json"},
-            **requests_kwargs(),
-        )
-        if resp.status_code != 200:
-            return result
-
-        records: list[dict] = []
-        seen_ips: set[str] = set()
-
-        # Response is newline-delimited JSON
-        for line in resp.text.strip().splitlines():
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(entry, Mapping):
-                continue
-
-            rrtype = entry.get("rrtype", "")
-            rdata  = entry.get("rdata", "")
-
-            records.append({
-                "rrtype":     rrtype,
-                "rdata":      rdata,
-                "first_seen": entry.get("time_first_ms") or entry.get("time_first"),
-                "last_seen":  entry.get("time_last_ms")  or entry.get("time_last"),
-                "count":      entry.get("count"),
-            })
-
-            if rrtype in ("A", "AAAA") and rdata:
-                seen_ips.add(rdata)
-
-        result["records"]               = records
-        result["unique_historical_ips"] = sorted(seen_ips)
-
-    except Exception:
-        pass
-
-    return result
 
 
 # ── Subdomain origin probe ────────────────────────────────────────────────────
@@ -777,7 +574,22 @@ def probe_wordlist_subdomains(domain: str) -> list[dict]:
         ]
 
     leaks: list[dict] = []
-    with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+    # Bounded, not one thread per word. This was `max_workers=len(candidates)`,
+    # which for the 322-entry wordlist meant 322 concurrent DNS queries per
+    # domain — and with ANALYSIS_WORKERS concurrent targets, ~3,900 in flight at
+    # once against the public resolvers in IP_INTEL_DNS_RESOLVERS.
+    #
+    # That is well past where 1.1.1.1/8.8.8.8 start dropping traffic, and a
+    # dropped query does not fail fast: it costs a full resolver timeout. So the
+    # unbounded pool was not buying speed, it was converting a rate-limit into
+    # seconds of dead wall-clock, and dragging every other DNS-using step in the
+    # concurrent parity block down with it (origin candidates measured 5.1s
+    # alone, 19.7s alongside).
+    #
+    # 24 keeps this step's own latency flat (322 lookups in ~14 rounds) while
+    # leaving resolver headroom for the rest of the scan.
+    workers = min(len(candidates), _WORDLIST_PROBE_WORKERS) or 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         for hits in ex.map(_check, candidates):
             leaks.extend(hits)
 
@@ -830,92 +642,26 @@ def _select_wordlist_followup_targets(wordlist_hits: list[dict], *, limit: int =
 
 # ── SPF ip4 extraction ────────────────────────────────────────────────────────
 
-def extract_spf_origins(txt_records: list) -> list[dict]:
-    """
-    Parse SPF TXT records and extract ip4:/ip6: directives as origin candidates.
-    No extra network call — operates on already-fetched TXT records.
-    """
-    return collect_spf_details("__seed__", txt_records).get("origins", [])
 
 
 # ── HackerTarget host search ──────────────────────────────────────────────────
 
-def hackertarget_host_search(domain: str) -> list[dict]:
-    """
-    Query HackerTarget hostsearch for subdomains and their IPs.
-    Different from reverse-IP lookup — this goes domain → subdomains+IPs
-    and surfaces non-Cloudflare addresses directly.
-    """
-    try:
-        resp = requests.get(
-            "https://api.hackertarget.com/hostsearch/",
-            params={"q": domain},
-            timeout=15,
-            **requests_kwargs(),
-        )
-        if resp.status_code != 200:
-            return []
-        text = resp.text.strip()
-        if "error" in text.lower() or "API count" in text:
-            return []
-        results: list[dict] = []
-        for line in text.splitlines():
-            parts = line.strip().split(",")
-            if len(parts) == 2:
-                subdomain, ip = parts[0].strip(), parts[1].strip()
-                if ip:
-                    results.append({
-                        "subdomain": subdomain,
-                        "ip":        ip,
-                        "cf":        is_cloudflare_ip(ip),
-                        "source":    "HackerTarget hostsearch",
-                    })
-        return results
-    except Exception:
-        return []
 
 
 # ── urlscan.io historical IPs ─────────────────────────────────────────────────
 
-def urlscan_historical_ips(domain: str) -> list[dict]:
-    """
-    Query urlscan.io for historical scan results and extract IPs seen serving
-    the domain. Pre-Cloudflare snapshots often reveal the real origin IP.
-    No API key required for basic search.
-    """
-    try:
-        resp = requests.get(
-            "https://urlscan.io/api/v1/search/",
-            params={"q": f"domain:{domain}", "size": "100"},
-            timeout=15,
-            headers={"User-Agent": "ip-intel/1.0 (OSINT research)"},
-            **requests_kwargs(),
-        )
-        if resp.status_code != 200:
-            return []
-        seen: set[str] = set()
-        results: list[dict] = []
-        for hit in resp.json().get("results", []):
-            ip   = hit.get("page", {}).get("ip", "")
-            date = hit.get("task", {}).get("time", "")[:10]
-            if ip and ip not in seen:
-                seen.add(ip)
-                results.append({
-                    "ip":     ip,
-                    "date":   date,
-                    "url":    hit.get("page", {}).get("url", ""),
-                    "cf":     is_cloudflare_ip(ip),
-                    "source": "urlscan.io",
-                })
-        return results
-    except Exception:
-        return []
 
 
 # ── Censys cert search ────────────────────────────────────────────────────────
 
-# Safety caps so a popular cert can't make a single run paginate forever.
-_CENSYS_SEARCH_MAX_PAGES   = 10   # 10 * 100 = up to 1000 current hosts
+# Cost caps. Censys bills 1 credit for a search and 1 more for *every additional
+# page of 100 results*, so page count is the credit count: one page, one credit,
+# up to 100 hosts. This was 10 (up to 1000 hosts, up to 10 credits) — the extra
+# nine pages are hosts serving a cert naming the domain, which past the first
+# hundred are overwhelmingly shared-CDN edges rather than origins. The response
+# still reports `total_hits`, so a domain whose cert is on more than 100 hosts is
+# visible as such without paying to enumerate them.
+_CENSYS_SEARCH_MAX_PAGES   = 1    # 1 * 100 = up to 100 current hosts, 1 credit
 _CENSYS_HISTORY_MAX_CERTS  = 5    # distinct leaf certs to pull history for
 _CENSYS_HISTORY_MAX_PAGES  = 5    # history pages per cert (100 ranges each)
 
@@ -936,33 +682,83 @@ def _as_dict(obj) -> dict:
     return {}
 
 
+def _service_key(svc: dict) -> tuple[int | None, str]:
+    """The (port, transport) identity shared by a host service and a
+    `matched_services` entry, so the two can be lined up.
+
+    transport_protocol may arrive as a ServiceTransportProtocol enum whose
+    str() is the member name ("ServiceTransportProtocol.TCP"); use its .value
+    ("tcp") when present."""
+    proto = svc.get("transport_protocol") or ""
+    proto = getattr(proto, "value", proto)
+    port  = svc.get("port")
+    return (port if isinstance(port, int) else None), str(proto).lower()
+
+
 def _censys_parse_host_hit(hit) -> tuple[dict | None, str | None]:
     """Turn one search hit into our normalized host entry and pull the leaf
-    cert fingerprint (presented_chain[0]) so we can pivot on cert history."""
-    host = (_as_dict(hit).get("host_v1") or {}).get("resource") or {}
-    ip   = host.get("ip")
+    cert fingerprint of the service that actually matched the query.
+
+    `host_v1.matched_services` (SDK model HostAssetWithMatchedServices) is the
+    API telling us which of the host's services matched — i.e. which one serves
+    a cert naming the domain we asked about. It carries only
+    {port, protocol, transport_protocol} and no cert, so it is used as a
+    selector into `host_v1.resource.services` rather than as the fingerprint
+    source itself.
+
+    This matters on shared hosting: a host can run dozens of services for
+    dozens of tenants, and taking the first cert-bearing one frequently picks
+    a *different* tenant's certificate — which the cert-history pivot then
+    spends 25 credits chasing for infrastructure that was never ours.
+    """
+    host_v1 = _as_dict(hit).get("host_v1") or {}
+    host    = host_v1.get("resource") or {}
+    ip      = host.get("ip")
     if not ip:
         return None, None
 
     asn_block = host.get("autonomous_system") or {}
     loc_block = host.get("location") or {}
 
+    matched_keys = [_service_key(svc) for svc in (host_v1.get("matched_services") or [])]
+
+    def _matches_query(key: tuple[int | None, str]) -> bool:
+        port, proto = key
+        # Transport is only compared when both sides report one: a service and
+        # its matched_services entry always agree on port, but either side can
+        # come back with an empty transport_protocol.
+        return any(
+            port is not None and port == m_port and (not proto or not m_proto or proto == m_proto)
+            for m_port, m_proto in matched_keys
+        )
+
     services: list[str] = []
-    fingerprint: str | None = None
+    matched_fingerprint: str | None = None
+    first_fingerprint: str | None = None
     for svc in (host.get("services") or []):
-        port  = svc.get("port")
-        # transport_protocol may arrive as a ServiceTransportProtocol enum
-        # whose str() is the member name ("ServiceTransportProtocol.TCP");
-        # use its .value ("tcp") when present.
-        proto = svc.get("transport_protocol") or ""
-        proto = getattr(proto, "value", proto)
+        key = _service_key(svc)
+        port, proto = key
         if port:
-            services.append(f"{port}/{str(proto).lower()}")
-        if fingerprint is None:
-            # The served leaf cert lives under svc["cert"]; presented_chain[0]
-            # is frequently the issuing intermediate, so pivot cert history on
-            # the leaf fingerprint instead.
-            fingerprint = (svc.get("cert") or {}).get("fingerprint_sha256")
+            services.append(f"{port}/{proto}")
+        # The served leaf cert lives under svc["cert"]; presented_chain[0]
+        # is frequently the issuing intermediate, so pivot cert history on
+        # the leaf fingerprint instead.
+        fp = (svc.get("cert") or {}).get("fingerprint_sha256")
+        if not fp:
+            continue
+        if first_fingerprint is None:
+            first_fingerprint = fp
+        if matched_fingerprint is None and _matches_query(key):
+            matched_fingerprint = fp
+
+    # Fall back to the first cert-bearing service only when the response
+    # carried no matched_services at all — older API versions omit it, and the
+    # SDK documents that a `fields` selection dropping
+    # host.services.port/transport_protocol/protocol suppresses it too. When
+    # the field *is* present but none of the matched services carried a cert,
+    # we deliberately return no fingerprint rather than guess: a wrong
+    # fingerprint costs 25 credits of history pivot on someone else's host.
+    fingerprint = matched_fingerprint if matched_keys else first_fingerprint
 
     entry = {
         "ip":         ip,
@@ -971,6 +767,21 @@ def _censys_parse_host_hit(hit) -> tuple[dict | None, str | None]:
         "asn_name":   asn_block.get("description") or asn_block.get("name"),
         "country":    loc_block.get("country_code"),
         "services":   services,
+        # The leaf fingerprint is kept on the hit, not just returned for the
+        # history pivot. It used to be discarded whenever CENSYS_CERT_HISTORY
+        # was off — which is the default and the only sane setting for a Core
+        # account — throwing away the most valuable thing in the response.
+        #
+        # A shared TLS fingerprint is the strongest correlation signal the
+        # system has (utils/pairwise.py scores it 100, "near-identity"), and
+        # until now the only source of one was `tls_certs.probes`: our own
+        # socket probes, capped at IP_PROBE_LIMIT and limited to hosts that
+        # actually answer on the ports we try. This response carries leaf
+        # fingerprints for up to 100 hosts, already paid for, including hosts
+        # we cannot reach. Censys host *enrichment* returns no cert data at all
+        # (see utils/censys_enrichment.normalize_host_enrichment), so there is
+        # no free path to this and nothing here overlaps it.
+        "cert_fingerprint_sha256": fingerprint,
     }
     return entry, fingerprint
 
@@ -1023,17 +834,38 @@ def _censys_cert_history(sdk, fingerprints: list[str]) -> list[dict]:
     return history
 
 
-def censys_cert_search(domain: str, *, include_history: bool = True) -> dict:
+def _censys_history_enabled() -> bool:
+    """Whether the cert-history pivot is switched on for this run.
+
+    Off unless CENSYS_CERT_HISTORY is set, because the pivot dominates the
+    Censys bill: _CENSYS_HISTORY_MAX_CERTS × _CENSYS_HISTORY_MAX_PAGES × 5
+    credits = up to 125 of the ~135 credits a single seed domain spends, and it
+    needs the Enterprise Adversary Investigation entitlement that most accounts
+    (including every Starter/Core one) lack — so on a typical account it burns
+    the run's whole budget only to record per-cert entitlement errors. The free
+    CIRCL passive-DNS source already covers much of the same "IPs that used to
+    serve this domain" ground at zero cost.
+    """
+    return os.environ.get("CENSYS_CERT_HISTORY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def censys_cert_search(domain: str, *, include_history: bool | None = None) -> dict:
     """
     Search Censys Platform for hosts currently serving a TLS cert whose CN
     matches the target domain. Any result that isn't a Cloudflare IP is a
     candidate origin server.
 
     Paginates the current-state host search (up to _CENSYS_SEARCH_MAX_PAGES)
-    and, when ``include_history`` is set, pivots each distinct leaf cert
-    through the threat-hunting host-observation endpoint to recover historical
-    origins. Historical IPs that aren't Cloudflare and aren't already in the
-    current hits are folded into ``origin_candidates``.
+    and, when cert history is enabled, pivots each distinct leaf cert through
+    the threat-hunting host-observation endpoint to recover historical origins.
+    Historical IPs that aren't Cloudflare and aren't already in the current
+    hits are folded into ``origin_candidates``.
+
+    ``include_history`` defaults to ``None``, meaning "ask the environment"
+    (CENSYS_CERT_HISTORY — see _censys_history_enabled); pass ``True``/``False``
+    to force it for one call. It is **off** by default: the pivot is up to 125
+    of the ~135 credits per seed domain and needs an entitlement most accounts
+    don't have.
 
     Requires a Censys Starter tier or higher for the search API; cert history
     additionally needs the Enterprise Adversary Investigation entitlement.
@@ -1042,7 +874,11 @@ def censys_cert_search(domain: str, *, include_history: bool = True) -> dict:
     Add to .env:
         CENSYS_API_KEY=<personal-access-token>
         CENSYS_ORG_ID=<organization-id>
+        CENSYS_CERT_HISTORY=1        # opt in to the cert-history pivot
     """
+    if include_history is None:
+        include_history = _censys_history_enabled()
+
     api_key = os.environ.get("CENSYS_API_KEY")
     org_id  = os.environ.get("CENSYS_ORG_ID")
 
@@ -1120,99 +956,10 @@ def censys_cert_search(domain: str, *, include_history: bool = True) -> dict:
 
 # ── Shodan cert search ───────────────────────────────────────────────────────
 
-def shodan_cert_search(domain: str) -> dict:
-    """
-    Search Shodan for hosts whose TLS banner matches the target domain using
-    the ssl:"domain" filter. Returns all hits with ASN, org, country, and open
-    ports. Any non-Cloudflare result is a candidate origin server.
-
-    Requires a free Shodan account — add to .env:
-        SHODAN_API_KEY=<your-api-key>
-    """
-    api_key = os.environ.get("SHODAN_API_KEY")
-    if not api_key:
-        return {"skipped": True, "reason": "SHODAN_API_KEY not set in .env"}
-
-    import shodan
-
-    result: dict = {"hits": [], "origin_candidates": []}
-    try:
-        api = shodan.Shodan(api_key)
-        resp = api.search(f'ssl:"{domain}"', minify=False)
-
-        for match in _iter_mapping_items(resp.get("matches", [])):
-            ip = match.get("ip_str")
-            if not ip:
-                continue
-
-            loc = match.get("location", {}) if isinstance(match.get("location"), Mapping) else {}
-            entry = {
-                "ip":         ip,
-                "cloudflare": is_cloudflare_ip(ip),
-                "asn":        match.get("asn"),
-                "org":        match.get("org"),
-                "country":    loc.get("country_code"),
-                "ports":      match.get("ports", []),
-                "hostnames":  match.get("hostnames", []),
-            }
-            result["hits"].append(entry)
-            if not entry["cloudflare"]:
-                result["origin_candidates"].append(entry)
-
-        result["total"] = resp.get("total", len(result["hits"]))
-
-    except Exception as exc:
-        result["error"] = str(exc)
-
-    return result
 
 
 # ── Netlas cert search ───────────────────────────────────────────────────────
 
-def netlas_cert_search(domain: str) -> dict:
-    """
-    Search Netlas for hosts whose TLS response includes a cert with the target
-    domain as the CN. Netlas has a free tier (~50 queries/day, no credit card).
-
-    Requires a free Netlas account — add to .env:
-        NETLAS_KEY=<your-api-key>
-    """
-    api_key = os.environ.get("NETLAS_KEY") or os.environ.get("NETLAS_API_KEY")
-    if not api_key:
-        return {"skipped": True, "reason": "NETLAS_KEY not set in .env"}
-
-    import netlas
-
-    result: dict = {"hits": [], "origin_candidates": []}
-    try:
-        conn  = netlas.Netlas(api_key=api_key)
-        query = f'certificate.subject.common_name:"{domain}"'
-        resp  = conn.query(query=query, datatype="response", page=0)
-
-        for item in _iter_mapping_items((resp or {}).get("items", [])):
-            data = item.get("data", {})
-            if not isinstance(data, Mapping):
-                continue
-            ip   = data.get("ip")
-            if not ip:
-                continue
-
-            entry = {
-                "ip":         ip,
-                "cloudflare": is_cloudflare_ip(ip),
-                "port":       data.get("port"),
-                "protocol":   data.get("protocol"),
-                "asn":        data.get("asn", {}).get("asn") if isinstance(data.get("asn"), dict) else data.get("asn"),
-                "org":        data.get("asn", {}).get("org")  if isinstance(data.get("asn"), dict) else None,
-                "country":    data.get("geo", {}).get("country") if isinstance(data.get("geo"), dict) else None,
-            }
-            result["hits"].append(entry)
-            if not entry["cloudflare"]:
-                result["origin_candidates"].append(entry)
-    except Exception as exc:
-        result["error"] = str(exc)
-
-    return result
 
 
 # ── Targeted origin scan ─────────────────────────────────────────────────────
@@ -1362,22 +1109,6 @@ def _parse_tls_cert(der: bytes, ip: str, port: int, domain: str) -> dict | None:
     }
 
 
-def grab_tls_cert(
-    ip: str,
-    sni: str | None = None,
-    port: int = 443,
-    timeout: float = 5.0,
-) -> dict | None:
-    """
-    Grab a TLS certificate directly from ip:port without hostname verification.
-
-    sni is used as the TLS SNI / server_hostname hint.  When None the IP itself
-    is used as the hostname so at least SNI is attempted even without a domain.
-
-    Returns a dict with full cert metadata, or None if the connection fails
-    or the peer presents no certificate.
-    """
-    return fetch_tls_certificate(ip, sni=sni, port=port, timeout=timeout)
 
 
 async def _tcp_open_async(ip: str, port: int, timeout: float) -> bool:
@@ -1770,111 +1501,16 @@ def targeted_country_scan(
 
 # ── Reverse IP via hackertarget ───────────────────────────────────────────────
 
-def hackertarget_reverse_ip(ip: str) -> list[str]:
-    try:
-        resp = requests.get(
-            "https://api.hackertarget.com/reverseiplookup/",
-            params={"q": ip},
-            timeout=15,
-            **requests_kwargs(),
-        )
-        if resp.status_code != 200:
-            return []
-        text = resp.text.strip()
-        if "error" in text.lower() or "API count" in text:
-            return []
-        return [line.strip() for line in text.splitlines() if line.strip()]
-    except Exception:
-        return []
 
 
 # ── WHOIS ─────────────────────────────────────────────────────────────────────
 
-def get_domain_whois(domain: str) -> dict:
-    """Domain WHOIS lookup.
-
-    Captures every field the TLD-specific parser extracted -- registrant/
-    admin/tech name, org, address, city, state, postal code, phone/email
-    when the registry exposes them, not just the handful of summary fields
-    kept previously -- plus the full raw response text under "raw".
-    db/intel_db.py's whois_data table and identifier extraction read a few
-    of these by their historical names (expiry_date, nameservers), so those
-    stay aliased for backward compatibility.
-    """
-    try:
-        w = whois.whois(domain)
-
-        def _fmt(v):
-            if v is None:
-                return None
-            if isinstance(v, list):
-                seen = []
-                for item in v:
-                    s = str(item)
-                    if s not in seen:
-                        seen.append(s)
-                return seen
-            return str(v)
-
-        result = {key: _fmt(value) for key, value in dict(w).items()}
-        result["expiry_date"] = _fmt(w.expiration_date)
-        result["nameservers"] = _fmt(w.name_servers)
-        result["raw"] = getattr(w, "text", None)
-        return result
-    except Exception as exc:
-        return {"error": str(exc)}
 
 
-def get_ip_whois(ip: str) -> dict:
-    """ASN/network lookup for a bare IP: RDAP via ipwhois for network_name/
-    network_cidr/asn_cidr, with ipinfo Lite as the primary source for
-    asn/asn_description/asn_country (see merge_ipinfo_lite) — RDAP remains
-    the sole source for those fields only when ipinfo Lite is unavailable."""
-    try:
-        obj = IPWhois(ip)
-        result = obj.lookup_rdap(depth=1)
-        net = result.get("network", {})
-        asn_info = {
-            "asn":             result.get("asn"),
-            "asn_description": result.get("asn_description"),
-            "asn_country":     result.get("asn_country_code"),
-            "asn_cidr":        result.get("asn_cidr"),
-            "asn_registry":    result.get("asn_registry"),
-            "network_name":    net.get("name"),
-            "network_cidr":    net.get("cidr"),
-            "network_country": net.get("country"),
-        }
-    except IPDefinedError:
-        return {"error": "Private/reserved IP address — no public WHOIS"}
-    except Exception as exc:
-        asn_info = {"error": str(exc)}
-    return merge_ipinfo_lite(asn_info, ip)
 
 
 # ── Per-IP enrichment (used for IPs resolved from a domain) ───────────────────
 
-def enrich_ip(ip: str) -> dict:
-    cf = is_cloudflare_ip(ip)
-
-    ptr = get_ptr(ip)
-
-    if cf:
-        asn_info = {"asn_description": "Cloudflare, Inc.", "asn_country": "US", "note": "Cloudflare anycast — RDAP skipped"}
-        other_domains = []
-    else:
-        asn_info = get_ip_whois(ip)
-        other_domains = hackertarget_reverse_ip(ip)
-
-    proxy_details = detect_proxy_details(ip, ptr, asn_info)
-
-    return {
-        "ptr":                 ptr,
-        "cloudflare":          cf,
-        "asn_info":            asn_info,
-        "other_domains_on_ip": other_domains,
-        "proxy_family":        proxy_details.get("proxy_family"),
-        "proxy_confidence":    proxy_details.get("proxy_confidence"),
-    }
 
 
 # ── Page metadata / FIMI signals ─────────────────────────────────────────────
@@ -1902,100 +1538,10 @@ _SOCIAL_DEFS = [
 _SOCIAL_NOISE = {"", "home", "login", "signup", "help", "support", "about", "contact"}
 
 
-def _process_page_html(html: str) -> dict:
-    """Pure extraction of FIMI signals from raw HTML — no I/O."""
-    out: dict = {
-        "google_analytics": [],
-        "gtm_ids":          [],
-        "facebook_pixel":   [],
-        "tiktok_pixel":     [],
-        "yandex_metrika":   [],
-        "html_lang":        None,
-        "cms_generator":    None,
-        "social_links":     {},
-        "social_handles":   {},
-        "adsense_publisher_ids": [],
-        "fb_app_id":        [],
-        "twitter_site":     [],
-        "twitter_creator":  [],
-        "authors":          [],
-        "rel_me":           [],
-        "homepage_html_hash": None,
-        "meta_tags":        {},
-        "script_assets":    [],
-        "bundler_hints":    [],
-    }
-    if not html:
-        return out
-
-    m = re.search(r'<html[^>]+\blang=["\']([^"\']{2,10})["\']', html, re.I)
-    if m:
-        out["html_lang"] = m.group(1).lower()
-
-    ga = re.findall(r'\b(UA-\d{4,12}-\d{1,3}|G-[A-Z0-9]{6,12}|AW-[0-9]{8,12})\b', html)
-    out["google_analytics"] = sorted(set(ga))
-
-    gtm = re.findall(r'\b(GTM-[A-Z0-9]{4,8})\b', html)
-    out["gtm_ids"] = sorted(set(gtm))
-
-    fb = re.findall(r'fbq\(["\']init["\'],\s*["\'](\d{10,20})["\']', html)
-    out["facebook_pixel"] = sorted(set(fb))
-
-    tt = re.findall(r'ttq\.load\(["\']([A-Z0-9]{15,25})["\']', html)
-    out["tiktok_pixel"] = sorted(set(tt))
-
-    ym  = re.findall(r'\bym\((\d{5,12})\s*,', html)
-    ym2 = re.findall(r'metrika\.yandex\.(?:com|ru)/watch/(\d{5,12})', html)
-    out["yandex_metrika"] = sorted(set(ym + ym2))
-
-    cm = re.search(
-        r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']'
-        r'|<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']generator["\']',
-        html, re.I,
-    )
-    if cm:
-        out["cms_generator"] = (cm.group(1) or cm.group(2) or "").strip()
-
-    social_links: dict[str, list[str]] = {}
-    social_handles: dict[str, list[str]] = {}
-    for key, pattern in _SOCIAL_DEFS:
-        for m2 in re.finditer(pattern, html, re.I):
-            full_url = m2.group(0).rstrip("/?")
-            handle   = m2.group(1).rstrip("/?")
-            if handle.lower() in _SOCIAL_NOISE:
-                continue
-            social_links.setdefault(key, [])
-            if full_url not in social_links[key]:
-                social_links[key].append(full_url)
-            social_handles.setdefault(key, [])
-            if handle not in social_handles[key]:
-                social_handles[key].append(handle)
-
-    out["social_links"]   = {k: sorted(set(v)) for k, v in social_links.items()}
-    out["social_handles"] = {k: sorted(set(v)) for k, v in social_handles.items()}
-    out.update(extract_page_enrichment(html))
-    return out
 
 
-def fetch_page_metadata(domain: str, save_favicon_as: Path | None = None) -> dict:
-    """
-    Fetch the domain homepage and extract FIMI-relevant signals:
-    Google Analytics / GTM / Facebook Pixel / TikTok Pixel / Yandex.Metrika IDs,
-    HTML lang attribute, CMS generator, social links + handles, and favicon MD5.
-    """
-    async def _run() -> dict:
-        async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True, **httpx_kwargs()) as client:
-            return await _afetch_page_metadata(domain, client, save_favicon_as)
-
-    return asyncio.run(_run())
 
 
-def get_dmarc_dkim(domain: str) -> dict:
-    """
-    Look up DMARC policy and DKIM public keys for common selectors.
-    Useful for attributing operators via mail infrastructure.
-    """
-    return get_email_security_records(domain)
 
 
 # ── Main analysis functions ───────────────────────────────────────────────────
@@ -2005,37 +1551,8 @@ def get_dmarc_dkim(domain: str) -> dict:
 _HTTPX_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
 
 
-async def _aget_dns_records(domain: str) -> dict:
-    """True-async DNS resolution using dns.asyncresolver (no threads)."""
-    try:
-        resolver = _build_async_resolver(timeout=5, lifetime=10)
-    except Exception as exc:
-        return _empty_dns_records(str(exc))
-
-    async def _resolve(rtype: str):
-        try:
-            answers = await resolver.resolve(domain, rtype)
-            if rtype == "MX":
-                return rtype, [{"preference": r.preference, "exchange": str(r.exchange).rstrip(".")} for r in answers]
-            if rtype == "SOA":
-                r = answers[0]
-                return rtype, {"mname": str(r.mname).rstrip("."), "rname": str(r.rname).rstrip("."), "serial": int(r.serial), "refresh": int(r.refresh), "retry": int(r.retry), "expire": int(r.expire), "minimum": int(r.minimum)}
-            if rtype == "NS":
-                return rtype, sorted(str(r).rstrip(".") for r in answers)
-            if rtype == "TXT":
-                return rtype, [b"".join(r.strings).decode("utf-8", errors="replace") for r in answers]
-            return rtype, [str(r) for r in answers]
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-            return rtype, []
-        except dns.exception.DNSException as exc:
-            return rtype, {"error": str(exc)}
-
-    pairs = await asyncio.gather(*[_resolve(rt) for rt in _DNS_RECORD_TYPES])
-    return dict(pairs)
 
 
-async def _aget_dmarc_dkim(domain: str) -> dict:
-    return await aget_email_security_records(domain)
 
 
 _CRT_SH_FAILED = {**_CRT_SH_EMPTY, "_failed": True}
@@ -2091,85 +1608,22 @@ async def _acrt_sh_data(domain: str, client: httpx.AsyncClient) -> dict:
         return await _acertspotter_data(domain, client)
 
 
-async def _acircl_passive_dns(domain: str, client: httpx.AsyncClient) -> dict:
-    result: dict = {"records": [], "unique_historical_ips": []}
-    try:
-        resp = await client.get(f"https://www.circl.lu/pdns/query/{domain}", headers={"Accept": "application/json"}, timeout=15.0)
-        if resp.status_code != 200:
-            return result
-        records: list[dict] = []
-        seen_ips: set[str] = set()
-        for line in resp.text.strip().splitlines():
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rrtype = entry.get("rrtype", "")
-            rdata  = entry.get("rdata", "")
-            records.append({"rrtype": rrtype, "rdata": rdata, "first_seen": entry.get("time_first_ms") or entry.get("time_first"), "last_seen": entry.get("time_last_ms") or entry.get("time_last"), "count": entry.get("count")})
-            if rrtype in ("A", "AAAA") and rdata:
-                seen_ips.add(rdata)
-        result["records"]               = records
-        result["unique_historical_ips"] = sorted(seen_ips)
-    except Exception:
-        pass
-    return result
 
 
-async def _ahackertarget_host_search(domain: str, client: httpx.AsyncClient) -> list:
-    try:
-        resp = await client.get("https://api.hackertarget.com/hostsearch/", params={"q": domain}, timeout=15.0)
-        if resp.status_code != 200:
-            return []
-        text = resp.text.strip()
-        if "error" in text.lower() or "API count" in text:
-            return []
-        results: list[dict] = []
-        for line in text.splitlines():
-            parts = line.strip().split(",")
-            if len(parts) == 2:
-                subdomain, ip = parts[0].strip(), parts[1].strip()
-                if ip:
-                    results.append({"subdomain": subdomain, "ip": ip, "cf": is_cloudflare_ip(ip), "source": "HackerTarget hostsearch"})
-        return results
-    except Exception:
-        return []
 
 
 _RATE_LIMITED = "__rate_limited__"
 
-async def _run_serial_urlscan(coro):
-    try:
-        await asyncio.to_thread(_URLSCAN_GATE.acquire)
-    except asyncio.CancelledError:
-        coro.close()
-        raise
-    try:
-        return await coro
-    finally:
-        _URLSCAN_GATE.release()
 
 
-async def _aurlscan_historical_ips(domain: str, client: httpx.AsyncClient) -> list:
-    try:
-        resp = await client.get("https://urlscan.io/api/v1/search/", params={"q": f"domain:{domain}", "size": "100"}, timeout=15.0)
-        if resp.status_code == 429:
-            return [{"_error": _RATE_LIMITED, "source": "urlscan"}]
-        if resp.status_code != 200:
-            return []
-        seen: set[str] = set()
-        results: list[dict] = []
-        for hit in _iter_mapping_items(resp.json().get("results", [])):
-            ip   = hit.get("page", {}).get("ip", "")
-            date = hit.get("task", {}).get("time", "")[:10]
-            if ip and ip not in seen:
-                seen.add(ip)
-                results.append({"ip": ip, "date": date, "url": hit.get("page", {}).get("url", ""), "cf": is_cloudflare_ip(ip), "source": "urlscan.io"})
-        return results
-    except Exception:
-        return []
 
 
+# Anchored to specific Google/Meta/Yandex endpoints, so unlike GA_PROPERTY_RE
+# these do not need a strict boundary or an exact ID length to be safe — an
+# `id=` inside `googletagmanager.com/gtag/js` is a measurement ID by
+# construction. The length bounds stay deliberately loose here so a real ID
+# that does not happen to be 10 characters is still captured from a URL where
+# it cannot be anything else.
 _URLSCAN_ANALYTICS_PATTERNS: list[tuple[str, re.Pattern]] = [
     # GA4 gtag loader URL:  /gtag/js?id=G-XXXXXX
     ("ga",             re.compile(r'googletagmanager\.com/gtag/js\?id=(G-[A-Z0-9]{6,12})')),
@@ -2197,829 +1651,17 @@ _URLSCAN_ANALYTICS_KEY_MAP = {
 }
 
 
-async def _aurlscan_fetch_analytics(domain: str, client: httpx.AsyncClient) -> dict:
-    """
-    Pull analytics / tracking IDs from the most recent urlscan.io result for
-    this domain by:
-      1. Searching for the latest scan UUID
-      2. Fetching the full result JSON and parsing every request URL
-      3. Fetching the rendered DOM HTML and running the same regex extraction
 
-    Returns a dict with the same keys as page_metadata tracking fields.
-    An empty dict is returned on any failure or rate-limit.
-    """
-    out: dict[str, list[str]] = {v: [] for v in _URLSCAN_ANALYTICS_KEY_MAP.values()}
 
-    try:
-        # Step 1 — find the most recent scan for this domain
-        search_resp = await client.get(
-            "https://urlscan.io/api/v1/search/",
-            params={"q": f"domain:{domain}", "size": "5"},
-            timeout=15.0,
-        )
-        if search_resp.status_code == 429:
-            return out
-        if search_resp.status_code != 200:
-            return out
 
-        results = search_resp.json().get("results", [])
-        if not results:
-            return out
 
-        # Take the most recent scan that has a result URL
-        uuid = None
-        for hit in _iter_mapping_items(results):
-            uid = hit.get("task", {}).get("uuid") or hit.get("_id")
-            if uid:
-                uuid = uid
-                break
-        if not uuid:
-            return out
 
-        found: dict[str, set[str]] = {v: set() for v in _URLSCAN_ANALYTICS_KEY_MAP.values()}
 
-        # Step 2 — fetch the full result JSON, parse request URLs
-        result_resp = await client.get(
-            f"https://urlscan.io/api/v1/result/{uuid}/",
-            timeout=20.0,
-        )
-        if result_resp.status_code == 200:
-            result_json = result_resp.json()
-            requests_list = result_json.get("data", {}).get("requests", [])
-            for req_entry in _iter_mapping_items(requests_list):
-                nested_requests = req_entry.get("requests")
-                nested_request = None
-                if isinstance(nested_requests, list) and nested_requests:
-                    first_nested = nested_requests[0]
-                    if isinstance(first_nested, Mapping):
-                        nested_request = first_nested.get("request", {})
-                url = (
-                    req_entry.get("request", {}).get("url")
-                    or nested_request.get("url", "")
-                    if isinstance(nested_request, Mapping)
-                    else req_entry.get("request", {}).get("url", "")
-                )
-                if not url:
-                    continue
-                for id_type, pattern in _URLSCAN_ANALYTICS_PATTERNS:
-                    for m in pattern.finditer(url):
-                        field = _URLSCAN_ANALYTICS_KEY_MAP[id_type]
-                        found[field].add(m.group(1))
 
-        # Step 3 — fetch the rendered DOM, run the same HTML extraction
-        dom_resp = await client.get(
-            f"https://urlscan.io/dom/{uuid}/",
-            timeout=20.0,
-        )
-        if dom_resp.status_code == 200:
-            dom_result = _process_page_html(dom_resp.text)
-            for id_type, field in _URLSCAN_ANALYTICS_KEY_MAP.items():
-                html_key = field  # field names match page_metadata keys
-                for val in (dom_result.get(html_key) or []):
-                    found[field].add(val)
 
-        for field, values in found.items():
-            out[field] = sorted(values)
-
-    except Exception:
-        pass
-
-    return out
-
-
-async def _afetch_page_metadata(domain: str, client: httpx.AsyncClient, save_favicon_as: Path | None = None) -> dict:
-    result: dict = {
-        "google_analytics": [], "gtm_ids": [], "facebook_pixel": [], "tiktok_pixel": [],
-        "yandex_metrika": [], "html_lang": None, "cms_generator": None,
-        "social_links": {}, "social_handles": {}, "site_verifications": {}, "favicon_md5": None,
-        "favicon_mmh3": None, "favicon_saved": None, "error": None,
-        "adsense_publisher_ids": [], "fb_app_id": [], "twitter_site": [],
-        "twitter_creator": [], "authors": [], "rel_me": [],
-        "homepage_html_hash": None, "meta_tags": {}, "script_assets": [],
-        "bundler_hints": [], "http_fingerprint": {}, "source_map_leaks": [],
-        "final_url": None,
-    }
-    profile = await afetch_homepage_profile(
-        domain,
-        client,
-        save_favicon_as=save_favicon_as,
-        user_agent=_PAGE_UA,
-    )
-    html = profile.pop("html", "")
-    if html:
-        result.update(_process_page_html(html))
-    result.update(profile)
-    return result
-
-
-async def _analyze_domain_async(
-    domain: str,
-    scan: bool = False,
-    scan_europe: bool = False,
-    scan_all: bool = False,
-    scan_providers: bool = False,
-    scan_countries: list[str] | None = None,
-    scan_eu_countries: bool = False,
-    scan_full: bool = False,
-    concurrency: int = 5_000,
-    *,
-    rate: int,
-    on_partial=None,
-    persist: bool = True,
-    enable_wordlist_probe: bool = True,
-    enable_wordlist_followups: bool = True,
-    enable_urlscan: bool = True,
-    enable_censys: bool = True,
-    enable_netlas: bool = True,
-) -> dict:
-    result: dict = {
-        "input":             domain,
-        "type":              "domain",
-        "timestamp":         datetime.now(timezone.utc).isoformat(),
-        "whois":             {},
-        "dns":               {},
-        "dns_txt_tokens":    [],
-        "zone_transfer":     [],
-        "subdomains":        [],
-        "cert_transparency": {},
-        "historical_dns":    {},
-        "page_metadata":     {},
-        "email_security":    {},
-        "spf_origins":       [],
-        "nameserver_analysis": {},
-        "well_known":        {},
-        "legal_pages":       [],
-        "mail_client_config": {},
-        "microsoft_tenant":  {},
-        "origin_candidates": {},
-        "ip_details":        {},
-        "ssh_host_keys":     [],
-        "subdomain_followups": [],
-        "subdomain_followup_summary": {
-            "enabled": enable_wordlist_followups,
-            "limit": _WORDLIST_FOLLOWUP_LIMIT,
-            "candidate_count": 0,
-            "selected_count": 0,
-            "truncated": 0,
-            "completed": 0,
-            "failed": 0,
-            "status": "pending" if enable_wordlist_followups else "disabled",
-        },
-    }
-
-    _search_id: int | None = None
-    if persist:
-        try:
-            from db.intel_db import create_search, save_search_fields, finalize_search
-            _search_id = create_search(domain, "domain", result["timestamp"])
-            result["search_id"] = _search_id
-        except Exception as _exc:
-            log(f"DB create_search failed: {_exc}")
-
-    RESULTS_DIR.mkdir(exist_ok=True)
-    _safe     = re.sub(r"[^a-zA-Z0-9._-]", "_", domain)
-    _ts       = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    _fav_path = RESULTS_DIR / f"{_safe}_{_ts}_favicon.ico"
-
-    def _cb(key: str, value) -> None:
-        """Store value into result and fire the on_partial callback."""
-        if "." in key:
-            top, sub = key.split(".", 1)
-            result.setdefault(top, {})[sub] = value
-        else:
-            result[key] = value
-        if on_partial:
-            on_partial(key, value)
-
-    async def _task(key: str, coro):
-        v = await coro
-        _cb(key, v)
-        return v
-
-    async def _oc_task(key: str, coro):
-        v = await coro
-        _cb(f"origin_candidates.{key}", v)
-        return v
-
-    async def _empty_list():
-        return []
-
-    async def _empty_dict():
-        return {}
-
-    # ── Group 1: all concurrent via shared httpx client ───────────────────────
-    log("WHOIS / DNS / crt.sh / CIRCL pDNS / page metadata / well-known / legal / tenant probe (async)...")
-    async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, follow_redirects=True, **httpx_kwargs()) as client:
-        (_, dns_records, cert_transparency_raw, _, _, _, _, _, _, _) = await asyncio.gather(
-            _task("whois",             asyncio.to_thread(get_domain_whois, domain)),
-            _task("dns",               _aget_dns_records(domain)),
-            _task("_ct_tmp",           _acrt_sh_data(domain, client)),
-            _task("historical_dns",    _acircl_passive_dns(domain, client)),
-            _task("page_metadata",     _afetch_page_metadata(domain, client, _fav_path)),
-            _task("email_security",    _aget_dmarc_dkim(domain)),
-            _task("well_known",        afetch_well_known_artifacts(domain, client)),
-            _task("legal_pages",       ascrape_legal_pages(domain, client)),
-            _task("mail_client_config", afetch_mail_client_config(domain, client)),
-            _task("microsoft_tenant",  aprobe_microsoft_tenant(domain, client)),
-        )
-
-        # Post-process CT — split subdomains out and notify each separately
-        del result["_ct_tmp"]
-        crt_sh_failed = cert_transparency_raw.pop("_failed", False)
-        discovered_subdomains = cert_transparency_raw.pop("subdomains", [])
-        result["subdomains"]        = discovered_subdomains
-        result["cert_transparency"] = cert_transparency_raw
-        result["crt_sh_status"]     = "pending_retry" if crt_sh_failed else "ok"
-        _cb("cert_transparency", cert_transparency_raw)
-        _cb("subdomains", discovered_subdomains)
-
-        dns_records["CAA_parsed"] = parse_caa_records(dns_records.get("CAA", []))
-        _cb("dns", dns_records)
-        _cb("dns_txt_tokens", extract_txt_tenancy_tokens(dns_records.get("TXT", [])))
-
-        nameservers  = dns_records.get("NS", [])
-        _mx_raw      = dns_records.get("MX") or []
-        mx_records   = _mx_raw if isinstance(_mx_raw, list) else []
-        _cb("nameserver_analysis", _classify_nameservers(nameservers))
-
-        if _search_id:
-            try:
-                save_search_fields(_search_id, {k: result[k] for k in (
-                    "whois", "dns", "cert_transparency", "historical_dns", "page_metadata",
-                    "email_security", "spf_origins", "well_known", "legal_pages",
-                    "mail_client_config", "microsoft_tenant", "nameserver_analysis",
-                    "dns_txt_tokens", "subdomains", "input", "type", "timestamp",
-                ) if k in result})
-            except Exception as _exc:
-                log(f"DB incremental save (group1) failed: {_exc}")
-
-        # ── Group 2: origin discovery + zone transfer — all concurrent ────────
-        # Zone transfer is included here (not before) so its per-nameserver
-        # 5 s timeout does not delay the rest of origin discovery.
-        if nameservers:
-            log(f"Zone transfer attempt on {len(nameservers)} nameserver(s) (concurrent with origin discovery)")
-        group_two_sources = "Zone transfer / subdomain probe / MX / wordlist / HackerTarget / SPF"
-        if enable_urlscan:
-            group_two_sources += " / urlscan"
-        group_two_sources += " (async)..."
-        log(group_two_sources)
-        _spf_txt = dns_records.get("TXT", [])
-        # Rotate the VPN exit IP before the origin-discovery batch so the
-        # per-source-IP rate-limited providers (urlscan ~50/day, HackerTarget,
-        # crt.sh) and the direct origin probes all run from a fresh IP. No-op
-        # unless VPN_API_BASE_URL is configured (see utils.vpn). Traffic reaches
-        # that IP via OUTBOUND_PROXY_URL (the tinyproxy sidecar in the VPN netns).
-        async with vpn_rotation_batch(nested_label="origin_discovery"):
-            await asyncio.gather(
-                _task("zone_transfer",      asyncio.to_thread(attempt_zone_transfer, domain, nameservers) if nameservers else _empty_list()),
-                _oc_task("subdomain_leaks", asyncio.to_thread(probe_subdomain_origins, discovered_subdomains) if discovered_subdomains else _empty_list()),
-                _oc_task("mx_leaks",        asyncio.to_thread(probe_mx_origins, mx_records)),
-                _oc_task("wordlist_leaks",  asyncio.to_thread(probe_wordlist_subdomains, domain) if enable_wordlist_probe else _empty_list()),
-                _oc_task("hackertarget",    _ahackertarget_host_search(domain, client)),
-                _oc_task("urlscan",         _run_serial_urlscan(_aurlscan_historical_ips(domain, client)) if enable_urlscan else _empty_list()),
-                _task("urlscan_analytics",  _run_serial_urlscan(_aurlscan_fetch_analytics(domain, client)) if enable_urlscan else _empty_dict()),
-                _task("spf_details_tmp",    acollect_spf_details(domain, _spf_txt)),
-                _oc_task("censys",          asyncio.to_thread(censys_cert_search, domain) if enable_censys else _empty_dict()),
-                _oc_task("netlas",          asyncio.to_thread(netlas_cert_search, domain) if enable_netlas else _empty_dict()),
-                # _oc_task("shodan",          asyncio.to_thread(shodan_cert_search, domain)),
-            )
-
-    _spf_details = result.pop("spf_details_tmp", {}) or {}
-    _cb("spf_origins", _spf_details.get("origins", []))
-    _email_sec = result.get("email_security") or {}
-    _email_sec["spf_includes"] = _spf_details.get("includes", [])
-    _email_sec["spf_records"]  = _spf_details.get("records", [])
-    _cb("email_security", _email_sec)
-
-    wordlist_hits = (result.get("origin_candidates", {}) or {}).get("wordlist_leaks", [])
-    all_wordlist_followup_targets = _select_wordlist_followup_targets(
-        wordlist_hits,
-        limit=max(len(wordlist_hits), _WORDLIST_FOLLOWUP_LIMIT),
-    )
-    wordlist_followup_targets = all_wordlist_followup_targets[:_WORDLIST_FOLLOWUP_LIMIT]
-    followup_summary = {
-        "enabled": enable_wordlist_followups,
-        "limit": _WORDLIST_FOLLOWUP_LIMIT,
-        "candidate_count": len(all_wordlist_followup_targets),
-        "selected_count": len(wordlist_followup_targets),
-        "truncated": 0,
-        "completed": 0,
-        "failed": 0,
-        "status": "pending" if wordlist_followup_targets and enable_wordlist_followups else ("disabled" if not enable_wordlist_followups else "none"),
-    }
-    followup_summary["truncated"] = max(0, followup_summary["candidate_count"] - followup_summary["selected_count"])
-    _cb("subdomain_followup_summary", followup_summary)
-
-    # ── Merge urlscan analytics IDs into page_metadata ───────────────────────
-    # urlscan renders pages in a real browser — it catches IDs that a plain
-    # HTTP fetch misses (lazy-loaded scripts, GTM-injected tags, etc.).
-    # We merge rather than replace so both sources contribute.
-    _us_analytics = result.get("urlscan_analytics") or {}
-    if _us_analytics:
-        _pm = result.setdefault("page_metadata", {})
-        for _field, _vals in _us_analytics.items():
-            existing = _pm.get(_field) or []
-            merged   = sorted(set(existing) | set(_vals))
-            if merged:
-                _pm[_field] = merged
-        _cb("page_metadata", _pm)
-    # Remove the staging key — not needed in the final result
-    result.pop("urlscan_analytics", None)
-
-    # ── Extract source errors (e.g. rate limits) from origin_candidates ───────
-    source_errors: list[str] = []
-    oc = result.get("origin_candidates", {})
-    for src, entries in list(oc.items()):
-        if isinstance(entries, list):
-            errors   = [e for e in entries if isinstance(e, dict) and "_error" in e]
-            clean    = [e for e in entries if not (isinstance(e, dict) and "_error" in e)]
-            if errors:
-                source_errors.extend(e["source"] for e in errors)
-                oc[src] = clean
-    if source_errors:
-        result["source_errors"] = source_errors
-
-    if _search_id:
-        try:
-            save_search_fields(_search_id, {k: result[k] for k in (
-                "zone_transfer", "origin_candidates", "page_metadata", "source_errors",
-            ) if k in result})
-        except Exception as _exc:
-            log(f"DB incremental save (group2) failed: {_exc}")
-
-    # ── Scan phases — sequential, long-running, each uses its own event loop ──
-    do_gcp_europe_scan   = scan_europe   or scan_full
-    do_provider_scan     = scan_providers or scan_full
-    do_eu_country_scan   = scan_eu_countries or scan_full
-    country_code_list    = list({country_code.upper() for country_code in (scan_countries or [])})
-    if do_eu_country_scan:
-        country_code_list = sorted(set(country_code_list) | set(EU_MEMBER_STATES))
-
-    cert_issuers     = result["cert_transparency"].get("issuers", [])
-    gts_issuer_names = {"GTS CA 1P5", "GTS CA 1C3", "GTS CA 1D4", "GTS Root R1"}
-    has_gts_cert     = bool(set(cert_issuers) & gts_issuer_names)
-
-    if scan_all or do_gcp_europe_scan or scan or (scan_full and has_gts_cert):
-        if scan_all:
-            gcp_regions, force_scan, scan_label = None, True, "all GCP regions globally"
-        elif do_gcp_europe_scan or scan_full:
-            gcp_regions, force_scan, scan_label = GCP_EUROPE_ALL_REGIONS, True, "all European GCP regions + Turkey"
-        else:
-            gcp_regions, force_scan, scan_label = GCP_DEFAULT_REGIONS, False, "Eastern European GCP regions"
-        log(f"Origin scan (GCP): {scan_label}")
-        gcp_scan_result = await asyncio.to_thread(
-            targeted_origin_scan, domain, cert_issuers, regions=gcp_regions, force=force_scan, concurrency=concurrency, rate=rate,
-        )
-        _cb("origin_candidates.scan", gcp_scan_result)
-    else:
-        _cb("origin_candidates.scan", {"skipped": True, "reason": "Pass --scan, --scan-europe, --scan-full, or --scan-all to enable GCP scanning"})
-
-    if do_provider_scan:
-        log(f"Origin scan (providers): {len(PROVIDER_ASNS)} ASNs via RIPE Stat")
-        provider_scan_result = await asyncio.to_thread(targeted_asn_scan, domain, concurrency=concurrency, rate=rate)
-        _cb("origin_candidates.provider_scan", provider_scan_result)
-    else:
-        _cb("origin_candidates.provider_scan", {"skipped": True, "reason": "Pass --scan-providers or --scan-full to scan known RU/EU hosters"})
-
-    if country_code_list:
-        log(f"Origin scan (country): {', '.join(country_code_list)}")
-        country_scan_result = await asyncio.to_thread(targeted_country_scan, domain, country_code_list, concurrency=concurrency, rate=rate)
-        _cb("origin_candidates.country_scan", country_scan_result)
-    else:
-        _cb("origin_candidates.country_scan", {"skipped": True, "reason": "Pass --scan-country CC or --scan-full (EU) to scan country IP space"})
-
-    if _search_id:
-        try:
-            save_search_fields(_search_id, {"origin_candidates": result.get("origin_candidates", {})})
-        except Exception as _exc:
-            log(f"DB incremental save (scans) failed: {_exc}")
-
-    # ── IP enrichment ──────────────────────────────────────────────────────────
-    # Collect every IP seen from any source: direct DNS + all origin discovery.
-    # ip_sources tracks which source(s) surfaced each IP so the report can show
-    # where it came from.
-    ip_sources: dict[str, list[str]] = {}
-
-    for record_type in ("A", "AAAA"):
-        for ip_address in (dns_records.get(record_type) or []):
-            if isinstance(ip_address, str):
-                ip_sources.setdefault(ip_address, []).append("dns")
-
-    origin_candidates_result = result.get("origin_candidates", {})
-
-    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("hackertarget", [])):
-        ip_address = candidate_entry.get("ip", "")
-        if ip_address and not candidate_entry.get("cf", False):
-            ip_sources.setdefault(ip_address, []).append("hackertarget")
-
-    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("wordlist_leaks", [])):
-        ip_address = candidate_entry.get("ip", "")
-        if ip_address:
-            ip_sources.setdefault(ip_address, []).append("wordlist_probe")
-
-    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("mx_leaks", [])):
-        ip_address = candidate_entry.get("ip", "")
-        if ip_address:
-            ip_sources.setdefault(ip_address, []).append("mx_record")
-
-    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("subdomain_leaks", [])):
-        ip_address = candidate_entry.get("ip", "")
-        if ip_address:
-            ip_sources.setdefault(ip_address, []).append("subdomain_probe")
-
-    for candidate_entry in _iter_mapping_items(origin_candidates_result.get("urlscan", [])):
-        ip_address = candidate_entry.get("ip", "")
-        if ip_address and not candidate_entry.get("cf", False):
-            ip_sources.setdefault(ip_address, []).append("urlscan")
-
-    historical_dns = result.get("historical_dns") if isinstance(result.get("historical_dns"), Mapping) else {}
-    for historical_record in _iter_mapping_items(historical_dns.get("records", [])):
-        if historical_record.get("rrtype") in ("A", "AAAA"):
-            ip_address = historical_record.get("rdata", "")
-            if ip_address and not is_cloudflare_ip(ip_address):
-                ip_sources.setdefault(ip_address, []).append("historical_dns")
-
-    for spf_entry in _iter_mapping_items(result.get("spf_origins", [])):
-        ip_address = spf_entry.get("ip", "")
-        if ip_address and not is_cloudflare_ip(ip_address):
-            ip_sources.setdefault(ip_address, []).append("spf")
-
-    provider_source_map = {
-        "censys": "censys",
-        "shodan": "shodan",
-        "netlas": "netlas",
-    }
-    for provider_key, source_name in provider_source_map.items():
-        provider_result = origin_candidates_result.get(provider_key, {})
-        if not isinstance(provider_result, Mapping):
-            continue
-        for hit in _iter_mapping_items(provider_result.get("hits", [])):
-            ip_address = hit.get("ip", "")
-            if ip_address:
-                ip_sources.setdefault(ip_address, []).append(source_name)
-
-    scan_source_map = {
-        "scan": "scan_gcp",
-        "provider_scan": "scan_provider",
-        "country_scan": "scan_country",
-    }
-    for scan_key, source_name in scan_source_map.items():
-        scan_result = origin_candidates_result.get(scan_key, {})
-        if not isinstance(scan_result, Mapping):
-            continue
-        for hit in _iter_mapping_items(scan_result.get("hits", [])):
-            ip_address = hit.get("ip", "")
-            if ip_address:
-                ip_sources.setdefault(ip_address, []).append(source_name)
-
-    if ip_sources:
-        log(f"IP enrichment ({len(ip_sources)} unique IPs from DNS + all discovery sources)...")
-        all_discovered_ips = list(ip_sources.keys())
-        enrichment_results = await asyncio.gather(*[asyncio.to_thread(enrich_ip, ip_address) for ip_address in all_discovered_ips])
-        ip_details: dict = {}
-        for ip_address, enrichment_data in zip(all_discovered_ips, enrichment_results):
-            enriched_entry = dict(enrichment_data)
-            enriched_entry["sources"] = ip_sources[ip_address]
-            ip_details[ip_address] = enriched_entry
-        _cb("ip_details", ip_details)
-
-    # ── TLS probe — grab live certs from every non-CF IP found ────────────────
-    # ip_sources already contains every IP from every discovery source.
-    # Filter to non-Cloudflare IPs only; each is probed with the target domain
-    # as SNI so the server presents the cert it is actually serving.
-    tls_probe_targets: dict[str, str] = {
-        ip_address: domain
-        for ip_address in ip_sources
-        if not is_cloudflare_ip(ip_address)
-    }
-
-    result["non_cf_ips"] = list(tls_probe_targets.keys())
-
-    if tls_probe_targets:
-        log(f"TLS probe: grabbing certs from {len(tls_probe_targets)} non-Cloudflare IP(s)...")
-        raw_tls_certs = await asyncio.gather(*[
-            asyncio.to_thread(grab_tls_cert, ip_address, sni_domain)
-            for ip_address, sni_domain in tls_probe_targets.items()
-        ])
-        non_cloudflare_tls_certs = [cert for cert in raw_tls_certs if cert is not None]
-        log(f"TLS probe: {len(non_cloudflare_tls_certs)} cert(s) retrieved")
-    else:
-        non_cloudflare_tls_certs = []
-
-    if tls_probe_targets:
-        log(f"SSH probe: grabbing host keys from {len(tls_probe_targets)} non-Cloudflare IP(s)...")
-        ssh_results = await asyncio.gather(*[
-            asyncio.to_thread(fetch_ssh_host_key, ip_address)
-            for ip_address in tls_probe_targets
-        ])
-        _cb("ssh_host_keys", [entry for entry in ssh_results if entry])
-
-    result["non_cf_tls_certs"] = non_cloudflare_tls_certs
-    if result.get("ip_details"):
-        certs_by_ip = {cert.get("ip"): cert for cert in _iter_mapping_items(non_cloudflare_tls_certs) if cert.get("ip")}
-        for ip_address, details in result["ip_details"].items():
-            proxy_details = detect_proxy_details(
-                ip_address,
-                details.get("ptr"),
-                details.get("asn_info"),
-                certs_by_ip.get(ip_address),
-            )
-            details["proxy_family"] = proxy_details.get("proxy_family")
-            details["proxy_confidence"] = proxy_details.get("proxy_confidence")
-        _cb("ip_details", result["ip_details"])
-    _cb("non_cf_tls_certs", non_cloudflare_tls_certs)
-
-    if _search_id:
-        try:
-            save_search_fields(_search_id, {k: result[k] for k in (
-                "ip_details", "non_cf_tls_certs", "ssh_host_keys", "non_cf_ips",
-            ) if k in result})
-        except Exception as _exc:
-            log(f"DB incremental save (ip/tls) failed: {_exc}")
-
-    if enable_wordlist_followups and wordlist_followup_targets:
-        log(
-            f"Subdomain follow-up scans: {len(wordlist_followup_targets)} "
-            f"wordlist hit(s) selected (cap {followup_summary['limit']}, "
-            f"{followup_summary['truncated']} skipped)"
-        )
-        followups: list[dict] = []
-        for target in wordlist_followup_targets:
-            subdomain = target["subdomain"]
-            log(f"Subdomain follow-up: scanning {subdomain}")
-            try:
-                nested_result = await _analyze_domain_async(
-                    subdomain,
-                    scan=scan,
-                    scan_europe=scan_europe,
-                    scan_all=scan_all,
-                    scan_providers=scan_providers,
-                    scan_countries=scan_countries,
-                    scan_eu_countries=scan_eu_countries,
-                    scan_full=scan_full,
-                    concurrency=concurrency,
-                    rate=rate,
-                    on_partial=None,
-                    persist=False,
-                    enable_wordlist_probe=False,
-                    enable_wordlist_followups=False,
-                    enable_urlscan=False,
-                    enable_censys=False,
-                    enable_netlas=False,
-                )
-                followups.append(
-                    {
-                        "subdomain": subdomain,
-                        "source": "wordlist_probe",
-                        "ips": list(target.get("ips") or []),
-                        "hits": list(target.get("hits") or []),
-                        "status": "completed",
-                        "result": nested_result,
-                    }
-                )
-                followup_summary["completed"] += 1
-            except Exception as exc:
-                log(f"Subdomain follow-up failed for {subdomain}: {exc}")
-                followups.append(
-                    {
-                        "subdomain": subdomain,
-                        "source": "wordlist_probe",
-                        "ips": list(target.get("ips") or []),
-                        "hits": list(target.get("hits") or []),
-                        "status": "failed",
-                        "error": str(exc),
-                        "result": {
-                            "input": subdomain,
-                            "type": "domain",
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "error": str(exc),
-                            "subdomain_followups": [],
-                        },
-                    }
-                )
-                followup_summary["failed"] += 1
-
-            _cb("subdomain_followups", followups)
-            _cb("subdomain_followup_summary", followup_summary)
-
-        followup_summary["status"] = "completed"
-        _cb("subdomain_followup_summary", followup_summary)
-
-        if _search_id:
-            try:
-                save_search_fields(_search_id, {k: result[k] for k in (
-                    "subdomain_followups", "subdomain_followup_summary",
-                ) if k in result})
-            except Exception as _exc:
-                log(f"DB incremental save (followups) failed: {_exc}")
-
-    # Cloudflare-fronted flag
-    current_a_records = dns_records.get("A") or []
-    result["cloudflare_fronted"] = bool(current_a_records) and all(
-        is_cloudflare_ip(ip_address) for ip_address in current_a_records if isinstance(ip_address, str)
-    )
-
-    # ── Persist everything to PostgreSQL ──────────────────────────────────────
-    if persist:
-        try:
-            from db.intel_db import finalize_search, save_search
-            if _search_id:
-                finalize_search(_search_id, result, timestamp=result["timestamp"])
-            else:
-                save_search(result)
-            log("Search saved to intel database")
-        except Exception as _exc:
-            log(f"DB save failed: {_exc}")
-
-    return result
-
-
-def analyze_domain(
-    domain: str,
-    scan: bool = False,
-    scan_europe: bool = False,
-    scan_all: bool = False,
-    scan_providers: bool = False,
-    scan_countries: list[str] | None = None,
-    scan_eu_countries: bool = False,
-    scan_full: bool = False,
-    concurrency: int = 5_000,
-    enable_urlscan: bool = True,
-    *,
-    rate: int,
-    on_partial=None,
-) -> dict:
-    """Sync entry point — runs the async core in a new event loop."""
-    return asyncio.run(_analyze_domain_async(
-        domain,
-        scan=scan,
-        scan_europe=scan_europe,
-        scan_all=scan_all,
-        scan_providers=scan_providers,
-        scan_countries=scan_countries,
-        scan_eu_countries=scan_eu_countries,
-        scan_full=scan_full,
-        concurrency=concurrency,
-        enable_urlscan=enable_urlscan,
-        rate=rate,
-        on_partial=on_partial,
-    ))
-
-
-def analyze_ip(ip: str) -> dict:
-    result: dict = {
-        "input":               ip,
-        "type":                "ip",
-        "timestamp":           datetime.now(timezone.utc).isoformat(),
-        "ptr":                 None,
-        "cloudflare":          False,
-        "asn_info":            {},
-        "other_domains_on_ip": [],
-        "ssh_host_keys":       [],
-    }
-
-    log(f"PTR record for {ip}")
-    result["ptr"] = get_ptr(ip)
-
-    log(f"ASN / network info for {ip}")
-    result["asn_info"] = get_ip_whois(ip)
-
-    result["cloudflare"] = is_cloudflare_ip(ip)
-    if result["cloudflare"]:
-        log(f"Skipping reverse IP lookup — Cloudflare anycast (results would be meaningless)")
-    else:
-        log(f"Reverse IP lookup (hackertarget)")
-        result["other_domains_on_ip"] = hackertarget_reverse_ip(ip)
-
-    # ── TLS probe — grab cert directly from this IP ───────────────────────────
-    result["tls_cert"] = None
-    result["non_cf_ips"] = []
-    result["non_cf_tls_certs"] = []
-    result["cloudflare_fronted"] = result["cloudflare"]
-
-    if not result["cloudflare"]:
-        log(f"Grabbing TLS cert from {ip}:443")
-        # Use PTR hostname as SNI if we have one, otherwise fall back to bare IP
-        sni = result.get("ptr") or ip
-        cert = grab_tls_cert(ip, sni=sni)
-        result["tls_cert"] = cert
-        result["non_cf_ips"] = [ip]
-        result["non_cf_tls_certs"] = [cert] if cert else []
-        if cert:
-            log(f"TLS cert: CN={cert.get('cn')}  issuer={cert.get('issuer_cn')}")
-        ssh_host_key = fetch_ssh_host_key(ip)
-        if ssh_host_key:
-            result["ssh_host_keys"] = [ssh_host_key]
-
-    # ── Persist to PostgreSQL ─────────────────────────────────────────────────
-    proxy_details = detect_proxy_details(ip, result.get("ptr"), result.get("asn_info"), result.get("tls_cert"))
-    result["proxy_family"] = proxy_details.get("proxy_family")
-    result["proxy_confidence"] = proxy_details.get("proxy_confidence")
-
-    try:
-        from db.intel_db import create_search, finalize_search
-        sid = create_search(ip, "ip", result["timestamp"])
-        finalize_search(sid, result, timestamp=result["timestamp"])
-        log("Search saved to intel database")
-    except Exception as _exc:
-        log(f"DB save failed: {_exc}")
-
-    return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser(
-        prog="ip_intel",
-        description="Domain / IP intelligence tool",
-    )
-    parser.add_argument("target", help="Domain name or IP address to analyse")
-    parser.add_argument(
-        "--scan",
-        action="store_true",
-        help="Scan Eastern-European GCP regions for the origin cert (requires GTS cert in history)",
-    )
-    parser.add_argument(
-        "--scan-europe",
-        action="store_true",
-        help="Scan ALL European GCP regions + Turkey coverage (forces scan regardless of cert history)",
-    )
-    parser.add_argument(
-        "--scan-all",
-        action="store_true",
-        help="Scan every GCP region globally (very slow — several hours without masscan)",
-    )
-    parser.add_argument(
-        "--scan-providers",
-        action="store_true",
-        help="Scan Hetzner, OVH, M247, Aeza, Selectel, TimeWeb and other RU/EU hosters via RIPE Stat",
-    )
-    parser.add_argument(
-        "--scan-country",
-        metavar="CC",
-        nargs="+",
-        help="Scan all IPv4 space allocated to one or more countries (ISO codes, e.g. RU UA BY)",
-    )
-    parser.add_argument(
-        "--scan-eu-countries",
-        action="store_true",
-        help="Scan all IPv4 space for all 27 EU member states via RIPE Stat",
-    )
-    parser.add_argument(
-        "--scan-full",
-        action="store_true",
-        help="Run everything: EU countries + known providers + GCP Europe (+ GCP if GTS cert found)",
-    )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=5_000,
-        metavar="N",
-        help="Max concurrent connections for async TCP/TLS phase (default: 5000, reduce if network struggles)",
-    )
-    parser.add_argument(
-        "--rate",
-        type=int,
-        default=100_000,
-        metavar="PPS",
-        help="masscan packets-per-second rate (default: 100000, e.g. --rate 1000 to be gentle)",
-    )
-    args = parser.parse_args()
-
-    target = clean_target(args.target)
-
-    out_dir = Path(__file__).parent / "results"
-    out_dir.mkdir(exist_ok=True)
-
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", target)
-    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file   = out_dir / f"{safe_name}_{timestamp}.json"
-
-    print(f"\n  ip-intel  |  target: {target}\n")
-
-    if is_ip(target):
-        data = analyze_ip(target)
-    else:
-        data = analyze_domain(
-            target,
-            scan=args.scan,
-            scan_europe=args.scan_europe,
-            scan_all=args.scan_all,
-            scan_providers=args.scan_providers,
-            scan_countries=args.scan_country,
-            scan_eu_countries=args.scan_eu_countries,
-            scan_full=args.scan_full,
-            concurrency=args.concurrency,
-            rate=args.rate,
-        )
-
-    with open(out_file, "w") as fh:
-        json.dump(data, fh, indent=2, default=str)
-
-    print(f"\n  [+] Saved → {out_file}\n")
 
 
-if __name__ == "__main__":
-    main()

@@ -37,7 +37,8 @@ React + FastAPI application for domain and IP OSINT, origin discovery, and infra
 | `utils/check.py` | Pairwise comparison logic + global graph linkage scoring (`link_evidence`, `links_for`) |
 | `utils/cluster.py` | Legacy cluster-graph rendering helpers (global clustering is materialized in `db/intel_db.py`) |
 | `utils/evidence_meta.py` | Evidence type catalog + per-selector base weights and strength tiers |
-| `utils/ipinfo_lite.py` | ipinfo.io Lite client — primary ASN/geo source (RDAP supplements CIDR/network-name detail and is the fallback when no key is set) and edge/reverse-proxy classification input |
+| `utils/ipinfo_lite.py` | ipinfo.io Lite client — primary ASN/geo source (free and uncapped; RDAP supplements CIDR/network-name detail and is the fallback when no key is set) and edge/reverse-proxy classification input |
+| `utils/censys_enrichment.py` | Censys host-enrichment client — 0 credits but capped at 20k calls/day, so it gap-fills ASN/network fields and contributes only what nothing else has (reputation, GreyNoise, VPN/proxy/hosting flags, abuse contacts) |
 | `integrations/mattermost_alerts.py` | Optional Mattermost webhook notifications |
 | `integrations/opencti_ingest.py` | OpenCTI ingestion — Domain-Name observables, Channel SDOs, and website-channel tier/label extraction |
 | `frontend/` | React frontend built with Vite |
@@ -202,6 +203,12 @@ There is no case API — everything is the global pool and its connections.
 - `POST /api/ingest` — add a domain / IP / CSV to the pool. JSON `{"target": "...", "label": "..."}` or multipart with a CSV `file`. `label` is an optional free-text tag on the ingest; it scopes nothing. Returns a `job_id` to poll. The scanned targets join the one shared correlation graph.
 - `GET /api/jobs/{job_id}` — poll live ingest progress (stage, percent, logs).
 
+#### Ingestion pipeline tuning
+
+- `ANALYSIS_WORKERS` (default `12`) — how many targets a single job/case analyzes concurrently in `cases/case_runtime.py`'s pool. Each target itself fans out roughly a dozen more threads internally (service calls, IP enrichment, probe fan-out — see [Concurrency inside a single domain analysis](#concurrency-inside-a-single-domain-analysis)), so real thread count is `ANALYSIS_WORKERS × ~12`. Raise it for large bulk sweeps (e.g. the OpenCTI channel sweep), lower it if a paid provider's own account-level rate limit — not the source IP — becomes the bottleneck.
+- **Startup recovery is off by default.** On boot, `cases/case_app.py`'s `lifespan` no longer resumes jobs left `queued`/`running` from an unclean shutdown — it flips them to `failed` (`cases/case_store.py`'s `mark_interrupted_jobs()`) so nothing silently re-runs (a resumed OpenCTI sweep previously re-scanned its whole in-flight batch from the start). Set `RECOVER_JOBS_ON_STARTUP=1` to restore the old resume-on-boot behavior (`runtime.recover()`).
+- Per-target job logs now include discovery context (depth, origin domain, discovery reason), per-target elapsed time, and a running `done/failed/pending` tally, so a long sweep's log is diagnosable without a debugger.
+
 ### The pool
 
 - `GET /api/pool?search=&limit=` — every channel (registrable domain) in the pool, with host count, recency, and cluster membership.
@@ -215,7 +222,13 @@ There is no case API — everything is the global pool and its connections.
 - `GET /api/graph/by-selector?kind=<kind>&min_domains=2` — browse **by edge type**: groups of channels that share a selector of `kind` (e.g. every set of channels sharing a TLS cert / SSH key / IP). Omit `kind` for all edge types.
 - `GET /api/graph/clusters` — the strongest clusters lake-wide.
 - `GET /api/graph/cluster/{value}` — the cluster a channel belongs to, with members.
+- `GET /api/graph/path?a=<rd>&b=<rd>` — the precomputed shortest evidence chain connecting two channels, hop by hop (`db/intel_db.py`'s `path_between` / `graph_paths` table — see [Multi-hop path precompute](#multi-hop-path-precompute)). 404 if no path exists within the configured hop limit.
+- `GET /api/graph/related/{value}` — a channel's precomputed multi-hop neighborhood (direct links plus everything reachable through an intermediary), strongest/shortest first. Query params `max_hops`, `limit`.
 - `POST /api/graph/recompute` — global recompute: rebuild the whole correlation graph + clusters from stored intel (no rescanning).
+
+### Search
+
+- `GET /api/search?q=&limit=` — ranked domain / selector-value matches for the global search box (`db/intel_db.py`'s `search_targets`).
 
 ### Meta
 
@@ -294,6 +307,25 @@ A configurable **denylist** marks selectors non-attributing — known CDN/cloud
 ASNs, big-provider nameservers, default/shared-host cert SANs, and any selector
 whose degree exceeds `CORRELATION_DEGREE_THRESHOLD` (default 50). Denylisted
 nodes are kept in the graph but never create a link.
+
+The degree rule is deliberately looser for **account-bound** selectors —
+webmaster-tools verification codes and AdSense/GA ids — which use
+`CORRELATION_ACCOUNT_DEGREE_THRESHOLD` (default 500) instead. These are issued
+to an account rather than deployed on shared infrastructure, so two sites never
+come to share one incidentally the way they share a CDN ASN. High degree there
+means one account owns many domains, which is the finding itself: applying the
+infrastructure cutoff would discard a broadcaster's own verification code
+exactly because it covers the whole network being investigated. Rarity weighting
+still applies, so a wide token degrades smoothly rather than at a cliff.
+
+#### Multi-hop path precompute
+
+`graph_links` (built by `rebuild_clusters()`) is a scored, weighted adjacency list of each domain's *direct* connections. On top of it, the same rebuild pass BFS-walks every domain out to a configurable hop limit and materializes the result into a `graph_paths` table (`db/intel_db.py`'s `_extend_paths`), so "why is A related to C" — including a same-cluster relationship with no direct edge — is always an indexed `SELECT` (`path_between`, `related_through`; see `GET /api/graph/path` and `GET /api/graph/related/{value}`) rather than a live traversal triggered by a search or page load.
+
+- `GRAPH_PATH_MAX_HOPS` (default `3`) — how many hops the BFS walks per domain.
+- `GRAPH_PATH_MAX_NODES` (default `200`) — cap on how many reachable domains are materialized per source domain, so a densely-connected hub doesn't blow up the table.
+- Each BFS step only follows a node's own top-N direct links (frontier-limited, independent of `graph_links`' own unlimited storage), so a hub domain with hundreds of direct connections can't blow up every other domain's path walk.
+- `rebuild_clusters()` runs `DELETE FROM graph_clusters` / `graph_cluster_links` rather than `TRUNCATE` before rematerializing them: `TRUNCATE` takes an `ACCESS EXCLUSIVE` lock held until commit, which would block every concurrent `/api/pool` and `/api/graph/clusters` read for the whole (potentially long) rebuild. `DELETE` only takes `ROW EXCLUSIVE`, so readers keep seeing the previous snapshot under MVCC and flip to the new one atomically on commit.
 
 #### WHOIS capture and redaction filtering
 
@@ -440,11 +472,33 @@ active provider set.
 ### Censys
 
 - **Tier requirement:** the cert→host search uses the Censys Platform **search API**, which is **not available on the free tier** (free API is lookup-only). A **Starter** tier or higher is required for any Censys results; the **Enterprise Adversary Investigation** entitlement is additionally required for certificate history.
+- **One implementation, one query.** `core/basic.py`'s `get_censys` — the entry in `SERVICES`, i.e. the one the web pipeline actually runs — delegates to `core/ip_intel.py`'s `censys_cert_search`. It previously ran its own copy of the identical query with `fields=["host.ip"]` and kept only the IP, paying the same search credits for a fraction of the response; the shared implementation keeps the ASN, country, open-service list, non-Cloudflare origin-candidate split, and pagination that come back in the same paid call.
+- **The right tenant's certificate.** A search hit's `host_v1.matched_services` names the service(s) that actually matched the queried domain, so the leaf fingerprint is taken from *that* service rather than from the first cert-bearing service on the host. On shared hosting the first one is frequently a different tenant's cert, and chasing the wrong fingerprint costs 25 credits of cert history against infrastructure that was never the target's. When a response carries no `matched_services` (older API versions, or a `fields` selection that omits `host.services.port`/`transport_protocol`/`protocol`), the first-cert behaviour is used as a documented fallback.
+- **Cert history is opt-in** (`CENSYS_CERT_HISTORY=1`, default off). The threat-hunting cert→host-observation pivot is up to 125 of the ~135 credits a single seed domain spends (5 certs × 5 pages × 5 credits) and needs the Enterprise Adversary Investigation entitlement most accounts lack, so by default it would burn the run's budget only to record entitlement errors. Free CIRCL passive DNS already covers much of the same "IPs that used to serve this domain" ground at no cost. `censys_cert_search(domain, include_history=True/False)` overrides the env var for a single call.
 - Current-state cert-to-host hits are normalized into the same durable
   provider/origin path as free-source hits so they can enrich IP context and
   correlation.
 - Missing credentials, missing package support, tier failures, or API errors
   are surfaced as skipped/error metadata without aborting the rest of the run.
+
+#### Censys host enrichment vs the free sources
+
+`GET /v3/global/asset/enrichment/host/{ip}` (`utils/censys_enrichment.py`) spends
+no search credits but is capped at **20,000 calls/day account-wide**, shared
+across every IP of every domain in a sweep — which makes it the *scarcer*
+source, not the cheaper one. It therefore only **fills gaps** on
+`asn`/`asn_description`/`asn_country`/`network_name`/`network_cidr`, and spends
+its budget on what nothing else provides: reputation, GreyNoise, threat and
+VPN/proxy/hosting classification, city-level geo, abuse contacts, and
+open-service labels.
+
+The primary for the overlapping fields stays [ipinfo Lite](https://ipinfo.io/lite),
+because the Lite endpoint is genuinely free **and uncapped** — ipinfo's Lite API
+docs state it "has no daily or monthly limit and provides unlimited access"
+(re-verified 2026-08-12). Note this is specific to Lite; ipinfo's *legacy* free
+endpoint is capped at 50k/month, which is what makes it easy to assume wrongly
+that Lite is metered. RDAP stays the source for network name/CIDR and the
+fallback when `IP_INFO_KEY` is unset.
 
 ### Dormant compatibility providers
 
@@ -467,6 +521,16 @@ Docker, tests, or README conformance.
 - Source failures are isolated so a single provider or passive-source problem does not kill the whole run.
 - Provider hits, scan hits, and direct TLS probes are normalized into the same enrichment and clustering pipeline.
 
+### Concurrency inside a single domain analysis
+
+`core/basic.py`'s `analyze()` and its per-domain helpers fan work out instead of running it sequentially, since almost every step is I/O-bound (DNS, HTTP, provider APIs):
+
+- **External services** (`SERVICES` — crt.sh, CIRCL pDNS, HackerTarget, urlscan.io, WHOIS, ViewDNS, Censys, ...) run concurrently in a `ThreadPoolExecutor` sized to `len(SERVICES)`, each in a copied `contextvars.Context` so the per-provider log lines still reach the job log/UI from worker threads. Previously this was a sequential `for name, fn in SERVICES` loop, so total wall time was the sum of every source's latency; now it's roughly the slowest single source.
+- **`sources/signal_web.py`**'s multi-path fetchers — `fetch_well_known_files`, `scrape_legal_pages`, `probe_mail_client_config` (autodiscover/autoconfig) — fan every candidate path/URL out concurrently (`_run_probes_concurrent`, capped at `_PROBE_FANOUT = 8` workers) instead of walking the path list one request at a time. A site with N well-known paths previously cost up to `N × timeout` on a slow/unreachable host; now it costs roughly one timeout for the whole fetcher. `httpx.Client` is thread-safe over its shared connection pool, so this reuses the same client.
+- The **IP enrichment loop** (PTR + RDAP/WHOIS + reverse-IP per non-CF IP) stays intentionally sequential — RDAP/WHOIS providers rate-limit hard per source IP — but now logs per-IP elapsed time and flags any IP taking ≥5s, so a stalled lookup is visible in the job log instead of the whole loop looking hung.
+- Parity enrichment steps (email security, zone transfer, well-known, legal pages, mail client config, Microsoft tenant, page metadata, source maps, origin candidates) are each wrapped in a timing context manager (`core/analysis_service.py`'s `_step`) that logs entry, exit, elapsed time, and flags anything ≥10s as `<== SLOW`.
+- Per-target concurrency across a job (how many domains a single ingest analyzes at once) is controlled by `ANALYSIS_WORKERS` — see [Ingestion pipeline tuning](#ingestion-pipeline-tuning).
+
 ## OpenCTI Ingestion
 
 `integrations/opencti_ingest.py` pulls targets from OpenCTI (set `OPENCTI_URL` and `OPENCTI_TOKEN`). OpenCTI website-channel ingestion is intentionally operator-triggered from Docker, not exposed in the web UI:
@@ -487,40 +551,130 @@ docker compose exec ip-intel python -m scripts.ingest_opencti_channels --dry-run
 `scripts/ingest_opencti_channels.py`:
 
 1. Fetches **every** OpenCTI Channel SDO with `channel_types` containing `website` (`fetch_all_website_channel_data()`, server-side filtered, fully paginated — no 100-item cap).
-2. Runs every resolved domain through the same full app ingest pipeline (`CaseRuntime.submit_case` → `analyze_target` → `core/basic.py`'s `analyze()` with parity enrichments, subdomain/sibling follow-ups, and `db/intel_db.py` correlation), blocking and printing job progress until it finishes — safe to run as a one-shot container command, unlike the fire-and-forget frontend button.
-3. Extracts a **tier-1..tier-5** classification from each channel's OpenCTI labels: `_extract_tier()` matches `tier` + a digit 1-5, case/space/dash/underscore-insensitive (`Tier 1`, `tier-2`, `TIER_3`, ... all match) — a channel's other labels (campaign names, platform tags, ...) are not tiers and are ignored. If a channel somehow carries more than one tier label, the lower number (higher priority) wins.
-4. Writes the tier to `db/intel_db.py`'s `domain_tiers` table (`set_domain_tier`) — keyed on the **registrable domain**, not a search_id, so it's a durable, curated attribute that survives rescans instead of living and dying with one scan result. Not part of the append-only raw substrate and explicitly excluded from `rebuild_clusters`/`rebuild_all_correlation`, so a correlation-graph rebuild never touches it.
-5. Attaches the full label list (not just the tier) to that ingestion's own scan result as `opencti_labels` (`save_search_fields`), informational only.
+2. Records tier classification for every channel up front (step 3 below), before any scanning, so it's captured even if a domain's analysis later fails or times out.
+3. **Skips channels already in the pool** by default (`existing_search_targets()` — a set membership check against every already-scanned normalized target): the analysis pipeline is the expensive part, so a re-run of the sweep only scans channels new since the last run. Skipped channels still get their tier and OpenCTI labels refreshed. Pass `--rescan-existing` to force a full re-run of every channel regardless.
+4. Splits the remaining new domains into **sequential batches** (`--batch-size`, default `250`; `0` = one batch for everything) submitted as separate cases, one after another. Each batch completes and persists (scans, tiers, labels) before the next starts, so a crash or restart only loses the in-flight batch, not the whole sweep — and progress (attached labels, graph state) is durable incrementally rather than only at the very end. A failed batch doesn't abort the sweep; remaining batches still run, and the script exits non-zero at the end if any batch failed.
+5. Runs every domain in a batch through the same full app ingest pipeline (`CaseRuntime.submit_case` → `analyze_target` → `core/basic.py`'s `analyze()` with parity enrichments, subdomain/sibling follow-ups, and `db/intel_db.py` correlation), blocking and printing job progress until each batch finishes — safe to run as a one-shot container command, unlike the fire-and-forget frontend button. Progress lines are only printed when the job's stage/percent/done/failed/total counters actually change (`_progress_signature`), so a concurrent analysis pool (`ANALYSIS_WORKERS`) doesn't flood the log with identical polling snapshots.
+6. Extracts a **tier-1..tier-5** classification from each channel's OpenCTI labels: `_extract_tier()` matches `tier` + a digit 1-5, case/space/dash/underscore-insensitive (`Tier 1`, `tier-2`, `TIER_3`, ... all match) — a channel's other labels (campaign names, platform tags, ...) are not tiers and are ignored. If a channel somehow carries more than one tier label, the lower number (higher priority) wins.
+7. Writes the tier to `db/intel_db.py`'s `domain_tiers` table (`set_domain_tier`) — keyed on the **registrable domain**, not a search_id, so it's a durable, curated attribute that survives rescans instead of living and dying with one scan result. Not part of the append-only raw substrate and explicitly excluded from `rebuild_clusters`/`rebuild_all_correlation`, so a correlation-graph rebuild never touches it.
+8. Attaches the full label list (not just the tier) to that ingestion's own scan result as `opencti_labels` (`save_search_fields`), informational only.
+9. Rebuilds graph materializations (`rebuild_clusters()`) once at the end, after all batches finish (or immediately, if every channel was already scanned).
+
+Since this script runs detached (stdout redirected to a logfile, no terminal attached), it attaches its own stdout handler to the `ip_intel` logger family (`_configure_logging()`) — the web app's handler setup in `cases/case_app.py` never runs here, so without this, per-domain scan progress (crt.sh hit counts, slow-step warnings, etc.) would silently never reach the log. Level honors `IP_INTEL_LOG_LEVEL` (default `INFO`).
 
 The tier shows up wherever the domain does: a colored badge next to the name on the pool listing and the domain detail page, and node fill color (with a legend) on the network graph (`ClusterGraph.jsx`) — tier 1 (highest priority) is deep red, fading through orange/amber/blue to tier 5 (slate). `GET /api/pool`, `GET /api/domain/{value}`, and `POST /api/graph/connections` all include tier data (`list_pool_domains`, `domain_profile`, `check.connections_among` respectively).
 
-## Optional Configuration
+## Configuration
 
-Create a `.env` file and add any provider keys you have:
+Everything is configured through environment variables, read from `.env` (which
+Docker Compose passes to the `ip-intel` service via `env_file`). Only
+`DATABASE_URL` is required; every other variable has a working default or
+degrades gracefully when unset.
+
+A minimal `.env` to get started:
 
 ```env
 DATABASE_URL=postgresql://ip_intel:ip_intel@localhost:5432/ip_intel
 CENSYS_API_KEY=<personal-access-token>
-VIEW_DNS_API_KEY=<your-api-key>
+CENSYS_ORG_ID=<organization-id>
 IP_INFO_KEY=<your-ipinfo-lite-token>
-MATTERMOST_WEBHOOK_URL=<incoming-webhook-url>
-SMTP_HOST=<smtp-server-hostname>
-SMTP_PORT=587
-SMTP_USERNAME=<smtp-username>
-SMTP_PASSWORD=<smtp-password>
-SMTP_STARTTLS=true
-ALERT_EMAIL_FROM=<sender-address>
-ALERT_EMAIL_TO=<recipient-address>,<recipient-address>
+URLSCAN_KEY=<your-urlscan-api-key>
 ```
 
-Notes:
+### Database
 
-- `DATABASE_URL` is required. The default points to the Docker Compose Postgres service.
-- `INTEL_DATABASE_URL` is optional and only needed if the raw intel tables should live in a different PostgreSQL database than the app/job tables.
-- All provider/source keys are optional. Missing keys degrade gracefully.
-- `CENSYS_API_KEY` requires a **Starter tier or higher** Censys Platform account — the free tier's API is lookup-only and cannot run the cert→host search. Certificate history additionally needs the Enterprise Adversary Investigation entitlement.
-- `IP_INFO_KEY` enables [ipinfo.io Lite](https://ipinfo.io/lite) lookups (`utils/ipinfo_lite.py`), the **primary** ASN/org/country source for every associated IP — its values win over RDAP's whenever it succeeds, since RDAP errors/times out per-RIR fairly often and ipinfo Lite rarely does. RDAP (`get_ip_whois`) still always runs too, since ipinfo Lite's response doesn't include network name/CIDR, and both feed `detect_proxy_details` for edge-server/reverse-proxy classification. Missing key degrades gracefully to RDAP-only lookups.
-- `MATTERMOST_WEBHOOK_URL` is optional. When set, the backend sends non-blocking alerts for analysis completion and failure.
-- Email alerts are optional and mirror the Mattermost notifications. They are enabled only when both `SMTP_HOST` and `ALERT_EMAIL_TO` are set; otherwise sends are silent no-ops.
-- `SMTP_PORT` defaults to `587` and `SMTP_STARTTLS` defaults to `true`. `SMTP_USERNAME`/`SMTP_PASSWORD` are optional (authentication is skipped when unset).
-- `ALERT_EMAIL_TO` accepts a comma-separated list of recipients. `ALERT_EMAIL_FROM` sets the sender address. Email delivery runs in a background thread and never blocks or fails the caller.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | — | **Required.** App/job tables. The Compose default points at the bundled `postgres` service. |
+| `INTEL_DATABASE_URL` | `DATABASE_URL` | Only needed to put the raw intel tables in a *different* database from the app/job tables. |
+| `TEST_INTEL_DATABASE_URL` | `postgresql://intel_test:intel_test@127.0.0.1:5433/intel_test` | Scratch database for the DB-backed tests. They **skip silently** when it is unreachable, so set this before trusting a green run. |
+
+### Provider keys
+
+All optional — a missing key disables that source and is reported as a
+`skipped` marker rather than an error.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CENSYS_API_KEY` | unset | Censys Platform personal access token. |
+| `CENSYS_ORG_ID` | unset | Censys organization id. Required alongside the key — the Platform API rejects requests without one. |
+| `CENSYS_CERT_HISTORY` | `0` | Set `1` to opt in to the cert→host-observation pivot. Off by default; it costs up to 125 of the ~135 credits per seed domain. |
+| `CENSYS_ENRICHMENT_DAILY_LIMIT` | `20000` | Daily cap on host-enrichment calls, enforced *before* the request goes out. Set `0` to disable enrichment entirely. |
+| `IP_INFO_KEY` | unset | ipinfo.io Lite token — the primary ASN/org/country source. |
+| `URLSCAN_KEY` | unset | Authenticates urlscan.io, lifting the anonymous per-IP rate limit. |
+| `SHODAN_API_KEY` | unset | Shodan origin-IP search. |
+| `NETLAS_KEY` | unset | Netlas cert→host search. `NETLAS_API_KEY` is accepted as a fallback name. |
+| `CERTSPOTTER_API_KEY` | unset | CertSpotter CT source. |
+| `VIEW_DNS_API_KEY` | unset | ViewDNS reverse-IP lookups. |
+
+### Correlation graph
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CORRELATION_DEGREE_THRESHOLD` | `50` | Selector degree past which a selector is denylisted as too common to attribute. |
+| `CORRELATION_ACCOUNT_DEGREE_THRESHOLD` | `500` | The same ceiling for account-bound selectors (`site_verification`, AdSense/GA tracking ids), which are issued per account rather than deployed on shared infrastructure. |
+| `CORRELATION_CLUSTER_MAX_FANOUT` | `25` | Caps how many neighbours one node contributes during clustering. |
+| `GRAPH_CLUSTER_REBUILD_INTERVAL` | `900` | Seconds between whole-pool cluster passes. |
+| `GRAPH_FULL_RECONCILE_INTERVAL` | `86400` | Seconds between full reconciles. `0` disables the automatic schedule. |
+| `GRAPH_INCREMENTAL_BATCH` | `500` | Domains rescored per maintenance tick. |
+| `GRAPH_INCREMENTAL_QUEUE_MAX` | `5000` | Queue ceiling; past it the queue is dropped and a whole-pool rebuild picks the work up instead. |
+| `GRAPH_PATH_MAX_HOPS` | `3` | Multi-hop reachability precompute depth. |
+| `GRAPH_PATH_MAX_NODES` | `200` | Node ceiling for that precompute. |
+| `REBUILD_WORKERS` | CPU count (clamped 2–16) | Parallelism for a full rebuild's per-domain scoring pass. Postgres runs on the same host, so workers past the core count queue rather than overlap; raise this only for a genuinely remote database. |
+| `TLS_SAN_BUNDLE_THRESHOLD` | `15` | SAN count past which a certificate is treated as a shared bundle rather than one operator's. |
+
+### Response cache
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `REDIS_URL` | `redis://redis:6379/0` | Server-side cache for the read endpoints. Unset or unreachable means every endpoint computes live — the app runs unchanged without the `redis` service. |
+| `CACHE_REWARM_DEBOUNCE_SECONDS` | `5` | Quiet period before the cache re-warms itself after an invalidation. Invalidations fire once per projected search, so this coalesces a reconcile's burst into a single warm. |
+
+### Ingestion pipeline
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ANALYSIS_WORKERS` | `12` | Per-job target concurrency; see [Ingestion pipeline tuning](#ingestion-pipeline-tuning). |
+| `URLSCAN_MAX_PARALLEL` | `1` | Concurrent urlscan.io calls. Raising it without `URLSCAN_KEY` will trip the anonymous rate limit. |
+| `RECOVER_JOBS_ON_STARTUP` | `0` | Set `1` to resume jobs left `queued`/`running` after an unclean shutdown instead of marking them `failed`. |
+| `OPENCTI_URL` | unset | OpenCTI instance URL. |
+| `OPENCTI_TOKEN` | unset | OpenCTI API token. |
+| `OPENCTI_INGEST_CHANNELS` | `true` | Whether the website-channel sweep is enabled. |
+| `OPENCTI_INGEST_WORKERS` | `3` | Concurrency for that sweep. |
+
+### Outbound / VPN
+
+See [VPN / Outbound Proxy](#vpn--outbound-proxy) for how these fit together.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OUTBOUND_PROXY_URL` | unset | `http://` or `socks5://` proxy for provider traffic. Unset means direct connections. |
+| `VPN_API_BASE_URL` | unset | ProtonVPN rotation control API. |
+| `VPN_ROTATE_DISABLE` | unset | Set `1` to disable rotation even when the VPN is up. |
+| `COUNTRY_CODES` | `NL, DE, LT` | Comma-separated rotation pool. |
+| `DEFAULT_COUNTRY_CODE` | unset | Preferred exit country. |
+
+### Alerts and diagnostics
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APP_BASE_URL` | `""` | Base URL used in alert links. |
+| `MATTERMOST_WEBHOOK_URL` | unset | Non-blocking alerts on analysis completion and failure. |
+| `SMTP_HOST` | unset | Email alerts are enabled only when both this and `ALERT_EMAIL_TO` are set. |
+| `SMTP_PORT` | `587` | |
+| `SMTP_STARTTLS` | `true` | |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | unset | Optional; authentication is skipped when unset. |
+| `ALERT_EMAIL_FROM` | unset | Sender address. |
+| `ALERT_EMAIL_TO` | unset | Comma-separated recipients. Delivery runs in a background thread and never blocks the caller. |
+| `IP_INTEL_LOG_LEVEL` | `INFO` | Backend log level. |
+| `IP_INTEL_DNS_RESOLVERS` | `1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4` | Resolvers used for direct DNS probes (never proxied). |
+
+### Notes on the ones with real trade-offs
+- `CENSYS_API_KEY` requires a **Starter tier or higher** Censys Platform account — the free tier's API is lookup-only and cannot run the cert→host search. Certificate history additionally needs the Enterprise Adversary Investigation entitlement. `CENSYS_ORG_ID` is required too: the Platform API rejects requests not associated with an organization.
+- `CENSYS_CERT_HISTORY` — set to `1` to opt in to the cert→host-observation pivot. **Default off**, because it is up to 125 of the ~135 credits per seed domain and requires the Enterprise Adversary Investigation entitlement; see [Censys](#censys).
+- `IP_INFO_KEY` enables [ipinfo.io Lite](https://ipinfo.io/lite) lookups (`utils/ipinfo_lite.py`), the **primary** ASN/org/country source for every associated IP — its values win over RDAP's whenever it succeeds, since RDAP errors/times out per-RIR fairly often and ipinfo Lite rarely does. The Lite endpoint is free with no daily or monthly request cap, so nothing metered is ever used in its place for those fields. RDAP (`get_ip_whois`) still always runs too, since ipinfo Lite's response doesn't include network name/CIDR, and both feed `detect_proxy_details` for edge-server/reverse-proxy classification. Missing key degrades gracefully to RDAP-only lookups.
+- `URLSCAN_KEY` authenticates urlscan.io calls (`core/basic.py`'s `_urlscan_headers`), lifting the anonymous per-source-IP rate limit that otherwise forces a VPN rotation (and the batch-wide stall that comes with it) on nearly every domain during a bulk sweep. Missing key falls back to an unauthenticated UA-only request, same as before.
+- `CENSYS_ENRICHMENT_DAILY_LIMIT` — host enrichment is a *separate* quota from the credit-consuming search/view APIs: 20,000 calls/day account-wide on the Core plan, spending no credits. The cap is claimed in the database before each request rather than by reacting to a 429, because on a pool-wide sweep the difference is thousands of wasted round trips. Host enrichment is Core-tier only; on a lower plan every call returns 409 and is skipped without consuming budget. See [Censys host enrichment vs the free sources](#censys-host-enrichment-vs-the-free-sources).
+- `REDIS_URL` / `CACHE_REWARM_DEBOUNCE_SECONDS` — the cache re-warms itself. Any graph invalidation bumps the cache generation and signals a background worker, which waits for the debounce window to go quiet and then refills the hot keys once. Invalidating without re-warming would leave every page cold until someone happened to open it and pay the full query cost, and warming per invalidation would bury Postgres during a reconcile — the debounce is what makes both correct.
+- `GRAPH_INCREMENTAL_QUEUE_MAX` — when the rescore queue overflows, it is discarded rather than truncated, and the next full reconcile picks the work up. Correctness is preserved either way; the trade is a slower path to consistency in exchange for never letting the queue grow without bound.
+- `TEST_INTEL_DATABASE_URL` — the DB-backed tests **skip** rather than fail when this is unreachable, so a run reporting "29 skipped" has verified none of the SQL. Point it at a scratch database before relying on a green suite.

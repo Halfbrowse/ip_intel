@@ -10,6 +10,7 @@ Usage:
     python ip_intel.py <domain>
 """
 
+import contextvars
 import hashlib
 import ipaddress
 import json
@@ -19,6 +20,7 @@ import re
 import socket
 import ssl
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -36,8 +38,10 @@ from cryptography.x509.oid import NameOID
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from core.ip_intel import detect_proxy_details
+from core.ip_intel import _DNS_GATE, censys_cert_search, detect_proxy_details
+from sources import signal_web
 from utils.ipinfo_lite import merge_ipinfo_lite
+from utils.censys_enrichment import merge_censys_enrichment
 from utils.outbound import requests_kwargs
 
 load_dotenv()
@@ -55,7 +59,51 @@ OUTPUT_FILE     = Path(__file__).parent / "results.json"
 # so this can be generous:
 # it only costs DNS/WHOIS/crt.sh/page-fetch time, not API credits.
 FOLLOWUP_LIMIT  = 20    # max subdomains to recurse into
+
+# Two separate caps, because the two stages are limited by different things and
+# used to share one number.
+#
+# `IP_PROBE_LIMIT` bounds the TLS and SSH probes: raw socket connections to
+# ports that are frequently filtered, so each miss costs a full connect timeout.
+# That is a latency budget and 20 is about where it stops being worth waiting.
+#
+# `IP_ENRICH_LIMIT` bounds the per-IP ASN/PTR/host-enrichment pass, which is
+# plain HTTP against ipinfo Lite (free and uncapped) and Censys host enrichment
+# (no credits; 20,000/day, claimed per call in db.intel_db so it self-limits at
+# the cap). Nothing here is billed per IP, so the old shared cap of 20 was
+# spending a latency budget it did not need to: a Censys cert search returns up
+# to 100 hosts and the 80 past the cap were being dropped with no ASN, no geo
+# and no reputation — the exact attribution the paid credit was spent to find.
+# 100 matches the search's page size so a full page is always covered.
 IP_PROBE_LIMIT  = 20    # max IPs to TLS/SSH probe per run
+IP_ENRICH_LIMIT = 100   # max IPs to run ASN/PTR/Censys-enrichment over
+
+# Concurrency for the per-IP enrichment fan-out, and a separate bound on the one
+# source inside it that rate-limits.
+#
+# These were a single number (6 workers) sized entirely by HackerTarget's
+# reverse-IP limit — it 429s readily, and tripping it forces a VPN rotation. So
+# every IP was throttled to protect one call that most of them no longer make:
+# HackerTarget now runs only for the probe-tier IPs (see _enrich_one_ip), while
+# the rest do ipinfo Lite (free and uncapped) plus Censys host enrichment (no
+# per-second limit, only a daily budget claimed up front).
+#
+# Splitting them lets the fan-out run wide while HackerTarget stays as polite as
+# it was: at IP_ENRICH_LIMIT the enrichment phase was ~15s of a scan (51 IPs at
+# ~1.8s each through 6 workers) and is bounded by the semaphore, not the pool.
+# 8, not 16. Measured on a 32-target run: at 16 workers per-IP enrichment went
+# from 1.80s to 3.31s, so throughput rose only 1.45x for a 2.67x worker
+# increase — already past the knee. Worse, each worker does a get_ptr() DNS
+# lookup, and 16 of those per domain across 12 concurrent targets saturated the
+# resolver: the DNS-heavy parity steps inflated in lockstep (origin candidates
+# 5.13s -> 19.66s, zone transfer 0.25s -> 1.31s). Because origin candidates is
+# the parity block's long pole, the extra workers made the critical path slower
+# to speed up a phase that had barely gained. Tune via IP_ENRICH_WORKERS, but
+# measure get_ptr latency and the parity step times together — they share a
+# resolver, so this number cannot be judged on its own.
+_IP_ENRICH_WORKERS = max(1, int(os.environ.get("IP_ENRICH_WORKERS", "8")))
+_HACKERTARGET_CONCURRENCY = max(1, int(os.environ.get("HACKERTARGET_CONCURRENCY", "4")))
+_HACKERTARGET_GATE = threading.Semaphore(_HACKERTARGET_CONCURRENCY)
 
 
 # ── Logging helpers ───────────────────────────────────────────────────────────
@@ -130,15 +178,57 @@ def is_cloudflare_ip(ip: str) -> bool:
         return False
 
 
+# Fallback resolvers, used only when dns.resolver.Resolver() cannot read the
+# system configuration. Same env var and same default list as
+# core/ip_intel.py and sources/signal_dns.py, which already honoured it — this
+# module did not, so a resolver-config failure here silently produced empty
+# record sets that read exactly like "this domain has no records".
+_DNS_FALLBACK_NAMESERVERS = tuple(
+    item.strip()
+    for item in os.getenv("IP_INTEL_DNS_RESOLVERS", "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4").split(",")
+    if item.strip()
+)
+
+_dns_fallback_warned = False
+
+
+def _build_resolver(*, timeout: float, lifetime: float):
+    """A configured resolver, falling back to IP_INTEL_DNS_RESOLVERS.
+
+    dns.resolver.Resolver() reads /etc/resolv.conf; in a container that is
+    Docker's embedded DNS. When that read fails there is nothing to resolve
+    with, and every caller here swallows per-record exceptions, so without this
+    fallback the whole scan reports empty DNS rather than a resolver error.
+    """
+    global _dns_fallback_warned
+    try:
+        resolver = dns.resolver.Resolver()
+    except Exception as exc:
+        if not _DNS_FALLBACK_NAMESERVERS:
+            raise
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = list(_DNS_FALLBACK_NAMESERVERS)
+        if not _dns_fallback_warned:
+            _dns_fallback_warned = True
+            log_warn(
+                f"DNS resolver configuration unavailable ({exc}); "
+                f"falling back to IP_INTEL_DNS_RESOLVERS"
+            )
+    resolver.timeout = timeout
+    resolver.lifetime = lifetime
+    return resolver
+
+
 def resolve_ips(hostname: str) -> list[str]:
     """Return A + AAAA for hostname, empty list on failure."""
-    resolver = dns.resolver.Resolver()
-    resolver.timeout  = 5
-    resolver.lifetime = 8
+    resolver = _build_resolver(timeout=5, lifetime=8)
     ips: list[str] = []
     for rtype in ("A", "AAAA"):
         try:
-            ips.extend(str(r) for r in resolver.resolve(hostname, rtype))
+            # Shared with core.ip_intel's resolvers — see _DNS_GATE there for
+            # why the bound is process-wide rather than per call site.
+            with _DNS_GATE:
+                ips.extend(str(r) for r in resolver.resolve(hostname, rtype))
         except Exception:
             pass
     return ips
@@ -150,9 +240,7 @@ def get_dns(domain: str) -> dict:
     """Resolve A, AAAA, MX, NS, TXT, SOA, CNAME, CAA records (parallel lookups)."""
 
     def _resolve_one(rtype: str) -> tuple[str, object]:
-        resolver = dns.resolver.Resolver()
-        resolver.timeout  = 5
-        resolver.lifetime = 10
+        resolver = _build_resolver(timeout=5, lifetime=10)
         try:
             answers = resolver.resolve(domain, rtype)
             if rtype == "MX":
@@ -481,57 +569,19 @@ def get_hackertarget(domain: str) -> dict:
             return {"error": str(exc)}
 
 
-def get_viewdns_subdomains(domain: str) -> dict:
-    """Subdomains from ViewDNS's Subdomain Finder (needs VIEW_DNS_API_KEY).
+def _urlscan_headers() -> dict:
+    """Headers for urlscan.io calls, authenticating when URLSCAN_KEY is set.
 
-    Feeds the same `{"hits": [{"subdomain", "ip"}, ...]}` shape as
-    get_hackertarget so it composes with the same downstream consumers
-    (collect_non_cf_ips, pick_followup_subdomains). ViewDNS's own response
-    puts each hit under response.subdomains, as either a bare hostname string
-    or a {"subdomain", "ip"} object depending on plan/endpoint version, so
-    both shapes are handled defensively.
+    An authenticated key lifts the anonymous per-source-IP rate limit that
+    otherwise forces a VPN rotation (and the batch-wide stall that comes with
+    it) on nearly every domain. Falls back to an unauthenticated UA-only
+    request when no key is configured, so local/dev behaves as before.
     """
-    api_key = os.environ.get("VIEW_DNS_API_KEY", "").strip()
-    if not api_key:
-        return {"hits": [], "skipped": True, "reason": "VIEW_DNS_API_KEY not set"}
-    try:
-        resp = requests.get(
-            "https://api.viewdns.info/subdomains/",
-            params={"domain": domain, "apikey": api_key, "output": "json"},
-            timeout=20,
-            **requests_kwargs(),
-        )
-        if resp.status_code != 200:
-            return {"hits": [], "error": f"HTTP {resp.status_code}"}
-        payload = resp.json()
-        if payload.get("success") is False or "error" in payload:
-            message = (payload.get("error") or {}).get("message") or payload.get("error") or "unknown error"
-            log_warn(f"ViewDNS: {message}")
-            return {"hits": [], "error": str(message)}
-
-        raw = ((payload.get("response") or {}).get("subdomains")) or []
-        hits = []
-        for entry in raw:
-            if isinstance(entry, dict):
-                sub = str(
-                    entry.get("subdomain") or entry.get("domain") or entry.get("name") or ""
-                ).strip()
-                ips = entry.get("ips")
-                if isinstance(ips, list):
-                    ip = str(ips[0]) if ips else ""
-                else:
-                    ip = str(entry.get("ip") or "").strip()
-            else:
-                sub = str(entry or "").strip()
-                ip = ""
-            if sub:
-                hits.append({"subdomain": sub, "ip": ip})
-
-        log_ok(f"ViewDNS: {len(hits)} subdomains")
-        return {"hits": hits}
-    except Exception as exc:
-        log_warn(f"ViewDNS failed: {exc}")
-        return {"error": str(exc)}
+    headers = {"User-Agent": "ip-intel/1.0"}
+    api_key = os.environ.get("URLSCAN_KEY", "").strip()
+    if api_key:
+        headers["API-Key"] = api_key
+    return headers
 
 
 def _fetch_urlscan_referrers(uuid: str, domain: str, timeout: float = 15.0) -> dict:
@@ -550,7 +600,7 @@ def _fetch_urlscan_referrers(uuid: str, domain: str, timeout: float = 15.0) -> d
     try:
         resp = requests.get(
             f"https://urlscan.io/api/v1/result/{uuid}/",
-            headers={"User-Agent": "ip-intel/1.0"},
+            headers=_urlscan_headers(),
             timeout=timeout,
             **requests_kwargs(),
         )
@@ -592,7 +642,7 @@ def get_urlscan(domain: str) -> dict:
             resp = requests.get(
                 "https://urlscan.io/api/v1/search/",
                 params={"q": f"domain:{domain}", "size": "100"},
-                headers={"User-Agent": "ip-intel/1.0"},
+                headers=_urlscan_headers(),
                 timeout=15,
                 **requests_kwargs(),
             )
@@ -651,197 +701,58 @@ def get_urlscan(domain: str) -> dict:
 
 
 def get_censys(domain: str) -> dict:
-    """Hosts serving a TLS cert matching the domain (needs CENSYS_API_KEY)."""
-    api_key = os.environ.get("CENSYS_API_KEY")
-    org_id  = os.environ.get("CENSYS_ORG_ID")
-    if not api_key:
-        return {"skipped": True, "reason": "CENSYS_API_KEY not set"}
-    if not org_id:
-        return {"skipped": True, "reason": "CENSYS_ORG_ID not set"}
-    try:
-        from censys_platform import SDK
-    except ImportError:
-        return {"skipped": True, "reason": "censys_platform not installed"}
+    """Hosts serving a TLS cert matching the domain (needs CENSYS_API_KEY).
 
-    try:
-        with SDK(personal_access_token=api_key, organization_id=org_id) as sdk:
-            query = f'host.services.cert.names = "{domain}"'
-            resp = sdk.global_data.search(search_query_input_body={
-                "query":     query,
-                "fields":    ["host.ip"],
-                "page_size": 100,
-            })
-        # The generated SDK returns resp.result (a SearchQueryResponse) whose
-        # model_dump() nests the real payload under a further "result" key;
-        # each hit wraps the host under host_v1.resource. Navigate via
-        # model_dump() so we don't depend on drifting typed attribute paths.
-        outer   = resp.result.model_dump() if hasattr(getattr(resp, "result", None), "model_dump") else {}
-        payload = outer.get("result") or outer
-        hits = []
-        for hit in (payload.get("hits") or []):
-            ip = ((hit.get("host_v1") or {}).get("resource") or {}).get("ip")
-            if ip:
-                hits.append({"ip": ip})
-        log_ok(f"Censys: {len(hits)} hits")
-        return {"hits": hits}
-    except Exception as exc:
-        log_warn(f"Censys failed: {exc}")
-        return {"error": str(exc)}
+    Delegates to core.ip_intel.censys_cert_search rather than keeping a second
+    implementation. Both hit the same endpoint with the same query and so cost
+    the same search credits, but this one used to ask for `fields=["host.ip"]`
+    and keep only the IP — throwing away the ASN, country, open-service list,
+    non-Cloudflare origin-candidate split and pagination that arrive in the
+    very same paid response. Since the web pipeline runs *this* function (it's
+    the entry in SERVICES) while the CLI ran the richer twin, the web pipeline
+    was the one paying full price for a fraction of the data.
 
-
-def get_shodan(domain: str) -> dict:
-    """Shodan hosts matching ssl:<domain> (needs SHODAN_API_KEY)."""
-    api_key = os.environ.get("SHODAN_API_KEY")
-    if not api_key:
-        return {"skipped": True, "reason": "SHODAN_API_KEY not set"}
-    try:
-        import shodan
-    except ImportError:
-        return {"skipped": True, "reason": "shodan not installed"}
-
-    try:
-        api  = shodan.Shodan(api_key)
-        resp = api.search(f'ssl:"{domain}"', minify=False)
-        hits = []
-        for match in resp.get("matches", []):
-            hits.append({
-                "ip":        match.get("ip_str"),
-                "asn":       match.get("asn"),
-                "org":       match.get("org"),
-                "ports":     match.get("ports", []),
-                "hostnames": match.get("hostnames", []),
-            })
-        log_ok(f"Shodan: {len(hits)} hits (total={resp.get('total')})")
-        return {"total": resp.get("total", len(hits)), "hits": hits}
-    except Exception as exc:
-        log_warn(f"Shodan failed: {exc}")
-        return {"error": str(exc)}
-
-
-def get_netlas(domain: str) -> dict:
-    """Netlas hosts with TLS cert matching domain (needs NETLAS_KEY)."""
-    api_key = os.environ.get("NETLAS_KEY") or os.environ.get("NETLAS_API_KEY")
-    if not api_key:
-        return {"skipped": True, "reason": "NETLAS_KEY not set"}
-    try:
-        import netlas
-    except ImportError:
-        return {"skipped": True, "reason": "netlas not installed"}
-
-    try:
-        conn  = netlas.Netlas(api_key=api_key)
-        query = f'certificate.subject.common_name:"{domain}"'
-        resp  = conn.query(query=query, datatype="response", page=0)
-        hits  = []
-        for item in (resp or {}).get("items", []):
-            data = item.get("data", {})
-            ip   = data.get("ip")
-            if ip:
-                hits.append({
-                    "ip":       ip,
-                    "port":     data.get("port"),
-                    "protocol": data.get("protocol"),
-                })
-        log_ok(f"Netlas: {len(hits)} hits")
-        return {"hits": hits}
-    except Exception as exc:
-        log_warn(f"Netlas failed: {exc}")
-        return {"error": str(exc)}
+    The cert-history pivot stays off unless CENSYS_CERT_HISTORY is set — see
+    core.ip_intel._censys_history_enabled for why.
+    """
+    result = censys_cert_search(domain)
+    if result.get("skipped"):
+        log_info(f"Censys skipped: {result.get('reason')}")
+    elif result.get("error"):
+        log_warn(f"Censys failed: {result['error']}")
+    else:
+        log_ok(f"Censys: {len(result.get('hits') or [])} hits, "
+               f"{len(result.get('origin_candidates') or [])} origin candidate(s)")
+    return result
 
 
 def get_page_metadata(domain: str) -> dict:
-    """Fetch homepage and extract tracking IDs, CMS generator, social links."""
-    out = {
-        "google_analytics": [], "gtm_ids": [], "facebook_pixel": [],
-        "yandex_metrika": [], "html_lang": None, "cms_generator": None,
-        "social_links": {}, "fetched_insecure": False, "fetched_http": False,
-    }
+    """Fetch the homepage and extract tracking IDs, favicon hashes, and identity signals.
 
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; ip-intel/1.0)"}
-    html: str | None = None
-    last_err: str | None = None
+    Delegates to sources/signal_web.py rather than scraping here. This used to
+    be its own fetch with its own regex set — a strict subset of signal_web's
+    (no TikTok pixel, no AdSense, no `AW-` conversion IDs, no favicon hashing,
+    no phone/crypto/meta-tag extraction, no ok.ru or Pinterest) — while
+    core/analysis_service.py separately called signal_web for the real thing
+    and merged the two. Every domain therefore had its homepage fetched twice,
+    and the second fetch contributed nothing the first did not already have.
+    One collector also means one output vocabulary: see
+    signal_web.canonicalize_page_metadata for why that matters.
+    """
+    result = signal_web.fetch_page_metadata(domain)
+    if result.get("error") and not result.get("final_url"):
+        log_warn(f"Page fetch failed: {result['error']}")
+        return {"error": result["error"]}
 
-    # Try HTTPS with normal verification first.
-    try:
-        resp = requests.get(f"https://{domain}", headers=headers,
-                            timeout=15, allow_redirects=True,
-                            **requests_kwargs())
-        html = resp.text
-    except Exception as exc:
-        last_err = str(exc)
-
-    # If that failed with any TLS/cert error, retry without verification. We're
-    # not doing auth here — just scraping the rendered page for signals — so
-    # an expired or mismatched cert shouldn't cost us the whole result.
-    if html is None and last_err and any(
-        needle in last_err.lower()
-        for needle in ("certificate", "sslerror", "ssl:", "ssl error")
-    ):
-        try:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            resp = requests.get(f"https://{domain}", headers=headers,
-                                timeout=15, allow_redirects=True, verify=False,
-                                **requests_kwargs())
-            html = resp.text
-            out["fetched_insecure"] = True
-            log_warn(f"page_metadata: {domain} has broken TLS — fetched anyway")
-        except Exception as exc:
-            last_err = str(exc)
-
-    # Last resort: plain HTTP.
-    if html is None:
-        try:
-            resp = requests.get(f"http://{domain}", headers=headers,
-                                timeout=15, allow_redirects=True,
-                                **requests_kwargs())
-            html = resp.text
-            out["fetched_http"] = True
-            log_warn(f"page_metadata: {domain} fell back to plain HTTP")
-        except Exception as exc:
-            last_err = str(exc)
-
-    if html is None:
-        log_warn(f"Page fetch failed: {last_err}")
-        return {"error": last_err or "unknown fetch error"}
-
-    m = re.search(r'<html[^>]+\blang=["\']([^"\']+)["\']', html, re.I)
-    if m:
-        out["html_lang"] = m.group(1).lower()
-
-    out["google_analytics"] = sorted(set(re.findall(
-        r'\b(UA-\d{4,12}-\d{1,3}|G-[A-Z0-9]{6,12})\b', html)))
-    out["gtm_ids"]        = sorted(set(re.findall(r'\b(GTM-[A-Z0-9]{4,8})\b', html)))
-    out["facebook_pixel"] = sorted(set(re.findall(
-        r'fbq\(["\']init["\'],\s*["\'](\d{10,20})["\']', html)))
-    out["yandex_metrika"] = sorted(set(re.findall(r'\bym\((\d{5,12})\s*,', html)))
-
-    m = re.search(
-        r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']',
-        html, re.I,
+    tracker_total = sum(
+        len(result.get(key) or [])
+        for key in ("google_analytics", "gtm_ids", "facebook_pixel",
+                    "yandex_metrika", "tiktok_pixel", "adsense_publisher_ids")
     )
-    if m:
-        out["cms_generator"] = m.group(1).strip()
-
-    social_patterns = {
-        "telegram":  r'https?://t\.me/([A-Za-z0-9_]{3,60})',
-        "twitter_x": r'https?://(?:www\.)?(?:twitter|x)\.com/([^\s"\'<>/?]{2,60})',
-        "facebook":  r'https?://(?:www\.)?facebook\.com/([^\s"\'<>/?]{2,80})',
-        "youtube":   r'https?://(?:www\.)?youtube\.com/(?:channel/|@)([^\s"\'<>/?]{2,80})',
-        "instagram": r'https?://(?:www\.)?instagram\.com/([^\s"\'<>/?]{2,60})',
-        "linkedin":  r'https?://(?:www\.)?linkedin\.com/(?:company|in)/([^\s"\'<>/?]{2,80})',
-        "vk":        r'https?://(?:www\.)?vk\.com/([^\s"\'<>/?]{2,80})',
-    }
-    for name, pattern in social_patterns.items():
-        matches = sorted(set(re.findall(pattern, html, re.I)))
-        if matches:
-            out["social_links"][name] = matches
-
-    tracker_total = sum(len(out[k]) for k in
-                        ("google_analytics", "gtm_ids", "facebook_pixel", "yandex_metrika"))
-    log_ok(f"page_metadata: lang={out['html_lang']} cms={out['cms_generator']} "
-           f"social={len(out['social_links'])} trackers={tracker_total}")
-    return out
+    log_ok(f"page_metadata: lang={result.get('html_lang')} "
+           f"cms={result.get('cms_generator')} "
+           f"social={len(result.get('social_links') or {})} trackers={tracker_total}")
+    return result
 
 
 # ── TLS / SSH probes ──────────────────────────────────────────────────────────
@@ -974,7 +885,7 @@ def get_ssh_host_keys(ips: list[str]) -> dict:
 # ── Post-service helpers ──────────────────────────────────────────────────────
 
 def collect_non_cf_ips(
-    results: dict, limit: int = IP_PROBE_LIMIT, *, with_sources: bool = False,
+    results: dict, limit: int = IP_ENRICH_LIMIT, *, with_sources: bool = False,
 ) -> list[str] | tuple[list[str], dict[str, list[str]]]:
     """Pull every non-Cloudflare IP surfaced across all services.
 
@@ -1002,16 +913,16 @@ def collect_non_cf_ips(
 
     for hit in (results.get("hackertarget", {}) or {}).get("hits", []) or []:
         _add(hit.get("ip", ""), "hackertarget")
-    for hit in (results.get("viewdns", {}) or {}).get("hits", []) or []:
-        _add(hit.get("ip", ""), "viewdns")
     for hit in (results.get("urlscan", {}) or {}).get("hits", []) or []:
         _add(hit.get("ip", ""), "urlscan")
     for rec in (results.get("circl_pdns", {}) or {}).get("records", []) or []:
         if rec.get("rrtype") in ("A", "AAAA"):
             _add(rec.get("rdata", ""), "circl_pdns")
-    for src in ("censys", "shodan", "netlas"):
-        for hit in (results.get(src, {}) or {}).get("hits", []) or []:
-            _add(hit.get("ip", ""), src)
+    # Censys only: this runs on a freshly-collected `results` dict, so the
+    # retired shodan/netlas/viewdns keys can never be present here. Stored
+    # payloads that do carry them are handled by the readers in db/intel_db.py.
+    for hit in (results.get("censys", {}) or {}).get("hits", []) or []:
+        _add(hit.get("ip", ""), "censys")
 
     limited = ips[:limit]
     if with_sources:
@@ -1034,7 +945,7 @@ _MIN_CONTENT_FOLLOWUPS = 5
 
 def pick_followup_subdomains(results: dict, limit: int = FOLLOWUP_LIMIT) -> list[str]:
     """
-    Pick subdomains from crt.sh and ViewDNS worth a full follow-up scan.
+    Pick subdomains from crt.sh and HackerTarget worth a full follow-up scan.
 
     Previously this required a non-Cloudflare IP (an "origin leak" signal),
     which meant any subdomain that's legitimately CDN-fronted -- exactly the
@@ -1043,18 +954,25 @@ def pick_followup_subdomains(results: dict, limit: int = FOLLOWUP_LIMIT) -> list
     content-level matches on it (shared analytics/pixel IDs, etc.) could never
     surface. We only require that the subdomain actually resolves (skip
     dead/parked entries); origin-leak detection itself still lives separately
-    in ip_intel.probe_subdomain_origins. Follow-up scans skip paid providers
-    (Censys/Shodan/Netlas -- see analysis_service.run_providers) regardless of
-    what's picked here, so widening this selection doesn't touch paid-provider
-    usage -- only DNS/WHOIS/crt.sh/page-fetch time.
+    in ip_intel.probe_subdomain_origins. Follow-up scans skip the paid provider
+    (Censys -- see analysis_service.run_providers) regardless of what's picked
+    here, so widening this selection doesn't touch paid-provider usage -- only
+    DNS/WHOIS/crt.sh/page-fetch time.
+
+    The second source is HackerTarget rather than ViewDNS: ViewDNS was the only
+    subdomain source costing a paid key while returning the same
+    `{"subdomain", "ip"}` shape HackerTarget already gives for free, so it was
+    retired. HackerTarget was previously collected but never consulted here,
+    which meant dropping ViewDNS would otherwise have left follow-ups sourced
+    from crt.sh alone.
     """
     crt_subs = (results.get("crt_sh", {}) or {}).get("subdomains", []) or []
-    viewdns_subs = [
+    hackertarget_subs = [
         hit.get("subdomain", "")
-        for hit in (results.get("viewdns", {}) or {}).get("hits", []) or []
+        for hit in (results.get("hackertarget", {}) or {}).get("hits", []) or []
         if hit.get("subdomain")
     ]
-    subs = sorted({*crt_subs, *viewdns_subs})
+    subs = sorted({*crt_subs, *hackertarget_subs})
     priority = ("mail", "api", "dev", "staging", "admin", "portal", "vpn",
                 "cpanel", "webmail", "ftp", "smtp", "ns", "autodiscover")
 
@@ -1102,6 +1020,16 @@ def _apex(hostname: str) -> str:
     eTLD+1 lookup would need `tldextract`, another dep.
     """
     hostname = (hostname or "").strip(".").lower()
+    # An IP literal has no apex. Splitting on dots and keeping the last two
+    # labels turns 78.17.42.166 into the "domain" 42.166 — a string that is not
+    # a domain, not the IP, and not anything. Censys web properties are
+    # routinely keyed on a bare IP (a site served with no hostname), so this
+    # reached discovered_targets and queued 42.166-style garbage for scanning.
+    try:
+        ipaddress.ip_address(hostname)
+        return hostname
+    except ValueError:
+        pass
     parts = hostname.split(".")
     if len(parts) <= 2:
         return hostname
@@ -1229,8 +1157,41 @@ def _detect_platform(headers: dict[str, str]) -> str | None:
     return None
 
 
-def _detect_cms(html: str, headers: dict[str, str]) -> str | None:
-    """Quick CMS detection from headers + HTML signatures."""
+_GENERATOR_CMS_SIGNATURES = (
+    ("wordpress", "wordpress"),
+    ("drupal", "drupal"),
+    ("joomla", "joomla"),
+    ("ghost", "ghost"),
+    ("typo3", "typo3"),
+    ("wix", "wix"),
+    ("squarespace", "squarespace"),
+    ("shopify", "shopify"),
+    ("hugo", "hugo"),
+    ("jekyll", "jekyll"),
+    ("bitrix", "bitrix"),
+)
+
+
+def _detect_cms(html: str, headers: dict[str, str], generator: str | None = None) -> str | None:
+    """Quick CMS detection from the generator meta tag, then headers + HTML.
+
+    `generator` is page_metadata.cms_generator — the `<meta name="generator">`
+    value. It is checked first because it is the platform declaring itself,
+    which beats inference from headers or markup. The header/HTML heuristics
+    stay for the majority of hardened sites that strip the tag.
+
+    Previously these were two independent fields (`live_probe.cms` from the
+    heuristics, `page_metadata.cms_generator` from the tag) scored separately,
+    so a site that both declared a generator and fingerprinted as the same CMS
+    counted as two matching signals instead of one. This resolves them into a
+    single value; the raw tag is still kept as `page_metadata.cms_generator`.
+    """
+    declared = str(generator or "").strip().lower()
+    if declared:
+        for needle, label in _GENERATOR_CMS_SIGNATURES:
+            if needle in declared:
+                return label
+
     normalized = {k.lower(): str(v or "") for k, v in headers.items()}
 
     # WordPress tells on itself in multiple ways.
@@ -1254,131 +1215,72 @@ def _detect_cms(html: str, headers: dict[str, str]) -> str | None:
     return None
 
 
-def get_live_probe(domain: str) -> dict:
+def get_live_probe(
+    domain: str,
+    *,
+    dns_records: dict | None = None,
+    page_metadata: dict | None = None,
+    html_prefix: str = "",
+) -> dict:
     """
-    Capture current-state evidence for the domain:
-      - what it resolves to RIGHT NOW
-      - what HTTP headers / status its homepage returns
+    Current-state evidence for the domain, derived rather than re-fetched:
+      - what it resolves to right now
+      - what HTTP status / headers its homepage returned
       - what managed platform (if any) is serving it
       - what CMS (if any) is running
-      - whether it's currently reachable at all
+      - whether it is currently reachable at all
 
-    This is deliberately separate from page_metadata so that a scan can fail
-    at the HTML level but still capture "is this site alive / where is it /
-    what's running it" — which is enough to calibrate historical evidence.
+    This used to do its own DNS resolution *and* its own HEAD/GET of the
+    homepage. Both were redundant. `resolve_ips` re-queried A/AAAA that
+    `get_dns` was resolving concurrently in the same scan — so "current" and
+    "historical" were the same instant — and the HTTP leg re-fetched a homepage
+    that `page_metadata` was fetching anyway, where
+    `signal_web.capture_http_fingerprint` already recorded status, final URL,
+    server and X-Powered-By plus more (header order, cookie names, CSP,
+    X-Generator). Only the redirect chain and the platform fingerprint were
+    unique to this function, and both are now computed from the page-metadata
+    response.
+
+    So this is now a projection over two inputs the caller already has. Both are
+    optional: with neither, the result is the empty/unreachable shape rather
+    than a second round of network calls, which keeps the output keys stable for
+    the evidence/pairwise paths that read `live_probe.*`.
     """
+    dns_records = dns_records or {}
+    page_metadata = page_metadata or {}
+    fingerprint = page_metadata.get("http_fingerprint") or {}
+    headers_dict = fingerprint.get("headers") or {}
+
+    v4 = [ip for ip in (dns_records.get("A") or []) if str(ip).strip()]
+    v6 = [ip for ip in (dns_records.get("AAAA") or []) if str(ip).strip()]
+
+    status = fingerprint.get("status_code") or page_metadata.get("status_code")
+    final_url = fingerprint.get("url") or page_metadata.get("final_url")
+    fetch_error = page_metadata.get("error")
+
     out: dict = {
-        "probed_at":        datetime.now(timezone.utc).isoformat(),
-        "current_ips":      [],
-        "current_ipv6":     [],
-        "http_status":      None,
-        "final_url":        None,
-        "redirect_chain":   [],
-        "server_header":    None,
-        "x_powered_by":     None,
-        "platform":         None,
-        "cms":              None,
-        "headers":          {},
-        "reachable":        False,
-        "fetch_error":      None,
+        "probed_at":      datetime.now(timezone.utc).isoformat(),
+        "current_ips":    v4,
+        "current_ipv6":   v6,
+        "http_status":    status,
+        "final_url":      final_url,
+        "redirect_chain": fingerprint.get("redirect_chain") or [],
+        "server_header":  fingerprint.get("server"),
+        "x_powered_by":   fingerprint.get("x_powered_by"),
+        "platform":       _detect_platform(headers_dict) if headers_dict else None,
+        "cms":            _detect_cms(html_prefix, headers_dict,
+                                      generator=page_metadata.get("cms_generator")),
+        "headers":        headers_dict,
+        "reachable":      bool(status) and int(status) < 500,
+        "fetch_error":    fetch_error,
     }
 
-    # Current DNS resolution — not the historical one in the other scan blocks.
-    out["current_ips"]  = resolve_ips(domain)  # includes A + AAAA
-
-    # Split v4/v6 for clarity downstream.
-    import ipaddress
-    v4 = []
-    v6 = []
-    for ip in out["current_ips"]:
-        try:
-            addr = ipaddress.ip_address(ip)
-            (v4 if addr.version == 4 else v6).append(ip)
-        except ValueError:
-            continue
-    out["current_ips"]  = v4
-    out["current_ipv6"] = v6
-
     if not v4 and not v6:
-        out["fetch_error"] = "no DNS resolution"
+        out["fetch_error"] = out["fetch_error"] or "no DNS resolution"
         log_warn(f"live_probe: {domain} does not resolve")
         return out
 
-    # Live HTTP fetch with redirect chain tracked. We deliberately use a HEAD
-    # as the initial probe so we don't pull a large body for closed/redirecting
-    # sites; if HEAD is rejected, fall back to GET.
-    headers_req = {
-        "User-Agent": "Mozilla/5.0 (compatible; ip-intel/live-probe/1.0)",
-        "Accept":     "*/*",
-    }
-    try:
-        resp = requests.head(
-            f"https://{domain}/",
-            headers=headers_req,
-            timeout=10,
-            allow_redirects=True,
-            **requests_kwargs(),
-        )
-        # Some servers lie about HEAD — accept but treat 405/501 as "retry GET".
-        if resp.status_code in (405, 501):
-            raise requests.RequestException("HEAD not supported, retry GET")
-    except Exception:
-        try:
-            resp = requests.get(
-                f"https://{domain}/",
-                headers=headers_req,
-                timeout=15,
-                allow_redirects=True,
-                stream=True,  # don't pull the body — headers are enough
-                **requests_kwargs(),
-            )
-        except Exception as exc:
-            # One more try on plain HTTP.
-            try:
-                resp = requests.get(
-                    f"http://{domain}/",
-                    headers=headers_req,
-                    timeout=15,
-                    allow_redirects=True,
-                    stream=True,
-                    **requests_kwargs(),
-                )
-            except Exception as exc2:
-                out["fetch_error"] = str(exc2)
-                log_warn(f"live_probe: {domain} fetch failed: {exc2}")
-                return out
-
-    # Capture the redirect chain so we can see e.g. "example.com → cdn.example.com"
-    chain = []
-    for hop in resp.history:
-        chain.append({
-            "url":    hop.url,
-            "status": hop.status_code,
-            "location": hop.headers.get("Location"),
-        })
-    out["redirect_chain"] = chain
-    out["final_url"]      = resp.url
-    out["http_status"]    = resp.status_code
-    out["reachable"]      = resp.status_code < 500
-
-    headers_dict = {k: v for k, v in resp.headers.items()}
-    out["headers"]       = headers_dict
-    out["server_header"] = headers_dict.get("Server") or headers_dict.get("server")
-    out["x_powered_by"]  = headers_dict.get("X-Powered-By") or headers_dict.get("x-powered-by")
-    out["platform"]      = _detect_platform(headers_dict)
-
-    # Only fetch the body if HEAD succeeded and we still need CMS detection.
-    # This is cheap — keeps tests lightweight for dead sites.
-    html = ""
-    if resp.request.method == "GET" and resp.status_code < 400:
-        try:
-            # Pull first 32KB — enough for <head> + early body for CMS detect.
-            html = resp.raw.read(32 * 1024, decode_content=True).decode("utf-8", errors="replace")
-        except Exception:
-            pass
-    out["cms"] = _detect_cms(html, headers_dict)
-
-    log_ok(f"live_probe: {domain} → {resp.status_code} "
+    log_ok(f"live_probe: {domain} -> {status or '-'} "
            f"ips={len(v4)} platform={out['platform'] or '-'} "
            f"cms={out['cms'] or '-'} server={out['server_header'] or '-'}")
     return out
@@ -1442,29 +1344,39 @@ def annotate_historical_ips(results: dict) -> dict:
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
+# `live_probe` is deliberately absent: it is no longer a network service but a
+# projection over the `dns` and `page_metadata` results, so analyze() computes it
+# after this fan-out completes rather than concurrently with them.
 SERVICES = [
     ("dns",           get_dns),
     ("whois",         get_whois),
-    ("live_probe",    get_live_probe),   # NEW — captures current state
     ("crt_sh",        get_crt_sh),
     ("circl_pdns",    get_circl_pdns),
     ("hackertarget",  get_hackertarget),
-    ("viewdns",       get_viewdns_subdomains),
     ("urlscan",       get_urlscan),
     ("censys",        get_censys),
-    ("shodan",        get_shodan),
-    ("netlas",        get_netlas),
     ("page_metadata", get_page_metadata),
 ]
 
 # Cert-search providers that cost one paid/rate-limited API call per target.
 # Gated behind analyze(run_providers=...) so subdomain follow-ups don't each
-# fire their own Censys/Shodan/Netlas query.
-_PROVIDER_SERVICES = {"censys", "shodan", "netlas"}
+# fire their own Censys query.
+#
+# Shodan and Netlas used to sit here too. Both answered the same question as
+# Censys ("which hosts serve a TLS cert naming this domain") on their own paid
+# keys, and Netlas returned strictly less than the other two (ip/port/protocol
+# only — no ASN, org or hostnames), so all three were billed for overlapping
+# answers. Their *readers* stay: db/intel_db.py, utils/evidence_meta.py and
+# utils/pairwise.py still resolve `shodan.hits`/`netlas.hits` out of payloads
+# stored before this removal, so a rebuild_clusters keeps projecting the IPs
+# those scans already recorded.
+_PROVIDER_SERVICES = {"censys"}
 
 
-# steps per analyze() call: one per service + TLS probe + SSH probe + IP enrich
-STEPS_PER_DOMAIN = len(SERVICES) + 3
+# steps per analyze() call: one per service, then live_probe (derived from dns +
+# page_metadata, so it bumps outside the SERVICES fan-out), TLS probe, SSH probe,
+# IP enrich.
+STEPS_PER_DOMAIN = len(SERVICES) + 4
 
 # Global record of every domain we've already scanned in this process. Shared
 # across analyze() calls to prevent duplicate work when a batch run turns up
@@ -1495,17 +1407,20 @@ def analyze(domain: str, *, is_followup: bool = False,
     `follow_siblings=False` disables sibling discovery (useful when called
     from batch mode so we don't explode the scan count).
 
-    `run_providers=False` skips the paid/rate-limited cert-search providers
-    (Censys, Shodan, Netlas). Each of those is an API call per target, so
-    running them on every discovered subdomain is what makes a single case
-    burn 30+ Censys calls. A subdomain's certs/origins are already covered by
+    `run_providers=False` skips the paid/rate-limited cert-search provider
+    (Censys). That is an API call per target, so running it on every discovered
+    subdomain is what makes a single case burn 30+ Censys calls. A subdomain's certs/origins are already covered by
     its apex's provider search plus crt.sh / DNS / TLS probing, so callers
     pass run_providers=False for subdomain follow-ups and keep them only for
     apex-level targets.
     """
     started = time.time()
     prefix  = "└─ " if is_followup else ""
-    log_info(f"{prefix}analyzing {domain}")
+    log_info(
+        f"{prefix}=== analyze {domain} === "
+        f"(follow-up={is_followup}, providers={'on' if run_providers else 'off'}, "
+        f"siblings={'on' if follow_siblings else 'off'})"
+    )
 
     # Register this domain so any sibling/subdomain picker elsewhere in the
     # process skips it. Mark before scanning so recursion with the same name
@@ -1519,41 +1434,116 @@ def analyze(domain: str, *, is_followup: bool = False,
     }
 
     # ── 1. External services ──────────────────────────────────────────────────
-    for name, fn in SERVICES:
+    # Each service is an independent network call (15-20s timeouts) with no
+    # shared mutable state between them, so we fan them all out concurrently and
+    # collect results as they complete. Only the main thread mutates `results`,
+    # calls `save_results`, and bumps the progress bar — the worker threads just
+    # perform the (thread-safe) network calls.
+    def _run_service(name, fn):
+        # Evaluate the skip logic inside the worker so it stays a single unit of
+        # work per service; no network call is made for a skipped provider.
         if name in _PROVIDER_SERVICES and not run_providers:
             # Skip the per-target paid cert-search APIs on follow-ups; record a
             # marker so the key is present and downstream code treats it like
             # any other skipped service.
-            results[name] = {"skipped": True,
-                             "reason": "provider cert search runs on apex targets only"}
+            return {"skipped": True,
+                    "reason": "provider cert search runs on apex targets only"}
+        return fn(domain)
+
+    log_info(f"querying {len(SERVICES)} sources concurrently for {domain}")
+    with ThreadPoolExecutor(max_workers=len(SERVICES),
+                            thread_name_prefix="svc") as ex:
+        future_to_name = {}
+        service_started: dict = {}
+        for name, fn in SERVICES:
+            service_started[name] = time.time()
+            # Run each service in a copy of the current context so the worker
+            # thread inherits the ContextVar-based log/save hooks that
+            # analysis_service._basic_runtime sets on this thread. Without this,
+            # the per-provider log lines emitted *inside* each service (e.g.
+            # "crt.sh: N certs") would bypass CaseRuntime._log and never reach
+            # the job log / UI. A fresh copy per submit is required — a single
+            # Context object cannot be entered by two threads at once.
+            ctx = contextvars.copy_context()
+            future_to_name[ex.submit(ctx.run, _run_service, name, fn)] = name
+
+        for fut in as_completed(future_to_name):
+            name = future_to_name[fut]
+            elapsed = time.time() - service_started[name]
+            try:
+                results[name] = fut.result()
+            except Exception as exc:
+                log_warn(f"{name} crashed: {exc}")
+                results[name] = {"error": str(exc)}
+            log_info(f"source {name} for {domain} done in {elapsed:.1f}s")
+            # Persist and bump from the main thread as each future completes.
+            if all_results is not None:
+                save_results(all_results)
             _bump(overall_bar, name, domain)
-            continue
-        try:
-            results[name] = fn(domain)
-        except Exception as exc:
-            log_warn(f"{name} crashed: {exc}")
-            results[name] = {"error": str(exc)}
-        if all_results is not None:
-            save_results(all_results)
-        _bump(overall_bar, name, domain)
+
+    # ── 1b. live_probe: projection over dns + page_metadata ───────────────────
+    # Not a service (see the SERVICES comment): it needs both of those results,
+    # so it runs here instead of in the fan-out. `_html_prefix` is the markup
+    # page_metadata already downloaded; it feeds the CMS heuristics and is then
+    # dropped so it never reaches the stored payload.
+    page_meta = results.get("page_metadata")
+    if not isinstance(page_meta, dict):
+        page_meta = {}
+    html_prefix = page_meta.pop("_html_prefix", "") or ""
+    results["live_probe"] = get_live_probe(
+        domain,
+        dns_records=results.get("dns") or {},
+        page_metadata=page_meta,
+        html_prefix=html_prefix,
+    )
+    if all_results is not None:
+        save_results(all_results)
+    _bump(overall_bar, "live_probe", domain)
 
     # ── 2. TLS + SSH probing on non-CF IPs ────────────────────────────────────
     non_cf_ips, non_cf_ip_sources = collect_non_cf_ips(results, with_sources=True)
     log_info(f"non-CF IPs found: {len(non_cf_ips)}")
     results["non_cf_ips"] = non_cf_ips
 
-    results["tls_certs"] = get_tls_certs(domain, non_cf_ips)
+    # Sliced explicitly now that collect_non_cf_ips returns up to
+    # IP_ENRICH_LIMIT. The list arrives DNS-first (see its _add order), so the
+    # IPs the domain currently resolves to are the ones that get probed and the
+    # long tail of historical/Censys-discovered hosts is what falls outside —
+    # which is the right way round for a socket probe of live services.
+    probe_ips = non_cf_ips[:IP_PROBE_LIMIT]
+    log_info(f"TLS/SSH probing {len(probe_ips)} IPs (of {len(non_cf_ips)}) for {domain}")
+
+    # SSH runs in the background, overlapping the TLS probe *and* the whole
+    # per-IP enrichment pass below, because nothing between here and the join
+    # reads `ssh_host_keys`.
+    #
+    # It is by far the slowest probe and for a structural reason: port 22 is
+    # filtered on most public hosts, so nearly all of its time is connect
+    # timeouts rather than work. Measured over 20 IPs it takes ~10s against the
+    # TLS probe's ~1.2s. Run in sequence, that 10s was pure dead wall-clock in
+    # the middle of a scan; overlapped, the phase costs roughly whichever of SSH
+    # and IP enrichment is slower instead of their sum.
+    #
+    # copy_context() for the same reason the SERVICES fan-out uses it: the
+    # worker inherits the ContextVar log/save hooks, so probe output still
+    # reaches the job log.
+    ssh_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ssh-probe")
+    ssh_ctx = contextvars.copy_context()
+    ssh_future = ssh_pool.submit(ssh_ctx.run, get_ssh_host_keys, probe_ips)
+
+    results["tls_certs"] = get_tls_certs(domain, probe_ips)
     if all_results is not None:
         save_results(all_results)
     _bump(overall_bar, "tls_probe", domain)
 
-    results["ssh_host_keys"] = get_ssh_host_keys(non_cf_ips)
-    if all_results is not None:
-        save_results(all_results)
-    _bump(overall_bar, "ssh_probe", domain)
-
     # ── 2b. Per-IP ASN + edge/reverse-proxy classification ────────────────────
-    # Same IPs we just TLS/SSH-probed, so this rides on the IP_PROBE_LIMIT cap.
+    # Runs over *every* non-CF IP (IP_ENRICH_LIMIT), not just the IP_PROBE_LIMIT
+    # subset that was TLS/SSH-probed above: none of it is billed per IP, and the
+    # IPs beyond the probe cap are exactly the ones a paid Censys cert search
+    # surfaced, which would otherwise be stored with no ASN, geo or reputation.
+    # `tls_probes_by_ip` is therefore a partial map and detect_proxy_details
+    # gets None for the unprobed IPs, which it already handles.
+    #
     # Feeds db/intel_db.py's ip_details storage (asn_desc, proxy_family, ...)
     # used for cross-domain clustering and the frontend's provider labels.
     tls_probes_by_ip = {
@@ -1562,20 +1552,97 @@ def analyze(domain: str, *, is_followup: bool = False,
         if probe.get("ip") and "error" not in probe
     }
     ip_details: dict[str, dict] = {}
-    for ip in non_cf_ips:
+    ip_total = len(non_cf_ips)
+    log_info(f"enriching {ip_total} IPs (ASN/PTR/proxy) for {domain}")
+
+    probe_tier = set(probe_ips)
+
+    def _enrich_one_ip(ip: str) -> tuple[str, dict, float]:
+        ip_started = time.time()
         ptr = get_ptr(ip)
         asn_info = get_ip_whois(ip)
         proxy_details = detect_proxy_details(ip, ptr, asn_info, tls_probes_by_ip.get(ip))
-        ip_details[ip] = {
-            "sources":             non_cf_ip_sources.get(ip, []),
-            "ptr":                 ptr,
-            "cloudflare":          False,
-            "asn_info":            asn_info,
-            "other_domains_on_ip": hackertarget_reverse_ip(ip),
-            "proxy_family":        proxy_details.get("proxy_family"),
-            "proxy_confidence":    proxy_details.get("proxy_confidence"),
+
+        # Domains-on-IP from both available sources, unioned. HackerTarget's
+        # reverse-IP API is historical and broad on shared hosting; Censys
+        # enrichment's `dns_names` is what it currently binds forward and rides
+        # along free in the enrichment call already made above. Neither is a
+        # superset of the other, so both contribute.
+        #
+        # HackerTarget is asked only about the probe-tier IPs. It is the one
+        # source here that rate-limits (hard enough to trip a VPN rotation), so
+        # widening this loop from IP_PROBE_LIMIT to IP_ENRICH_LIMIT would have
+        # quintupled the calls against it while the two free, unmetered sources
+        # in this function absorbed the change without noticing. The long tail
+        # still gets its domains-on-IP from enrichment's `dns_names` — which is
+        # forward-binding and therefore the more accurate half anyway.
+        #
+        # `other_domains_on_ip` stays a flat list of hostnames because several
+        # consumers iterate it as strings (db.intel_db.normalize_ip_details,
+        # _ips_table_observations, integrations.mattermost_alerts). Provenance
+        # goes in the sibling map instead of changing that shape.
+        enrichment = asn_info.get("censys_enrichment") or {}
+        domain_sources: dict[str, list[str]] = {}
+        if ip in probe_tier:
+            # Bounded independently of the pool: this is the only rate-limited
+            # source in the function, so it gets the throttle rather than every
+            # IP paying for it.
+            with _HACKERTARGET_GATE:
+                reverse_names = hackertarget_reverse_ip(ip)
+            for name in reverse_names:
+                cleaned = str(name or "").strip().lower()
+                if cleaned:
+                    domain_sources.setdefault(cleaned, []).append("hackertarget")
+        for name in enrichment.get("dns_names") or []:
+            cleaned = str(name or "").strip().lower()
+            if cleaned and "censys_enrichment" not in domain_sources.setdefault(cleaned, []):
+                domain_sources[cleaned].append("censys_enrichment")
+
+        detail = {
+            "sources":                     non_cf_ip_sources.get(ip, []),
+            "ptr":                         ptr,
+            "cloudflare":                  False,
+            "asn_info":                    asn_info,
+            "other_domains_on_ip":         sorted(domain_sources),
+            "other_domains_on_ip_sources": domain_sources,
+            "proxy_family":                proxy_details.get("proxy_family"),
+            "proxy_confidence":            proxy_details.get("proxy_confidence"),
         }
+        return ip, detail, time.time() - ip_started
+
+    if non_cf_ips:
+        with ThreadPoolExecutor(
+            max_workers=min(_IP_ENRICH_WORKERS, len(non_cf_ips)),
+            thread_name_prefix="ip-enrich",
+        ) as ex:
+            futures = {ex.submit(_enrich_one_ip, ip): ip for ip in non_cf_ips}
+            for idx, fut in enumerate(as_completed(futures), 1):
+                try:
+                    ip, detail, ip_elapsed = fut.result()
+                except Exception as exc:
+                    failed_ip = futures[fut]
+                    log_warn(f"  IP enrichment failed for {failed_ip}: {exc}")
+                    continue
+                ip_details[ip] = detail
+                log_info(
+                    f"  IP {idx}/{ip_total} {ip} enriched in {ip_elapsed:.1f}s"
+                    f"{'  <== SLOW' if ip_elapsed >= 5 else ''}"
+                )
     results["ip_details"] = ip_details
+
+    # Join the SSH probe started before the TLS probe. By now it has had the TLS
+    # probe and the entire enrichment fan-out to finish in, so this is usually
+    # already done. Failures are contained: a probe error must not lose the
+    # enrichment work this function just did.
+    try:
+        results["ssh_host_keys"] = ssh_future.result()
+    except Exception as exc:
+        log_warn(f"SSH probe failed: {exc}")
+        results["ssh_host_keys"] = {"probes": [], "error": str(exc)}
+    finally:
+        ssh_pool.shutdown(wait=False)
+    _bump(overall_bar, "ssh_probe", domain)
+
     if all_results is not None:
         save_results(all_results)
     _bump(overall_bar, "ip_enrich", domain)
@@ -1584,6 +1651,7 @@ def analyze(domain: str, *, is_followup: bool = False,
     # Runs after every service + probe completes, so the result has both the
     # live resolution from live_probe and the accumulated historical IPs from
     # urlscan / hackertarget / circl_pdns.
+    log_info(f"annotating IP freshness for {domain}")
     results["freshness"] = annotate_historical_ips(results)
     if all_results is not None:
         save_results(all_results)
@@ -1620,7 +1688,8 @@ def analyze(domain: str, *, is_followup: bool = False,
         results["subdomain_followups"] = []
         results["sibling_followups"]   = []
 
-        for sub in sub_picks:
+        for idx, sub in enumerate(sub_picks, 1):
+            log_info(f"[{domain}] subdomain follow-up {idx}/{len(sub_picks)}: {sub}")
             sub_result = analyze(sub, is_followup=True,
                                  all_results=all_results,
                                  overall_bar=overall_bar,
@@ -1630,7 +1699,9 @@ def analyze(domain: str, *, is_followup: bool = False,
                 all_results["subdomain_followups"] = results["subdomain_followups"]
                 save_results(all_results)
 
-        for pick in sibling_picks:
+        for idx, pick in enumerate(sibling_picks, 1):
+            log_info(f"[{domain}] sibling follow-up {idx}/{len(sibling_picks)}: "
+                     f"{pick['domain']} [{pick['reason']}]")
             sib_result = analyze(pick["domain"], is_followup=True,
                                  all_results=all_results,
                                  overall_bar=overall_bar,
@@ -2117,31 +2188,26 @@ def is_ip(target: str) -> bool:
 
 
 def get_ip_whois(ip: str) -> dict:
-    """ASN/network lookup for a bare IP: RDAP via ipwhois for network_name/
-    network_cidr/asn_cidr, with ipinfo Lite as the primary source for
-    asn/asn_description/asn_country (see merge_ipinfo_lite) — RDAP remains
-    the sole source for those fields only when ipinfo Lite is unavailable."""
-    try:
-        from ipwhois import IPWhois
-    except ImportError:
-        return merge_ipinfo_lite({"error": "ipwhois not installed (pip install ipwhois)"}, ip)
-    try:
-        obj = IPWhois(ip)
-        result = obj.lookup_rdap(depth=1)
-        net = result.get("network", {}) or {}
-        asn_info = {
-            "asn":             result.get("asn"),
-            "asn_description": result.get("asn_description"),
-            "asn_country":     result.get("asn_country_code"),
-            "asn_cidr":        result.get("asn_cidr"),
-            "asn_registry":    result.get("asn_registry"),
-            "network_name":    net.get("name"),
-            "network_cidr":    net.get("cidr"),
-            "network_country": net.get("country"),
-        }
-    except Exception as exc:
-        asn_info = {"error": str(exc)}
-    return merge_ipinfo_lite(asn_info, ip)
+    """ASN/network lookup for a bare IP: ipinfo Lite, then Censys enrichment.
+
+    ipinfo Lite owns asn/asn_description/asn_country (see merge_ipinfo_lite);
+    Censys host enrichment supplies network_name/network_cidr (from its WHOIS
+    network block, falling back to bgp_prefix) plus everything only it has —
+    reputation, GreyNoise, threat classification, VPN/proxy/hosting flags,
+    abuse contacts and city-level geo.
+
+    The RDAP leg (ipwhois.lookup_rdap) was removed. Once enrichment landed,
+    RDAP's only unique fields were asn_cidr and asn_registry, and it was the
+    slowest, least reliable source in the chain — per-RIR timeouts and hard
+    rate limits were the sole reason the per-IP enrichment loop in analyze()
+    had to run sequentially. Dropping it lets that loop go concurrent.
+
+    Consequence worth knowing: `asn_info` no longer carries asn_cidr,
+    asn_registry or network_country. The `ips.asn_registry` column is left in
+    place (nullable) so rows written before this change still read back.
+    """
+    asn_info: dict = {}
+    return merge_censys_enrichment(merge_ipinfo_lite(asn_info, ip), ip)
 
 
 def get_ptr(ip: str) -> str | None:
@@ -2153,7 +2219,10 @@ def get_ptr(ip: str) -> str | None:
         resolver.timeout = 5
         resolver.lifetime = 5
         rev = dns.reversename.from_address(ip)
-        answers = resolver.resolve(rev, "PTR")
+        # One PTR per IP-enrichment worker, so this is a real contributor to
+        # total DNS pressure even though each call is cheap.
+        with _DNS_GATE:
+            answers = resolver.resolve(rev, "PTR")
         return str(answers[0]).rstrip(".")
     except Exception:
         return None

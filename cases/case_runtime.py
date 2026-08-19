@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any
 
@@ -50,8 +52,21 @@ _JOB_LOG_LEVELS = {
 
 # Per-case concurrency for target analysis. Each target spends most of its
 # time waiting on network I/O (DNS, WHOIS, TLS probes, provider APIs), so a
-# small pool cuts wall-clock time roughly linearly without hammering sources.
-ANALYSIS_WORKERS = 4
+# larger pool cuts wall-clock time roughly linearly. Configurable via
+# ANALYSIS_WORKERS so a bulk sweep (e.g. the OpenCTI ingest of thousands of
+# domains) can scale up without a code change, while leaving room to dial back
+# if a paid provider's own rate limit — not the source IP — becomes the
+# ceiling. Each target itself fans out ~12 service threads plus probe pools, so
+# the real thread count is this value multiplied by that; 12 keeps it sane.
+def _analysis_workers() -> int:
+    try:
+        value = int(os.environ.get("ANALYSIS_WORKERS", "12"))
+    except ValueError:
+        return 12
+    return max(1, value)
+
+
+ANALYSIS_WORKERS = _analysis_workers()
 
 
 class CaseRuntime:
@@ -151,7 +166,18 @@ class CaseRuntime:
         pending: dict[Future[AnalysisRun], dict[str, Any]] = {}
 
         def _analyze(item: dict[str, Any]) -> AnalysisRun:
-            self._log(job_id, "info", f"Analyzing {item['target']}", stage="enrichment")
+            item["_started"] = time.monotonic()
+            origin = item.get("discovered_from")
+            reason = item.get("discovery_reason")
+            detail = f" (depth {item['depth']}"
+            if origin:
+                detail += f", from {origin}"
+            if reason:
+                detail += f", {reason}"
+            detail += ")"
+            self._log(
+                job_id, "info", f"Analyzing {item['target']}{detail}", stage="enrichment"
+            )
             return analyze_target(
                 item["target"],
                 depth=item["depth"],
@@ -201,7 +227,15 @@ class CaseRuntime:
                         )
                         saved_runs.append({"id": run_id, "analysis": run})
                         completed_targets += 1
-                        self._log(job_id, "success", f"Completed {current_target}", stage="enrichment")
+                        started_at = item.get("_started")
+                        elapsed = time.monotonic() - started_at if started_at else 0.0
+                        self._log(
+                            job_id,
+                            "success",
+                            f"Completed {current_target} in {elapsed:.1f}s "
+                            f"({completed_targets}/{total_targets} done, {failed_targets} failed)",
+                            stage="enrichment",
+                        )
 
                         for discovered in run.discovered_targets:
                             target = clean_target(str(discovered.get("target") or ""))
@@ -214,10 +248,13 @@ class CaseRuntime:
                                 continue
                             seen_targets.add(target)
                             total_targets += 1
+                            reason = discovered.get("reason") or "discovered"
+                            kind = discovered.get("kind") or "?"
                             self._log(
                                 job_id,
                                 "info",
-                                f"Queued follow-up target {target}",
+                                f"Queued follow-up {target} "
+                                f"(kind={kind}, reason: {reason}, from {run.normalized_target})",
                                 stage="enrichment",
                             )
                             _submit(

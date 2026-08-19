@@ -16,6 +16,7 @@ helpers (``confidence_from_score``, ``_is_cloudflare_ip_local``) from here.
 
 import ipaddress
 import math
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -69,6 +70,51 @@ def _is_known_shared_infra_ip(ip: str) -> bool:
     return ip in _KNOWN_SHARED_INFRA_IPS
 
 
+# Email domains belonging to registrars, hosting providers, and privacy
+# proxies. A WHOIS / imprint / security.txt contact at one of these is a
+# provider role address (abuse@godaddy.com, hostmaster@cloudflare.com) — it
+# identifies the provider, not the site's operator. Two domains "sharing"
+# abuse@godaddy.com share a registrar and nothing else, so this is the email
+# equivalent of a shared Cloudflare IP and must never stand as an identity
+# match.
+_GENERIC_EMAIL_DOMAINS = (
+    "godaddy.com", "secureserver.net", "namecheap.com", "namecheaphosting.com",
+    "cloudflare.com", "domainsbyproxy.com", "whoisguard.com",
+    "withheldforprivacy.com", "withheldforprivacy.email", "privacyguardian.org",
+    "contactprivacy.com", "privacyprotect.org", "gandi.net", "ovh.net",
+    "ionos.com", "1and1.com", "hostgator.com", "bluehost.com", "googledomains.com",
+    "markmonitor.com", "cscglobal.com", "tucows.com", "enom.com", "enomdomains.com",
+    "publicdomainregistry.com", "wildwestdomains.com", "porkbun.com", "dynadot.com",
+    "name.com", "networksolutions.com", "register.com", "fastdomain.com",
+    "key-systems.net", "1api.net", "hostinger.com", "squarespace.com",
+    # ccTLD registrars and their privacy services, which the Western-centric
+    # list above missed entirely — nic.ru's role address alone was attached to
+    # 120 domains in one pool.
+    "nic.ru", "whoisproxy.ru", "reg.ru", "r01.ru", "salenames.ru", "webnames.ru",
+    "internet.bs", "openprovider.com", "hosting.ua", "ukraine.com.ua",
+)
+
+# Structural backstop for the same class of address. Enumerating registrars is
+# a treadmill — there is always another national registrar or privacy service —
+# but they name themselves: a mail domain advertising whois/privacy/proxy/
+# protection is offering to stand in for the owner, which is precisely what
+# makes the address useless as an identity signal.
+_PRIVACY_PROXY_DOMAIN_RE = re.compile(
+    r"(?i)(whois|privacy|privat|proxy|protect|redact|anonymous|withheld|hidden|"
+    r"contactfilter|domaindiscreet)"
+)
+
+
+def _is_generic_email(text: str) -> bool:
+    """True for registrar/provider/privacy-proxy emails (not owner identity)."""
+    if "@" not in text:
+        return False
+    domain = text.rpartition("@")[2].strip().lower()
+    if any(domain == d or domain.endswith("." + d) for d in _GENERIC_EMAIL_DOMAINS):
+        return True
+    return bool(_PRIVACY_PROXY_DOMAIN_RE.search(domain))
+
+
 def confidence_from_score(score: int | float) -> int:
     """
     Map an open-ended evidence score onto a bounded 0–100 confidence.
@@ -76,9 +122,11 @@ def confidence_from_score(score: int | float) -> int:
     Raw scores are additive weights with no upper bound (a pair sharing a
     TLS fingerprint plus IPs plus trackers can exceed 300), so showing the
     raw number as a percentage was meaningless. The saturating curve keeps
-    ordering, never reaches 100 (this is correlation, not proof), and is
-    calibrated so a single crypto-strength match (~100) lands around 60%
-    and corroborated multi-signal pairs climb into the 75–90% band.
+    ordering and never reaches 100 (this is correlation, not proof). A single
+    fresh, rare decisive-kind match (TLS cert / near-identity tracking ID,
+    weight ~170-200 — see SELECTOR_BASE_WEIGHTS) now lands in the ~72-75%
+    band on its own; corroborated multi-signal pairs climb into the 85-90%+
+    band.
     """
     s = max(0, float(score or 0))
     return int(round(100 * s / (s + 65)))
@@ -100,6 +148,10 @@ def confidence_from_score(score: int | float) -> int:
 
 _RARITY_FLOOR = 0.04
 _OVERLAP_FLOOR = 0.25
+_RECENCY_FLOOR = 0.3
+# A shared node last seen within this window is still clearly live
+# infrastructure and gets no age penalty at all.
+_RECENCY_FULL_CREDIT_DAYS = 180
 # IPs shared by more registrable domains than this are shared infrastructure
 # (CDN/cloud pools) and contribute nothing even before the denylist applies.
 _IP_NOISE_DEGREE = 50
@@ -156,6 +208,25 @@ def time_overlap_factor(a_first, a_last, b_first, b_last) -> float:
         return 1.0
     gap_days = (latest_start - earliest_end).days
     return max(_OVERLAP_FLOOR, 1.0 - gap_days / 365.0)
+
+
+def recency_weight(most_recent: datetime | None) -> float:
+    """Decay factor for how long ago a shared node was last seen at all —
+    absolute staleness, distinct from time_overlap_factor's a-vs-b *relative*
+    overlap. Two sides can agree perfectly on timing (overlap=1.0) while both
+    only ever saw the match years ago — e.g. a TLS certificate that was
+    current in 2019 and has since expired/rotated is much weaker evidence of
+    a *present-day* shared-ownership relationship than the same exact match
+    seen last month, even though the two sides' windows line up. Unknown
+    timestamps get full credit (nothing to penalize).
+    """
+    if most_recent is None:
+        return 1.0
+    age_days = (datetime.now(timezone.utc) - most_recent).days
+    if age_days <= _RECENCY_FULL_CREDIT_DAYS:
+        return 1.0
+    decayed_days = age_days - _RECENCY_FULL_CREDIT_DAYS
+    return max(_RECENCY_FLOOR, 1.0 - decayed_days / 730.0)
 
 
 # Per-provider plain-language explanation for a shared site-verification code:
@@ -235,6 +306,43 @@ _SELECTOR_KIND_EXPLANATIONS = {
         "claim by the operator, though a shared marketing agency, syndication network, or copied template can "
         "occasionally repeat a handle across unrelated properties."
     ),
+    "crypto_wallet": (
+        "Both sites solicit payment to the same cryptocurrency address. A wallet is controlled by whoever holds "
+        "its private key, so two sites collecting funds to one address are almost always the same operation — "
+        "the money ends up in one place. The exception to watch for is a copycat or scraper republishing "
+        "someone else's donation address, which looks identical on the page."
+    ),
+    "legal_registration": (
+        "Both sites publish the same company registration number. A registry issues that number to exactly one "
+        "legal entity, so this is a declaration by the sites themselves that one company stands behind both — "
+        "about as close to an ownership statement as an imprint gets. It is read out of free-form page text, "
+        "so the failure mode to rule out is a mis-parse rather than a coincidence."
+    ),
+    "contact_email": (
+        "Both sites publish the same contact mailbox. An address is account-bound and someone has to read it, so "
+        "it usually belongs to whoever runs both. Registrar and privacy-proxy role addresses are filtered out "
+        "before this point, but a shared agency or outsourced support desk can still explain it."
+    ),
+    "legal_entity": (
+        "Both sites name the same company in their legal or imprint pages. That is a direct claim of common "
+        "ownership — but company names are not unique, generic ones collide across unrelated firms, and the name "
+        "is parsed out of prose, so treat it as corroboration rather than proof on its own."
+    ),
+    "legal_address": (
+        "Both sites publish the same postal address. This can be one operator's real office, but registered-agent "
+        "services, accountants, and coworking suites act as the registered address for thousands of unrelated "
+        "companies, so it is only meaningful alongside something that isn't a mailbox."
+    ),
+    "legal_text_hash": (
+        "Both sites serve a byte-identical legal page. Either one operator published the same document twice or "
+        "one site copied the other. The common innocent explanation is a policy generator producing identical "
+        "boilerplate for unrelated customers, so it carries about as much weight as an identical homepage."
+    ),
+    "contact_phone": (
+        "Both sites publish the same contact phone number. A working number has to be answered by someone, so "
+        "it usually points at one back office — but shared call centres, franchise and reseller networks, and "
+        "template placeholder numbers all repeat a number across genuinely unrelated sites, so corroborate it."
+    ),
     "favicon_mmh3": (
         "Both sites serve a byte-identical favicon. This often carries over when a site is cloned, rebranded, or "
         "built from the same template — common enough on templated/CMS-default sites that it's best treated as "
@@ -254,6 +362,11 @@ _SELECTOR_KIND_EXPLANATIONS = {
         "Both domains delegate to the same nameserver hostname. Meaningful when it's a small, custom/vanity "
         "nameserver dedicated to one operator; much weaker when it's a big DNS host's shared nameserver serving "
         "thousands of unrelated customers (those are filtered out where recognized)."
+    ),
+    "spf_origin": (
+        "Both domains authorise the same server to send email on their behalf (SPF). Meaningful when it's a "
+        "self-hosted or small dedicated mail origin, which points at one operator running the mail for both; "
+        "close to noise when it's a large provider like Google or SendGrid that most of the internet lists."
     ),
     "network_cidr": (
         "Both domains' IPs sit in the same network block. Supporting context on top of a direct IP or "
@@ -276,21 +389,103 @@ def _explain_selector(kind: str, subkind: str | None) -> str | None:
     return _SELECTOR_KIND_EXPLANATIONS.get(kind)
 
 
-def _score_selector_row(row: dict) -> tuple[dict, float]:
+def _recency_note(recency: float, most_recent: datetime | None) -> str | None:
+    """The age fragment of a degradation note ("it hasn't been seen in about
+    N years"), shared by every indicator kind — selectors and shared IPs
+    alike. Split out from _degradation_note so _score_ip_row can reuse just
+    this half (an IP's rarity/degree story is already told by its own
+    CDN/pool/origin classification in _explain_shared_ip; repeating "shared
+    with N other domains" there would just duplicate what describe_ip_network
+    already said in different words)."""
+    if most_recent is None or recency >= 0.85:
+        return None
+    age_years = (datetime.now(timezone.utc) - most_recent).days / 365.0
+    return f"it hasn't been seen in about {age_years:.1f} years" if age_years >= 1 else "it hasn't been seen recently"
+
+
+def _degradation_note(degree: int, rarity: float, recency: float, most_recent: datetime | None) -> str | None:
+    """Plain-language reason a match scored lower here specifically — e.g. a
+    TLS certificate match is close to decisive in the abstract, but the exact
+    same certificate reused across a shared-hosting fleet (high degree -> low
+    rarity) or one that hasn't been seen in years (low recency) is much
+    weaker evidence of a *current* shared-ownership relationship. An analyst
+    should be told why the number is smaller, not just shown a smaller
+    number. Applies uniformly to every selector kind — an already-low-weight
+    match (nameserver, ASN, ...) degrading further is just as worth
+    explaining as a normally-strong one.
+    """
+    notes: list[str] = []
+    if degree >= 10 and rarity < 0.6:
+        notes.append(f"it's shared with {degree} other domains in the pool")
+    recency_note = _recency_note(recency, most_recent)
+    if recency_note:
+        notes.append(recency_note)
+    if not notes:
+        return None
+    return (
+        "Scored lower than a typical match of this kind because " + " and ".join(notes)
+        + " — weaker evidence of a relationship that's still current."
+    )
+
+
+def _cert_validity_note(cert_info: dict | None) -> str | None:
+    """Plain-language status from the certificate's own not_before/not_after
+    (its real, CA-issued validity window) — distinct from the observation
+    windows already shown, which only say when *our scanner* last saw it.
+    An investigator needs to know whether the certificate itself is still
+    alive, not just whether our last probe was recent."""
+    if not cert_info:
+        return None
+    not_after = _parse_dt(cert_info.get("not_after"))
+    if not_after is None:
+        return None
+    now = datetime.now(timezone.utc)
+    if not_after < now:
+        return f"This certificate expired on {not_after.date().isoformat()}."
+    not_before = _parse_dt(cert_info.get("not_before"))
+    if not_before and not_before > now:
+        return f"This certificate isn't valid until {not_before.date().isoformat()}."
+    return f"This certificate is currently valid through {not_after.date().isoformat()}."
+
+
+def _score_selector_row(row: dict, cert_meta: dict[str, dict] | None = None) -> tuple[dict, float]:
     kind = row["kind"]
     value = row["value"]
     degree = int(row.get("entity_count") or 0)
     base = selector_base_weight(kind, value)
     rarity = rarity_weight(degree)
     overlap = time_overlap_factor(row.get("a_first"), row.get("a_last"), row.get("b_first"), row.get("b_last"))
-    weight = base * rarity * overlap
+    # Absolute staleness (distinct from `overlap`'s a-vs-b relative agreement):
+    # the more recent of the two sides' last-seen dates for this exact shared
+    # node, so a match still active on either side isn't penalized just
+    # because the other side's own observations are older.
+    most_recent = max(
+        (d for d in (_parse_dt(row.get("a_last")), _parse_dt(row.get("b_last"))) if d is not None),
+        default=None,
+    )
+    recency = recency_weight(most_recent)
+    weight = base * rarity * overlap * recency
     sources = sorted({s for s in (list(row.get("a_sources") or []) + list(row.get("b_sources") or [])) if s})
-    # `tracking_id`/`site_verification`/`social_handle` values are "<provider>|<id>";
-    # expose the provider so the UI can label e.g. an AdSense account distinctly
-    # from a reused GTM container, or a Google vs. Yandex verification code.
-    has_prefix = "|" in value and kind in ("tracking_id", "site_verification", "social_handle")
+    # `tracking_id`/`site_verification`/`social_handle`/`crypto_wallet` values are
+    # "<provider>|<id>"; expose the provider so the UI can label e.g. an AdSense
+    # account distinctly from a reused GTM container, a Google vs. Yandex
+    # verification code, or a Bitcoin vs. Ethereum wallet.
+    has_prefix = "|" in value and kind in ("tracking_id", "site_verification", "social_handle", "crypto_wallet")
     subkind = value.split("|", 1)[0] if has_prefix else None
     explanation = _explain_selector(kind, subkind)
+    degradation = _degradation_note(degree, rarity, recency, most_recent)
+    if degradation:
+        explanation = f"{explanation} {degradation}" if explanation else degradation
+    # Real certificate metadata (CN, issuer, actual CA-issued validity window)
+    # for tls_cert_sha256 matches — the full "why" an OSINT investigator needs
+    # for a cert match, not just that the fingerprint is identical. Keyed by
+    # the selector's own value (the sha256) so it's a plain dict lookup, no
+    # extra query per row (cert_meta is batch-fetched by the caller).
+    cert_info = (cert_meta or {}).get(value) if kind == "tls_cert_sha256" else None
+    if cert_info:
+        validity_note = _cert_validity_note(cert_info)
+        if validity_note:
+            explanation = f"{explanation} {validity_note}"
     evidence = {
         "node_type": "selector",
         "kind": kind,
@@ -302,8 +497,19 @@ def _score_selector_row(row: dict) -> tuple[dict, float]:
         "base_weight": round(base, 2),
         "rarity": round(rarity, 3),
         "time_overlap": round(overlap, 3),
+        "recency": round(recency, 3),
+        "degraded": bool(degradation),
         "weight": round(weight, 2),
         "sources": sources,
+        # Certificate identity/validity, only populated for tls_cert_sha256
+        # matches — the CN/issuer an investigator would check against the
+        # actual site, and the cert's own CA-issued not_before/not_after
+        # (never the observation window above, which is our scan history).
+        "cert_cn": cert_info.get("cn") if cert_info else None,
+        "cert_issuer_cn": cert_info.get("issuer_cn") if cert_info else None,
+        "cert_issuer_org": cert_info.get("issuer_org") if cert_info else None,
+        "cert_not_before": cert_info.get("not_before") if cert_info else None,
+        "cert_not_after": cert_info.get("not_after") if cert_info else None,
         "window_a": [row.get("a_first"), row.get("a_last")],
         "window_b": [row.get("b_first"), row.get("b_last")],
         # The specific host(s) that actually exhibited this selector on each
@@ -395,9 +601,70 @@ def _looks_like_cdn_network(meta: dict) -> bool:
     return bool(haystack.strip()) and any(pattern in haystack for pattern in _CDN_NETWORK_PATTERNS)
 
 
+# Censys host-enrichment labels that mean "shared/transit infrastructure", not
+# "someone's own server".
+_CENSYS_SHARED_LABELS = ("cdn", "hosting", "proxy", "vpn", "tor")
+
+
+def _censys_says_shared(meta: dict) -> bool:
+    """Whether Censys host enrichment classifies this IP as shared infrastructure.
+
+    Complements detect_proxy_details rather than replacing it: `proxy_family`
+    stays the display/clustering label, and this only ever *discounts* shared_ip
+    evidence. It is the pipeline's only source of Tor/VPN/relay classification —
+    two sites meeting on a VPN exit or Tor relay is not shared hosting in any
+    meaningful sense, and previously nothing here knew the difference.
+
+    Note `censys_hosting` alone is deliberately included: a datacenter IP is not
+    by itself proof of sharing, but combined with the degree-keyed rarity factor
+    that classify_ip_network already applies, treating it as non-origin is the
+    safer error — it only ever weakens a link, never invents one.
+    """
+    if any(
+        bool(meta.get(f"censys_{flag}"))
+        for flag in ("hosting", "proxy", "vpn", "tor", "relay", "anonymous")
+    ):
+        return True
+    labels = [str(x).lower() for x in (meta.get("censys_labels") or [])]
+    return any(label in _CENSYS_SHARED_LABELS for label in labels)
+
+
+def _censys_shared_reason(meta: dict) -> str | None:
+    """The most specific Censys classification for this IP, for the explanation.
+
+    Ordered most- to least-specific: a Tor relay or VPN exit is a much sharper
+    reason to discard a shared_ip link than "this is a datacenter".
+    """
+    for flag, phrase in (
+        ("tor", "a Tor relay"),
+        ("vpn", "a VPN exit node"),
+        ("relay", "a privacy relay"),
+        ("proxy", "an open proxy"),
+        ("anonymous", "an anonymising service"),
+    ):
+        if meta.get(f"censys_{flag}"):
+            return phrase
+    labels = [str(x).lower() for x in (meta.get("censys_labels") or [])]
+    if "cdn" in labels:
+        return "a CDN edge"
+    if meta.get("censys_hosting") or "hosting" in labels:
+        return "shared datacenter hosting"
+    return None
+
+
 def _explain_shared_ip(network: str, degree: int, meta: dict) -> str:
     asn_desc = str(meta.get("asn_desc") or "").strip()
     if network == "cdn":
+        censys_reason = _censys_shared_reason(meta)
+        # Prefer the Censys classification when it is more specific than "some
+        # edge network" — "both sites were seen on a Tor relay" is a materially
+        # different finding from "both sites are behind Cloudflare", and the
+        # analyst needs to be able to tell them apart.
+        if censys_reason and not meta.get("proxy_family"):
+            return (
+                f"IP that Censys classifies as {censys_reason} — two sites meeting here "
+                "is shared infrastructure, not evidence of common ownership."
+            )
         label = meta.get("proxy_family") or meta.get("network_name") or asn_desc or "a CDN / reverse-proxy"
         return (
             f"Front-door IP behind {label} — both sites share the same edge network, "
@@ -428,6 +695,7 @@ def describe_ip_network(value: str, degree: int, meta: dict | None = None, *, no
         or _is_cloudflare_ip_local(value)
         or _is_known_shared_infra_ip(value)
         or _looks_like_cdn_network(meta)
+        or _censys_says_shared(meta)
     )
     network = classify_ip_network(degree=degree, cdn=cdn)
     return {"network": network, "explanation": _explain_shared_ip(network, degree, meta)}
@@ -443,13 +711,30 @@ def _score_ip_row(row: dict, meta: dict | None = None) -> tuple[dict, float]:
     base = selector_base_weight("shared_ip")
     rarity = 0.0 if noisy else rarity_weight(degree)
     overlap = time_overlap_factor(row.get("a_first"), row.get("a_last"), row.get("b_first"), row.get("b_last"))
-    weight = base * rarity * overlap
+    # Same absolute-staleness treatment as selectors (see recency_weight): an
+    # "origin" IP both sides only ever shared years ago is weaker evidence of
+    # a still-current relationship than one seen last month, even when the
+    # two sides' own windows agree with each other (overlap=1.0). Skipped
+    # when noisy/rarity is already 0 — nothing left to discount further.
+    most_recent = max(
+        (d for d in (_parse_dt(row.get("a_last")), _parse_dt(row.get("b_last"))) if d is not None),
+        default=None,
+    )
+    recency = 1.0 if noisy else recency_weight(most_recent)
+    weight = base * rarity * overlap * recency
     sources = sorted({s for s in (list(row.get("a_sources") or []) + list(row.get("b_sources") or [])) if s})
+    explanation = described["explanation"]
+    # Degree/rarity is already explained by describe_ip_network's own
+    # cdn/pool/origin classification above — only the age half of
+    # _degradation_note applies here, so it isn't said twice in different words.
+    recency_note = _recency_note(recency, most_recent) if not noisy else None
+    if recency_note:
+        explanation = f"{explanation} Also, {recency_note} — weaker evidence of a relationship that's still current."
     evidence = {
         "node_type": "ip",
         "kind": "shared_ip",
         "network": network,
-        "explanation": described["explanation"],
+        "explanation": explanation,
         "value": value,
         "degree": degree,
         "attributing": not noisy,
@@ -462,6 +747,8 @@ def _score_ip_row(row: dict, meta: dict | None = None) -> tuple[dict, float]:
         "base_weight": round(base, 2),
         "rarity": round(rarity, 3),
         "time_overlap": round(overlap, 3),
+        "recency": round(recency, 3),
+        "degraded": bool(recency_note),
         "weight": round(weight, 2),
         "sources": sources or ["resolves_to"],
         "window_a": [row.get("a_first"), row.get("a_last")],
@@ -486,24 +773,79 @@ def _graph_strength(score: float, evidence: list[dict]) -> str:
     return "weak"
 
 
+# The two graph kinds that carry the same webmaster-verification codes:
+# `site_verification` is scraped from a <meta> tag, `dns_txt_token` from a DNS
+# TXT record. A provider issues one code and site owners routinely publish it
+# both ways, so the same secret would otherwise be counted as two independent
+# selectors and inflate a link's score.
+#
+# Which one survives is deliberate rather than arbitrary: a token in DNS proves
+# control of the *zone*, a token in HTML only proves control of the page, so the
+# DNS spelling is kept when both are present. They stay separate kinds in the
+# graph — provenance is worth keeping — and are collapsed only here, at scoring
+# time, which is the decision the user made when this was raised.
+_VERIFICATION_TOKEN_KINDS = ("dns_txt_token", "site_verification")
+
+
+def _verification_token_identity(row: dict) -> str | None:
+    """`provider|token` for a verification-code row, lowercased; None otherwise."""
+    kind = str(row.get("kind") or "")
+    if kind not in _VERIFICATION_TOKEN_KINDS:
+        return None
+    value = str(row.get("value") or "").strip().lower()
+    return value or None
+
+
+def _dedupe_verification_tokens(rows: list[dict]) -> list[dict]:
+    """Drop the HTML-sourced copy of any verification code also seen in DNS.
+
+    Order-independent: the DNS row wins whichever way round the two arrive.
+    Non-verification rows pass through untouched and keep their original order.
+    """
+    dns_identities = {
+        identity
+        for row in rows
+        if str(row.get("kind") or "") == "dns_txt_token"
+        and (identity := _verification_token_identity(row))
+    }
+    if not dns_identities:
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        if str(row.get("kind") or "") == "site_verification":
+            identity = _verification_token_identity(row)
+            if identity and identity in dns_identities:
+                continue
+        out.append(row)
+    return out
+
+
 def _assemble_link(
     shared_selectors: list[dict],
     shared_ips: list[dict],
     ip_meta: dict[str, dict] | None = None,
+    cert_meta: dict[str, dict] | None = None,
 ) -> dict:
     """Score one link from its shared selectors + IPs.
 
     `ip_meta` is the IP→network-context map from ``intel_db.ip_network_context``.
-    Pass it in when scoring many links at once (e.g. ``links_for``) so the
-    context is fetched a single time for the whole batch instead of once per
-    link; when omitted it is fetched here for this link's IPs alone.
+    `cert_meta` is the sha256→certificate-metadata map from
+    ``intel_db.tls_cert_context`` (CN, issuer, real not_before/not_after —
+    what an investigator needs to judge a TLS cert match, not just that one
+    exists). Pass either in when scoring many links at once (e.g.
+    ``links_for``) so the context is fetched a single time for the whole
+    batch instead of once per link; when omitted each is fetched here for
+    this link's own selectors/IPs alone.
     """
     from db import intel_db
 
+    if cert_meta is None:
+        cert_shas = [str(row["value"]) for row in shared_selectors if row.get("kind") == "tls_cert_sha256" and row.get("value")]
+        cert_meta = intel_db.tls_cert_context(cert_shas) if cert_shas else {}
     evidence: list[dict] = []
     total = 0.0
-    for row in shared_selectors:
-        ev, weight = _score_selector_row(row)
+    for row in _dedupe_verification_tokens(shared_selectors):
+        ev, weight = _score_selector_row(row, cert_meta)
         evidence.append(ev)
         total += weight
     if ip_meta is None:
@@ -636,21 +978,29 @@ def links_for(value: str, *, limit: int | None = 50, min_score: float = 1.0) -> 
     from db import intel_db
 
     candidates = intel_db.link_candidates_for(value)
-    # Fetch every candidate's IP network context in one query rather than one
-    # per candidate inside _assemble_link. On a well-connected domain this
-    # collapses dozens of short-lived DB connections into a single lookup — the
-    # difference that makes rebuild_clusters (which calls this for every domain
-    # in the pool) and the domain-detail page fast.
+    # Fetch every candidate's IP network context and TLS cert metadata in one
+    # query each rather than one per candidate inside _assemble_link. On a
+    # well-connected domain this collapses dozens of short-lived DB
+    # connections into two lookups — the difference that makes rebuild_clusters
+    # (which calls this for every domain in the pool) and the domain-detail
+    # page fast.
     all_ip_values = [
         str(row.get("value") or "")
         for bundle in candidates.values()
         for row in (bundle.get("ips") or [])
     ]
     ip_meta = intel_db.ip_network_context(all_ip_values)
+    all_cert_shas = [
+        str(row["value"])
+        for bundle in candidates.values()
+        for row in (bundle.get("selectors") or [])
+        if row.get("kind") == "tls_cert_sha256" and row.get("value")
+    ]
+    cert_meta = intel_db.tls_cert_context(all_cert_shas) if all_cert_shas else {}
 
     results: list[dict] = []
     for rd, bundle in candidates.items():
-        link = _assemble_link(bundle.get("selectors") or [], bundle.get("ips") or [], ip_meta)
+        link = _assemble_link(bundle.get("selectors") or [], bundle.get("ips") or [], ip_meta, cert_meta)
         if link["score"] < min_score:
             continue
         link["target"] = rd

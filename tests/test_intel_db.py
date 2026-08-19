@@ -128,6 +128,63 @@ class IdentifierExtractionTests(unittest.TestCase):
         )
 
 
+    def test_dmarc_report_uris_survives_the_shape_the_pipeline_actually_emits(self) -> None:
+        """core/analysis_service replaces `dmarc_report_uris` with a flat list.
+
+        Every other test here feeds the tagged dict straight to save_search,
+        which is a shape the live pipeline no longer produces — so a `.get()`
+        on that list raised AttributeError in production while the suite stayed
+        green. analyze_target swallows save_search failures as a warning, so the
+        symptom was a searches row with zero identifiers rather than a crash.
+        """
+        payload = {
+            "input": "example.com",
+            "domain": "example.com",
+            "email_security": {
+                # What the pipeline emits today: flat list for utils/pairwise,
+                # tagged map beside it for this extractor.
+                "dmarc_report_uris": ["admin@example.com", "forensics@example.com"],
+                "dmarc_report_uris_by_tag": {
+                    "rua": ["mailto:admin@example.com"],
+                    "ruf": ["mailto:forensics@example.com"],
+                },
+            },
+        }
+        identifiers = {
+            (row["id_type"], row["id_value"])
+            for row in intel_db.extract_search_identifiers(payload)
+        }
+        self.assertIn(("dmarc_rua", "admin@example.com"), identifiers)
+        self.assertIn(("dmarc_ruf", "forensics@example.com"), identifiers)
+
+    def test_dmarc_report_uris_as_a_bare_list_does_not_raise(self) -> None:
+        # Payloads written in the window before dmarc_report_uris_by_tag existed
+        # carry only the flat list. Typing is unrecoverable from it, but the
+        # extractor must degrade rather than abort the whole save.
+        payload = {
+            "input": "example.com",
+            "domain": "example.com",
+            "email_security": {"dmarc_report_uris": ["admin@example.com"]},
+        }
+        intel_db.extract_search_identifiers(payload)
+
+    def test_dmarc_report_uris_legacy_dict_still_reads(self) -> None:
+        # Payloads stored before the split keep the tagged dict on the original
+        # key; the fallback must still type them.
+        payload = {
+            "input": "example.com",
+            "domain": "example.com",
+            "email_security": {
+                "dmarc_report_uris": {"rua": ["mailto:legacy@example.com"], "ruf": []}
+            },
+        }
+        identifiers = {
+            (row["id_type"], row["id_value"])
+            for row in intel_db.extract_search_identifiers(payload)
+        }
+        self.assertIn(("dmarc_rua", "legacy@example.com"), identifiers)
+
+
 class EntityClassificationTests(unittest.TestCase):
     """Pure classification logic for the correlation layer — no database."""
 
@@ -455,8 +512,8 @@ class IntelDbTests(unittest.TestCase):
         self.assertEqual(
             set(intel_db.get_domain_targets()), {"smoke.example", "smoke2.example"}
         )
-        errored = intel_db.get_domains_with_source_errors("crt_sh")
-        self.assertEqual({entry["id"] for entry in errored}, {sid, sid2})
+        # get_domains_with_source_errors was removed with the source-error retry
+        # path; searches.source_errors is no longer written.
         self.assertEqual(intel_db.get_by_id(sid)["target"], "smoke.example")
         self.assertEqual(intel_db.get_latest_search_id_for_target("smoke.example"), sid)
         self.assertEqual(len(intel_db.get_history_for_target("smoke.example")), 1)

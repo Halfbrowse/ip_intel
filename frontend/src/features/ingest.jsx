@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Button, Card, FileUpload, Text, TextField, View } from "reshaped";
 
 import {
   formatDate,
@@ -6,6 +7,7 @@ import {
   formatPercent,
   isTerminalStatus,
   normalizeJob,
+  readJsonResponse,
   useApi,
 } from "../api.js";
 import {
@@ -25,59 +27,56 @@ export async function postIngest({ file, target, label }) {
       body: formData,
       headers: { Accept: "application/json" },
     });
-    return finishIngest(response);
+    return readJsonResponse(response);
   }
   const response = await fetch("/api/ingest", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ target, label }),
   });
-  return finishIngest(response);
+  return readJsonResponse(response);
 }
 
-export async function finishIngest(response) {
-  const text = await response.text();
-  let payload = null;
-  try {
-    payload = text ? JSON.parse(text) : null;
-  } catch {
-    payload = text;
-  }
-  if (!response.ok) {
-    const message =
-      (payload && typeof payload === "object" && (payload.detail || payload.message || payload.error)) ||
-      (typeof payload === "string" ? payload : null) ||
-      `Request failed with status ${response.status}.`;
-    throw new Error(message);
-  }
-  return payload;
-}
+// Kept as a named re-export: this was the de-facto shared response parser and
+// other modules import it from here. The behaviour now lives in api.js.
+export { readJsonResponse as finishIngest };
 
 function JobProgress({ jobId, onComplete }) {
-  const jobRequest = useApi(jobId ? `/api/jobs/${jobId}` : null, { pollInterval: 4000 });
+  // `done` gates the interval: a finished job is a terminal resource, and
+  // polling it every 4s for as long as the pool page stays open is pure waste.
+  // The hook reads pollInterval on each render, so flipping it to 0 tears the
+  // timer down without disturbing the data already loaded.
+  const [done, setDone] = useState(false);
+  const jobRequest = useApi(jobId ? `/api/jobs/${jobId}` : null, {
+    pollInterval: done ? 0 : 4000,
+  });
   const job = useMemo(() => normalizeJob(jobRequest.data, jobId), [jobRequest.data, jobId]);
-  const done = isTerminalStatus(job.status);
+  const terminal = isTerminalStatus(job.status);
+
+  useEffect(() => {
+    setDone(terminal);
+  }, [terminal]);
   const visibleSteps = job.steps.slice(0, 6);
   const recentLogs = job.logs.slice(-5);
   const notifiedRef = useRef(null);
 
   useEffect(() => {
-    if (done && jobId && notifiedRef.current !== jobId) {
+    if (terminal && jobId && notifiedRef.current !== jobId) {
       notifiedRef.current = jobId;
       onComplete?.();
     }
-  }, [done, jobId, onComplete]);
+  }, [terminal, jobId, onComplete]);
 
   if (!jobId) {
     return null;
   }
 
   return (
-    <div className="callout active-job-strip">
-      <div className="mini-progress-top">
-        <span>Ingest job {jobId}</span>
-        <strong>{formatPercent(job.percent ?? 0)}</strong>
-      </div>
+    <Card padding={4}>
+      <View align="center" direction="row" justify="space-between">
+        <Text color="neutral-faded">Ingest job {jobId}</Text>
+        <Text weight="bold">{formatPercent(job.percent ?? 0)}</Text>
+      </View>
       <ProgressBar value={job.percent ?? 0} />
 
       <div className="job-status-grid">
@@ -131,10 +130,10 @@ function JobProgress({ jobId, onComplete }) {
       ) : null}
 
       {job.failedTargets ? (
-        <p className="card-copy danger-copy">{job.failedTargets} target(s) failed during this ingest.</p>
+        <Text color="critical">{job.failedTargets} target(s) failed during this ingest.</Text>
       ) : null}
       {jobRequest.error ? <ErrorState message={jobRequest.error} /> : null}
-    </div>
+    </Card>
   );
 }
 
@@ -172,49 +171,62 @@ export default function IngestPanel({ onIngested }) {
         </div>
       </div>
 
-      <label className="search-field">
-        <span>Label (optional)</span>
-        <input
+      <View gap={1}>
+        <Text variant="body-2" weight="medium">
+          Label (optional)
+        </Text>
+        <TextField
           name="label"
-          onChange={(event) => setLabel(event.target.value)}
+          onChange={({ value }) => setLabel(value)}
           placeholder="campaign, source, or analyst note"
-          type="text"
           value={label}
         />
-      </label>
+      </View>
 
       <div className="submission-grid">
-        <div className="submission-card">
-          <label className="search-field">
-            <span>Single domain or IP</span>
-            <input
-              name="target"
-              onChange={(event) => setTargetInput(event.target.value)}
-              placeholder="example.com or 203.0.113.10"
-              type="text"
-              value={targetInput}
-            />
-          </label>
-          <button
-            className="primary-button"
-            disabled={busy || !targetInput.trim()}
-            onClick={() => run({ target: targetInput.trim() })}
-            type="button"
-          >
-            {busy ? "Submitting..." : "Scan and add"}
-          </button>
-        </div>
+        <Card padding={4}>
+          <View gap={3}>
+            <View gap={1}>
+              <Text variant="body-2" weight="medium">
+                Single domain or IP
+              </Text>
+              <TextField
+                name="target"
+                onChange={({ value }) => setTargetInput(value)}
+                placeholder="example.com or 203.0.113.10"
+                value={targetInput}
+              />
+            </View>
+            <Button
+              color="primary"
+              disabled={busy || !targetInput.trim()}
+              loading={busy}
+              onClick={() => run({ target: targetInput.trim() })}
+            >
+              {busy ? "Submitting..." : "Scan and add"}
+            </Button>
+          </View>
+        </Card>
 
-        <div className="submission-card">
-          <label className="search-field file-field">
-            <span>CSV upload</span>
-            <input accept=".csv,text/csv" onChange={(event) => setCsvFile(event.target.files?.[0] || null)} type="file" />
-          </label>
-          <button className="primary-button" disabled={busy || !csvFile} onClick={() => run({ file: csvFile })} type="button">
-            {busy ? "Submitting..." : "Upload CSV"}
-          </button>
-        </div>
-
+        <Card padding={4}>
+          <View gap={3}>
+            <View gap={1}>
+              <Text variant="body-2" weight="medium">
+                CSV upload
+              </Text>
+              <FileUpload
+                inputAttributes={{ accept: ".csv,text/csv" }}
+                name="csv-upload"
+                onChange={({ value }) => setCsvFile(value?.[0] || null)}
+              >
+                {csvFile ? csvFile.name : "Choose a CSV file or drag it here"}
+              </FileUpload>
+            </View>
+            <Button color="primary" disabled={busy || !csvFile} loading={busy} onClick={() => run({ file: csvFile })}>
+              {busy ? "Submitting..." : "Upload CSV"}
+            </Button>
+          </View>
+        </Card>
       </div>
 
       {error ? <ErrorState message={error} /> : null}

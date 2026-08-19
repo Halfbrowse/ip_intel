@@ -1,6 +1,14 @@
 import { useCallback, useMemo, useState } from "react";
+import { Badge, Button, Card, Text, TextField, View } from "reshaped";
 
-import { formatDate, formatLabel, normalizeGraphLinks, useApi } from "../api.js";
+import {
+  formatDate,
+  formatLabel,
+  normalizeGraphLinks,
+  normalizeGraphPath,
+  normalizeRelatedThrough,
+  useApi,
+} from "../api.js";
 import { EmptyState, ErrorState, LoadingState } from "../components/primitives.jsx";
 import {
   ConnectionCard,
@@ -10,7 +18,9 @@ import {
   ipNetworkBadge,
   sharedNodeLabel,
 } from "../features/evidence.jsx";
+import { downloadReportCsv, downloadReportJson, printReport } from "../features/exportReport.js";
 import { rememberFocus } from "../features/focus.js";
+import { PathChain } from "../features/pathExplain.jsx";
 import { Link, useParams } from "../router.jsx";
 import AppShell from "../shell/AppShell.jsx";
 
@@ -21,7 +31,20 @@ export default function DomainPage() {
   const profile = profileRequest.data;
   const links = useMemo(() => normalizeGraphLinks(linksRequest.data), [linksRequest.data]);
   const [expanded, setExpanded] = useState(null);
+  // printReport returns false when the browser blocked the popup; without
+  // surfacing it, "Export report" simply did nothing with no explanation.
+  const [printBlocked, setPrintBlocked] = useState(false);
   const toggle = useCallback((key) => setExpanded((current) => (current === key ? null : key)), []);
+  const directTargets = useMemo(() => new Set(links.map((link) => link.target)), [links]);
+  const exportScope = useMemo(
+    () => ({
+      title: `${value} — connection report`,
+      domains: [value],
+      pairs: links.map((link) => ({ ...link, a: value, b: link.target, connected: true })),
+      chains: [],
+    }),
+    [value, links],
+  );
 
   const selectorsByKind = useMemo(() => {
     const map = new Map();
@@ -41,6 +64,8 @@ export default function DomainPage() {
   const socialHandleEntries = Object.entries(intel?.social_handles || {}).filter(([, item]) => item && item.length);
   const socialLinkEntries = Object.entries(intel?.social_links || {}).filter(([, item]) => item && item.length);
   const siteVerificationEntries = Object.entries(intel?.site_verifications || {}).filter(([, item]) => item && item.length);
+  const cryptoWalletEntries = Object.entries(intel?.crypto_wallets || {}).filter(([, item]) => item && item.length);
+  const phoneNumbers = (intel?.phone_numbers || []).filter(Boolean);
   const otherHosts = (profile?.hosts || []).filter((host) => host.value !== profile?.domain);
 
   return (
@@ -78,13 +103,13 @@ export default function DomainPage() {
               </p>
             ) : null}
             {(intel?.opencti_labels || []).length > 0 ? (
-              <span className="chip-row opencti-labels">
+              <View direction="row" gap={1} wrap>
                 {intel.opencti_labels.map((label) => (
-                  <span className="chip evidence-chip" key={label} title="OpenCTI label">
+                  <Badge attributes={{ title: "OpenCTI label" }} color="primary" key={label} variant="faded">
                     {label}
-                  </span>
+                  </Badge>
                 ))}
-              </span>
+              </View>
             ) : null}
           </div>
           <Link className="primary-button" onClick={() => rememberFocus(value)} to="/connections">
@@ -117,13 +142,47 @@ export default function DomainPage() {
                     key={link.target}
                     leftLabel={value}
                     link={link}
-                    onToggle={() => toggle(link.target)}
+                    onToggle={toggle}
                     rightLabel={link.target}
+                    toggleKey={link.target}
                   />
                 ))}
+                {/* Silent truncation is a lie of omission on an intel page:
+                    the analyst had no way to tell 25 connections from 250. */}
+                {links.length > 25 ? (
+                  <Text color="neutral-faded" variant="body-2">
+                    Showing the 25 strongest of {links.length} connections. Use Compare channels to
+                    work through the rest.
+                  </Text>
+                ) : null}
               </div>
             )}
           </section>
+
+          {links.length > 0 ? (
+            <Card padding={4}>
+              <View align="center" direction="row" gap={3} wrap>
+                <Text color="neutral-faded">Share these findings without the graph:</Text>
+                <Button onClick={() => setPrintBlocked(!printReport(exportScope))} size="small" title="Open a printable plain-language report (use your browser's Save as PDF)" variant="outline">
+                  Export report
+                </Button>
+                <Button onClick={() => downloadReportCsv(exportScope)} size="small" title="Download every connection and its evidence as a CSV" variant="outline">
+                  Export CSV
+                </Button>
+                <Button onClick={() => downloadReportJson(exportScope)} size="small" title="Download the raw connection data as JSON" variant="outline">
+                  Export JSON
+                </Button>
+              </View>
+              {printBlocked ? (
+                <Text color="critical" variant="body-2">
+                  Allow pop-ups for this site to open the printable report.
+                </Text>
+              ) : null}
+            </Card>
+          ) : null}
+
+          <RelatedThroughSection value={value} directTargets={directTargets} />
+          <FindPathSection value={value} />
 
           <section className="panel section-stack">
             <div className="panel-header">
@@ -141,19 +200,25 @@ export default function DomainPage() {
                     <h4>{sharedNodeLabel(kind)}</h4>
                     <span>{items.length}</span>
                   </div>
-                  <div className="chip-row">
+                  <View direction="row" gap={1} wrap>
                     {items.slice(0, 30).map((selector) => (
-                      <span
-                        className={`chip ${selector.degree > 1 ? "evidence-chip" : ""}`}
+                      <Badge
+                        attributes={{ title: `shared by ${selector.degree}` }}
+                        color={selector.degree > 1 ? "primary" : "neutral"}
                         key={selector.value}
-                        title={`shared by ${selector.degree}`}
+                        variant="faded"
                       >
                         <FaviconThumb kind={kind} value={selector.value} />
                         {selector.value}
                         {selector.degree > 1 ? ` - ${selector.degree}` : ""}
-                      </span>
+                      </Badge>
                     ))}
-                  </div>
+                    {items.length > 30 ? (
+                      <Text color="neutral-faded" variant="body-2">
+                        +{items.length - 30} more
+                      </Text>
+                    ) : null}
+                  </View>
                 </div>
               ))
             )}
@@ -179,15 +244,23 @@ export default function DomainPage() {
                     .join(" | ");
                   return (
                     <DefRow key={entry.ip} label={entry.ip}>
-                      <span className="chip-row">
-                        {badge ? <span className={`status-badge compact ${badge.tone}`}>{badge.label}</span> : null}
-                        {entry.degree > 1 ? (
-                          <span className="chip" title="Other domains on this IP">
-                            {entry.degree} domains
-                          </span>
+                      <View align="center" direction="row" gap={1} wrap>
+                        {badge ? (
+                          <Badge color={badge.color} variant="faded">
+                            {badge.label}
+                          </Badge>
                         ) : null}
-                      </span>
-                      {context ? <span className="card-copy small-copy">{context}</span> : null}
+                        {entry.degree > 1 ? (
+                          <Badge attributes={{ title: "Other domains on this IP" }} color="neutral" variant="faded">
+                            {entry.degree} domains
+                          </Badge>
+                        ) : null}
+                      </View>
+                      {context ? (
+                        <Text color="neutral-faded" variant="caption-1">
+                          {context}
+                        </Text>
+                      ) : null}
                     </DefRow>
                   );
                 })}
@@ -239,6 +312,27 @@ export default function DomainPage() {
               </div>
             ) : null}
 
+            {/* Wallet addresses and phone numbers are deliberately inert text --
+                no block-explorer or tel: links, since an outbound request would
+                disclose the analyst's interest in this target to a third party. */}
+            {phoneNumbers.length > 0 || cryptoWalletEntries.length > 0 ? (
+              <div className="section-stack tight">
+                <h4>Contact and wallets</h4>
+                {phoneNumbers.length > 0 ? <DefRow label="Phone numbers">{asText(phoneNumbers)}</DefRow> : null}
+                {cryptoWalletEntries.map(([chain, addresses]) => (
+                  <DefRow key={`wallet-${chain}`} label={`${formatLabel(chain)} wallet`}>
+                    <View direction="row" gap={1} wrap>
+                      {addresses.map((address) => (
+                        <Badge attributes={{ title: address }} color="neutral" key={address} variant="faded">
+                          {truncateAddress(address)}
+                        </Badge>
+                      ))}
+                    </View>
+                  </DefRow>
+                ))}
+              </div>
+            ) : null}
+
             {!intel ? <EmptyState message="No raw scan stored for this channel yet." /> : null}
           </section>
 
@@ -265,29 +359,31 @@ export default function DomainPage() {
                       </Link>
                     </span>
                     <span className="def-value">
-                      <span className="chip-row">
-                        <span className="status-badge compact info">Found subdomain</span>
+                      <View align="center" direction="row" gap={1} wrap>
+                        <Badge color="primary" variant="faded">
+                          Found subdomain
+                        </Badge>
                         {(host.ips || []).length > 0 ? (
                           host.ips.map((ip) => (
-                            <span className="chip" key={ip}>
+                            <Badge color="neutral" key={ip} variant="faded">
                               {ip}
-                            </span>
+                            </Badge>
                           ))
                         ) : (
-                          <span className="muted">no resolved IP on record</span>
+                          <Text color="neutral-faded">no resolved IP on record</Text>
                         )}
-                      </span>
+                      </View>
                       {host.discovery_kind ? (
-                        <span className="card-copy small-copy">
+                        <Text color="neutral-faded" variant="caption-1">
                           via {formatLabel(host.discovery_kind)}
                           {host.discovered_from ? ` from ${host.discovered_from}` : ""}
-                        </span>
+                        </Text>
                       ) : null}
                     </span>
                   </div>
                 ))}
                 {otherHosts.length > 60 ? (
-                  <span className="chip digest-more-chip">+{otherHosts.length - 60} more</span>
+                  <Badge color="neutral">+{otherHosts.length - 60} more</Badge>
                 ) : null}
               </div>
             )}
@@ -295,6 +391,136 @@ export default function DomainPage() {
         </>
       ) : null}
     </AppShell>
+  );
+}
+
+// A channel's precomputed multi-hop neighborhood (db.intel_db.graph_paths) --
+// domains reachable only through an intermediary, not shared directly.
+// Always an instant indexed read (see /api/graph/related/{value}), never a
+// traversal triggered by opening this page.
+function RelatedThroughSection({ value, directTargets }) {
+  const relatedRequest = useApi(`/api/graph/related/${encodeURIComponent(value)}`);
+  const related = useMemo(
+    () => normalizeRelatedThrough(relatedRequest.data).filter((entry) => entry.hops > 1 && !directTargets.has(entry.target)),
+    [relatedRequest.data, directTargets],
+  );
+  const [expandedTarget, setExpandedTarget] = useState(null);
+
+  if (relatedRequest.loading && !relatedRequest.data) {
+    return null;
+  }
+  if (related.length === 0) {
+    return null;
+  }
+
+  return (
+    <section className="panel section-stack">
+      <div className="panel-header">
+        <div>
+          <h2>Related through other channels</h2>
+          <p className="section-copy">
+            No direct evidence with this channel, but reachable through an intermediary — precomputed, not a guess.
+          </p>
+        </div>
+      </div>
+      <View gap={3}>
+        {/* The toggle is a header button rather than an onClick on the Card.
+            Reshaped turns a Card with onClick into a <button>, and the
+            expanded body renders PathChain — which is itself made of clickable
+            ConnectionCards (more buttons) and lists. Nesting those inside a
+            button is invalid, and the inner clicks bubbled out to collapse the
+            chain the user had just opened. */}
+        {related.slice(0, 20).map((entry) => (
+          <Card key={entry.target} padding={4}>
+            <button
+              aria-expanded={expandedTarget === entry.target}
+              className="disclosure-button"
+              onClick={() => setExpandedTarget((current) => (current === entry.target ? null : entry.target))}
+              type="button"
+            >
+              <View align="center" direction="row" justify="space-between">
+                <View gap={1}>
+                  <Text weight="semibold">
+                    {value} ↔ {entry.target}
+                  </Text>
+                  <Text color="neutral-faded" variant="body-2">
+                    {entry.hops} hop{entry.hops === 1 ? "" : "s"} away
+                  </Text>
+                </View>
+                <Text attributes={{ "aria-hidden": true }} color="neutral-faded">
+                  {expandedTarget === entry.target ? "▴" : "▾"}
+                </Text>
+              </View>
+            </button>
+            {expandedTarget === entry.target ? (
+              <View attributes={{ style: { marginTop: 16 } }}>
+                <PathChain chain={entry.chain} />
+              </View>
+            ) : null}
+          </Card>
+        ))}
+      </View>
+    </section>
+  );
+}
+
+// Precomputed lookup (db.intel_db.path_between / graph_paths) for a specific
+// second channel, rather than browsing everything related -- an indexed
+// read, not a live search-triggered traversal.
+function FindPathSection({ value }) {
+  const [input, setInput] = useState("");
+  const [target, setTarget] = useState(null);
+  const pathRequest = useApi(
+    target ? `/api/graph/path?a=${encodeURIComponent(value)}&b=${encodeURIComponent(target)}` : null,
+  );
+  const path = useMemo(() => normalizeGraphPath(pathRequest.data), [pathRequest.data]);
+
+  const submit = (event) => {
+    event.preventDefault();
+    const trimmed = input.trim();
+    if (trimmed) {
+      setTarget(trimmed);
+    }
+  };
+
+  return (
+    <section className="panel section-stack">
+      <div className="panel-header">
+        <div>
+          <h2>Find a path to another channel</h2>
+          <p className="section-copy">See how this channel connects to a specific one, hop by hop.</p>
+        </div>
+      </div>
+      <View as="form" attributes={{ onSubmit: submit }} direction="row" gap={2}>
+        <View grow>
+          <TextField
+            inputAttributes={{ type: "search" }}
+            name="find-path-target"
+            onChange={({ value }) => setInput(value)}
+            placeholder="Type a domain to check..."
+            value={input}
+          />
+        </View>
+        <Button disabled={!input.trim()} type="submit" variant="outline">
+          Find path
+        </Button>
+      </View>
+      {target && pathRequest.loading && !pathRequest.data ? <LoadingState message="Looking up the precomputed path..." /> : null}
+      {/* Only a 404 — or a successful lookup that came back empty — means
+          "these two are not connected". A 500 or a dropped connection is a
+          failure to answer, and reporting it as an analytic negative tells the
+          analyst something false. */}
+      {target && pathRequest.error && pathRequest.status === 404 ? (
+        <EmptyState message={`No precomputed path between ${value} and ${target} within the configured hop limit.`} />
+      ) : null}
+      {target && pathRequest.error && pathRequest.status !== 404 ? (
+        <ErrorState message={`Could not look up the path: ${pathRequest.error}`} />
+      ) : null}
+      {target && !pathRequest.error && !pathRequest.loading && path.chain.length === 0 ? (
+        <EmptyState message={`No precomputed path between ${value} and ${target} within the configured hop limit.`} />
+      ) : null}
+      {path.chain.length > 0 ? <PathChain chain={path.chain} /> : null}
+    </section>
   );
 }
 
@@ -318,6 +544,13 @@ function DefRow({ label, children }) {
       <span className="def-value">{children}</span>
     </div>
   );
+}
+
+// Same head-truncation the TLS sha256 rows use; the full address stays
+// available on the badge's title attribute for copying.
+function truncateAddress(value) {
+  const text = String(value ?? "");
+  return text.length > 20 ? `${text.slice(0, 16)}...` : text;
 }
 
 function asText(value) {

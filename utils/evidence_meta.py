@@ -169,6 +169,51 @@ EVIDENCE_DEFINITIONS: dict[str, EvidenceDefinition] = {
         caveat="Aggregator or mirrored social links can reduce confidence.",
         base_importance="supporting",
     ),
+    "page_metadata.crypto_wallet_values": EvidenceDefinition(
+        path="page_metadata.crypto_wallet_values",
+        label="Shared crypto wallet address",
+        category="Identity",
+        description="Both targets solicit payment to the same cryptocurrency address.",
+        why_it_matters="A wallet is controlled by whoever holds its key, so funds from both sites land with one operator.",
+        caveat="A copycat or scraper can republish someone else's donation address verbatim.",
+        base_importance="decisive",
+    ),
+    "page_metadata.phone_numbers": EvidenceDefinition(
+        path="page_metadata.phone_numbers",
+        label="Shared contact phone number",
+        category="Identity",
+        description="Both targets publish the same contact telephone number.",
+        why_it_matters="A number someone has to answer usually points back to a single back office.",
+        caveat="Shared call centres, franchise networks, and template placeholder numbers repeat across unrelated sites.",
+        base_importance="strong",
+    ),
+    "legal_pages.emails": EvidenceDefinition(
+        path="legal_pages.emails",
+        label="Shared imprint email",
+        category="Identity",
+        description="Both targets published the same contact email on a legal or imprint page.",
+        why_it_matters="A contact mailbox is account-bound and read by whoever operates the site.",
+        caveat="A shared agency or outsourced support desk can answer for several unrelated clients.",
+        base_importance="strong",
+    ),
+    "legal_pages.addresses": EvidenceDefinition(
+        path="legal_pages.addresses",
+        label="Shared registered address",
+        category="Identity",
+        description="Both targets published the same postal address on a legal or imprint page.",
+        why_it_matters="A shared office can place two operations under one roof.",
+        caveat="Registered-agent services, accountants, and coworking suites front for thousands of unrelated companies.",
+        base_importance="supporting",
+    ),
+    "legal_pages.phones": EvidenceDefinition(
+        path="legal_pages.phones",
+        label="Shared imprint phone number",
+        category="Identity",
+        description="Both targets published the same telephone number on a legal or imprint page.",
+        why_it_matters="An imprint number is disclosed to satisfy a legal requirement, so it points at the operating entity itself.",
+        caveat="Agencies and hosting resellers sometimes file their own number on behalf of every client site.",
+        base_importance="strong",
+    ),
     "whois.emails": EvidenceDefinition(
         path="whois.emails",
         label="Shared WHOIS email",
@@ -177,6 +222,33 @@ EVIDENCE_DEFINITIONS: dict[str, EvidenceDefinition] = {
         why_it_matters="Registration contacts can directly link ownership or administrative control.",
         caveat="Privacy proxies and registrar aliases make this less common and sometimes noisy.",
         base_importance="strong",
+    ),
+    "whois.name": EvidenceDefinition(
+        path="whois.name",
+        label="Shared WHOIS registrant name",
+        category="Registration",
+        description="Both targets named the same registrant in WHOIS.",
+        why_it_matters="A registrant name is an explicit ownership claim, and an unusual one rarely repeats by chance.",
+        caveat="Redacted and privacy-service placeholders are dropped; common personal names can still collide.",
+        base_importance="strong",
+    ),
+    "spf_origins": EvidenceDefinition(
+        path="spf_origins",
+        label="Shared SPF sending origin",
+        category="Infrastructure",
+        description="Both targets authorise the same server to send their email.",
+        why_it_matters="A self-hosted or dedicated mail origin usually means one operator runs the mail for both.",
+        caveat="Most domains delegate to a handful of large providers, which is close to noise on its own.",
+        base_importance="supporting",
+    ),
+    "historical_dns.records[*].rdata": EvidenceDefinition(
+        path="historical_dns.records[*].rdata",
+        label="Shared historical IP",
+        category="Infrastructure",
+        description="Both targets resolved to the same address at some point in the past.",
+        why_it_matters="Past co-location catches an operator who has since moved hosting, which current DNS misses.",
+        caveat="Weighted down by age, and old shared hosting can put unrelated sites on one address.",
+        base_importance="supporting",
     ),
     "whois.registrar": EvidenceDefinition(
         path="whois.registrar",
@@ -349,6 +421,23 @@ EVIDENCE_DEFINITIONS: dict[str, EvidenceDefinition] = {
         caveat="Scan observations can be historical or reflect shared platforms.",
         base_importance="supporting",
     ),
+    "censys.hits[*].cert_fingerprint_sha256": EvidenceDefinition(
+        path="censys.hits[*].cert_fingerprint_sha256",
+        label="Shared certificate (Censys-observed)",
+        category="Transport",
+        description="Censys observed both targets' hosts serving the same leaf TLS certificate.",
+        why_it_matters=(
+            "Byte-identical certificates point at one operator provisioning both, and this "
+            "reaches hosts our own TLS probe cannot — ones that refuse our connection or fall "
+            "outside the probe cap."
+        ),
+        caveat=(
+            "Ranks below a directly probed fingerprint: the search returns the fingerprint "
+            "without the certificate body, so the shared-default-vhost check that qualifies "
+            "our own cert matches cannot run on it."
+        ),
+        base_importance="strong",
+    ),
     "shodan.hits[*].ip": EvidenceDefinition(
         path="shodan.hits[*].ip",
         label="Shared Shodan host",
@@ -471,22 +560,105 @@ IMPORTANCE_TIER_WEIGHTS: dict[str, float] = {
 
 # "shared_ip" is a pseudo-kind: a shared `ip` entity that two domains both
 # resolve to is scored like a selector (a CDN-free dedicated IP is strong).
+#
+# tls_cert_sha256 sits above the nominal 100 "decisive" reference point
+# (IMPORTANCE_TIER_WEIGHTS["decisive"]) on purpose: utils.check.rarity_weight
+# decays as 1/log2(degree), so even a base of 100 falls under the graph's
+# decisive-strength cutoff (weight >= 50, see utils.check._graph_strength)
+# once a cert is shared by more than ~4 entities — which punishes the exact
+# case this selector exists to catch, one operator's own small portfolio of
+# sites reusing the same cert (10-15 domains is a completely normal size for
+# that, not noise). 200 keeps a single match decisive up to ~degree 15 while
+# the hard denylist (CORRELATION_DEGREE_THRESHOLD, default 50) still catches
+# genuinely-shared-hosting-scale reuse regardless of this weight. Retune
+# alongside TRACKING_SUBKIND_WEIGHTS's near-identity entries below if the
+# survivable degree needs to move.
+#
+# crypto_wallet gets the same >100 headroom as tls_cert_sha256 and
+# adsense_publisher, and for the same structural reason: an address is a public
+# key whose funds only one keyholder can spend, so two sites collecting payment
+# to it are one operation by definition — and the case that most needs to
+# survive rarity decay is exactly the one where a wallet is reused across a
+# fundraising/scam network's whole spread of front sites. At 185 a match stays
+# above the decisive cutoff to roughly degree 13, which covers that spread,
+# while genuinely promiscuous reuse still trips CORRELATION_DEGREE_THRESHOLD.
+# It sits just *below* adsense_publisher because a wallet address is plain
+# copyable page text — an impersonator or scraper can republish someone else's
+# donation address and manufacture the match, whereas a publisher ID has to be
+# minted by Google for the account that gets paid.
+#
+# legal_registration gets headroom for the same reason as crypto_wallet: a
+# company registration number is issued by a state registry to exactly one
+# legal entity, so two sites publishing the same one are declaring the same
+# company — and the case that must survive rarity decay is one operating
+# company standing behind a spread of trading names. It sits below
+# crypto_wallet because extraction reads it out of free imprint prose (see
+# signal_web._extract_registration_ids, which is why only structured ID tokens
+# on registration-labelled lines are accepted) rather than off a validated
+# checksum, so a parse error is the realistic failure mode here.
+#
+# legal_entity and legal_address are the same disclosure but far softer.
+# Company names collide across unrelated firms ("Digital Media Ltd") and
+# addresses are routinely a registered-agent, accountant, or coworking suite
+# shared by thousands of companies — noise that scales *with* degree, so like
+# contact_phone they are left below 100 to let rarity decay bite early.
+# legal_address sits under legal_entity because the shared-mailbox story is
+# the more common one.
+#
+# legal_text_hash is an exact hash of the normalized text of a legal page, so
+# it only fires on a byte-identical policy — either one operator publishing
+# the same document twice, or one site copying another's. Generator-produced
+# policies (iubenda, Termly, ...) are the false-positive source and they are
+# common, so it is pinned at html_hash's weight: the same "identical page
+# body" class of evidence, and no stronger.
+#
+# contact_email is the strongest of the imprint set after the registration id:
+# a mailbox is account-bound and someone has to read it. Provider and
+# privacy-proxy role addresses are the noise source and they are filtered out
+# before a selector is ever written (utils.check._is_generic_email), so what
+# reaches scoring is an operator-chosen address.
+#
+# contact_phone is deliberately denied that headroom despite being a real
+# operational tie. Its noise sources — outsourced call centres, franchise and
+# reseller networks, and copy-paste template/placeholder numbers — all scale
+# *with* degree rather than being independent of it, so rarity decay is the
+# right correction here and we want it to bite early. At 60 a phone shared by
+# two sites is strong corroboration (above social_handle: you can register a
+# handle for free, a live number has to be answered) but drops out of decisive
+# strength at degree 3, which is where the shared-switchboard explanation
+# starts to compete with the shared-operator one.
 SELECTOR_BASE_WEIGHTS: dict[str, float] = {
-    "tls_cert_sha256": 100.0,   # exact current leaf cert — decisive
+    "tls_cert_sha256": 200.0,   # exact current leaf cert — decisive, see note above
     "ssh_fp": 95.0,             # shared SSH host key — decisive
     "site_verification": 92.0,  # webmaster-tools verification code — near-decisive
     "shared_ip": 85.0,          # dedicated shared origin IP — strong+
     "tls_spki": 80.0,           # shared public-key (SPKI) reuse — strong
     "tracking_id": 70.0,        # GA/GTM/pixel/AdSense — see TRACKING_SUBKIND_WEIGHTS
+    "crypto_wallet": 185.0,     # same payment wallet — near-identity, see note above
+    "legal_registration": 165.0,  # same company registration id — near-identity, see note above
+    "contact_email": 88.0,      # same operator-chosen contact mailbox — strong+
+    "legal_entity": 68.0,       # same legal/company name — strong-, see note above
+    "contact_phone": 60.0,      # same published phone number — strong-, see note above
+    "legal_address": 46.0,      # same registered/postal address — supporting, see note above
+    "legal_text_hash": 45.0,    # byte-identical legal page text — supporting+
     "social_handle": 55.0,      # same social handle (Telegram/VK/Instagram/…) — strong-
     "html_hash": 45.0,          # identical homepage body — supporting+
     "favicon_mmh3": 45.0,       # favicon fingerprint — supporting
     "favicon_md5": 40.0,        # favicon md5 — supporting
     "tls_san": 40.0,            # cert names overlap (not full fp) — supporting
     "network_cidr": 30.0,       # same network block — supporting-
+    "spf_origin": 30.0,         # same authorised mail sender — supporting-, see note below
     "nameserver": 25.0,         # shared nameserver — supporting-
     "asn": 15.0,                # bare ASN — low-signal
 }
+
+# `spf_origin` sits level with network_cidr rather than higher: the overwhelming
+# majority of domains authorise one of a few large providers (Google, Microsoft,
+# SendGrid), so the kind is high-degree by construction and most matches carry
+# almost no information. That is handled the same way it is for `asn` — degree
+# denylisting plus rarity_weight collapse the common blocks automatically — and
+# what survives is the case worth having: two sites authorising the same
+# self-hosted mail origin, which is a real operational tie.
 
 # `tracking_id` is a single selector kind whose value is prefixed with the
 # provider (see _TRACKING_SELECTOR_MAP in db.intel_db), so we grade it per
@@ -497,9 +669,19 @@ SELECTOR_BASE_WEIGHTS: dict[str, float] = {
 #   - GA properties / ad pixels bind to one analytics/ad account — strong.
 #   - GTM containers are routinely reused by agencies across unrelated clients,
 #     and a Facebook app ID rides along with shared themes/plugins — strong.
+#
+# adsense_publisher and ga_property are pushed well above 100 for the same
+# reason as tls_cert_sha256 above: they're the two subkinds that genuinely
+# bind to one operator's account (a publisher/analytics ID isn't something
+# two unrelated sites end up sharing by accident, unlike a GTM container or
+# ad pixel, which is why those two stay near their original weight instead).
+# Without the headroom, an operator's own handful of properties sharing one
+# GA/AdSense ID would fall under the graph's decisive-strength cutoff on
+# rarity alone even though that's precisely the ownership signal this
+# selector is meant to catch.
 TRACKING_SUBKIND_WEIGHTS: dict[str, float] = {
-    "adsense_publisher": 90.0,
-    "ga_property": 82.0,
+    "adsense_publisher": 190.0,
+    "ga_property": 170.0,
     "fb_pixel": 65.0,
     "yandex_metrika": 74.0,
     "tiktok_pixel": 55.0,

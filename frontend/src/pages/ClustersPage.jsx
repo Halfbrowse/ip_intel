@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { createPortal } from "react-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Badge, Button, Card, Modal, Text, View } from "reshaped";
 
-import { normalizeConnectionsGraph, normalizeGraphClusters, useApi } from "../api.js";
+import { fetchJson, normalizeConnectionsGraph, normalizeGraphClusters, useApi } from "../api.js";
 import LazyClusterGraph from "../components/LazyClusterGraph.jsx";
 import { EmptyState, ErrorState, LoadingState } from "../components/primitives.jsx";
 import { FaviconThumb, sharedNodeLabel } from "../features/evidence.jsx";
 import { rememberFocus } from "../features/focus.js";
-import { finishIngest } from "../features/ingest.jsx";
 import { Link } from "../router.jsx";
 import AppShell from "../shell/AppShell.jsx";
 
@@ -20,11 +19,12 @@ export default function ClustersPage() {
     setRecomputing(true);
     setRecomputeMsg(null);
     try {
-      const response = await fetch("/api/graph/recompute", {
+      // A full graph recompute is long-running, so it gets a longer ceiling
+      // than the default request timeout rather than being cut off mid-rebuild.
+      const payload = await fetchJson("/api/graph/recompute", {
         method: "POST",
-        headers: { Accept: "application/json" },
+        timeoutMs: 10 * 60 * 1000,
       });
-      const payload = await finishIngest(response);
       setRecomputeMsg(`Rebuilt: ${payload?.clusters ?? 0} clusters, ${payload?.entities ?? "?"} entities.`);
       clustersRequest.refresh();
     } catch (err) {
@@ -50,14 +50,14 @@ export default function ClustersPage() {
             <h1>Clusters</h1>
             <p>Groups of channels connected through shared infrastructure or identifiers.</p>
           </div>
-          <div className="action-row">
-            <button className="secondary-button" onClick={clustersRequest.refresh} type="button">
+          <View direction="row" gap={2}>
+            <Button onClick={clustersRequest.refresh} variant="outline">
               Refresh
-            </button>
-            <button className="secondary-button" disabled={recomputing} onClick={recompute} type="button">
+            </Button>
+            <Button disabled={recomputing} loading={recomputing} onClick={recompute} variant="outline">
               {recomputing ? "Recomputing..." : "Recompute graph"}
-            </button>
-          </div>
+            </Button>
+          </View>
         </div>
         {recomputeMsg ? (
           <div className="callout">
@@ -87,20 +87,32 @@ function ClusterCard({ cluster }) {
   const [modalOpen, setModalOpen] = useState(false);
   const [graphState, setGraphState] = useState({ loading: false, error: null, data: null });
 
+  const graphAbortRef = useRef(null);
   const loadGraph = useCallback(async () => {
+    // Abortable and unmount-safe: this is a live scoring call, and closing the
+    // card previously left it running and then set state on a dead component.
+    graphAbortRef.current?.abort();
+    const controller = new AbortController();
+    graphAbortRef.current = controller;
+
     setGraphState({ loading: true, error: null, data: null });
     try {
-      const response = await fetch("/api/graph/connections", {
+      const payload = await fetchJson("/api/graph/connections", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ domains: cluster.members, pool_links: false }),
+        signal: controller.signal,
       });
-      const payload = await finishIngest(response);
       setGraphState({ loading: false, error: null, data: payload });
     } catch (err) {
+      if (controller.signal.aborted) {
+        return;
+      }
       setGraphState({ loading: false, error: err.message || "Could not load the network graph.", data: null });
     }
   }, [cluster.members]);
+
+  useEffect(() => () => graphAbortRef.current?.abort(), []);
 
   const openGraph = useCallback(() => {
     setModalOpen(true);
@@ -118,99 +130,85 @@ function ClusterCard({ cluster }) {
   const truncated = Array.isArray(scoredDomains) && scoredDomains.length < cluster.members.length;
 
   return (
-    <article className="cluster-card">
-      <div className="cluster-card-top">
-        <div>
-          <span className="muted">Cluster</span>
-          <h4>{cluster.id}</h4>
-        </div>
-        <strong title="Channels in this cluster">{cluster.size}</strong>
-      </div>
-      <div className="chip-row">
-        {cluster.members.slice(0, 12).map((member) => (
-          <span className="chip" key={`${cluster.id}-${member}`}>
-            {member}
-          </span>
-        ))}
-        {cluster.members.length > 12 ? (
-          <span className="chip digest-more-chip">+{cluster.members.length - 12} more</span>
+    <Card padding={4}>
+      <View gap={3}>
+        <View align="center" direction="row" justify="space-between">
+          <View gap={1}>
+            <Text color="neutral-faded" variant="caption-1">
+              Cluster
+            </Text>
+            <Text variant="body-1" weight="bold">
+              {cluster.id}
+            </Text>
+          </View>
+          <Badge attributes={{ title: "Channels in this cluster" }} color="primary" variant="faded">
+            {cluster.size}
+          </Badge>
+        </View>
+        <View direction="row" gap={1} wrap>
+          {cluster.members.slice(0, 12).map((member) => (
+            <Badge color="neutral" key={`${cluster.id}-${member}`} variant="faded">
+              {member}
+            </Badge>
+          ))}
+          {cluster.members.length > 12 ? (
+            <Badge color="neutral">+{cluster.members.length - 12} more</Badge>
+          ) : null}
+        </View>
+        {cluster.links.length > 0 ? (
+          <View gap={1}>
+            <Text color="neutral-faded" variant="caption-1">
+              Connected by
+            </Text>
+            <View direction="row" gap={1} wrap>
+              {cluster.links.map((link) => (
+                <Badge
+                  attributes={{ title: `${sharedNodeLabel(link.kind)}: ${link.value}` }}
+                  color="primary"
+                  key={`${cluster.id}-${link.kind}-${link.value}`}
+                  variant="faded"
+                >
+                  <FaviconThumb kind={link.kind} value={link.value} />
+                  {sharedNodeLabel(link.kind)}: {link.value}
+                  {link.memberCount ? ` x${link.memberCount}` : ""}
+                </Badge>
+              ))}
+              {cluster.linkCount > cluster.links.length ? (
+                <Badge color="neutral">+{cluster.linkCount - cluster.links.length} more</Badge>
+              ) : null}
+            </View>
+          </View>
         ) : null}
-      </div>
-      {cluster.links.length > 0 ? (
-        <div className="cluster-links">
-          <span className="muted">Connected by</span>
-          <div className="chip-row">
-            {cluster.links.map((link) => (
-              <span
-                className="chip connector-chip"
-                key={`${cluster.id}-${link.kind}-${link.value}`}
-                title={`${sharedNodeLabel(link.kind)}: ${link.value}`}
-              >
-                <FaviconThumb kind={link.kind} value={link.value} />
-                {sharedNodeLabel(link.kind)}
-                <span className="connector-value">{link.value}</span>
-                {link.memberCount ? <span className="connector-count">x{link.memberCount}</span> : null}
-              </span>
-            ))}
-            {cluster.linkCount > cluster.links.length ? (
-              <span className="chip digest-more-chip">+{cluster.linkCount - cluster.links.length} more</span>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-      <div className="action-row">
-        <button className="secondary-button" onClick={openGraph} type="button">
-          View network graph
-        </button>
-        <Link className="primary-button" onClick={() => rememberFocus(cluster.members)} to="/connections">
-          Show connections
-        </Link>
-      </div>
-      {modalOpen ? (
-        <GraphModal onClose={() => setModalOpen(false)} title={`Cluster ${cluster.id}`}>
+        <View direction="row" gap={3}>
+          <Button onClick={openGraph} variant="outline">
+            View network graph
+          </Button>
+          {/* Link (not Button) -- needs the router's client-side navigation. */}
+          <Link className="primary-button" onClick={() => rememberFocus(cluster.members)} to="/connections">
+            Show connections
+          </Link>
+        </View>
+      </View>
+      <Modal active={modalOpen} onClose={() => setModalOpen(false)} size="90vw">
+        <View gap={4}>
+          <View align="center" direction="row" justify="space-between">
+            <Text variant="title-3" weight="bold">
+              Cluster {cluster.id}
+            </Text>
+            <Button onClick={() => setModalOpen(false)} size="small" variant="ghost">
+              Close
+            </Button>
+          </View>
           {graphState.loading ? <LoadingState message="Scoring connections..." /> : null}
           {graphState.error ? <ErrorState message={graphState.error} /> : null}
           {truncated ? (
-            <p className="muted">
+            <Text color="neutral-faded">
               Showing the first {scoredDomains.length} of {cluster.members.length} channels.
-            </p>
+            </Text>
           ) : null}
           {graph ? <LazyClusterGraph graph={graph} seedTargets={seedTargets} /> : null}
-        </GraphModal>
-      ) : null}
-    </article>
-  );
-}
-
-function GraphModal({ title, onClose, children }) {
-  useEffect(() => {
-    const onKeyDown = (event) => {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
-
-  return createPortal(
-    <div className="graph-modal-backdrop" onClick={onClose}>
-      <div
-        aria-label={title}
-        aria-modal="true"
-        className="graph-modal"
-        onClick={(event) => event.stopPropagation()}
-        role="dialog"
-      >
-        <div className="graph-modal-head">
-          <strong>{title}</strong>
-          <button className="secondary-button small" onClick={onClose} type="button">
-            Close
-          </button>
-        </div>
-        <div className="graph-modal-body">{children}</div>
-      </div>
-    </div>,
-    document.body,
+        </View>
+      </Modal>
+    </Card>
   );
 }

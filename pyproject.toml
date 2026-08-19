@@ -7,17 +7,15 @@ dependencies = [
     "dnspython>=2.6",
     "python-whois>=0.9",
     "requests[socks]>=2.31",
-    "ipwhois>=1.2",
     "python-dotenv>=1.0",
     "censys-platform>=0.13.4",
-    "shodan>=1.31",
-    "netlas>=0.5",
     "httpx[socks]>=0.27",
     "cryptography>=42.0",
     "colorama>=0.4.6",
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "psycopg[binary]>=3.2",
+    "redis>=5.0",
     "python-multipart>=0.0.9",
     "pycti>=6.0",
     "libmagic>=1.0",
@@ -28,8 +26,9 @@ dependencies = [
     "pytest>=8.3",
 ]
 
-[project.scripts]
-ip-intel = "core.ip_intel:main"
+# No [project.scripts]: the `ip-intel` console script pointed at
+# core.ip_intel:main, the CLI entry point for the retired async scan engine.
+# The app is served as `uvicorn app:app` (see Dockerfile).
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

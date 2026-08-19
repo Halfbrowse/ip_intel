@@ -35,6 +35,7 @@ RUN uv pip install --system --no-cache -r pyproject.toml
 
 # Copy application code
 COPY app.py ./
+COPY tests ./tests
 COPY sources ./sources
 COPY core ./core
 COPY cases ./cases
@@ -46,6 +47,7 @@ COPY config ./config
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 
 RUN mkdir -p /app/data
+
 
 EXPOSE 8000
 

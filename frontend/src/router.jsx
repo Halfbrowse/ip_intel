@@ -144,6 +144,11 @@ export function useParams() {
   return useContext(RouteContext).params;
 }
 
+export function useNavigate() {
+  const router = useContext(RouterContext);
+  return (to, options) => router.navigate(to, options);
+}
+
 function createRouteObjects(children) {
   return Children.toArray(children)
     .filter((child) => isValidElement(child))

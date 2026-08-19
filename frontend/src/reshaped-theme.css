@@ -1,0 +1,31 @@
+/* Champagne + midnight-blue dark mode, layered on top of Reshaped's stock
+   "slate" theme (imported separately in main.jsx, before this file) via its
+   own documented runtime-theming mechanism -- plain CSS custom-property
+   overrides scoped to the same [data-rs-theme][data-rs-color-mode] selector
+   Reshaped itself uses. Light mode is intentionally left as Reshaped's stock
+   slate palette; only dark mode is recolored here. */
+[data-rs-theme~="slate"][data-rs-color-mode="dark"] {
+  --rs-color-background-page: #0b1229;
+  --rs-color-background-page-faded: #0d1530;
+  --rs-color-background-elevation-base: #10152b;
+  --rs-color-background-elevation-raised: #141b36;
+  --rs-color-background-elevation-overlay: #182047;
+
+  --rs-color-foreground-neutral: #f3e9d2;
+  --rs-color-foreground-neutral-faded: #b8a788;
+  --rs-color-on-background-neutral: #f3e9d2;
+
+  --rs-color-background-neutral: #182047;
+  --rs-color-background-neutral-highlighted: #1c2650;
+  --rs-color-border-neutral: rgba(216, 194, 152, 0.16);
+  --rs-color-border-neutral-faded: rgba(216, 194, 152, 0.1);
+
+  --rs-color-background-primary: #d9c298;
+  --rs-color-background-primary-highlighted: #c9a86a;
+  --rs-color-background-primary-faded: #241f14;
+  --rs-color-background-primary-highlighted-faded: rgba(217, 194, 152, 0.08);
+  --rs-color-border-primary: #c9a86a;
+  --rs-color-border-primary-faded: #3a3220;
+  --rs-color-foreground-primary: #d9c298;
+  --rs-color-on-background-primary: #10152b;
+}

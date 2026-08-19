@@ -504,56 +504,75 @@ def save_search_run(
 
 
 def _replace_helper_rows(cur: psycopg.Cursor[Any], run_id: str, helpers: dict[str, Any]) -> None:
-    for entry in helpers.get("observed_ips", []) or []:
-        cur.execute(
+    # Batched with executemany instead of one INSERT round-trip per row — a
+    # single target can carry dozens to hundreds of discovered targets /
+    # identifiers, and this runs once per analyzed target on the case-runtime
+    # hot path (cases/case_runtime.py's per-target analysis loop).
+    observed_ips = [
+        (run_id, entry.get("ip"), entry.get("source"))
+        for entry in helpers.get("observed_ips", []) or []
+    ]
+    if observed_ips:
+        cur.executemany(
             """
             INSERT INTO search_run_observed_ips (search_run_id, ip, source)
             VALUES (%s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
-            (run_id, entry.get("ip"), entry.get("source")),
+            observed_ips,
         )
-    for entry in helpers.get("tls_fingerprints", []) or []:
-        cur.execute(
+    tls_fingerprints = [
+        (run_id, entry.get("fingerprint_sha256"), entry.get("cn"), entry.get("issuer"))
+        for entry in helpers.get("tls_fingerprints", []) or []
+    ]
+    if tls_fingerprints:
+        cur.executemany(
             """
             INSERT INTO search_run_tls_fingerprints (search_run_id, fingerprint_sha256, cn, issuer)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
-            (run_id, entry.get("fingerprint_sha256"), entry.get("cn"), entry.get("issuer")),
+            tls_fingerprints,
         )
-    for entry in helpers.get("identifiers", []) or []:
-        cur.execute(
+    identifiers = [
+        (run_id, entry.get("category"), entry.get("value"))
+        for entry in helpers.get("identifiers", []) or []
+    ]
+    if identifiers:
+        cur.executemany(
             """
             INSERT INTO search_run_identifiers (search_run_id, category, value)
             VALUES (%s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
-            (run_id, entry.get("category"), entry.get("value")),
+            identifiers,
         )
-    for entry in helpers.get("provider_hits", []) or []:
-        cur.execute(
+    provider_hits = [
+        (run_id, entry.get("provider"), entry.get("value"))
+        for entry in helpers.get("provider_hits", []) or []
+    ]
+    if provider_hits:
+        cur.executemany(
             """
             INSERT INTO search_run_provider_hits (search_run_id, provider, value)
             VALUES (%s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
-            (run_id, entry.get("provider"), entry.get("value")),
+            provider_hits,
         )
-    for entry in helpers.get("discovered_targets", []) or []:
-        cur.execute(
+    discovered_targets = [
+        (run_id, entry.get("target"), entry.get("kind"), entry.get("reason"))
+        for entry in helpers.get("discovered_targets", []) or []
+    ]
+    if discovered_targets:
+        cur.executemany(
             """
             INSERT INTO search_run_discovered_targets (
                 search_run_id, discovered_target, discovery_kind, discovery_reason
             ) VALUES (%s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
-            (
-                run_id,
-                entry.get("target"),
-                entry.get("kind"),
-                entry.get("reason"),
-            ),
+            discovered_targets,
         )
 
 
@@ -726,29 +745,35 @@ def find_historical_candidates(
 
 
 def replace_pairings(case_id: str, pairings: list[dict[str, Any]]) -> None:
+    # Pairing count is O(targets^2) for a case's full comparison matrix, so
+    # this is batched with executemany instead of one INSERT round-trip per
+    # pair.
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM pairings WHERE case_id = %s", (case_id,))
-            for item in pairings:
-                cur.execute(
+            if pairings:
+                cur.executemany(
                     """
                     INSERT INTO pairings (
                         id, case_id, scope, left_run_id, right_run_id,
                         left_target, right_target, score, match_count, payload
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (
-                        item["id"],
-                        case_id,
-                        item["scope"],
-                        item["left_run_id"],
-                        item["right_run_id"],
-                        item["left_target"],
-                        item["right_target"],
-                        item["score"],
-                        item["match_count"],
-                        Jsonb(item["payload"]),
-                    ),
+                    [
+                        (
+                            item["id"],
+                            case_id,
+                            item["scope"],
+                            item["left_run_id"],
+                            item["right_run_id"],
+                            item["left_target"],
+                            item["right_target"],
+                            item["score"],
+                            item["match_count"],
+                            Jsonb(item["payload"]),
+                        )
+                        for item in pairings
+                    ],
                 )
         conn.commit()
 
@@ -893,6 +918,40 @@ def recoverable_jobs() -> list[dict[str, Any]]:
                 """
             )
             return list(cur.fetchall())
+
+
+def mark_interrupted_jobs() -> int:
+    """Flip every still-open job (and its case) to 'failed'.
+
+    Used on startup when auto-recovery is disabled: a job left 'queued'/'running'
+    when the process stopped would otherwise sit forever showing in-progress.
+    Marking it failed gives a clean slate on restart and guarantees nothing
+    resumes. Returns the number of jobs flipped.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed',
+                    error = COALESCE(error, 'Interrupted by restart (auto-recovery disabled)'),
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE status IN ('queued', 'running')
+                """
+            )
+            job_count = cur.rowcount
+            cur.execute(
+                """
+                UPDATE cases
+                SET status = 'failed',
+                    finished_at = COALESCE(finished_at, NOW()),
+                    updated_at = NOW()
+                WHERE status IN ('queued', 'running')
+                """
+            )
+        conn.commit()
+    return job_count
 
 
 def healthcheck() -> dict[str, Any]:

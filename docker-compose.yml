@@ -1,35 +1,14 @@
 services:
   # ── VPN egress with on-demand IP rotation (rate-limit bypass) ──────────────
-  # The ProtonVPN container itself is NOT managed here — it's the shared
-  # `protonvpn-cli` container from the separate protonvpn-cli-community stack
-  # at /srv/protonvpn-cli-community (docker compose up there), already on
-  # `shared_net`. Defining it again in this file would collide on
-  # `container_name: protonvpn-cli`, so this compose only adds the piece that
-  # stack is missing: a forward HTTP proxy.
-  #
-  # protonvpn-cli exposes a control API (connect/disconnect/reconnect/status)
-  # on :8000 — utils/vpn.py calls it (VPN_API_BASE_URL) to rotate the exit IP.
-  # It is NOT an HTTP proxy though, so provider traffic needs a separate proxy
-  # sharing its network namespace to actually egress via the VPN tunnel
-  # (OUTBOUND_PROXY_URL). Only provider traffic is proxied; DB/DNS/raw socket
-  # probes stay direct (see utils/outbound.py). Started with:
-  #   docker compose --profile vpn up protonvpn-proxy
-  protonvpn-proxy:
-    image: vimagick/tinyproxy
-    container_name: protonvpn-proxy
-    profiles: ["vpn"]
-    # Attaches to the externally-managed protonvpn-cli container's network
-    # namespace by name (works across compose projects, unlike
-    # `service:protonvpn-cli` which only resolves within this same file) —
-    # so its egress IP is always the current ProtonVPN exit IP. The app
-    # reaches it on shared_net as http://protonvpn-cli:8888.
-    network_mode: "container:protonvpn-cli"
-    volumes:
-      # Default image config only allows 127.0.0.1; this opens the proxy to the
-      # docker private ranges so the app (on shared_net) can reach it. Verify
-      # the in-image config path on first run (some builds use /etc/tinyproxy.conf).
-      - ./config/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
-    restart: unless-stopped
+  # Both the ProtonVPN container (protonvpn-cli, control API on :8000) and its
+  # forward HTTP proxy (protonvpn-proxy / tinyproxy on :8888) are managed by the
+  # separate protonvpn-cli-community stack at /srv/protonvpn-cli-community — the
+  # proxy is defined there (not here) so it shares the VPN container's network
+  # namespace AND recreates together with it, which is what keeps it from being
+  # orphaned on a stale namespace when the VPN restarts. This app reaches them
+  # on shared_net as http://protonvpn-cli:8888 (proxy, OUTBOUND_PROXY_URL) and
+  # http://protonvpn-cli:8000 (rotation API, VPN_API_BASE_URL). Only provider
+  # traffic is proxied; DB/DNS/raw-socket probes stay direct (utils/outbound.py).
 
   postgres:
     image: postgres:16
@@ -46,6 +25,30 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Server-side response cache for the read endpoints (cases/cache.py). Kept on
+  # the internal `default` network only — no published port, so it is reachable
+  # from ip-intel and nothing else. Cache-only workload: persistence is off
+  # (a cold cache re-warms itself on boot), and a hard memory ceiling with LRU
+  # eviction stops a large pool payload from growing into the app's own budget.
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   ip-intel:
     build: .
     ports:
@@ -54,6 +57,9 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://ip_intel:ip_intel@postgres:5432/ip_intel
+      # Response cache. Unset/unreachable = every endpoint computes live, so
+      # the app runs unchanged without the redis service (cases/cache.py).
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:9000}
       # Empty by default = direct connection / no rotation, so runs without the
       # `vpn` profile work unchanged. To enable the rotating VPN egress, set in
@@ -70,6 +76,8 @@ services:
       - ./data:/app/data
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
     mem_limit: 6g

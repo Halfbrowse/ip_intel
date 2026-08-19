@@ -5,7 +5,7 @@ import DomainPage from "./pages/DomainPage.jsx";
 import NotFoundPage from "./pages/NotFoundPage.jsx";
 import PoolPage from "./pages/PoolPage.jsx";
 
-export { getInitialTheme } from "./shell/AppShell.jsx";
+export { getInitialTheme, ThemeProvider } from "./shell/AppShell.jsx";
 
 export default function App() {
   return (
